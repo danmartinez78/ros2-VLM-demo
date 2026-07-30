@@ -275,3 +275,48 @@ worker always sees the freshest available frame.
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+
+---
+
+## Automated Thor deployment setup
+
+The setup scripts target Jetson AGX Thor with JetPack 7.2 / Jetson Linux R39.2
+and Ubuntu 24.04. They install the full JetPack development stack, ROS 2 Jazzy,
+OpenCV, rosbag2, rosdep, colcon, and the packages needed to compile this node.
+
+From the repository root:
+
+```bash
+bash scripts/setup_deployment.sh
+```
+
+On the first run, the script installs system dependencies and creates a local
+configuration file:
+
+```text
+scripts/cosmos_env.sh
+```
+
+Review the model and engine paths in that file, then finish deployment:
+
+```bash
+bash scripts/build_workspace.sh
+bash scripts/verify_deployment.sh
+```
+
+To install RViz and the complete ROS desktop environment as well:
+
+```bash
+bash scripts/install_dependencies.sh --desktop
+```
+
+The default is the smaller `ros-jazzy-ros-base` deployment. The installer
+refuses to continue on an unexpected OS, CPU architecture, or Jetson Linux
+release unless `--force` is supplied.
+
+The scripts intentionally do not rebuild TensorRT Edge-LLM or the Cosmos
+engines. Those artifacts are hardware-specific and must already have been
+built on this Thor. `verify_deployment.sh` checks that the source tree, core
+archive, plugin, language engine, visual engine, ROS overlay, and installed
+node are all present.
