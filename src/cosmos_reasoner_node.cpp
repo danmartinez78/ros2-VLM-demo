@@ -23,6 +23,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <rclcpp/rclcpp.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 
@@ -214,6 +215,11 @@ void CosmosReasonerNode::validate_parameters()
   prompt_ = this->get_parameter("prompt").as_string();
   if (prompt_.empty()) {
     throw std::runtime_error("prompt must not be empty");
+  }
+
+  const auto queue_capacity = this->get_parameter("queue_capacity").as_int();
+  if (queue_capacity != 1) {
+    throw std::runtime_error("queue_capacity must be 1 in the current implementation");
   }
 
   drop_old_frames_ = this->get_parameter("drop_old_frames").as_bool();
