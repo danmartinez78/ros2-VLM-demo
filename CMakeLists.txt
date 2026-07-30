@@ -44,8 +44,6 @@ set(BUILD_TENSORRT_BACKEND FALSE)
 
 if(TENSORRT_EDGE_LLM_ROOT)
   message(STATUS "TensorRT Edge-LLM root : ${TENSORRT_EDGE_LLM_ROOT}")
-  enable_language(CUDA)
-  find_package(CUDAToolkit REQUIRED)
 
   # ── Locate TRT package dir (contains TRT headers and libs) ───────────────
   if(NOT TRT_PACKAGE_DIR)
@@ -81,6 +79,9 @@ if(TENSORRT_EDGE_LLM_ROOT)
 
   # ── Validate required Edge-LLM built libraries ───────────────────────────
   if(TENSORRT_EDGE_LLM_BUILD_DIR)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
     # TensorRT Edge-LLM 0.9.x builds tokenizer sources into edgellmCore.
     # A separate tokenizer archive is no longer produced.
     find_library(EDGELLM_CORE_LIB edgellmCore
@@ -127,6 +128,7 @@ target_include_directories(cosmos_reasoner_node PUBLIC
 
 ament_target_dependencies(cosmos_reasoner_node
   rclcpp
+  rcl_interfaces
   sensor_msgs
   std_msgs
   builtin_interfaces
