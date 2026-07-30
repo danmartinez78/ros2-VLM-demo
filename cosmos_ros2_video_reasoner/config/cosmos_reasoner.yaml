@@ -1,0 +1,51 @@
+# cosmos_ros2_video_reasoner — default parameters
+#
+# Copy to your workspace or override via launch arguments.
+# All path parameters must be absolute (~ is not expanded by rclcpp::Node).
+
+cosmos_reasoner:
+  ros__parameters:
+    # ── Topics ────────────────────────────────────────────────────────────────
+    image_topic: /camera/image_raw
+    result_topic: /cosmos/reasoning
+
+    # ── Engine paths (REQUIRED on hardware — set absolute paths) ─────────────
+    # Example:
+    #   llm_engine_dir: /home/nvidia/tensorrt-edgellm-workspace/Cosmos-Reason2-2B/engine/llm
+    #   multimodal_engine_dir: /home/nvidia/tensorrt-edgellm-workspace/Cosmos-Reason2-2B/engine
+    #   edge_llm_plugin_path: /home/nvidia/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so
+    llm_engine_dir: ""
+    multimodal_engine_dir: ""
+    edge_llm_plugin_path: ""
+
+    # ── VLM prompt ────────────────────────────────────────────────────────────
+    prompt: >
+      Describe the scene in this camera frame. Identify important objects,
+      people, animals, vehicles, terrain, hazards, and unusual conditions.
+      Do not claim details that are not visually supported.
+
+    # ── Sampling ──────────────────────────────────────────────────────────────
+    # Time between frames sent for inference (uses ROS message timestamp,
+    # so bag replay at any speed remains deterministic).
+    sample_period_seconds: 2.0
+
+    # ── Inference parameters ──────────────────────────────────────────────────
+    max_generate_length: 256
+    temperature: 0.2
+    top_p: 0.9
+    top_k: 20
+
+    # ── Image preprocessing ───────────────────────────────────────────────────
+    image_max_width: 1280
+    jpeg_quality: 90
+
+    # ── Queue / drop policy ───────────────────────────────────────────────────
+    queue_capacity: 1
+    drop_old_frames: true
+
+    # ── Output ────────────────────────────────────────────────────────────────
+    publish_results: true
+
+    # ── Profiling (developer option) ──────────────────────────────────────────
+    dump_profile: false
+    profile_output_directory: /tmp/cosmos_ros2_profiles
