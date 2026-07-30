@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cosmos_ros2_video_reasoner CXX)
+project(cosmos_ros2_video_reasoner LANGUAGES CXX CUDA)
 
 # ── C++ standard ─────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 20)
@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ── ament ─────────────────────────────────────────────────────────────────────
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rcl_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
@@ -16,6 +17,7 @@ find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
+find_package(CUDAToolkit REQUIRED)
 
 # ── Custom message ────────────────────────────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -59,6 +61,7 @@ if(TENSORRT_EDGE_LLM_ROOT)
     "cpp/runtime/imageUtils.h"
     "cpp/tokenizer/tokenizer.h"
     "cpp/multimodal/multimodalRunner.h"
+    "3rdParty/stb/stb_image.h"
   )
   foreach(_hdr IN LISTS _EDGELLM_REQUIRED_HEADERS)
     if(NOT EXISTS "${TENSORRT_EDGE_LLM_ROOT}/${_hdr}")
@@ -77,26 +80,21 @@ if(TENSORRT_EDGE_LLM_ROOT)
 
   # ── Validate required Edge-LLM built libraries ───────────────────────────
   if(TENSORRT_EDGE_LLM_BUILD_DIR)
-    foreach(_lib edgellmCore edgellmTokenizer)
-      find_library(_EDGELLM_${_lib}_LIB ${_lib}
-        HINTS "${TENSORRT_EDGE_LLM_BUILD_DIR}"
-        PATH_SUFFIXES lib)
-      if(NOT _EDGELLM_${_lib}_LIB)
-        message(FATAL_ERROR
-          "Required Edge-LLM library '${_lib}' not found in "
-          "TENSORRT_EDGE_LLM_BUILD_DIR=${TENSORRT_EDGE_LLM_BUILD_DIR}.\n"
-          "Build TensorRT-Edge-LLM first (see its README).")
-      endif()
-    endforeach()
+    # TensorRT Edge-LLM 0.9.x builds tokenizer sources into edgellmCore.
+    # A separate tokenizer archive is no longer produced.
+    find_library(EDGELLM_CORE_LIB edgellmCore
+      HINTS "${TENSORRT_EDGE_LLM_BUILD_DIR}"
+      PATH_SUFFIXES "" cpp lib
+      REQUIRED)
 
     find_library(NVINFER_LIB nvinfer
       HINTS ${TRT_PACKAGE_DIR}
       PATH_SUFFIXES lib lib64 ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu
       REQUIRED)
 
-    find_library(CUDART_LIB cudart
-      HINTS /usr/local/cuda
-      PATH_SUFFIXES lib64 lib
+    find_library(NVONNXPARSER_LIB nvonnxparser
+      HINTS ${TRT_PACKAGE_DIR}
+      PATH_SUFFIXES lib lib64 ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu
       REQUIRED)
 
     # nlohmann/json bundled with Edge-LLM
@@ -156,19 +154,25 @@ if(BUILD_TENSORRT_BACKEND)
     ${TENSORRT_EDGE_LLM_ROOT}/examples
     ${TRT_INCLUDE_DIR}
     ${_NLOHMANN_JSON_INCLUDE}
+    ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/stb
+    ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/miniaudio
+    ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
   )
 
   target_link_libraries(cosmos_trt_backend
     cosmos_reasoner_node
-    ${_EDGELLM_edgellmCore_LIB}
-    ${_EDGELLM_edgellmTokenizer_LIB}
+    ${EDGELLM_CORE_LIB}
     ${NVINFER_LIB}
-    ${CUDART_LIB}
+    ${NVONNXPARSER_LIB}
+    CUDA::cudart
+    CUDA::cuda_driver
     dl
     ${OpenCV_LIBRARIES}
   )
 
-  ament_target_dependencies(cosmos_trt_backend rclcpp)
+  ament_target_dependencies(cosmos_trt_backend rclcpp rcl_interfaces)
+  set_target_properties(cosmos_trt_backend PROPERTIES
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
 
   # ── Executable (uses TRT backend) ─────────────────────────────────────
   add_executable(cosmos_reasoner src/main.cpp)
@@ -203,6 +207,7 @@ endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS cosmos_reasoner_node
+  EXPORT cosmos_reasoner_nodeTargets
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -250,5 +255,6 @@ if(BUILD_TESTING)
 endif()
 
 ament_export_targets(cosmos_reasoner_nodeTargets HAS_LIBRARY_TARGET)
-ament_export_dependencies(rclcpp sensor_msgs std_msgs builtin_interfaces cv_bridge)
+ament_export_dependencies(
+  rclcpp rcl_interfaces sensor_msgs std_msgs builtin_interfaces cv_bridge image_transport)
 ament_package()
