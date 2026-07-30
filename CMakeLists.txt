@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cosmos_ros2_video_reasoner LANGUAGES CXX CUDA)
+project(cosmos_ros2_video_reasoner LANGUAGES CXX)
 
 # ── C++ standard ─────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 20)
@@ -17,7 +17,6 @@ find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
-find_package(CUDAToolkit REQUIRED)
 
 # ── Custom message ────────────────────────────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -45,6 +44,8 @@ set(BUILD_TENSORRT_BACKEND FALSE)
 
 if(TENSORRT_EDGE_LLM_ROOT)
   message(STATUS "TensorRT Edge-LLM root : ${TENSORRT_EDGE_LLM_ROOT}")
+  enable_language(CUDA)
+  find_package(CUDAToolkit REQUIRED)
 
   # ── Locate TRT package dir (contains TRT headers and libs) ───────────────
   if(NOT TRT_PACKAGE_DIR)
