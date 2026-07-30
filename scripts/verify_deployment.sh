@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+VERIFY_ISAAC_ROS=0
+for arg in "$@"; do
+  case "$arg" in
+    --isaac-ros) VERIFY_ISAAC_ROS=1 ;;
+    -h|--help)
+      echo "Usage: $0 [--isaac-ros]"
+      exit 0
+      ;;
+    *) echo "Unknown option: $arg" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -f /etc/apt/sources.list.d/nvidia-isaac-ros.list ]]; then
+  VERIFY_ISAAC_ROS=1
+fi
+
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 env_file="${COSMOS_ENV_FILE:-${script_dir}/cosmos_env.sh}"
@@ -30,6 +46,7 @@ cosmos_workspace="${COSMOS_WORKSPACE_DIR:-${HOME}/tensorrt-edgellm-workspace}"
 llm_engine="${COSMOS_LLM_ENGINE_DIR:-${cosmos_workspace}/${model_name}/engine/llm}"
 multimodal_engine="${COSMOS_MULTIMODAL_ENGINE_DIR:-${cosmos_workspace}/${model_name}/engine}"
 plugin_path="${EDGELLM_PLUGIN_PATH:-${edge_build}/libNvInfer_edgellm_plugin.so}"
+l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 
 check "Ubuntu 24.04" bash -c 'source /etc/os-release && [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]]'
 check "aarch64 architecture" bash -c '[[ "$(uname -m)" == aarch64 ]]'
@@ -38,6 +55,20 @@ check "JetPack metapackage" dpkg-query -W nvidia-jetpack
 check "CUDA compiler" bash -c 'export PATH=/usr/local/cuda/bin:$PATH; command -v nvcc && nvcc --version'
 check "TensorRT development headers" bash -c 'test -f /usr/include/NvInfer.h || test -f /usr/include/aarch64-linux-gnu/NvInfer.h'
 check "ROS 2 Jazzy setup" test -f "/opt/ros/${ros_distro}/setup.bash"
+if [[ "${VERIFY_ISAAC_ROS}" -eq 1 ]]; then
+  check "Isaac ROS 4.5 Thor APT source" grep -Fxq     "deb [signed-by=/usr/share/keyrings/nvidia-isaac-ros.gpg] https://isaac.download.nvidia.com/isaac-ros/release-4.5 noble-jetpack main"     /etc/apt/sources.list.d/nvidia-isaac-ros.list
+  check "Isaac ROS CLI package" dpkg-query -W isaac-ros-cli
+  check "Isaac ROS CLI" isaac-ros --help
+  check "NVIDIA container toolkit" dpkg-query -W nvidia-container-toolkit
+  check "Docker service" systemctl is-active --quiet docker
+  check "Docker CLI" command -v docker
+
+  if [[ "${l4t_release:-}" == *"# R39 (release), REVISION: 2"* ]]; then
+    printf 'WARN  Isaac ROS 4.5 is not yet officially validated on JetPack 7.2 / R39.2\n'
+    printf '      NVIDIA currently lists JetPack 7.1 / R38.4 for Jetson Thor.\n'
+  fi
+fi
+
 check "rosdep" command -v rosdep
 check "colcon" command -v colcon
 check "OpenCV development package" dpkg-query -W libopencv-dev
