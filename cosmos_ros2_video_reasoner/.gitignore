@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+install/
+log/
+
+# colcon
+*.egg-info/
+*.dist-info/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.make
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Profiling output
+/tmp/cosmos_ros2_profiles/
+
+# OS
+.DS_Store
+Thumbs.db
