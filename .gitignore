@@ -34,3 +34,6 @@ Thumbs.db
 
 # Local deployment configuration
 scripts/cosmos_env.sh
+
+# Downloaded test datasets
+test_data/
