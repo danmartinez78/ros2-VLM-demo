@@ -81,7 +81,7 @@ if [[ -z "${ros_source_version}" ]]; then
   exit 1
 fi
 
-ubuntu_codename="${UBUNTU_CODENAME:-${VERSION_CODENAME}}"
+ubuntu_codename="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
 ros_source_deb="ros2-apt-source_${ros_source_version}.${ubuntu_codename}_all.deb"
 setup_tmp_dir="$(mktemp -d)"
 cleanup() {
@@ -152,7 +152,7 @@ EOF
 
   # Docker mode is NVIDIA's recommended isolation strategy and protects the
   # host-side TensorRT Edge-LLM stack from Isaac ROS package version pins.
-  sudo isaac-ros init docker
+  isaac-ros init docker
 
   echo
   echo "Isaac ROS Docker mode initialized."
