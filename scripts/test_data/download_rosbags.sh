@@ -57,7 +57,7 @@ latest_compatible_version() {
     | select(test("^\\d+\\.\\d+\\.\\d+$"))
     | . as $version
     | split(".") | map(tonumber)
-    | select(.[0] == $major and .[1] <= $minor)
+    | select(.[0] == $major and .[1] == $minor)
     | $version
   ' <<<"${response}" | sort -V | tail -n 1
 }
@@ -100,6 +100,7 @@ download_asset() {
     exit 1
   fi
 
+  trap 'if [[ -n "${staging:-}" && -d "${staging}" ]]; then rm -rf -- "${staging}"; fi' ERR
   echo "Downloading ${key} (NGC ${resource} ${version})..."
   curl -fL --retry 3 --retry-delay 2 -C - -o "${archive}" "${download_url}"
   tar -tzf "${archive}" >/dev/null
@@ -107,6 +108,7 @@ download_asset() {
   tar -xzf "${archive}" -C "${staging}"
   printf '%s\n' "${version}" >"${staging}/.ngc-version"
   mv "${staging}" "${target}"
+  trap - ERR
   rm -f -- "${archive}"
 
   echo "${key}: installed at ${target}"

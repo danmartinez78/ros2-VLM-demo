@@ -22,8 +22,13 @@ if [[ -f "${env_file}" ]]; then
   source "${env_file}"
 fi
 ros_distro="${ROS_DISTRO:-jazzy}"
+ros_setup="/opt/ros/${ros_distro}/setup.bash"
+if [[ ! -f "${ros_setup}" ]]; then
+  echo "ROS 2 ${ros_distro} is not installed. Run scripts/install_dependencies.sh first." >&2
+  exit 1
+fi
 # shellcheck disable=SC1090
-source "/opt/ros/${ros_distro}/setup.bash"
+source "${ros_setup}"
 
 if [[ -n "${ROS_WORKSPACE:-}" && -f "${ROS_WORKSPACE}/install/setup.bash" ]]; then
   # shellcheck disable=SC1090
@@ -58,7 +63,14 @@ launch_pid=$!
 sleep 3
 if ! kill -0 "${launch_pid}" 2>/dev/null; then
   echo "The Cosmos reasoner exited before playback started." >&2
-  wait "${launch_pid}"
+  wait_status=0
+  if ! wait "${launch_pid}"; then
+    wait_status=$?
+  fi
+  if [[ "${wait_status}" -eq 0 ]]; then
+    wait_status=1
+  fi
+  exit "${wait_status}"
 fi
 
 echo "Playing NVIDIA image-proc bag: ${bag_path}"
