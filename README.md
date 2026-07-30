@@ -32,7 +32,7 @@ flowchart LR
 | Hardware | NVIDIA Jetson AGX Thor |
 | JetPack | 7.2 |
 | ROS 2 | Jazzy |
-| TensorRT Edge-LLM | 0.5.0 (`8fe7fe1`) |
+| TensorRT Edge-LLM | 0.9.x / current main |
 | Cosmos Reason2 model | 2B or 8B |
 
 ---
@@ -42,18 +42,23 @@ flowchart LR
 ### 1 — TensorRT Edge-LLM SDK
 
 ```bash
-git clone https://github.com/<nvidia-mirror>/TensorRT-Edge-LLM ~/TensorRT-Edge-LLM
+git clone https://github.com/NVIDIA/TensorRT-Edge-LLM.git ~/TensorRT-Edge-LLM
 cd ~/TensorRT-Edge-LLM
-git submodule update --init
-# Build per its README (requires TensorRT package dir)
-mkdir build && cd build
-cmake .. -DTRT_PACKAGE_DIR=/path/to/tensorrt -DAARCH64_BUILD=1
+git submodule update --init --recursive
+# Build for Jetson AGX Thor using the same configuration used for the engines
+mkdir -p build && cd build
+cmake .. \\
+  -DCMAKE_BUILD_TYPE=Release \\
+  -DTRT_PACKAGE_DIR=/usr \\
+  -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \\
+  -DEMBEDDED_TARGET=jetson-thor \\
+  -DCUDA_CTK_VERSION=13.0 \\
+  -DENABLE_CUTE_DSL=ALL
 make -j$(nproc)
 ```
 
 The build produces:
 * `build/libedgellmCore.a`
-* `build/libedgellmTokenizer.a`
 * `build/libNvInfer_edgellm_plugin.so`
 
 ### 2 — Cosmos Reason2 TensorRT engines
@@ -258,7 +263,7 @@ worker always sees the freshest available frame.
 
 ## Known limitations
 
-* **Sampled images, not video**: TensorRT Edge-LLM 0.5.0 has no native
+* **Sampled images, not video**: The ROS node currently processes independent sampled frames; its Edge-LLM integration does not yet expose native
   video-stream input.  Frames are treated as independent images.
 * **CompressedImage support**: Follow-up task — subscribe to
   `sensor_msgs/msg/CompressedImage` via `image_transport` to avoid
