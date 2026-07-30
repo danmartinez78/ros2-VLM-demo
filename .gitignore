@@ -31,3 +31,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local deployment configuration
+scripts/cosmos_env.sh

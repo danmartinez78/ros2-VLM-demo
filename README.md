@@ -34,6 +34,7 @@ flowchart LR
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | 0.9.x / current main |
 | Cosmos Reason2 model | 2B or 8B |
+| Isaac ROS | 4.5 in Docker (optional; experimental on JetPack 7.2) |
 
 ---
 
@@ -275,3 +276,77 @@ worker always sees the freshest available frame.
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+
+
+---
+
+## Automated Thor deployment setup
+
+The setup scripts target Jetson AGX Thor with JetPack 7.2 / Jetson Linux R39.2
+and Ubuntu 24.04. They install the full JetPack development stack, ROS 2 Jazzy,
+OpenCV, rosbag2, rosdep, colcon, and the packages needed to compile this node.
+
+From the repository root:
+
+```bash
+bash scripts/setup_deployment.sh
+```
+
+On the first run, the script installs system dependencies and creates a local
+configuration file:
+
+```text
+scripts/cosmos_env.sh
+```
+
+Review the model and engine paths in that file, then finish deployment:
+
+```bash
+bash scripts/build_workspace.sh
+bash scripts/verify_deployment.sh
+```
+
+To install RViz and the complete ROS desktop environment as well:
+
+```bash
+bash scripts/install_dependencies.sh --desktop
+```
+
+### Optional Isaac ROS environment
+
+NVIDIA Isaac ROS 4.5 uses ROS 2 Jazzy and supports Jetson AGX Thor, but its
+current tested platform matrix specifies JetPack 7.1 / Jetson Linux R38.4.
+This repository targets JetPack 7.2 / R39.2 for TensorRT Edge-LLM, so that
+exact combined configuration is not yet officially validated by NVIDIA.
+
+Configure Isaac ROS in NVIDIA's recommended Docker isolation mode:
+
+```bash
+bash scripts/install_dependencies.sh --isaac-ros
+```
+
+This adds NVIDIA's pinned `release-4.5 noble-jetpack` repository, installs
+`isaac-ros-cli` and the NVIDIA container toolkit, and initializes the CLI in
+Docker mode. It deliberately does not install Isaac ROS bare-metal or replace
+the host CUDA, TensorRT, or OpenCV packages.
+
+Log out and back in to refresh Docker group membership, then verify:
+
+```bash
+bash scripts/verify_deployment.sh --isaac-ros
+docker info | grep -E "Runtimes|Default Runtime"
+```
+
+The verifier treats missing Isaac ROS tooling as a failure but reports the
+JetPack 7.2 support-matrix gap as a warning. See NVIDIA's
+[Isaac ROS system requirements and setup](https://nvidia-isaac-ros.github.io/getting_started/index.html).
+
+The default is the smaller `ros-jazzy-ros-base` deployment. The installer
+refuses to continue on an unexpected OS, CPU architecture, or Jetson Linux
+release unless `--force` is supplied.
+
+The scripts intentionally do not rebuild TensorRT Edge-LLM or the Cosmos
+engines. Those artifacts are hardware-specific and must already have been
+built on this Thor. `verify_deployment.sh` checks that the source tree, core
+archive, plugin, language engine, visual engine, ROS overlay, and installed
+node are all present.
