@@ -42,6 +42,7 @@ struct TensorRTEdgeLLMConfig
   std::string llm_engine_dir;          //!< Path to the language-model TensorRT engine directory
   std::string multimodal_engine_dir;   //!< Path to the visual encoder TensorRT engine directory
   std::string edge_llm_plugin_path;    //!< Absolute path to libNvInfer_edgellm_plugin.so
+  int jpeg_quality{90};                 //!< JPEG quality for in-memory frame encoding
 };
 
 /// Production backend that wraps trt_edgellm::rt::LLMInferenceRuntime.
