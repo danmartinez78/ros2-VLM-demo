@@ -160,6 +160,49 @@ ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
 
 ---
 
+## Downloadable test rosbags
+
+The test-data scripts download NVIDIA's official Isaac ROS 4.5 quickstart
+assets from NGC. Downloads are version-selected at runtime, resumable, and
+stored under the ignored `test_data/rosbags/` directory.
+
+List or download datasets:
+
+```bash
+bash scripts/test_data/download_rosbags.sh list
+bash scripts/test_data/download_rosbags.sh download image-proc
+bash scripts/test_data/download_rosbags.sh download h264
+# Or download both:
+bash scripts/test_data/download_rosbags.sh all
+```
+
+| Dataset | Camera data | Use |
+|---|---|---|
+| `image-proc` | Raw RGB image and camera info | Direct end-to-end Cosmos test |
+| `h264` | Dual H.264 `CompressedImage` streams | Isaac ROS decoder pipeline testing |
+
+Inspect any downloaded or locally recorded ROS 2 bag:
+
+```bash
+bash scripts/test_data/inspect_rosbag.sh /path/to/bag
+```
+
+The inspector lists raw and compressed camera topics and prints suggested
+launch and playback commands. The current reasoner consumes
+`sensor_msgs/msg/Image` directly; the H.264 dataset requires
+`isaac_ros_h264_decoder` before its output can be sent to the reasoner.
+
+For a complete test using the directly compatible NVIDIA image-proc bag,
+configure `scripts/cosmos_env.sh`, build the workspace, then run:
+
+```bash
+bash scripts/test_data/run_image_proc_test.sh
+```
+
+The runner downloads the bag when needed, starts the persistent Cosmos
+reasoner, plays the bag with simulated time, and shuts the node down when
+playback completes. Override the data location with `ROSBAG_DIR`.
+
 ## Example output
 
 ```

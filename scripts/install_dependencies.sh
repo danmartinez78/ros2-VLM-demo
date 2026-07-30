@@ -58,7 +58,7 @@ fi
 sudo -v
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
-  ca-certificates curl locales software-properties-common gnupg
+  ca-certificates curl jq locales software-properties-common gnupg
 
 sudo locale-gen en_US en_US.UTF-8
 sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
