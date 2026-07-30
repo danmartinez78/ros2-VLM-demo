@@ -216,6 +216,11 @@ void CosmosReasonerNode::validate_parameters()
     throw std::runtime_error("prompt must not be empty");
   }
 
+  const auto queue_capacity = this->get_parameter("queue_capacity").as_int();
+  if (queue_capacity != 1) {
+    throw std::runtime_error("queue_capacity must be 1 in the current implementation");
+  }
+
   drop_old_frames_ = this->get_parameter("drop_old_frames").as_bool();
   publish_results_ = this->get_parameter("publish_results").as_bool();
 }
