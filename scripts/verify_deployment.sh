@@ -36,7 +36,7 @@ check "aarch64 architecture" bash -c '[[ "$(uname -m)" == aarch64 ]]'
 check "Jetson Linux R39.2" grep -q '# R39 (release), REVISION: 2' /etc/nv_tegra_release
 check "JetPack metapackage" dpkg-query -W nvidia-jetpack
 check "CUDA compiler" bash -c 'export PATH=/usr/local/cuda/bin:$PATH; command -v nvcc && nvcc --version'
-check "TensorRT development headers" test -f /usr/include/aarch64-linux-gnu/NvInfer.h
+check "TensorRT development headers" bash -c 'test -f /usr/include/NvInfer.h || test -f /usr/include/aarch64-linux-gnu/NvInfer.h'
 check "ROS 2 Jazzy setup" test -f "/opt/ros/${ros_distro}/setup.bash"
 check "rosdep" command -v rosdep
 check "colcon" command -v colcon
