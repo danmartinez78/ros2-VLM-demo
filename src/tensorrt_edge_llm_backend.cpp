@@ -35,7 +35,8 @@ namespace cosmos_ros2_video_reasoner
 {
 
 TensorRTEdgeLLMBackend::TensorRTEdgeLLMBackend(TensorRTEdgeLLMConfig config)
-: config_(std::move(config))
+: config_(std::move(config)),
+  jpeg_quality_(config_.jpeg_quality)
 {
 }
 
@@ -64,6 +65,10 @@ void TensorRTEdgeLLMBackend::initialize()
   }
   if (config_.multimodal_engine_dir.empty()) {
     throw std::runtime_error("multimodal_engine_dir is required but was not provided");
+  }
+
+  if (jpeg_quality_ < 1 || jpeg_quality_ > 100) {
+    throw std::runtime_error("jpeg_quality must be in [1, 100]");
   }
 
   namespace fs = std::filesystem;
