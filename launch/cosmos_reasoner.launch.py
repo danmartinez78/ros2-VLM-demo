@@ -88,6 +88,11 @@ def generate_launch_description() -> LaunchDescription:
             description='Maximum number of tokens to generate per frame',
         ),
         DeclareLaunchArgument(
+            'jpeg_quality',
+            default_value='90',
+            description='JPEG quality used by the inference worker (1-100)',
+        ),
+        DeclareLaunchArgument(
             'temperature',
             default_value='0.2',
             description='Sampling temperature',
@@ -121,6 +126,7 @@ def generate_launch_description() -> LaunchDescription:
                 'sample_period_seconds': LaunchConfiguration('sample_period_seconds'),
                 'max_generate_length': LaunchConfiguration('max_generate_length'),
                 'temperature': LaunchConfiguration('temperature'),
+                'jpeg_quality': LaunchConfiguration('jpeg_quality'),
             },
         ],
     )
@@ -132,6 +138,7 @@ def generate_launch_description() -> LaunchDescription:
             LaunchConfiguration('multimodal_engine_dir'),
             LaunchConfiguration('edge_llm_plugin_path'),
             LaunchConfiguration('worker_socket_path'),
+            LaunchConfiguration('jpeg_quality'),
         ],
         output='screen',
         respawn=True,
