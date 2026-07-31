@@ -296,3 +296,27 @@ The ROS-side IPC client now applies bounded send and receive timeouts to every w
 The launch description now respawns `cosmos_inference_worker` two seconds after an unexpected worker exit. This covers worker crashes and externally terminated wedged workers while preserving the ROS process. A future supervisor can add automatic termination of a still-alive GPU worker after a request deadline; the current deadline prevents the ROS inference thread from waiting indefinitely but does not itself kill a process stuck inside an uninterruptible GPU call.
 
 Remaining production hardening includes clean shutdown and socket cleanup tests, IPC protocol tests, an active worker watchdog for live-but-wedged processes, and repeatable latency/throughput benchmarks.
+
+
+## Worker crash-recovery validation
+
+The automated recovery test was run on Thor after replacing IPC writes with `send(..., MSG_NOSIGNAL)`. The test obtained a successful result, terminated `cosmos_inference_worker` with `SIGKILL`, observed launch create a worker with a new PID, and then received another successful result without restarting `cosmos_reasoner`.
+
+Post-recovery inference continued across multiple frames:
+
+```text
+frame 5: 1.573 seconds
+frame 7: 1.537 seconds
+frame 8: 1.547 seconds
+frame 10: 1.576 seconds
+```
+
+These measurements used a 64-token generation limit. The test confirms:
+
+- worker process respawn works;
+- the ROS process survives loss of the Unix-socket peer;
+- `SIGPIPE` is suppressed;
+- the IPC client reconnects on a subsequent frame;
+- the replacement worker reinitializes the engines and serves repeated requests.
+
+This validates recovery from worker exit. It does not yet validate automatic recovery from a live worker wedged inside a GPU call. That case requires an external watchdog capable of terminating the worker after the ROS-side request deadline.
