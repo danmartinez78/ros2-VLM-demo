@@ -12,6 +12,7 @@ struct IpcInferenceConfig
 {
   std::string socket_path{"/tmp/cosmos_edge_llm.sock"};
   int connect_timeout_seconds{120};
+  int request_timeout_seconds{90};
 };
 
 class IpcInferenceBackend : public InferenceBackend
@@ -23,6 +24,9 @@ public:
   InferenceResponse infer(InferenceRequest const & request) override;
 
 private:
+  void connect_worker();
+  void close_connection() noexcept;
+
   IpcInferenceConfig config_;
   int socket_fd_{-1};
   uint64_t next_request_id_{1};
