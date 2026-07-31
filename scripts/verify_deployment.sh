@@ -95,7 +95,56 @@ if [[ -n "${ros_workspace}" && -f "${ros_workspace}/install/setup.bash" ]]; then
   source "${ros_workspace}/install/setup.bash"
   set -u
   check "Installed ROS package" ros2 pkg prefix cosmos_ros2_video_reasoner
-  check "Installed reasoner executable" bash -c "ros2 pkg executables cosmos_ros2_video_reasoner | grep -q cosmos_reasoner"
+  check "Installed reasoner executable" bash -c "ros2 pkg executables cosmos_ros2_video_reasoner | grep -q ' cosmos_reasonerelse
+  printf 'FAIL  Built ROS workspace overlay\n'
+  failures=$((failures + 1))
+fi
+
+echo
+echo "Resolved deployment paths:"
+echo "  Edge-LLM source:       ${edge_root}"
+echo "  Edge-LLM build:        ${edge_build}"
+echo "  LLM engine:            ${llm_engine}"
+echo "  Multimodal engine:     ${multimodal_engine}"
+echo "  Plugin:                ${plugin_path}"
+echo
+
+if [[ "${failures}" -ne 0 ]]; then
+  echo "Deployment verification failed: ${failures} check(s)." >&2
+  exit 1
+fi
+
+echo "Deployment verification passed."
+"
+  check "Installed inference worker" bash -c "ros2 pkg executables cosmos_ros2_video_reasoner | grep -q ' cosmos_inference_workerelse
+  printf 'FAIL  Built ROS workspace overlay\n'
+  failures=$((failures + 1))
+fi
+
+echo
+echo "Resolved deployment paths:"
+echo "  Edge-LLM source:       ${edge_root}"
+echo "  Edge-LLM build:        ${edge_build}"
+echo "  LLM engine:            ${llm_engine}"
+echo "  Multimodal engine:     ${multimodal_engine}"
+echo "  Plugin:                ${plugin_path}"
+echo
+
+if [[ "${failures}" -ne 0 ]]; then
+  echo "Deployment verification failed: ${failures} check(s)." >&2
+  exit 1
+fi
+
+echo "Deployment verification passed."
+"
+
+  package_prefix="$(ros2 pkg prefix cosmos_ros2_video_reasoner)"
+  reasoner_executable="${package_prefix}/lib/cosmos_ros2_video_reasoner/cosmos_reasoner"
+  worker_executable="${package_prefix}/lib/cosmos_ros2_video_reasoner/cosmos_inference_worker"
+  check "ROS process excludes CUDA and TensorRT" bash -c \
+    '! ldd "$1" | grep -Eq "lib(cuda|nvinfer|cosmos_trt_backend)"' _ "${reasoner_executable}"
+  check "Inference worker excludes ROS libraries" bash -c \
+    '! ldd "$1" | grep -Eq "lib(rcl|rmw|rosidl|fastrtps)"' _ "${worker_executable}"
 else
   printf 'FAIL  Built ROS workspace overlay\n'
   failures=$((failures + 1))
