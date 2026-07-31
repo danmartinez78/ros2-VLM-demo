@@ -157,7 +157,7 @@ This control establishes that the following artifacts are functional together:
 | Reduce maximum generation length to 64 | Still stalls | Generation length is not the cause |
 | CUDA-GDB attach during stall | Fused attention remains active; host waits in prefill | Failure is inside TensorRT base-model prefill |
 | Run standalone program linked to installed `libcosmos_trt_backend.so` without ROS initialization | Still stalls | ROS, DDS, rosbag playback, executor, and cv_bridge are not required to reproduce |
-| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |\n| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is the failing boundary |
+| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |\n| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is a confirmed failure boundary |\n| Inspect production executable dependencies | OpenCV 4.6 and 4.8 loaded together through cv_bridge and NVIDIA OpenCV | A second C++ ABI hazard exists in the ROS image-conversion path |
 
 ## Benign action-runner message
 
@@ -207,3 +207,22 @@ Some local Thor tests changed the backend to:
 - use a 64-token generation limit.
 
 These changes were diagnostic and should not all be treated as the final production solution. In particular, writing every frame to `/tmp` is not acceptable for deployment. Revert or replace temporary diagnostics after the linkage root cause is confirmed.
+
+
+## OpenCV ABI conflict
+
+Linker and `ldd` inspection found that the ROS executable loaded two OpenCV C++ runtimes:
+
+```text
+libcv_bridge.so
+libopencv_core.so.406
+libopencv_imgproc.so.406
+libopencv_imgcodecs.so.406
+libopencv_core.so.408
+libopencv_imgproc.so.408
+libopencv_imgcodecs.so.408
+```
+
+ROS Jazzy's binary `cv_bridge` package is built against Ubuntu OpenCV 4.6, while the Thor JetPack stack provides NVIDIA OpenCV 4.8. Passing `cv::Mat` objects across this mixed C++ ABI boundary is unsafe and may cause memory corruption or undefined behavior.
+
+The production node therefore removes its `cv_bridge` runtime dependency and converts supported `sensor_msgs/msg/Image` encodings directly with the selected NVIDIA OpenCV runtime. Supported encodings are `bgr8`, `rgb8`, and `mono8`; row stride and payload size are validated before constructing an OpenCV view. This avoids downgrading NVIDIA OpenCV or removing JetPack packages.
