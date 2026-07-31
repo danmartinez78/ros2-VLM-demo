@@ -46,7 +46,7 @@ jobs:
             --from-paths . \
             --ignore-src \
             --rosdistro "${ROS_DISTRO}" \
-            --yes
+            -y
           rm -rf /var/lib/apt/lists/*
 
       - name: Build package
@@ -73,4 +73,8 @@ jobs:
           if [[ -f install/setup.bash ]]; then
             source install/setup.bash
           fi
-          colcon test-result --verbose
+          if [[ -d build ]]; then
+            colcon test-result --verbose
+          else
+            echo "No build directory; test results are unavailable."
+          fi
