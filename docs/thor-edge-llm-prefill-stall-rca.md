@@ -1,6 +1,6 @@
 # Jetson AGX Thor Edge-LLM prefill stall RCA
 
-Status: active investigation  
+Status: root cause localized; production fix under validation  
 Platform: NVIDIA Jetson AGX Thor  
 Date opened: 2026-07-30
 
@@ -8,7 +8,7 @@ Date opened: 2026-07-30
 
 The ROS 2 Cosmos reasoner successfully initializes the TensorRT Edge-LLM runtime, loads the Cosmos-Reason2-8B LLM and visual engines, receives and preprocesses a camera frame, and then stalls indefinitely during base-model prefill.
 
-The same engines and the same extracted camera image complete normally with NVIDIA's native `llm_inference` executable. A standalone smoke test that links against this repository's installed `libcosmos_trt_backend.so`, without initializing ROS, reproduces the stall. The current evidence therefore localizes the defect to how TensorRT Edge-LLM is embedded or linked into `libcosmos_trt_backend.so`, rather than ROS, the rosbag, or the model artifacts.
+The same engines and the same extracted camera image complete normally with NVIDIA's native `llm_inference` executable. A standalone smoke test that links against this repository's installed `libcosmos_trt_backend.so`, without initializing ROS, reproduces the stall. A direct-linked executable that compiles the same backend implementation into the final executable completes successfully in approximately 1.45 seconds. This confirms that the failing boundary is the intermediate `libcosmos_trt_backend.so` CUDA/TensorRT linkage, rather than ROS, the rosbag, the request implementation, or the model artifacts.
 
 ## System configuration
 
@@ -157,7 +157,7 @@ This control establishes that the following artifacts are functional together:
 | Reduce maximum generation length to 64 | Still stalls | Generation length is not the cause |
 | CUDA-GDB attach during stall | Fused attention remains active; host waits in prefill | Failure is inside TensorRT base-model prefill |
 | Run standalone program linked to installed `libcosmos_trt_backend.so` without ROS initialization | Still stalls | ROS, DDS, rosbag playback, executor, and cv_bridge are not required to reproduce |
-| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |
+| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |\n| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is the failing boundary |
 
 ## Benign action-runner message
 
@@ -188,15 +188,13 @@ The leading hypothesis is a CUDA/TensorRT linkage or device-registration differe
 
 ## Next RCA steps
 
-1. Build a standalone executable that compiles the backend implementation directly into the executable and links Edge-LLM exactly as a final executable target, rather than calling through `libcosmos_trt_backend.so`.
-2. Compare the final link commands and linked objects for:
-   - NVIDIA `llm_inference`
-   - `libcosmos_trt_backend.so`
-   - the direct-link standalone executable
-3. Compare CUDA fatbins with `cuobjdump --list-elf` and `cuobjdump --dump-elf`.
-4. Compare dynamic dependencies, RPATH, and symbol resolution using `readelf`, `ldd`, and `LD_DEBUG` where practical.
-5. If direct executable linking succeeds, restructure deployment so the Edge-LLM runtime lives in a dedicated native worker executable and the ROS node communicates with it through a bounded IPC interface.
-6. If direct executable linking also stalls, incrementally reuse NVIDIA's CMake target definitions and request-file parser until the first differing link or initialization behavior is identified.
+1. Build the production `cosmos_reasoner` executable with `tensorrt_edge_llm_backend.cpp` compiled directly into it.
+2. Link Edge-LLM core, CuTe DSL, TensorRT, and CUDA directly to `cosmos_reasoner`.
+3. Resolve CUDA device symbols for `sm_110a` at the final executable boundary.
+4. Verify that `ldd cosmos_reasoner` no longer resolves `libcosmos_trt_backend.so`.
+5. Verify the final executable contains an `sm_110a` cubin.
+6. Repeat the image-proc rosbag end-to-end test and confirm publication on `/cosmos/reasoning`.
+7. After validation, remove the obsolete shared backend or retain it only behind an explicit diagnostic build option.
 
 ## Temporary diagnostic changes
 
