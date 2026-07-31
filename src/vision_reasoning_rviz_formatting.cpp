@@ -28,6 +28,22 @@ std::string format_stamp(const builtin_interfaces::msg::Time & stamp)
   return out.str();
 }
 
+std::string format_stamp(const rclcpp::Time & stamp)
+{
+  const int64_t ns_per_sec = 1000000000LL;
+  int64_t total_ns = stamp.nanoseconds();
+  int64_t sec = total_ns / ns_per_sec;
+  int64_t nanosec = total_ns % ns_per_sec;
+  if (nanosec < 0) {
+    --sec;
+    nanosec += ns_per_sec;
+  }
+
+  std::ostringstream out;
+  out << sec << "." << std::setfill('0') << std::setw(9) << nanosec;
+  return out.str();
+}
+
 ResultPresentation build_result_presentation(
   const msg::VisionReasoningResult * result,
   const std::optional<rclcpp::Time> & latest_image_stamp,
@@ -66,7 +82,7 @@ ResultPresentation build_result_presentation(
           << "  latency_s=" << std::fixed << std::setprecision(3) << result->inference_seconds
           << "  age_s=" << std::fixed << std::setprecision(3) << age_seconds;
   if (stale_by_newer_image && latest_image_stamp.has_value()) {
-    details << "  newer_image_stamp=" << format_stamp(latest_image_stamp.value().to_msg());
+    details << "  newer_image_stamp=" << format_stamp(latest_image_stamp.value());
   }
   presentation.details_text = details.str();
   return presentation;
