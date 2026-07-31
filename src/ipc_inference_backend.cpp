@@ -125,6 +125,7 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
     response_header.text_bytes > ipc::kMaxTextBytes ||
     response_header.error_bytes > ipc::kMaxTextBytes)
   {
+    close_connection();
     throw std::runtime_error("invalid inference worker response");
   }
 
