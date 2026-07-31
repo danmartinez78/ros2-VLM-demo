@@ -40,6 +40,7 @@ struct ResultPresentation
 };
 
 std::string format_stamp(const builtin_interfaces::msg::Time & stamp);
+std::string format_stamp(const rclcpp::Time & stamp);
 
 ResultPresentation build_result_presentation(
   const msg::VisionReasoningResult * result,

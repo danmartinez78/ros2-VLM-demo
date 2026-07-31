@@ -181,8 +181,7 @@ void VisionReasoningPanel::refresh_display()
 
   result_stamp_line_->setText(QString::fromStdString(rviz::format_stamp(latest_result->header.stamp)));
   if (latest_image_stamp.has_value()) {
-    builtin_interfaces::msg::Time latest_image_msg_stamp = latest_image_stamp->to_msg();
-    image_stamp_line_->setText(QString::fromStdString(rviz::format_stamp(latest_image_msg_stamp)));
+    image_stamp_line_->setText(QString::fromStdString(rviz::format_stamp(latest_image_stamp.value())));
   } else {
     image_stamp_line_->setText("");
   }
