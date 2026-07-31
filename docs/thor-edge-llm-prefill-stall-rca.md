@@ -235,3 +235,20 @@ A direct-linked smoke executable was validated in both main-thread and `std::thr
 This establishes that ROS executor behavior, DDS traffic, node creation, callback scheduling, and CUDA thread affinity are not required to reproduce the failure. Loading the transitive ROS 2 C++ dependency set into the Edge-LLM process is sufficient.
 
 The production architecture must therefore isolate Edge-LLM from ROS in a separate process unless the exact conflicting shared object or symbol-interposition issue is identified and proven safe. The preferred deployment is a persistent ROS-free inference worker, direct-linked to Edge-LLM at its final executable boundary, with the ROS node using a bounded IPC protocol. Process isolation also allows a wedged GPU worker to be terminated and restarted without wedging ROS shutdown.
+
+
+## Isolated C++ production architecture
+
+The draft fix now separates the runtime into two native processes:
+
+```text
+cosmos_reasoner (ROS 2 / rclcpp)
+  -> versioned Unix-domain socket protocol
+cosmos_inference_worker (ROS-free, direct-linked Edge-LLM)
+```
+
+The ROS process no longer links TensorRT, CUDA, Edge-LLM, CuTe DSL, or the Edge-LLM plugin. The worker does not link ROS, RMW, or DDS libraries. Engines and the CUDA context remain persistent in the worker.
+
+IPC requests carry a monotonically increasing request ID, packed BGR8 image bytes, dimensions, prompt, and generation parameters. Responses carry the matching request ID, success state, text or error, and inference duration. The ROS node retains its bounded newest-frame queue and publishes the existing `VisionReasoningResult` message.
+
+This process boundary is intended both to avoid the confirmed library-load interaction and to permit future worker timeout/restart supervision without wedging ROS shutdown.
