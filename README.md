@@ -144,6 +144,10 @@ Test worker crash recovery:
 bash scripts/test_data/run_worker_recovery_test.sh
 ```
 
+That test obtains a successful result, kills only the inference worker,
+verifies launch respawns it, and confirms reasoning resumes without restarting
+the ROS node.
+
 Run task-level evaluation on recorded outputs:
 
 ```bash
@@ -154,10 +158,6 @@ python3 scripts/evaluation/evaluate_task_harness.py \
 ```
 
 See [docs/evaluation.md](docs/evaluation.md) for dataset and rubric details.
-
-That test obtains a successful result, kills only the inference worker,
-verifies launch respawns it, and confirms reasoning resumes without restarting
-the ROS node.
 
 The H.264 asset is not directly consumable. Decode it to
 `sensor_msgs/msg/Image` with an appropriate ROS/Isaac ROS decoder first.
