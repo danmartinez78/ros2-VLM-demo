@@ -156,6 +156,19 @@ That test obtains a successful result, kills only the inference worker,
 verifies launch respawns it, and confirms reasoning resumes without restarting
 the ROS node.
 
+## Task-level evaluation
+
+Run task-level evaluation on recorded outputs:
+
+```bash
+python3 scripts/evaluation/evaluate_task_harness.py \
+  --dataset scripts/evaluation/dataset_v1.json \
+  --run /absolute/path/to/run.json \
+  --output /absolute/path/to/eval-report.json
+```
+
+See [docs/evaluation.md](docs/evaluation.md) for dataset and rubric details.
+
 ## Automated IPC protocol tests (CPU-only)
 
 The hardware-independent test suite now covers IPC protocol framing, malformed
@@ -327,8 +340,8 @@ The production node accepts `bgr8`, `rgb8`, and `mono8` raw images.
   ([#8](https://github.com/danmartinez78/ros2-VLM-demo/issues/8)).
 - Batch size one; batching has not been shown beneficial for this live path.
 - Raw `sensor_msgs/msg/Image` only; compressed streams require decoding first.
-- No task-level quality evaluation harness yet
-  ([#11](https://github.com/danmartinez78/ros2-VLM-demo/issues/11)).
+- Task-level evaluation requires curated run outputs plus rubric review
+  ([docs/evaluation.md](docs/evaluation.md)).
 
 ## License
 
