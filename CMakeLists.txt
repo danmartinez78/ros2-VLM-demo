@@ -245,6 +245,43 @@ if(BUILD_TENSORRT_BACKEND)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
+  # ── Direct-linked diagnostic executable ───────────────────────────────
+  # Compiles the backend implementation into the final executable instead of
+  # consuming libcosmos_trt_backend.so. This isolates CUDA device-link and
+  # shared-library behavior from the backend implementation itself.
+  add_executable(cosmos_backend_direct_smoke
+    src/backend_direct_smoke.cpp
+    src/tensorrt_edge_llm_backend.cpp
+  )
+  target_include_directories(cosmos_backend_direct_smoke PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${TENSORRT_EDGE_LLM_ROOT}/cpp
+    ${TENSORRT_EDGE_LLM_ROOT}/examples
+    ${TRT_INCLUDE_DIR}
+    ${_NLOHMANN_JSON_INCLUDE}
+    ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/stb
+    ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/miniaudio
+    ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
+  )
+  target_link_libraries(cosmos_backend_direct_smoke
+    ${EDGELLM_CORE_LIB}
+    ${CUTE_DSL_STATIC_LIB}
+    ${NVINFER_LIB}
+    ${NVONNXPARSER_LIB}
+    CUDA::cudart
+    CUDA::cuda_driver
+    dl
+    ${OpenCV_LIBRARIES}
+  )
+  if(EXISTS "${CUTE_DSL_RUNTIME_LIB}")
+    target_link_libraries(cosmos_backend_direct_smoke
+      ${CUTE_DSL_RUNTIME_LIB})
+  endif()
+  set_target_properties(cosmos_backend_direct_smoke PROPERTIES
+    CUDA_ARCHITECTURES "${TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES}"
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    INSTALL_RPATH_USE_LINK_PATH TRUE)
+
   # ── Executable (uses TRT backend) ─────────────────────────────────────
   add_executable(cosmos_reasoner src/main.cpp)
   target_include_directories(cosmos_reasoner PRIVATE
@@ -259,7 +296,7 @@ if(BUILD_TENSORRT_BACKEND)
   )
   ament_target_dependencies(cosmos_reasoner rclcpp)
 
-  install(TARGETS cosmos_trt_backend cosmos_reasoner
+  install(TARGETS cosmos_trt_backend cosmos_reasoner cosmos_backend_direct_smoke
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION lib/${PROJECT_NAME}
