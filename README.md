@@ -148,6 +148,29 @@ That test obtains a successful result, kills only the inference worker,
 verifies launch respawns it, and confirms reasoning resumes without restarting
 the ROS node.
 
+## Automated IPC protocol tests (CPU-only)
+
+The hardware-independent test suite now covers IPC protocol framing, malformed
+or truncated worker responses, request/response header validation, timeout
+behavior, and reconnect logic using a fake Unix-socket worker.
+
+Run the IPC-focused tests with:
+
+```bash
+colcon test --packages-select cosmos_ros2_video_reasoner \
+  --ctest-args -R "test_(ipc_protocol|ipc_inference_backend)" --output-on-failure
+```
+
+GitHub Actions runs this CPU-only IPC coverage automatically in
+`.github/workflows/hardware-independent-tests.yml`.
+
+Thor-only validation is still required for the end-to-end worker respawn launch
+path:
+
+```bash
+bash scripts/test_data/run_worker_recovery_test.sh
+```
+
 The H.264 asset is not directly consumable. Decode it to
 `sensor_msgs/msg/Image` with an appropriate ROS/Isaac ROS decoder first.
 
