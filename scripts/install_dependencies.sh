@@ -152,7 +152,8 @@ EOF
 
   # Docker mode is NVIDIA's recommended isolation strategy and protects the
   # host-side TensorRT Edge-LLM stack from Isaac ROS package version pins.
-  isaac-ros init docker
+  # Initialization writes system configuration and therefore requires root.
+  sudo isaac-ros init docker
 
   echo
   echo "Isaac ROS Docker mode initialized."
