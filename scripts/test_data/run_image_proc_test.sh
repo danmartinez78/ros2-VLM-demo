@@ -27,16 +27,23 @@ if [[ ! -f "${ros_setup}" ]]; then
   echo "ROS 2 ${ros_distro} is not installed. Run scripts/install_dependencies.sh first." >&2
   exit 1
 fi
+# ROS-generated setup scripts may read optional variables without defaults.
+set +u
 # shellcheck disable=SC1090
 source "${ros_setup}"
+set -u
 
 if [[ -n "${ROS_WORKSPACE:-}" && -f "${ROS_WORKSPACE}/install/setup.bash" ]]; then
+  set +u
   # shellcheck disable=SC1090
   source "${ROS_WORKSPACE}/install/setup.bash"
+  set -u
 elif [[ -f "${repo_root}/../../install/setup.bash" ]]; then
   # Repository is normally checked out at <workspace>/src/<repo>.
+  set +u
   # shellcheck disable=SC1090
   source "${repo_root}/../../install/setup.bash"
+  set -u
 fi
 
 for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGIN_PATH; do
@@ -60,18 +67,33 @@ echo "Starting Cosmos reasoner on ${image_topic}..."
 ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py   image_topic:="${image_topic}"   llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}"   multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}"   edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}"   use_sim_time:=true &
 launch_pid=$!
 
-sleep 3
-if ! kill -0 "${launch_pid}" 2>/dev/null; then
-  echo "The Cosmos reasoner exited before playback started." >&2
-  wait_status=0
-  if ! wait "${launch_pid}"; then
-    wait_status=$?
+echo "Waiting for Cosmos reasoner initialization..."
+ready=false
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
+  if ! kill -0 "${launch_pid}" 2>/dev/null; then
+    echo "The Cosmos reasoner exited before playback started." >&2
+    wait_status=0
+    wait "${launch_pid}" || wait_status=$?
+    if [[ "${wait_status}" -eq 0 ]]; then
+      wait_status=1
+    fi
+    exit "${wait_status}"
   fi
-  if [[ "${wait_status}" -eq 0 ]]; then
-    wait_status=1
+
+  if ros2 topic info "${image_topic}" 2>/dev/null \
+      | grep -Eq 'Subscription count: [1-9][0-9]*'; then
+    ready=true
+    break
   fi
-  exit "${wait_status}"
+  sleep 1
+done
+
+if [[ "${ready}" != true ]]; then
+  echo "Timed out waiting 120 seconds for a subscriber on ${image_topic}." >&2
+  exit 1
 fi
 
+echo "Cosmos reasoner is ready."
 echo "Playing NVIDIA image-proc bag: ${bag_path}"
 ros2 bag play "${bag_path}" --clock

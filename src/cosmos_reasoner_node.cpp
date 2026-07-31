@@ -15,10 +15,10 @@
 #include "cosmos_ros2_video_reasoner/cosmos_reasoner_node.hpp"
 
 #include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
-#include <cv_bridge/cv_bridge.h>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
@@ -31,6 +31,76 @@
 
 namespace cosmos_ros2_video_reasoner
 {
+
+namespace
+{
+
+cv::Mat ros_image_to_bgr(sensor_msgs::msg::Image const & msg)
+{
+  if (msg.width == 0 || msg.height == 0) {
+    throw std::runtime_error("image width and height must be non-zero");
+  }
+  if (msg.width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+    msg.height > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+  {
+    throw std::runtime_error("image dimensions exceed OpenCV limits");
+  }
+
+  int cv_type = 0;
+  size_t channels = 0;
+  enum class Conversion {kCopy, kRgbToBgr, kMonoToBgr};
+  Conversion conversion;
+
+  if (msg.encoding == "bgr8") {
+    cv_type = CV_8UC3;
+    channels = 3;
+    conversion = Conversion::kCopy;
+  } else if (msg.encoding == "rgb8") {
+    cv_type = CV_8UC3;
+    channels = 3;
+    conversion = Conversion::kRgbToBgr;
+  } else if (msg.encoding == "mono8") {
+    cv_type = CV_8UC1;
+    channels = 1;
+    conversion = Conversion::kMonoToBgr;
+  } else {
+    throw std::runtime_error(
+      "unsupported image encoding '" + msg.encoding +
+      "'; expected bgr8, rgb8, or mono8");
+  }
+
+  const size_t minimum_step = static_cast<size_t>(msg.width) * channels;
+  if (msg.step < minimum_step) {
+    throw std::runtime_error("image row step is smaller than the packed row size");
+  }
+  const size_t required_size = static_cast<size_t>(msg.step) * msg.height;
+  if (msg.data.size() < required_size) {
+    throw std::runtime_error("image payload is smaller than step * height");
+  }
+
+  cv::Mat view(
+    static_cast<int>(msg.height),
+    static_cast<int>(msg.width),
+    cv_type,
+    const_cast<uint8_t *>(msg.data.data()),
+    static_cast<size_t>(msg.step));
+
+  cv::Mat bgr;
+  switch (conversion) {
+    case Conversion::kCopy:
+      bgr = view.clone();
+      break;
+    case Conversion::kRgbToBgr:
+      cv::cvtColor(view, bgr, cv::COLOR_RGB2BGR);
+      break;
+    case Conversion::kMonoToBgr:
+      cv::cvtColor(view, bgr, cv::COLOR_GRAY2BGR);
+      break;
+  }
+  return bgr;
+}
+
+}  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction / destruction
@@ -45,30 +115,34 @@ CosmosReasonerNode::CosmosReasonerNode(
   declare_parameters();
   validate_parameters();
 
-  // ── initialise backend (throws on failure → node does not finish constructing)
-  backend_->initialize();
-
-  // ── result publisher
   source_topic_ = this->get_parameter("image_topic").as_string();
   const std::string result_topic = this->get_parameter("result_topic").as_string();
 
-  if (publish_results_) {
-    result_pub_ = this->create_publisher<msg::VisionReasoningResult>(result_topic, 10);
-  }
+  // TensorRT, CUDA graph capture, and inference must stay on the same worker
+  // thread. start_worker() blocks until backend initialization succeeds.
+  start_worker();
 
-  // ── image subscriber (QoS: best effort, depth 1)
-  rclcpp::QoS sub_qos{rclcpp::KeepLast(1)};
-  sub_qos.best_effort();
-  image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-    source_topic_, sub_qos,
-    [this](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
-      image_callback(msg);
-    });
+  try {
+    // ── result publisher
+    if (publish_results_) {
+      result_pub_ = this->create_publisher<msg::VisionReasoningResult>(result_topic, 10);
+    }
+
+    // ── image subscriber (QoS: best effort, depth 1)
+    rclcpp::QoS sub_qos{rclcpp::KeepLast(1)};
+    sub_qos.best_effort();
+    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+      source_topic_, sub_qos,
+      [this](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
+        image_callback(msg);
+      });
+  } catch (...) {
+    stop_worker();
+    throw;
+  }
 
   RCLCPP_INFO(this->get_logger(), "Subscribed to %s", source_topic_.c_str());
   RCLCPP_INFO(this->get_logger(), "Publishing results to %s", result_topic.c_str());
-
-  start_worker();
 }
 
 CosmosReasonerNode::~CosmosReasonerNode()
@@ -232,8 +306,24 @@ void CosmosReasonerNode::validate_parameters()
 
 void CosmosReasonerNode::start_worker()
 {
-  worker_running_ = true;
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    worker_running_ = true;
+    backend_init_complete_ = false;
+    backend_init_error_ = nullptr;
+  }
   worker_thread_ = std::thread(&CosmosReasonerNode::worker_loop, this);
+
+  std::unique_lock<std::mutex> lock(queue_mutex_);
+  backend_init_cv_.wait(lock, [this] {return backend_init_complete_;});
+  if (backend_init_error_) {
+    auto error = backend_init_error_;
+    lock.unlock();
+    if (worker_thread_.joinable()) {
+      worker_thread_.join();
+    }
+    std::rethrow_exception(error);
+  }
 }
 
 void CosmosReasonerNode::stop_worker()
@@ -251,6 +341,25 @@ void CosmosReasonerNode::stop_worker()
 
 void CosmosReasonerNode::worker_loop()
 {
+  try {
+    backend_->initialize();
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      backend_init_error_ = std::current_exception();
+      backend_init_complete_ = true;
+      worker_running_ = false;
+    }
+    backend_init_cv_.notify_one();
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    backend_init_complete_ = true;
+  }
+  backend_init_cv_.notify_one();
+
   while (true) {
     PendingFrame frame;
 
@@ -274,14 +383,13 @@ void CosmosReasonerNode::worker_loop()
     // ── convert image ─────────────────────────────────────────────────────
     cv::Mat bgr;
     try {
-      auto cv_img = cv_bridge::toCvShare(frame.msg, "bgr8");
-      bgr = cv_img->image.clone();
-    } catch (const cv_bridge::Exception & e) {
-      RCLCPP_ERROR(this->get_logger(), "cv_bridge conversion failed: %s", e.what());
+      bgr = ros_image_to_bgr(*frame.msg);
+    } catch (const std::exception & e) {
+      RCLCPP_ERROR(this->get_logger(), "image conversion failed: %s", e.what());
       ++stats_.failure;
       InferenceResponse resp;
       resp.success = false;
-      resp.error = std::string("cv_bridge: ") + e.what();
+      resp.error = std::string("image conversion: ") + e.what();
       publish_result(frame.msg->header, frame.seq, resp);
       continue;
     }

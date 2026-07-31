@@ -16,8 +16,11 @@ if [[ ! -f "${ros_setup}" ]]; then
   echo "ROS 2 ${ros_distro} is not installed. Run scripts/install_dependencies.sh first." >&2
   exit 1
 fi
+# ROS-generated setup scripts may read optional variables without defaults.
+set +u
 # shellcheck disable=SC1090
 source "${ros_setup}"
+set -u
 
 edge_root="${TENSORRT_EDGE_LLM_ROOT:-${HOME}/TensorRT-Edge-LLM}"
 edge_build="${TENSORRT_EDGE_LLM_BUILD_DIR:-${edge_root}/build}"

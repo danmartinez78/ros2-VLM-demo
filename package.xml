@@ -5,7 +5,7 @@
   <version>0.1.0</version>
   <description>
     ROS 2 Jazzy pipeline for NVIDIA Jetson AGX Thor that samples camera frames,
-    runs each through a persistent NVIDIA Cosmos Reason2 TensorRT Edge-LLM VLM engine,
+    sends them to an isolated NVIDIA Cosmos Reason2 TensorRT Edge-LLM worker,
     and publishes structured inference results.
   </description>
   <maintainer email="dan@shadowhounddrones.com">Dan Martinez</maintainer>
@@ -19,7 +19,6 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>builtin_interfaces</depend>
-  <depend>cv_bridge</depend>
   <depend>image_transport</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
