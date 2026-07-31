@@ -3,6 +3,7 @@
 #include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
 
 #include <chrono>
+#include <cerrno>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -21,13 +22,28 @@ IpcInferenceBackend::IpcInferenceBackend(IpcInferenceConfig config)
 
 IpcInferenceBackend::~IpcInferenceBackend()
 {
+  close_connection();
+}
+
+void IpcInferenceBackend::close_connection() noexcept
+{
   if (socket_fd_ >= 0) {
     ::close(socket_fd_);
+    socket_fd_ = -1;
   }
 }
 
 void IpcInferenceBackend::initialize()
 {
+  connect_worker();
+}
+
+void IpcInferenceBackend::connect_worker()
+{
+  close_connection();
+  if (config_.connect_timeout_seconds <= 0 || config_.request_timeout_seconds <= 0) {
+    throw std::runtime_error("worker timeouts must be positive");
+  }
   if (config_.socket_path.empty() ||
     config_.socket_path.size() >= sizeof(sockaddr_un::sun_path))
   {
@@ -46,6 +62,17 @@ void IpcInferenceBackend::initialize()
     address.sun_family = AF_UNIX;
     std::strncpy(address.sun_path, config_.socket_path.c_str(), sizeof(address.sun_path) - 1);
     if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0) {
+      timeval timeout{};
+      timeout.tv_sec = config_.request_timeout_seconds;
+      if (::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ||
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0)
+      {
+        const int error = errno;
+        ::close(fd);
+        throw std::runtime_error(
+                "failed to configure IPC request timeout: " +
+                std::string(std::strerror(error)));
+      }
       socket_fd_ = fd;
       return;
     }
@@ -59,7 +86,7 @@ void IpcInferenceBackend::initialize()
 InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
 {
   if (socket_fd_ < 0) {
-    throw std::runtime_error("IPC backend is not connected");
+    connect_worker();
   }
   if (request.image.empty() || request.image.type() != CV_8UC3) {
     throw std::runtime_error("IPC backend requires a non-empty CV_8UC3 BGR image");
@@ -83,12 +110,16 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   header.top_p = request.top_p;
   header.top_k = request.top_k;
 
-  ipc::write_all(socket_fd_, &header, sizeof(header));
-  ipc::write_all(socket_fd_, packed.data, image_size);
-  ipc::write_all(socket_fd_, request.prompt.data(), request.prompt.size());
-
   ipc::ResponseHeader response_header;
-  ipc::read_all(socket_fd_, &response_header, sizeof(response_header));
+  try {
+    ipc::write_all(socket_fd_, &header, sizeof(header));
+    ipc::write_all(socket_fd_, packed.data, image_size);
+    ipc::write_all(socket_fd_, request.prompt.data(), request.prompt.size());
+    ipc::read_all(socket_fd_, &response_header, sizeof(response_header));
+  } catch (...) {
+    close_connection();
+    throw;
+  }
   if (response_header.magic != ipc::kMagic || response_header.version != ipc::kVersion ||
     response_header.request_id != header.request_id ||
     response_header.text_bytes > ipc::kMaxTextBytes ||
@@ -102,8 +133,13 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   response.inference_seconds = response_header.inference_seconds;
   response.text.resize(response_header.text_bytes);
   response.error.resize(response_header.error_bytes);
-  ipc::read_all(socket_fd_, response.text.data(), response.text.size());
-  ipc::read_all(socket_fd_, response.error.data(), response.error.size());
+  try {
+    ipc::read_all(socket_fd_, response.text.data(), response.text.size());
+    ipc::read_all(socket_fd_, response.error.data(), response.error.size());
+  } catch (...) {
+    close_connection();
+    throw;
+  }
   return response;
 }
 }  // namespace cosmos_ros2_video_reasoner
