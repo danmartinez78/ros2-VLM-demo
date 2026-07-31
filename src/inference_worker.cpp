@@ -8,6 +8,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -92,7 +93,10 @@ int main(int argc, char ** argv)
         header.version != cosmos_ros2_video_reasoner::ipc::kVersion ||
         header.encoding != cosmos_ros2_video_reasoner::ipc::kEncodingBgr8 ||
         header.width == 0 || header.height == 0 ||
-        header.step != header.width * 3 ||
+        header.width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        header.height > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        static_cast<uint64_t>(header.step) !=
+        static_cast<uint64_t>(header.width) * 3U ||
         header.prompt_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)
       {
         throw std::runtime_error("invalid IPC request header");
