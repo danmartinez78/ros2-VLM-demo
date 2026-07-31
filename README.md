@@ -156,6 +156,29 @@ That test obtains a successful result, kills only the inference worker,
 verifies launch respawns it, and confirms reasoning resumes without restarting
 the ROS node.
 
+## Automated IPC protocol tests (CPU-only)
+
+The hardware-independent test suite now covers IPC protocol framing, malformed
+or truncated worker responses, request/response header validation, timeout
+behavior, and reconnect logic using a fake Unix-socket worker.
+
+Run the IPC-focused tests with:
+
+```bash
+colcon test --packages-select cosmos_ros2_video_reasoner \
+  --ctest-args -R "test_(ipc_protocol|ipc_inference_backend)" --output-on-failure
+```
+
+GitHub Actions runs this CPU-only IPC coverage automatically in
+`.github/workflows/hardware-independent-tests.yml`.
+
+Thor-only validation is still required for the end-to-end worker respawn launch
+path:
+
+```bash
+bash scripts/test_data/run_worker_recovery_test.sh
+```
+
 The H.264 asset is not directly consumable. Decode it to
 `sensor_msgs/msg/Image` with an appropriate ROS/Isaac ROS decoder first.
 
@@ -166,7 +189,7 @@ Results are published as
 `/cosmos/reasoning` by default. Each result includes:
 
 - source image header and topic;
-- effective prompt;
+- effective prompt, selected task profile, prompt-version label, and prompt-configuration hash;
 - generated response;
 - inference duration;
 - sampled-frame sequence number;
@@ -219,7 +242,16 @@ rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
 | `llm_engine_dir` | string | empty | Required LLM engine/tokenizer directory |
 | `multimodal_engine_dir` | string | empty | Required multimodal engine directory |
 | `edge_llm_plugin_path` | string | empty | Required Edge-LLM plugin path |
-| `prompt` | string | scene-description prompt | Prompt applied to every sampled frame |
+| `prompt` | string | scene-description prompt | Legacy prompt used when `task_profile=legacy_prompt` |
+| `task_profile` | string | `legacy_prompt` | Active task profile (`legacy_prompt`, `scene_description`, `hazard_detection`, `inventory`, `navigation_assistance`) |
+| `prompt_version` | string | `v1` | Version label attached to every result for reproducibility |
+| `system_instruction` | string | empty | Optional system instruction text |
+| `task_instruction` | string | empty | Optional task instruction text |
+| `instruction_delivery_mode` | string | `inline` | Currently only `inline` is supported by the IPC protocol |
+| `prompt_history_max_entries` | int | `0` | Bound on prior successful responses retained for prompt-history injection |
+| `prompt_history_max_chars` | int | `0` | Maximum total retained prompt-history characters (`0` disables size limit) |
+| `prompt_history_reset_policy` | string | `never` | Prompt-history reset policy: `never`, `on_error`, `every_n_requests` |
+| `prompt_history_reset_interval_requests` | int | `0` | Reset interval when policy is `every_n_requests` |
 | `sample_period_seconds` | double | `2.0` | Minimum ROS timestamp interval between samples |
 | `max_generate_length` | int | `256` | Maximum generated tokens |
 | `temperature` | double | `0.2` | Sampling temperature |
@@ -230,8 +262,9 @@ rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
 | `drop_old_frames` | bool | `true` | Replace a queued stale frame with the newest frame |
 | `publish_results` | bool | `true` | Publish result messages |
 
-Prompt and context configuration beyond this single prompt is tracked in
-[#12](https://github.com/danmartinez78/ros2-VLM-demo/issues/12).
+Prompt behavior is template-driven and validated at startup/launch time.
+Unknown template variables, malformed braces, and unsupported instruction
+delivery modes fail fast with explicit errors.
 
 ## Operational behavior
 
