@@ -158,7 +158,7 @@ Results are published as
 `/cosmos/reasoning` by default. Each result includes:
 
 - source image header and topic;
-- effective prompt, selected task profile, and prompt-version label;
+- effective prompt, selected task profile, prompt-version label, and prompt-configuration hash;
 - generated response;
 - inference duration;
 - sampled-frame sequence number;
@@ -190,12 +190,11 @@ increase end-to-end latency.
 | `prompt_version` | string | `v1` | Version label attached to every result for reproducibility |
 | `system_instruction` | string | empty | Optional system instruction text |
 | `task_instruction` | string | empty | Optional task instruction text |
-| `instruction_delivery_mode` | string | `inline` | `inline` or `separate`; `separate` requires declared runtime support |
-| `model_capabilities.supports_system_instruction` | bool | `false` | Declared runtime capability for separate system instructions |
-| `model_capabilities.supports_context_retention` | bool | `true` | Declared runtime capability for retained prompt context |
-| `context_max_entries` | int | `0` | Bound on prior successful responses retained as context |
-| `context_reset_policy` | string | `never` | Context reset policy: `never`, `on_error`, `every_n_frames` |
-| `context_reset_interval_frames` | int | `0` | Reset period used when policy is `every_n_frames` |
+| `instruction_delivery_mode` | string | `inline` | Currently only `inline` is supported by the IPC protocol |
+| `prompt_history_max_entries` | int | `0` | Bound on prior successful responses retained for prompt-history injection |
+| `prompt_history_max_chars` | int | `0` | Maximum total retained prompt-history characters (`0` disables size limit) |
+| `prompt_history_reset_policy` | string | `never` | Prompt-history reset policy: `never`, `on_error`, `every_n_requests` |
+| `prompt_history_reset_interval_requests` | int | `0` | Reset interval when policy is `every_n_requests` |
 | `sample_period_seconds` | double | `2.0` | Minimum ROS timestamp interval between samples |
 | `max_generate_length` | int | `256` | Maximum generated tokens |
 | `temperature` | double | `0.2` | Sampling temperature |
@@ -206,9 +205,9 @@ increase end-to-end latency.
 | `drop_old_frames` | bool | `true` | Replace a queued stale frame with the newest frame |
 | `publish_results` | bool | `true` | Publish result messages |
 
-Prompt behavior is template-driven and validated at startup. Unknown template
-variables or incompatible capability declarations fail fast with explicit
-errors.
+Prompt behavior is template-driven and validated at startup/launch time.
+Unknown template variables, malformed braces, and unsupported instruction
+delivery modes fail fast with explicit errors.
 
 ## Operational behavior
 

@@ -54,12 +54,10 @@ cosmos_reasoner:
     system_instruction: ""
     task_instruction: ""
     instruction_delivery_mode: inline
-    model_capabilities:
-      supports_system_instruction: false
-      supports_context_retention: true
-    context_max_entries: 0
-    context_reset_policy: never
-    context_reset_interval_frames: 0
+    prompt_history_max_entries: 0
+    prompt_history_max_chars: 0
+    prompt_history_reset_policy: never
+    prompt_history_reset_interval_requests: 0
 
     # ── Sampling ──────────────────────────────────────────────────────────────
     # Time between frames sent for inference (uses ROS message timestamp,

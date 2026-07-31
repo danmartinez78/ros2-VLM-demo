@@ -17,6 +17,7 @@
 #include "cosmos_ros2_video_reasoner/inference_backend.hpp"
 #include "rclcpp/rclcpp.hpp"
 
+#include <cstddef>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -84,11 +85,12 @@ private:
     const InferenceResponse & resp,
     const std::string & effective_prompt);
 
-  // ── Prompt/context configuration helpers ─────────────────────────────────
+  // ── Prompt/history configuration helpers ─────────────────────────────────
   std::string render_effective_prompt(uint64_t frame_seq) const;
   void validate_template_variables(const std::string & name, const std::string & templ) const;
-  void maybe_reset_context_before_frame();
-  void update_context_after_response(const InferenceResponse & resp);
+  void maybe_reset_prompt_history_before_request();
+  void update_prompt_history_after_response(const InferenceResponse & resp);
+  size_t prompt_history_size_chars() const;
 
   // ── Backend ─────────────────────────────────────────────────────────────
   std::unique_ptr<InferenceBackend> backend_;
@@ -107,15 +109,15 @@ private:
   std::string legacy_prompt_;
   std::string task_profile_;
   std::string prompt_version_;
+  std::string prompt_config_hash_;
   std::string system_instruction_;
   std::string task_instruction_;
   std::string instruction_delivery_mode_{"inline"};
   std::string active_prompt_template_;
-  bool supports_system_instruction_{false};
-  bool supports_context_retention_{false};
-  int context_max_entries_{0};
-  std::string context_reset_policy_{"never"};
-  int context_reset_interval_frames_{0};
+  int prompt_history_max_entries_{0};
+  int prompt_history_max_chars_{0};
+  std::string prompt_history_reset_policy_{"never"};
+  int prompt_history_reset_interval_requests_{0};
   std::unordered_map<std::string, std::string> task_profiles_;
   int max_generate_length_{256};
   float temperature_{0.2f};
@@ -142,8 +144,8 @@ private:
   mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::optional<PendingFrame> pending_frame_;  // bounded queue of depth 1
-  std::deque<std::string> context_history_;
-  uint64_t frames_since_context_reset_{0};
+  std::deque<std::string> prompt_history_;
+  uint64_t requests_since_prompt_history_reset_{0};
 
   // ── Counters ─────────────────────────────────────────────────────────────
   struct Stats

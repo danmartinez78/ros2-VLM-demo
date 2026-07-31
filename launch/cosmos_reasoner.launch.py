@@ -98,9 +98,29 @@ def generate_launch_description() -> LaunchDescription:
             description='Optional task-level instruction text',
         ),
         DeclareLaunchArgument(
-            'context_max_entries',
+            'instruction_delivery_mode',
+            default_value='inline',
+            description='Instruction delivery mode (currently only inline is supported)',
+        ),
+        DeclareLaunchArgument(
+            'prompt_history_max_entries',
             default_value='0',
-            description='Count of prior successful responses retained as context',
+            description='Count of prior successful responses retained for prompt-history injection',
+        ),
+        DeclareLaunchArgument(
+            'prompt_history_max_chars',
+            default_value='0',
+            description='Maximum total retained prompt-history characters (0 disables size limit)',
+        ),
+        DeclareLaunchArgument(
+            'prompt_history_reset_policy',
+            default_value='never',
+            description='Prompt-history reset policy: never, on_error, every_n_requests',
+        ),
+        DeclareLaunchArgument(
+            'prompt_history_reset_interval_requests',
+            default_value='0',
+            description='Reset interval used when policy is every_n_requests',
         ),
         DeclareLaunchArgument(
             'sample_period_seconds',
@@ -152,7 +172,12 @@ def generate_launch_description() -> LaunchDescription:
                 'prompt_version': LaunchConfiguration('prompt_version'),
                 'system_instruction': LaunchConfiguration('system_instruction'),
                 'task_instruction': LaunchConfiguration('task_instruction'),
-                'context_max_entries': LaunchConfiguration('context_max_entries'),
+                'instruction_delivery_mode': LaunchConfiguration('instruction_delivery_mode'),
+                'prompt_history_max_entries': LaunchConfiguration('prompt_history_max_entries'),
+                'prompt_history_max_chars': LaunchConfiguration('prompt_history_max_chars'),
+                'prompt_history_reset_policy': LaunchConfiguration('prompt_history_reset_policy'),
+                'prompt_history_reset_interval_requests': LaunchConfiguration(
+                    'prompt_history_reset_interval_requests'),
                 'sample_period_seconds': LaunchConfiguration('sample_period_seconds'),
                 'max_generate_length': LaunchConfiguration('max_generate_length'),
                 'temperature': LaunchConfiguration('temperature'),

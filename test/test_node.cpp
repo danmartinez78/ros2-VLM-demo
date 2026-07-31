@@ -319,6 +319,7 @@ TEST_F(NodeTest, PublishesProfileAndPromptVersionMetadata)
   ASSERT_TRUE(ok) << "No result message received within timeout";
   EXPECT_EQ(last_msg.task_profile, "hazard_detection");
   EXPECT_EQ(last_msg.prompt_version, "hazard-v2");
+  EXPECT_FALSE(last_msg.prompt_config_hash.empty());
   EXPECT_NE(last_msg.prompt.find("Detect hazards in this camera frame"), std::string::npos);
 }
 
@@ -337,8 +338,70 @@ TEST_F(NodeTest, InvalidTemplateVariableRejected)
     std::exception);
 }
 
-/// Context retention stays bounded by context_max_entries.
-TEST_F(NodeTest, ContextRetentionIsBounded)
+/// Unsupported separate instruction delivery mode is rejected during startup.
+TEST_F(NodeTest, UnsupportedSeparateInstructionModeRejected)
+{
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("instruction_delivery_mode", "separate");
+  EXPECT_THROW(
+    std::make_shared<CosmosReasonerNode>(
+      std::make_unique<FakeInferenceBackend>(), opts),
+    std::exception);
+}
+
+/// Prompt rendering does not duplicate explicitly templated instructions.
+TEST_F(NodeTest, InstructionVariablesAreNotDuplicated)
+{
+  std::mutex prompts_mutex;
+  std::vector<std::string> captured_prompts;
+  std::atomic<int> calls{0};
+
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(prompts_mutex);
+        captured_prompts.push_back(req.prompt);
+      }
+      ++calls;
+      InferenceResponse resp;
+      resp.success = true;
+      resp.text = "ok";
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "System: {system_instruction}\nTask: {task_instruction}\nDescribe frame.");
+  opts.append_parameter_override("task_profile", "scene_description");
+  opts.append_parameter_override("system_instruction", "Conservative output.");
+  opts.append_parameter_override("task_instruction", "Bulleted response.");
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(550, 0, RCL_ROS_TIME)));
+  const bool ok = spin_until(node_, nullptr, [&] {return calls.load() >= 1;});
+  ASSERT_TRUE(ok) << "Expected one inference call";
+
+  std::lock_guard<std::mutex> lock(prompts_mutex);
+  ASSERT_EQ(captured_prompts.size(), 1u);
+  const std::string & prompt = captured_prompts[0];
+  const auto system_first = prompt.find("Conservative output.");
+  ASSERT_NE(system_first, std::string::npos);
+  EXPECT_EQ(prompt.find("Conservative output.", system_first + 1), std::string::npos);
+  const auto task_first = prompt.find("Bulleted response.");
+  ASSERT_NE(task_first, std::string::npos);
+  EXPECT_EQ(prompt.find("Bulleted response.", task_first + 1), std::string::npos);
+}
+
+/// Prompt-history injection stays bounded by prompt_history_max_entries.
+TEST_F(NodeTest, PromptHistoryIsBoundedByEntries)
 {
   std::mutex prompts_mutex;
   std::vector<std::string> captured_prompts;
@@ -359,7 +422,7 @@ TEST_F(NodeTest, ContextRetentionIsBounded)
     });
 
   rclcpp::NodeOptions opts = make_options(false);
-  opts.append_parameter_override("context_max_entries", 1);
+  opts.append_parameter_override("prompt_history_max_entries", 1);
   opts.append_parameter_override(
     "task_profiles.scene_description.template",
     "Current frame. Prior context:\n{context}");
@@ -374,11 +437,11 @@ TEST_F(NodeTest, ContextRetentionIsBounded)
   std::this_thread::sleep_for(50ms);
 
   pub->publish(*make_image(rclcpp::Time(600, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 1;}));
   pub->publish(*make_image(rclcpp::Time(601, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 2;}));
   pub->publish(*make_image(rclcpp::Time(602, 0, RCL_ROS_TIME)));
-
-  const bool ok = spin_until(node_, nullptr, [&] {return calls.load() >= 3;});
-  ASSERT_TRUE(ok) << "Expected three inference calls";
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 3;}));
 
   std::lock_guard<std::mutex> lock(prompts_mutex);
   ASSERT_GE(captured_prompts.size(), 3u);
@@ -386,6 +449,267 @@ TEST_F(NodeTest, ContextRetentionIsBounded)
   EXPECT_NE(captured_prompts[1].find("response 1"), std::string::npos);
   EXPECT_NE(captured_prompts[2].find("response 2"), std::string::npos);
   EXPECT_EQ(captured_prompts[2].find("response 1"), std::string::npos);
+}
+
+/// Prompt history is reset when a failed inference occurs under on_error policy.
+TEST_F(NodeTest, PromptHistoryResetsOnError)
+{
+  std::mutex prompts_mutex;
+  std::vector<std::string> captured_prompts;
+  std::atomic<int> calls{0};
+
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(prompts_mutex);
+        captured_prompts.push_back(req.prompt);
+      }
+      const int index = ++calls;
+      InferenceResponse resp;
+      resp.inference_seconds = 0.001;
+      if (index == 2) {
+        resp.success = false;
+        resp.error = "forced failure";
+        return resp;
+      }
+      resp.success = true;
+      resp.text = "response " + std::to_string(index);
+      return resp;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("prompt_history_max_entries", 2);
+  opts.append_parameter_override("prompt_history_reset_policy", "on_error");
+  opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Current frame. Prior context:\n{context}");
+  opts.append_parameter_override("task_profile", "scene_description");
+
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(610, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 1;}));
+  pub->publish(*make_image(rclcpp::Time(611, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 2;}));
+  pub->publish(*make_image(rclcpp::Time(612, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 3;}));
+
+  std::lock_guard<std::mutex> lock(prompts_mutex);
+  ASSERT_GE(captured_prompts.size(), 3u);
+  EXPECT_NE(captured_prompts[1].find("response 1"), std::string::npos);
+  EXPECT_EQ(captured_prompts[2].find("response 1"), std::string::npos);
+}
+
+/// every_n_requests reset policy clears history exactly at request boundaries.
+TEST_F(NodeTest, PromptHistoryEveryNRequestsBoundary)
+{
+  std::mutex prompts_mutex;
+  std::vector<std::string> captured_prompts;
+  std::atomic<int> calls{0};
+
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(prompts_mutex);
+        captured_prompts.push_back(req.prompt);
+      }
+      const int index = ++calls;
+      InferenceResponse resp;
+      resp.success = true;
+      resp.text = "response " + std::to_string(index);
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("prompt_history_max_entries", 4);
+  opts.append_parameter_override("prompt_history_reset_policy", "every_n_requests");
+  opts.append_parameter_override("prompt_history_reset_interval_requests", 2);
+  opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Current frame. Prior context:\n{context}");
+  opts.append_parameter_override("task_profile", "scene_description");
+
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(620, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 1;}));
+  pub->publish(*make_image(rclcpp::Time(621, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 2;}));
+  pub->publish(*make_image(rclcpp::Time(622, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 3;}));
+
+  std::lock_guard<std::mutex> lock(prompts_mutex);
+  ASSERT_GE(captured_prompts.size(), 3u);
+  EXPECT_NE(captured_prompts[1].find("response 1"), std::string::npos);
+  EXPECT_EQ(captured_prompts[2].find("response 1"), std::string::npos);
+  EXPECT_EQ(captured_prompts[2].find("response 2"), std::string::npos);
+}
+
+/// History can be enabled while unused when template omits {context}.
+TEST_F(NodeTest, HistoryEnabledWithoutContextVariableDoesNotInjectHistory)
+{
+  std::mutex prompts_mutex;
+  std::vector<std::string> captured_prompts;
+  std::atomic<int> calls{0};
+
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(prompts_mutex);
+        captured_prompts.push_back(req.prompt);
+      }
+      const int index = ++calls;
+      InferenceResponse resp;
+      resp.success = true;
+      resp.text = "response " + std::to_string(index);
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("prompt_history_max_entries", 2);
+  opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Describe the current frame only.");
+  opts.append_parameter_override("task_profile", "scene_description");
+
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(630, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 1;}));
+  pub->publish(*make_image(rclcpp::Time(631, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 2;}));
+
+  std::lock_guard<std::mutex> lock(prompts_mutex);
+  ASSERT_GE(captured_prompts.size(), 2u);
+  EXPECT_EQ(captured_prompts[1].find("response 1"), std::string::npos);
+}
+
+/// Prompt history is bounded by total character size.
+TEST_F(NodeTest, PromptHistoryIsBoundedByCharacterSize)
+{
+  std::mutex prompts_mutex;
+  std::vector<std::string> captured_prompts;
+  std::atomic<int> calls{0};
+
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(prompts_mutex);
+        captured_prompts.push_back(req.prompt);
+      }
+      const int index = ++calls;
+      InferenceResponse resp;
+      resp.success = true;
+      if (index == 1) {
+        resp.text = "AAAAAAAAAA";
+      } else if (index == 2) {
+        resp.text = "BBBBBBBBBB";
+      } else if (index == 3) {
+        resp.text = "CCCCCCCCCC";
+      } else {
+        resp.text = "DD";
+      }
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("prompt_history_max_entries", 4);
+  opts.append_parameter_override("prompt_history_max_chars", 20);
+  opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Current frame. Prior context:\n{context}");
+  opts.append_parameter_override("task_profile", "scene_description");
+
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(640, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 1;}));
+  pub->publish(*make_image(rclcpp::Time(641, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 2;}));
+  pub->publish(*make_image(rclcpp::Time(642, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 3;}));
+  pub->publish(*make_image(rclcpp::Time(643, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 4;}));
+
+  std::lock_guard<std::mutex> lock(prompts_mutex);
+  ASSERT_GE(captured_prompts.size(), 4u);
+  EXPECT_EQ(captured_prompts[3].find("AAAAAAAAAA"), std::string::npos);
+  EXPECT_NE(captured_prompts[3].find("BBBBBBBBBB"), std::string::npos);
+  EXPECT_NE(captured_prompts[3].find("CCCCCCCCCC"), std::string::npos);
+}
+
+/// Malformed templates fail validation and doubled braces render literal braces.
+TEST_F(NodeTest, TemplateBraceValidationAndLiteralBraces)
+{
+  rclcpp::NodeOptions bad_opts = make_options(false);
+  bad_opts.append_parameter_override("task_profile", "scene_description");
+  bad_opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Malformed template }");
+  EXPECT_THROW(
+    std::make_shared<CosmosReasonerNode>(
+      std::make_unique<FakeInferenceBackend>(), bad_opts),
+    std::exception);
+
+  std::mutex prompts_mutex;
+  std::vector<std::string> captured_prompts;
+  std::atomic<int> calls{0};
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(prompts_mutex);
+        captured_prompts.push_back(req.prompt);
+      }
+      ++calls;
+      InferenceResponse resp;
+      resp.success = true;
+      resp.text = "ok";
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  rclcpp::NodeOptions ok_opts = make_options(false);
+  ok_opts.append_parameter_override("task_profile", "scene_description");
+  ok_opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Literal {{brace}} and topic {source_topic}");
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), ok_opts);
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(650, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 1;}));
+
+  std::lock_guard<std::mutex> lock(prompts_mutex);
+  ASSERT_EQ(captured_prompts.size(), 1u);
+  EXPECT_NE(captured_prompts[0].find("Literal {brace}"), std::string::npos);
+  EXPECT_NE(captured_prompts[0].find("/camera/image_raw"), std::string::npos);
 }
 
 int main(int argc, char ** argv)
