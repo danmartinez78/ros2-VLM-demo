@@ -18,6 +18,7 @@ constexpr uint32_t kMagic = 0x434F534D;  // COSM
 constexpr uint32_t kVersion = 1;
 constexpr uint32_t kEncodingBgr8 = 1;
 constexpr uint32_t kMaxTextBytes = 1024 * 1024;
+constexpr uint32_t kMaxImageBytes = 256 * 1024 * 1024;
 
 struct RequestHeader
 {
