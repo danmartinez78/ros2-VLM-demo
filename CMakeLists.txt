@@ -261,6 +261,7 @@ if(BUILD_TENSORRT_BACKEND)
     ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/miniaudio
     ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
   )
+  ament_target_dependencies(cosmos_backend_direct_smoke rclcpp)
   target_link_libraries(cosmos_backend_direct_smoke
     ${EDGELLM_CORE_LIB}
     ${CUTE_DSL_STATIC_LIB}
