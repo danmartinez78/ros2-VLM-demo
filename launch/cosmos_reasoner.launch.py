@@ -38,6 +38,11 @@ def generate_launch_description() -> LaunchDescription:
             description='Unix-domain socket used by the isolated inference worker',
         ),
         DeclareLaunchArgument(
+            'worker_request_timeout_seconds',
+            default_value='90',
+            description='Maximum seconds to wait for one worker response',
+        ),
+        DeclareLaunchArgument(
             'image_topic',
             default_value='/camera/image_raw',
             description='Input image topic (sensor_msgs/msg/Image)',
@@ -105,6 +110,8 @@ def generate_launch_description() -> LaunchDescription:
             {
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
                 'worker_socket_path': LaunchConfiguration('worker_socket_path'),
+                'worker_request_timeout_seconds': LaunchConfiguration(
+                    'worker_request_timeout_seconds'),
                 'image_topic': LaunchConfiguration('image_topic'),
                 'result_topic': LaunchConfiguration('result_topic'),
                 'llm_engine_dir': LaunchConfiguration('llm_engine_dir'),
@@ -127,6 +134,8 @@ def generate_launch_description() -> LaunchDescription:
             LaunchConfiguration('worker_socket_path'),
         ],
         output='screen',
+        respawn=True,
+        respawn_delay=2.0,
     )
 
     return LaunchDescription(args + [worker, cosmos_node])
