@@ -94,7 +94,7 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
 
   cv::Mat packed = request.image.isContinuous() ? request.image : request.image.clone();
   const size_t image_size = packed.total() * packed.elemSize();
-  if (image_size > UINT32_MAX || request.prompt.size() > ipc::kMaxTextBytes) {
+  if (image_size > ipc::kMaxImageBytes || request.prompt.size() > ipc::kMaxTextBytes) {
     throw std::runtime_error("IPC request exceeds protocol limits");
   }
 
