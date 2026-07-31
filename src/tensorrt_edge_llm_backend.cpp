@@ -172,11 +172,11 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   user_msg.contents.push_back(text_content);
 
   trt_edgellm::rt::LLMGenerationRequest::Request inner_req;
-  inner_req.messages = {user_msg};
+  inner_req.messages.push_back(std::move(user_msg));
   inner_req.imageBuffers.push_back(std::move(image_data));
 
   trt_edgellm::rt::LLMGenerationRequest gen_req;
-  gen_req.requests = {inner_req};
+  gen_req.requests.push_back(std::move(inner_req));
   gen_req.temperature = request.temperature;
   gen_req.topP = request.top_p;
   gen_req.topK = static_cast<int64_t>(request.top_k);
