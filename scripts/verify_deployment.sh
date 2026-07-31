@@ -87,10 +87,13 @@ else
 fi
 
 if [[ -n "${ros_workspace}" && -f "${ros_workspace}/install/setup.bash" ]]; then
+  # ROS-generated setup scripts may read optional variables without defaults.
+  set +u
   # shellcheck disable=SC1090
   source "/opt/ros/${ros_distro}/setup.bash"
   # shellcheck disable=SC1090
   source "${ros_workspace}/install/setup.bash"
+  set -u
   check "Installed ROS package" ros2 pkg prefix cosmos_ros2_video_reasoner
   check "Installed reasoner executable" bash -c "ros2 pkg executables cosmos_ros2_video_reasoner | grep -q cosmos_reasoner"
 else
