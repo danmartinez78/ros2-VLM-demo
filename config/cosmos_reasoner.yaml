@@ -9,6 +9,7 @@ cosmos_reasoner:
     image_topic: /camera/image_raw
     worker_socket_path: /tmp/cosmos_edge_llm.sock
     worker_connect_timeout_seconds: 120
+    worker_request_timeout_seconds: 90
     result_topic: /cosmos/reasoning
 
     # ── Engine paths (REQUIRED on hardware — set absolute paths) ─────────────
