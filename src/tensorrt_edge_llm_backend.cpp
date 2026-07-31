@@ -104,8 +104,11 @@ void TensorRTEdgeLLMBackend::initialize()
   plugin_handle_ = plugin_uptr.release();
 
   // ── 3. Create CUDA stream ─────────────────────────────────────────────
-  if (cudaStreamCreate(&cuda_stream_) != cudaSuccess) {
-    throw std::runtime_error("cudaStreamCreate failed");
+  // Match NVIDIA's llm_inference executable.  Edge-LLM's TensorRT runners use
+  // auxiliary streams; a legacy blocking stream introduces implicit
+  // default-stream synchronization and can stall multimodal preprocessing.
+  if (cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking) != cudaSuccess) {
+    throw std::runtime_error("cudaStreamCreateWithFlags failed");
   }
 
   // ── 4. Construct the persistent LLMInferenceRuntime ───────────────────
