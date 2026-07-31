@@ -78,6 +78,31 @@ def generate_launch_description() -> LaunchDescription:
             description='Text prompt for the VLM',
         ),
         DeclareLaunchArgument(
+            'task_profile',
+            default_value='legacy_prompt',
+            description='Named task profile used to render the prompt',
+        ),
+        DeclareLaunchArgument(
+            'prompt_version',
+            default_value='v1',
+            description='Version label recorded with each reasoning result',
+        ),
+        DeclareLaunchArgument(
+            'system_instruction',
+            default_value='',
+            description='Optional system-level instruction text',
+        ),
+        DeclareLaunchArgument(
+            'task_instruction',
+            default_value='',
+            description='Optional task-level instruction text',
+        ),
+        DeclareLaunchArgument(
+            'context_max_entries',
+            default_value='0',
+            description='Count of prior successful responses retained as context',
+        ),
+        DeclareLaunchArgument(
             'sample_period_seconds',
             default_value='2.0',
             description='Seconds between sampled frames (uses message timestamp)',
@@ -123,6 +148,11 @@ def generate_launch_description() -> LaunchDescription:
                 'multimodal_engine_dir': LaunchConfiguration('multimodal_engine_dir'),
                 'edge_llm_plugin_path': LaunchConfiguration('edge_llm_plugin_path'),
                 'prompt': LaunchConfiguration('prompt'),
+                'task_profile': LaunchConfiguration('task_profile'),
+                'prompt_version': LaunchConfiguration('prompt_version'),
+                'system_instruction': LaunchConfiguration('system_instruction'),
+                'task_instruction': LaunchConfiguration('task_instruction'),
+                'context_max_entries': LaunchConfiguration('context_max_entries'),
                 'sample_period_seconds': LaunchConfiguration('sample_period_seconds'),
                 'max_generate_length': LaunchConfiguration('max_generate_length'),
                 'temperature': LaunchConfiguration('temperature'),

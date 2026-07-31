@@ -20,8 +20,10 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -280,6 +282,110 @@ TEST_F(NodeTest, InvalidTemperatureRejected)
     std::make_shared<CosmosReasonerNode>(
       std::make_unique<FakeInferenceBackend>(), opts),
     std::exception);
+}
+
+/// Selected task profile and prompt version are recorded with each published result.
+TEST_F(NodeTest, PublishesProfileAndPromptVersionMetadata)
+{
+  std::atomic<bool> received{false};
+  ResultMsg last_msg;
+
+  auto helper = std::make_shared<rclcpp::Node>("_test_helper_profile_metadata");
+  auto sub = helper->create_subscription<ResultMsg>(
+    "/cosmos/reasoning", rclcpp::SystemDefaultsQoS(),
+    [&](ResultMsg::SharedPtr msg) {
+      last_msg = *msg;
+      received = true;
+    });
+
+  rclcpp::NodeOptions opts = make_options(true);
+  opts.append_parameter_override("task_profile", "hazard_detection");
+  opts.append_parameter_override("prompt_version", "hazard-v2");
+  opts.append_parameter_override("task_instruction", "Use concise bullet points.");
+  node_ = std::make_shared<CosmosReasonerNode>(
+    std::make_unique<FakeInferenceBackend>(),
+    opts);
+
+  std::this_thread::sleep_for(100ms);
+
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = helper->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+
+  std::this_thread::sleep_for(50ms);
+  pub->publish(*make_image(rclcpp::Time(500, 0, RCL_ROS_TIME)));
+
+  const bool ok = spin_until(node_, helper, [&] {return received.load();});
+  ASSERT_TRUE(ok) << "No result message received within timeout";
+  EXPECT_EQ(last_msg.task_profile, "hazard_detection");
+  EXPECT_EQ(last_msg.prompt_version, "hazard-v2");
+  EXPECT_NE(last_msg.prompt.find("Detect hazards in this camera frame"), std::string::npos);
+}
+
+/// Unknown variables in prompt templates fail validation during startup.
+TEST_F(NodeTest, InvalidTemplateVariableRejected)
+{
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("task_profile", "scene_description");
+  opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Describe scene with {not_a_valid_variable}");
+
+  EXPECT_THROW(
+    std::make_shared<CosmosReasonerNode>(
+      std::make_unique<FakeInferenceBackend>(), opts),
+    std::exception);
+}
+
+/// Context retention stays bounded by context_max_entries.
+TEST_F(NodeTest, ContextRetentionIsBounded)
+{
+  std::mutex prompts_mutex;
+  std::vector<std::string> captured_prompts;
+  std::atomic<int> calls{0};
+
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(prompts_mutex);
+        captured_prompts.push_back(req.prompt);
+      }
+      const int index = ++calls;
+      InferenceResponse resp;
+      resp.success = true;
+      resp.text = "response " + std::to_string(index);
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("context_max_entries", 1);
+  opts.append_parameter_override(
+    "task_profiles.scene_description.template",
+    "Current frame. Prior context:\n{context}");
+  opts.append_parameter_override("task_profile", "scene_description");
+
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(600, 0, RCL_ROS_TIME)));
+  pub->publish(*make_image(rclcpp::Time(601, 0, RCL_ROS_TIME)));
+  pub->publish(*make_image(rclcpp::Time(602, 0, RCL_ROS_TIME)));
+
+  const bool ok = spin_until(node_, nullptr, [&] {return calls.load() >= 3;});
+  ASSERT_TRUE(ok) << "Expected three inference calls";
+
+  std::lock_guard<std::mutex> lock(prompts_mutex);
+  ASSERT_GE(captured_prompts.size(), 3u);
+  EXPECT_EQ(captured_prompts[0].find("response 1"), std::string::npos);
+  EXPECT_NE(captured_prompts[1].find("response 1"), std::string::npos);
+  EXPECT_NE(captured_prompts[2].find("response 2"), std::string::npos);
+  EXPECT_EQ(captured_prompts[2].find("response 1"), std::string::npos);
 }
 
 int main(int argc, char ** argv)

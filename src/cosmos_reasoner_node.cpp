@@ -15,9 +15,13 @@
 #include "cosmos_ros2_video_reasoner/cosmos_reasoner_node.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
@@ -100,6 +104,58 @@ cv::Mat ros_image_to_bgr(sensor_msgs::msg::Image const & msg)
   return bgr;
 }
 
+std::unordered_set<std::string> extract_template_variables(const std::string & templ)
+{
+  std::unordered_set<std::string> vars;
+  size_t pos = 0;
+  while (pos < templ.size()) {
+    const size_t open = templ.find('{', pos);
+    if (open == std::string::npos) {
+      break;
+    }
+    const size_t close = templ.find('}', open + 1);
+    if (close == std::string::npos) {
+      throw std::runtime_error("unterminated template variable in prompt template");
+    }
+    const std::string key = templ.substr(open + 1, close - open - 1);
+    if (key.empty()) {
+      throw std::runtime_error("empty template variable '{}' is not allowed");
+    }
+    vars.insert(key);
+    pos = close + 1;
+  }
+  return vars;
+}
+
+std::string render_template(
+  const std::string & templ,
+  const std::unordered_map<std::string, std::string> & vars)
+{
+  std::string out;
+  out.reserve(templ.size() + 256);
+  size_t pos = 0;
+  while (pos < templ.size()) {
+    const size_t open = templ.find('{', pos);
+    if (open == std::string::npos) {
+      out.append(templ, pos, std::string::npos);
+      break;
+    }
+    out.append(templ, pos, open - pos);
+    const size_t close = templ.find('}', open + 1);
+    if (close == std::string::npos) {
+      throw std::runtime_error("unterminated template variable in prompt template");
+    }
+    const std::string key = templ.substr(open + 1, close - open - 1);
+    const auto it = vars.find(key);
+    if (it == vars.end()) {
+      throw std::runtime_error("missing template variable: {" + key + "}");
+    }
+    out += it->second;
+    pos = close + 1;
+  }
+  return out;
+}
+
 }  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -143,6 +199,13 @@ CosmosReasonerNode::CosmosReasonerNode(
 
   RCLCPP_INFO(this->get_logger(), "Subscribed to %s", source_topic_.c_str());
   RCLCPP_INFO(this->get_logger(), "Publishing results to %s", result_topic.c_str());
+  RCLCPP_INFO(
+    this->get_logger(),
+    "Prompt configuration — profile: %s version: %s context_max_entries: %d reset_policy: %s",
+    task_profile_.c_str(),
+    prompt_version_.c_str(),
+    context_max_entries_,
+    context_reset_policy_.c_str());
 }
 
 CosmosReasonerNode::~CosmosReasonerNode()
@@ -194,7 +257,72 @@ void CosmosReasonerNode::declare_parameters()
     "Describe the scene in this camera frame. Identify important objects, "
     "people, animals, vehicles, terrain, hazards, and unusual conditions. "
     "Do not claim details that are not visually supported.",
-    desc("Text prompt sent to the VLM for every sampled frame"));
+    desc("Legacy text prompt sent to the VLM for every sampled frame"));
+
+  this->declare_parameter(
+    "task_profile", "legacy_prompt",
+    desc("Named task profile used to render the effective prompt"));
+
+  this->declare_parameter(
+    "prompt_version", "v1",
+    desc("User-defined version string for the active prompt/profile configuration"));
+
+  this->declare_parameter(
+    "task_profiles.scene_description.template",
+    "Describe the scene in this camera frame. Identify important objects, "
+    "people, animals, vehicles, terrain, hazards, and unusual conditions. "
+    "Do not claim details that are not visually supported.",
+    desc("Prompt template for scene description"));
+
+  this->declare_parameter(
+    "task_profiles.hazard_detection.template",
+    "Detect hazards in this camera frame. Focus on immediate risks to people, "
+    "vehicles, and infrastructure. Report only visually supported hazards.",
+    desc("Prompt template for hazard detection"));
+
+  this->declare_parameter(
+    "task_profiles.inventory.template",
+    "Identify visible inventory items in this camera frame. Summarize counts, "
+    "locations, and notable missing or misplaced items based only on visible evidence.",
+    desc("Prompt template for inventory analysis"));
+
+  this->declare_parameter(
+    "task_profiles.navigation_assistance.template",
+    "Provide navigation assistance from this camera frame. Describe traversable "
+    "space, obstacles, signage, and safe next-step guidance using only visible cues.",
+    desc("Prompt template for navigation assistance"));
+
+  this->declare_parameter(
+    "system_instruction", "",
+    desc("Optional system-level instruction text"));
+
+  this->declare_parameter(
+    "task_instruction", "",
+    desc("Optional task-level instruction text"));
+
+  this->declare_parameter(
+    "instruction_delivery_mode", "inline",
+    desc("Instruction delivery mode: inline or separate"));
+
+  this->declare_parameter(
+    "model_capabilities.supports_system_instruction", false,
+    desc("Declare whether the model runtime supports separate system instructions"));
+
+  this->declare_parameter(
+    "model_capabilities.supports_context_retention", true,
+    desc("Declare whether the model runtime supports prompt context retention"));
+
+  this->declare_parameter(
+    "context_max_entries", 0,
+    desc("Number of prior successful responses retained for prompt context (0 disables context)"));
+
+  this->declare_parameter(
+    "context_reset_policy", "never",
+    desc("Context reset policy: never, on_error, or every_n_frames"));
+
+  this->declare_parameter(
+    "context_reset_interval_frames", 0,
+    desc("Frames between context resets when context_reset_policy is every_n_frames"));
 
   this->declare_parameter(
     "sample_period_seconds", 2.0,
@@ -286,10 +414,104 @@ void CosmosReasonerNode::validate_parameters()
     throw std::runtime_error("jpeg_quality must be in [1, 100]");
   }
 
-  prompt_ = this->get_parameter("prompt").as_string();
-  if (prompt_.empty()) {
+  legacy_prompt_ = this->get_parameter("prompt").as_string();
+  if (legacy_prompt_.empty()) {
     throw std::runtime_error("prompt must not be empty");
   }
+
+  task_profile_ = this->get_parameter("task_profile").as_string();
+  if (task_profile_.empty()) {
+    throw std::runtime_error("task_profile must not be empty");
+  }
+  prompt_version_ = this->get_parameter("prompt_version").as_string();
+  if (prompt_version_.empty()) {
+    throw std::runtime_error("prompt_version must not be empty");
+  }
+
+  task_profiles_.clear();
+  task_profiles_["legacy_prompt"] = legacy_prompt_;
+  task_profiles_["scene_description"] = this->get_parameter(
+    "task_profiles.scene_description.template").as_string();
+  task_profiles_["hazard_detection"] = this->get_parameter(
+    "task_profiles.hazard_detection.template").as_string();
+  task_profiles_["inventory"] = this->get_parameter(
+    "task_profiles.inventory.template").as_string();
+  task_profiles_["navigation_assistance"] = this->get_parameter(
+    "task_profiles.navigation_assistance.template").as_string();
+
+  for (const auto & profile : task_profiles_) {
+    if (profile.second.empty()) {
+      throw std::runtime_error("prompt template for profile '" + profile.first + "' must not be empty");
+    }
+  }
+
+  auto active = task_profiles_.find(task_profile_);
+  if (active == task_profiles_.end()) {
+    throw std::runtime_error(
+            "unknown task_profile '" + task_profile_ +
+            "'. Valid values: legacy_prompt, scene_description, hazard_detection, "
+            "inventory, navigation_assistance");
+  }
+  active_prompt_template_ = active->second;
+
+  system_instruction_ = this->get_parameter("system_instruction").as_string();
+  task_instruction_ = this->get_parameter("task_instruction").as_string();
+  instruction_delivery_mode_ = this->get_parameter("instruction_delivery_mode").as_string();
+  if (instruction_delivery_mode_ != "inline" && instruction_delivery_mode_ != "separate") {
+    throw std::runtime_error("instruction_delivery_mode must be 'inline' or 'separate'");
+  }
+
+  supports_system_instruction_ = this->get_parameter(
+    "model_capabilities.supports_system_instruction").as_bool();
+  supports_context_retention_ = this->get_parameter(
+    "model_capabilities.supports_context_retention").as_bool();
+
+  if (instruction_delivery_mode_ == "separate" && !supports_system_instruction_) {
+    throw std::runtime_error(
+            "instruction_delivery_mode=separate requires "
+            "model_capabilities.supports_system_instruction=true");
+  }
+  if (instruction_delivery_mode_ == "separate") {
+    throw std::runtime_error(
+            "instruction_delivery_mode=separate is not compatible with the current IPC "
+            "runtime. Use instruction_delivery_mode=inline.");
+  }
+
+  context_max_entries_ = this->get_parameter("context_max_entries").as_int();
+  if (context_max_entries_ < 0) {
+    throw std::runtime_error("context_max_entries must be >= 0");
+  }
+  if (context_max_entries_ > 0 && !supports_context_retention_) {
+    throw std::runtime_error(
+            "context_max_entries > 0 requires "
+            "model_capabilities.supports_context_retention=true");
+  }
+
+  context_reset_policy_ = this->get_parameter("context_reset_policy").as_string();
+  if (
+    context_reset_policy_ != "never" &&
+    context_reset_policy_ != "on_error" &&
+    context_reset_policy_ != "every_n_frames")
+  {
+    throw std::runtime_error(
+            "context_reset_policy must be 'never', 'on_error', or 'every_n_frames'");
+  }
+  context_reset_interval_frames_ = this->get_parameter("context_reset_interval_frames").as_int();
+  if (context_reset_interval_frames_ < 0) {
+    throw std::runtime_error("context_reset_interval_frames must be >= 0");
+  }
+  if (context_reset_policy_ == "every_n_frames" && context_reset_interval_frames_ <= 0) {
+    throw std::runtime_error(
+            "context_reset_interval_frames must be > 0 when "
+            "context_reset_policy is every_n_frames");
+  }
+  if (context_reset_policy_ != "every_n_frames" && context_reset_interval_frames_ != 0) {
+    throw std::runtime_error(
+            "context_reset_interval_frames must be 0 unless "
+            "context_reset_policy is every_n_frames");
+  }
+
+  validate_template_variables("active profile template", active_prompt_template_);
 
   const auto queue_capacity = this->get_parameter("queue_capacity").as_int();
   if (queue_capacity != 1) {
@@ -298,6 +520,94 @@ void CosmosReasonerNode::validate_parameters()
 
   drop_old_frames_ = this->get_parameter("drop_old_frames").as_bool();
   publish_results_ = this->get_parameter("publish_results").as_bool();
+}
+
+void CosmosReasonerNode::validate_template_variables(
+  const std::string & name,
+  const std::string & templ) const
+{
+  const auto vars = extract_template_variables(templ);
+  static const std::unordered_set<std::string> kAllowedVariables{
+    "system_instruction",
+    "task_instruction",
+    "context",
+    "source_topic",
+    "sample_period_seconds",
+    "frame_sequence"};
+
+  for (const auto & var : vars) {
+    if (kAllowedVariables.find(var) == kAllowedVariables.end()) {
+      throw std::runtime_error(
+              name + " contains unsupported variable {" + var + "}. Allowed variables: "
+              "{system_instruction}, {task_instruction}, {context}, {source_topic}, "
+              "{sample_period_seconds}, {frame_sequence}");
+    }
+  }
+}
+
+std::string CosmosReasonerNode::render_effective_prompt(uint64_t frame_seq) const
+{
+  std::ostringstream context_stream;
+  for (size_t i = 0; i < context_history_.size(); ++i) {
+    context_stream << "[" << i + 1 << "] " << context_history_[i];
+    if (i + 1 < context_history_.size()) {
+      context_stream << '\n';
+    }
+  }
+
+  std::unordered_map<std::string, std::string> vars;
+  vars["system_instruction"] = system_instruction_;
+  vars["task_instruction"] = task_instruction_;
+  vars["context"] = context_stream.str();
+  vars["source_topic"] = source_topic_;
+  vars["sample_period_seconds"] = std::to_string(sample_period_seconds_);
+  vars["frame_sequence"] = std::to_string(frame_seq);
+
+  std::string rendered = render_template(active_prompt_template_, vars);
+  if (instruction_delivery_mode_ == "inline") {
+    if (!system_instruction_.empty()) {
+      rendered = "System instruction:\n" + system_instruction_ + "\n\n" + rendered;
+    }
+    if (!task_instruction_.empty()) {
+      rendered += "\n\nTask instruction:\n" + task_instruction_;
+    }
+  }
+  return rendered;
+}
+
+void CosmosReasonerNode::maybe_reset_context_before_frame()
+{
+  if (context_history_.empty()) {
+    return;
+  }
+  if (
+    context_reset_policy_ == "every_n_frames" &&
+    context_reset_interval_frames_ > 0 &&
+    frames_since_context_reset_ >= static_cast<uint64_t>(context_reset_interval_frames_))
+  {
+    context_history_.clear();
+    frames_since_context_reset_ = 0;
+  }
+}
+
+void CosmosReasonerNode::update_context_after_response(const InferenceResponse & resp)
+{
+  ++frames_since_context_reset_;
+
+  if (context_reset_policy_ == "on_error" && !resp.success) {
+    context_history_.clear();
+    frames_since_context_reset_ = 0;
+    return;
+  }
+
+  if (context_max_entries_ <= 0 || !resp.success || resp.text.empty()) {
+    return;
+  }
+
+  context_history_.push_back(resp.text);
+  while (context_history_.size() > static_cast<size_t>(context_max_entries_)) {
+    context_history_.pop_front();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -390,7 +700,10 @@ void CosmosReasonerNode::worker_loop()
       InferenceResponse resp;
       resp.success = false;
       resp.error = std::string("image conversion: ") + e.what();
-      publish_result(frame.msg->header, frame.seq, resp);
+      maybe_reset_context_before_frame();
+      const std::string effective_prompt = render_effective_prompt(frame.seq);
+      update_context_after_response(resp);
+      publish_result(frame.msg->header, frame.seq, resp, effective_prompt);
       continue;
     }
 
@@ -402,9 +715,11 @@ void CosmosReasonerNode::worker_loop()
     }
 
     // ── build and run inference request ──────────────────────────────────
+    maybe_reset_context_before_frame();
+    const std::string effective_prompt = render_effective_prompt(frame.seq);
     InferenceRequest req;
     req.image = bgr;
-    req.prompt = prompt_;
+    req.prompt = effective_prompt;
     req.max_generate_length = max_generate_length_;
     req.temperature = temperature_;
     req.top_p = top_p_;
@@ -432,7 +747,8 @@ void CosmosReasonerNode::worker_loop()
         frame.seq, resp.error.c_str());
     }
 
-    publish_result(frame.msg->header, frame.seq, resp);
+    update_context_after_response(resp);
+    publish_result(frame.msg->header, frame.seq, resp, effective_prompt);
   }
 }
 
@@ -476,7 +792,8 @@ void CosmosReasonerNode::image_callback(
 void CosmosReasonerNode::publish_result(
   const std_msgs::msg::Header & header,
   uint64_t frame_seq,
-  const InferenceResponse & resp)
+  const InferenceResponse & resp,
+  const std::string & effective_prompt)
 {
   if (!publish_results_ || !result_pub_) {
     return;
@@ -485,7 +802,9 @@ void CosmosReasonerNode::publish_result(
   msg::VisionReasoningResult out;
   out.header = header;
   out.source_topic = source_topic_;
-  out.prompt = prompt_;
+  out.task_profile = task_profile_;
+  out.prompt_version = prompt_version_;
+  out.prompt = effective_prompt;
   out.response = resp.text;
   out.inference_seconds = resp.inference_seconds;
   out.frame_sequence = frame_seq;

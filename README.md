@@ -158,7 +158,7 @@ Results are published as
 `/cosmos/reasoning` by default. Each result includes:
 
 - source image header and topic;
-- effective prompt;
+- effective prompt, selected task profile, and prompt-version label;
 - generated response;
 - inference duration;
 - sampled-frame sequence number;
@@ -185,7 +185,17 @@ increase end-to-end latency.
 | `llm_engine_dir` | string | empty | Required LLM engine/tokenizer directory |
 | `multimodal_engine_dir` | string | empty | Required multimodal engine directory |
 | `edge_llm_plugin_path` | string | empty | Required Edge-LLM plugin path |
-| `prompt` | string | scene-description prompt | Prompt applied to every sampled frame |
+| `prompt` | string | scene-description prompt | Legacy prompt used when `task_profile=legacy_prompt` |
+| `task_profile` | string | `legacy_prompt` | Active task profile (`legacy_prompt`, `scene_description`, `hazard_detection`, `inventory`, `navigation_assistance`) |
+| `prompt_version` | string | `v1` | Version label attached to every result for reproducibility |
+| `system_instruction` | string | empty | Optional system instruction text |
+| `task_instruction` | string | empty | Optional task instruction text |
+| `instruction_delivery_mode` | string | `inline` | `inline` or `separate`; `separate` requires declared runtime support |
+| `model_capabilities.supports_system_instruction` | bool | `false` | Declared runtime capability for separate system instructions |
+| `model_capabilities.supports_context_retention` | bool | `true` | Declared runtime capability for retained prompt context |
+| `context_max_entries` | int | `0` | Bound on prior successful responses retained as context |
+| `context_reset_policy` | string | `never` | Context reset policy: `never`, `on_error`, `every_n_frames` |
+| `context_reset_interval_frames` | int | `0` | Reset period used when policy is `every_n_frames` |
 | `sample_period_seconds` | double | `2.0` | Minimum ROS timestamp interval between samples |
 | `max_generate_length` | int | `256` | Maximum generated tokens |
 | `temperature` | double | `0.2` | Sampling temperature |
@@ -196,8 +206,9 @@ increase end-to-end latency.
 | `drop_old_frames` | bool | `true` | Replace a queued stale frame with the newest frame |
 | `publish_results` | bool | `true` | Publish result messages |
 
-Prompt and context configuration beyond this single prompt is tracked in
-[#12](https://github.com/danmartinez78/ros2-VLM-demo/issues/12).
+Prompt behavior is template-driven and validated at startup. Unknown template
+variables or incompatible capability declarations fail fast with explicit
+errors.
 
 ## Operational behavior
 
