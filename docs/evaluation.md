@@ -85,7 +85,8 @@ The output JSON includes:
 - comparison deltas (when `--compare-run` is provided)
 
 Use `mode: regression` for deterministic checks and `mode: exploratory` for model/parameter experiments.
+Regression mode requires a matching `dataset_id` and a result for every dataset example.
 
 ## Human review workflow
 
-Any example with a rubric marked `"scoring": "human"` is flagged as `human_review_required: true` and excluded from automatic correctness-rate denominator.
+Examples with a rubric marked `"scoring": "human"` are flagged as `human_review_required: true` when inference succeeds and are excluded from automatic correctness-rate denominator. Failed inferences are always counted as incorrect.

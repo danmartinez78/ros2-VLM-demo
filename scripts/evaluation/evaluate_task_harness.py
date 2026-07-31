@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -36,6 +37,24 @@ def _contains_any(haystack: str, alternatives: list[str]) -> tuple[bool, str | N
         if _normalize(item) in haystack:
             return True, item
     return False, None
+
+
+def _phrase_pattern(phrase: str) -> re.Pattern[str]:
+    words = _normalize(phrase).split()
+    if not words:
+        return re.compile(r"$^")
+    return re.compile(r"\b" + r"\s+".join(re.escape(word) for word in words) + r"\b")
+
+
+def _contains_phrase(haystack: str, phrase: str, *, allow_simple_negation: bool = False) -> bool:
+    pattern = _phrase_pattern(phrase)
+    for match in pattern.finditer(haystack):
+        if allow_simple_negation:
+            prefix = haystack[max(0, match.start() - 16) : match.start()]
+            if re.search(r"\b(?:no|not|without)\s+$", prefix):
+                continue
+        return True
+    return False
 
 
 
@@ -80,7 +99,7 @@ def score_rubric(response: str, rubric_name: str, rubric_definition: dict[str, A
 
     forbidden_hits: list[str] = []
     for forbidden in rubric_definition.get("forbidden_observations", []):
-        if _normalize(str(forbidden)) in normalized:
+        if _contains_phrase(normalized, str(forbidden), allow_simple_negation=True):
             forbidden_hits.append(str(forbidden))
 
     status = "passed" if not missed and not forbidden_hits else "failed"
@@ -104,7 +123,9 @@ def evaluate_run(dataset: dict[str, Any], run: dict[str, Any], mode_override: st
 
     if run_mode == "regression":
         expected_dataset = run.get("dataset_id")
-        if expected_dataset and expected_dataset != dataset_id:
+        if not expected_dataset:
+            raise ValueError("Regression run must include dataset_id")
+        if expected_dataset != dataset_id:
             raise ValueError(
                 f"Regression run dataset_id mismatch: run={expected_dataset} dataset={dataset_id}"
             )
@@ -161,15 +182,21 @@ def evaluate_run(dataset: dict[str, Any], run: dict[str, Any], mode_override: st
 
         unsupported_terms = [str(term) for term in dataset_example.get("unsupported_claim_terms", [])]
         normalized_response = _normalize(response)
-        unsupported_hits = [term for term in unsupported_terms if _normalize(term) in normalized_response]
+        unsupported_hits = [
+            term for term in unsupported_terms if _contains_phrase(normalized_response, term)
+        ]
         unsupported_claim_total += len(unsupported_hits)
 
-        if requires_human_review:
+        requires_human_review = success and requires_human_review
+        if not success:
+            auto_scored_examples += 1
+            correctness = False
+        elif requires_human_review:
             human_review_required += 1
             correctness = None
         else:
             auto_scored_examples += 1
-            correctness = success and not auto_rubric_failed and not unsupported_hits
+            correctness = not auto_rubric_failed and not unsupported_hits
             if correctness:
                 auto_scored_passed += 1
 
@@ -190,6 +217,13 @@ def evaluate_run(dataset: dict[str, Any], run: dict[str, Any], mode_override: st
         )
 
     total_examples = len(per_example)
+    if run_mode == "regression":
+        missing_examples = sorted(set(examples_by_id) - {entry["example_id"] for entry in per_example})
+        if missing_examples:
+            raise ValueError(
+                "Regression run is missing results for example_ids: "
+                + ", ".join(missing_examples)
+            )
     aggregate = {
         "total_examples": total_examples,
         "auto_scored_examples": auto_scored_examples,

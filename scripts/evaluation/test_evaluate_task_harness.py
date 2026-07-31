@@ -68,7 +68,7 @@ class EvaluateTaskHarnessTests(unittest.TestCase):
         run = {
             "run_id": "run-2",
             "dataset_id": "test-dataset",
-            "mode": "regression",
+            "mode": "exploratory",
             "configuration": {"model": "demo"},
             "results": [
                 {
@@ -87,12 +87,109 @@ class EvaluateTaskHarnessTests(unittest.TestCase):
         self.assertEqual(report["per_example"][0]["unsupported_claim_hits"], ["fire"])
         self.assertFalse(report["per_example"][0]["correctness"])
 
+    def test_forbidden_negation_and_word_boundary_matching(self):
+        dataset = {
+            "dataset_id": "word-boundary-test",
+            "version": "v1",
+            "examples": [
+                {
+                    "id": "example-1",
+                    "segment": {},
+                    "rubrics": {
+                        "hazard_recognition": {
+                            "required_observations": [["clear"]],
+                            "forbidden_observations": ["collision"],
+                        }
+                    },
+                    "unsupported_claim_terms": ["gun"],
+                }
+            ],
+        }
+        run = {
+            "run_id": "run-3",
+            "dataset_id": "word-boundary-test",
+            "mode": "regression",
+            "results": [
+                {
+                    "example_id": "example-1",
+                    "response": "The path is clear with no collision and the work has begun.",
+                    "success": True,
+                    "latency_seconds": 1.0,
+                }
+            ],
+        }
+
+        report = evaluate_run(dataset, run)
+        rubric = report["per_example"][0]["rubric_scores"]["hazard_recognition"]
+        self.assertEqual(rubric["forbidden_hits"], [])
+        self.assertEqual(report["per_example"][0]["unsupported_claim_hits"], [])
+        self.assertTrue(report["per_example"][0]["correctness"])
+
+    def test_failed_inference_not_excluded_by_human_rubric(self):
+        run = {
+            "run_id": "run-4",
+            "dataset_id": "test-dataset",
+            "mode": "regression",
+            "results": [
+                {
+                    "example_id": "example-1",
+                    "response": "pallet in warehouse",
+                    "success": True,
+                    "latency_seconds": 1.0,
+                },
+                {
+                    "example_id": "example-2",
+                    "response": "",
+                    "success": False,
+                    "error": "model crash",
+                    "latency_seconds": 0.5,
+                },
+            ],
+        }
+
+        report = evaluate_run(self.dataset, run)
+        self.assertEqual(report["aggregate"]["auto_scored_examples"], 2)
+        self.assertEqual(report["aggregate"]["human_review_required"], 0)
+        self.assertAlmostEqual(report["aggregate"]["correctness_rate"], 0.5)
+        self.assertFalse(report["per_example"][1]["correctness"])
+        self.assertFalse(report["per_example"][1]["human_review_required"])
+
+    def test_regression_requires_dataset_id_and_complete_coverage(self):
+        with self.assertRaisesRegex(ValueError, "must include dataset_id"):
+            evaluate_run(
+                self.dataset,
+                {
+                    "run_id": "run-5",
+                    "mode": "regression",
+                    "results": [],
+                },
+            )
+
+        with self.assertRaisesRegex(ValueError, "missing results for example_ids: example-2"):
+            evaluate_run(
+                self.dataset,
+                {
+                    "run_id": "run-6",
+                    "dataset_id": "test-dataset",
+                    "mode": "regression",
+                    "results": [
+                        {
+                            "example_id": "example-1",
+                            "response": "pallet in warehouse",
+                            "success": True,
+                            "latency_seconds": 1.0,
+                        }
+                    ],
+                },
+            )
+
     def test_comparison_output(self):
         base = evaluate_run(
             self.dataset,
             {
                 "run_id": "base",
                 "dataset_id": "test-dataset",
+                "mode": "exploratory",
                 "results": [
                     {
                         "example_id": "example-1",
@@ -108,6 +205,7 @@ class EvaluateTaskHarnessTests(unittest.TestCase):
             {
                 "run_id": "candidate",
                 "dataset_id": "test-dataset",
+                "mode": "exploratory",
                 "results": [
                     {
                         "example_id": "example-1",
