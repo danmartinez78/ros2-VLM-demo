@@ -157,7 +157,7 @@ This control establishes that the following artifacts are functional together:
 | Reduce maximum generation length to 64 | Still stalls | Generation length is not the cause |
 | CUDA-GDB attach during stall | Fused attention remains active; host waits in prefill | Failure is inside TensorRT base-model prefill |
 | Run standalone program linked to installed `libcosmos_trt_backend.so` without ROS initialization | Still stalls | ROS, DDS, rosbag playback, executor, and cv_bridge are not required to reproduce |
-| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |\n| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is a confirmed failure boundary |\n| Inspect production executable dependencies | OpenCV 4.6 and 4.8 loaded together through cv_bridge and NVIDIA OpenCV | A second C++ ABI hazard exists in the ROS image-conversion path |
+| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |\n| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is a confirmed failure boundary |\n| Inspect production executable dependencies | OpenCV 4.6 and 4.8 loaded together through cv_bridge and NVIDIA OpenCV | A second C++ ABI hazard exists in the ROS image-conversion path |\n| Run direct-linked backend entirely on a `std::thread` without ROS libraries | Succeeds in approximately 1.45 seconds | Worker-thread execution is safe |\n| Link the successful direct smoke executable to `rclcpp` but do not call `rclcpp::init()` | Stalls in the same fused-attention prefill kernel | Loading the ROS dependency set is sufficient to trigger the failure |
 
 ## Benign action-runner message
 
@@ -226,3 +226,12 @@ libopencv_imgcodecs.so.408
 ROS Jazzy's binary `cv_bridge` package is built against Ubuntu OpenCV 4.6, while the Thor JetPack stack provides NVIDIA OpenCV 4.8. Passing `cv::Mat` objects across this mixed C++ ABI boundary is unsafe and may cause memory corruption or undefined behavior.
 
 The production node therefore removes its `cv_bridge` runtime dependency and converts supported `sensor_msgs/msg/Image` encodings directly with the selected NVIDIA OpenCV runtime. Supported encodings are `bgr8`, `rgb8`, and `mono8`; row stride and payload size are validated before constructing an OpenCV view. This avoids downgrading NVIDIA OpenCV or removing JetPack packages.
+
+
+## ROS library-load isolation result
+
+A direct-linked smoke executable was validated in both main-thread and `std::thread` modes; both completed in approximately 1.45 seconds. The same executable was then linked to `rclcpp` without calling `rclcpp::init()` or constructing any ROS node. It stalled in the same TensorRT Blackwell fused-attention prefill kernel.
+
+This establishes that ROS executor behavior, DDS traffic, node creation, callback scheduling, and CUDA thread affinity are not required to reproduce the failure. Loading the transitive ROS 2 C++ dependency set into the Edge-LLM process is sufficient.
+
+The production architecture must therefore isolate Edge-LLM from ROS in a separate process unless the exact conflicting shared object or symbol-interposition issue is identified and proven safe. The preferred deployment is a persistent ROS-free inference worker, direct-linked to Edge-LLM at its final executable boundary, with the ROS node using a bounded IPC protocol. Process isolation also allows a wedged GPU worker to be terminated and restarted without wedging ROS shutdown.
