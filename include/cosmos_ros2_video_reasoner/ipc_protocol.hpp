@@ -8,6 +8,8 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace cosmos_ros2_video_reasoner::ipc
@@ -52,7 +54,7 @@ inline void write_all(int fd, void const * data, size_t size)
 {
   auto const * bytes = static_cast<uint8_t const *>(data);
   while (size > 0) {
-    const ssize_t written = ::write(fd, bytes, size);
+    const ssize_t written = ::send(fd, bytes, size, MSG_NOSIGNAL);
     if (written < 0) {
       if (errno == EINTR) {continue;}
       throw std::runtime_error("IPC write failed: " + std::string(std::strerror(errno)));
