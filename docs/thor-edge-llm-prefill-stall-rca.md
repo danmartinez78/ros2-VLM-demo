@@ -1,125 +1,131 @@
-# Jetson AGX Thor Edge-LLM prefill stall RCA
+# Jetson AGX Thor TensorRT Edge-LLM prefill stall RCA
 
-Status: isolated-worker production path validated on Thor  
-Platform: NVIDIA Jetson AGX Thor  
-Date opened: 2026-07-30
+Status: resolved by production process isolation  
+Opened: 2026-07-30  
+Validated platform: NVIDIA Jetson AGX Thor, JetPack 7.2 / R39.2
 
-## Summary
+## Executive summary
 
-The ROS 2 Cosmos reasoner successfully initializes the TensorRT Edge-LLM runtime, loads the Cosmos-Reason2-8B LLM and visual engines, receives and preprocesses a camera frame, and then stalls indefinitely during base-model prefill.
+The original ROS 2 Cosmos integration initialized successfully but stalled
+indefinitely during TensorRT base-model prefill after processing its first
+image. NVIDIA's native `llm_inference` executable completed normally with the
+same engine and extracted image.
 
-The same engines and the same extracted camera image complete normally with NVIDIA's native `llm_inference` executable. A standalone smoke test that links against this repository's installed `libcosmos_trt_backend.so`, without initializing ROS, reproduces the stall. A direct-linked executable that compiles the same backend implementation into the final executable completes successfully in approximately 1.45 seconds. This confirms that the failing boundary is the intermediate `libcosmos_trt_backend.so` CUDA/TensorRT linkage, rather than ROS, the rosbag, the request implementation, or the model artifacts.
+Two independent integration problems were found:
 
-## System configuration
+1. stale CUDA device code built for `sm_75` caused an initial
+   `device kernel image is invalid` failure on Thor (`sm_110a`);
+2. after correcting the CUDA architecture, co-loading the ROS 2 transitive
+   native dependency set and TensorRT Edge-LLM in one process reproducibly
+   triggered an indefinitely active Blackwell fused-attention prefill kernel.
+
+The supported fix separates the system into two native processes:
+
+```text
+cosmos_reasoner          ROS 2 only
+        <-> bounded Unix-domain socket
+cosmos_inference_worker  ROS-free, direct-linked TensorRT Edge-LLM
+```
+
+This architecture completed repeated rosbag inference, retained in-memory
+image loading, and recovered after the worker was killed and respawned. The
+exact ROS transitive library or symbol interaction that triggers the in-process
+stall has not been identified. Process isolation is the proven remedy; a more
+specific low-level root-cause claim would be speculation.
+
+## Tested system
 
 | Component | Observed value |
 | --- | --- |
 | Device | NVIDIA Jetson AGX Thor |
-| Architecture | aarch64 |
+| CPU architecture | aarch64 |
 | GPU compute capability | 11.0 |
-| Jetson Linux | R39.2 |
-| JetPack | 7.2 |
-| CUDA | 13.2 |
-| Driver | 595.78 |
+| Jetson Linux / JetPack | R39.2 / 7.2 |
+| CUDA / driver | 13.2 / 595.78 |
 | ROS 2 | Jazzy |
-| Isaac ROS | 4.5 packages, with NVIDIA compatibility warning on JetPack 7.2 |
-| Model | Cosmos-Reason2-8B |
-| Quantization | NVFP4 |
-| LLM engine maximum input | 1024 tokens |
-| LLM engine KV capacity | 4096 tokens |
+| Isaac ROS | 4.5 tooling; JetPack 7.2 combination outside the listed validation matrix |
+| Model | Cosmos-Reason2-8B, NVFP4 |
+| Engine limits | 1024-token input, 4096-token KV capacity |
 
-Resolved deployment paths during testing:
+Representative artifact layout:
 
 ```text
-Edge-LLM source:   /home/daniel/TensorRT-Edge-LLM
-Edge-LLM build:    /home/daniel/TensorRT-Edge-LLM/build
-Core archive:      /home/daniel/TensorRT-Edge-LLM/build/cpp/libedgellmCore.a
-Plugin:            /home/daniel/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so
-Model engine:      /home/daniel/tensorrt-edgellm-workspace/Cosmos-Reason2-8B/engine
-LLM engine:        /home/daniel/tensorrt-edgellm-workspace/Cosmos-Reason2-8B/engine/llm
-ROS workspace:     /home/daniel/ros2_ws
-Installed backend: /home/daniel/ros2_ws/install/cosmos_ros2_video_reasoner/lib/libcosmos_trt_backend.so
+$HOME/TensorRT-Edge-LLM
+$HOME/TensorRT-Edge-LLM/build/cpp/libedgellmCore.a
+$HOME/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so
+$HOME/tensorrt-edgellm-workspace/Cosmos-Reason2-8B/engine
+$HOME/tensorrt-edgellm-workspace/Cosmos-Reason2-8B/engine/llm
+$HOME/ros2_ws
 ```
 
-## Initial CUDA architecture failure
+## Failure 1: incorrect CUDA architecture
 
-The first ROS runs failed during runtime construction with:
+The first runtime construction attempts failed with:
 
 ```text
-CUDA runtime error in cudaOccupancyMaxActiveBlocksPerMultiprocessor(...): device kernel image is invalid
+CUDA runtime error in cudaOccupancyMaxActiveBlocksPerMultiprocessor(...):
+device kernel image is invalid
 ```
 
-Inspection showed stale or incorrectly device-linked CUDA code:
+Artifact inspection showed:
 
 ```text
-NVIDIA Thor compute capability: 11.0
-Edge-LLM RoPE object:            sm_110a
-Initial ROS backend cubin:       sm_75
+Thor compute capability: 11.0
+Edge-LLM RoPE object:     sm_110a
+Initial ROS consumer:     sm_75
 ```
 
-The Edge-LLM build and ROS backend were rebuilt for `sm_110a`. The installed backend now reports:
+Rebuilding Edge-LLM and the final consumer for `sm_110a` fixed runtime
+construction. Tensor allocation, tokenizer loading, visual-engine loading, and
+CUDA graph capture then completed. This was required but did not fix inference.
 
-```text
-libcosmos_trt_backend.1.sm_110a.cubin
-```
+## Failure 2: fused-attention prefill stall
 
-This fixed runtime construction. The runtime now allocates tensors, loads the tokenizer and visual engine, captures decoding graphs, and subscribes to the ROS image topic.
-
-## Current failure signature
-
-After receiving the first image, output stops after messages resembling:
+After the first image arrived, the in-process integration stopped after:
 
 ```text
 Processing vision inputs
 Switching optimization profile from: 1 to 0
 ```
 
-GPU compute utilization remains near 98 percent until the process is killed. On Thor, `nvidia-smi` reports GPU compute utilization but does not provide normal discrete-GPU memory accounting. A short utilization spike is expected; sustained utilization for more than a minute is not.
-
-CUDA-GDB shows the host inference thread blocked at:
+GPU utilization remained near 98 percent for more than a minute. CUDA-GDB
+showed the host waiting in:
 
 ```text
 cudaStreamSynchronize
-trt_edgellm::rt::LLMInferenceRuntime::runBaseModelPrefill
-trt_edgellm::rt::LLMInferenceRuntime::handleRequest
-cosmos_ros2_video_reasoner::TensorRTEdgeLLMBackend::infer
+LLMInferenceRuntime::runBaseModelPrefill
+LLMInferenceRuntime::handleRequest
+TensorRTEdgeLLMBackend::infer
 ```
 
-The active GPU kernel is a TensorRT Blackwell fused-attention kernel:
-
-```text
-kernel_cutlass_kernel___main__BlackwellFusedMultiHeadAttentionForward...
-```
-
-Observed launch geometry:
+The active GPU kernel was a TensorRT Blackwell fused multi-head attention
+forward kernel:
 
 ```text
 grid:  (22, 1, 1)
 block: (512, 1, 1)
-status: Active indefinitely
+state: active indefinitely
 ```
 
-No contemporaneous NVRM Xid, MMU fault, or GPU channel exception was found. Older NVRM messages in `dmesg` were emitted during system boot and were not correlated with the test.
+No contemporaneous NVRM Xid, MMU fault, or channel exception was found.
 
-## Camera input validation
+## Input and engine controls
 
-The NVIDIA image-proc rosbag publishes:
+The NVIDIA image-proc rosbag frame was validated as:
 
 ```text
-height:       1200
 width:        1920
+height:       1200
 encoding:     rgb8
 step:         5760
 payload size: 6912000 bytes
 ```
 
-`step` is exactly `width * 3`, so the source image has no unexpected row padding. The frame was captured through `cv_bridge`, written to JPEG, and validated as a 1920x1200 three-component JPEG.
+The row step equals `width * 3`; there was no unexpected padding or truncated
+payload. The exact frame was extracted and resized to 512x320.
 
-The wrapper's image-size limit was reduced from 1280 pixels to 512 pixels, producing a 512x320 inference image. The stall remained.
-
-## Successful native control test
-
-The exact captured Hawk frame was resized to 512x320 and used with NVIDIA's native executable:
+NVIDIA's native executable completed in approximately 1.6 seconds and returned
+a coherent warehouse description:
 
 ```bash
 ./build/examples/llm/llm_inference \
@@ -131,145 +137,77 @@ The exact captured Hawk frame was resized to 512x320 and used with NVIDIA's nati
   --dumpOutput
 ```
 
-The native executable completed in approximately 1.6 seconds and returned a coherent warehouse-scene description. Its visual profile changed from `1` to `0` and back from `0` to `1` before generation.
+This validated the engine bundle, visual engine, tokenizer, chat template,
+plugin, image, CUDA runtime, TensorRT runtime, and rebuilt `sm_110a` code.
 
-This control establishes that the following artifacts are functional together:
+## Experiment matrix
 
-- Cosmos-Reason2-8B LLM engine
-- Cosmos visual engine
-- Edge-LLM plugin
-- rebuilt `sm_110a` Edge-LLM code
-- captured Hawk image
-- 512x320 image shape
-- tokenizer and chat template
-- CUDA 13.2 runtime and driver
-
-## Experiments and results
-
-| Experiment | Result | Conclusion |
+| Experiment | Result | What it established |
 | --- | --- | --- |
-| Rebuild Edge-LLM and ROS backend for `sm_110a` | Runtime construction succeeds | Initial architecture mismatch fixed |
-| Reduce image width from 1280 to 512 | Still stalls | Input resolution is not the primary cause |
-| Capture exact rosbag frame and run native `llm_inference` | Succeeds | Image and engine artifacts are valid |
-| Move messages and inner request rather than copying them | Still stalls | Request copy semantics were not the cause |
-| Replace `loadImageFromMemory()` with temporary-file `loadImageFromFile()` | Still stalls | Memory image decoder and JPEG-buffer lifetime are not the cause |
-| Match native short prompt | Still stalls | Default prompt length is not the cause |
-| Reduce maximum generation length to 64 | Still stalls | Generation length is not the cause |
-| CUDA-GDB attach during stall | Fused attention remains active; host waits in prefill | Failure is inside TensorRT base-model prefill |
-| Run standalone program linked to installed `libcosmos_trt_backend.so` without ROS initialization | Still stalls | ROS, DDS, rosbag playback, executor, and cv_bridge are not required to reproduce |
-| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |
-| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is a confirmed failure boundary |
-| Inspect production executable dependencies | OpenCV 4.6 and 4.8 loaded together through cv_bridge and NVIDIA OpenCV | A second C++ ABI hazard exists in the ROS image-conversion path |
-| Run direct-linked backend entirely on a `std::thread` without ROS libraries | Succeeds in approximately 1.45 seconds | Worker-thread execution is safe |
-| Link the successful direct smoke executable to `rclcpp` but do not call `rclcpp::init()` | Stalls in the same fused-attention prefill kernel | Loading the ROS dependency set is sufficient to trigger the failure |
+| Rebuild final CUDA consumer for `sm_110a` | Initialization succeeds | Architecture mismatch fixed |
+| Reduce image width from 1280 to 512 | Stalls | Resolution not causal |
+| Native `llm_inference` with exact frame | Succeeds | Image and engine artifacts valid |
+| Move message/request objects instead of copying | Stalls | Request copying not causal |
+| Replace in-memory loader with temporary-file loader | Stalls | Decoder path and JPEG lifetime not causal |
+| Use native short prompt | Stalls | Prompt length not causal |
+| Reduce generation limit to 64 | Stalls | Failure occurs before generation |
+| CUDA-GDB during failure | Fused-attention kernel remains active | Stall is inside TensorRT prefill |
+| Standalone app consuming shared `libcosmos_trt_backend.so` | Stalls | ROS node, executor, and rosbag traffic not required |
+| Compile backend directly into a ROS-free executable | Succeeds, ~1.45 s | Final executable device linking matters |
+| Run direct-linked backend on `std::thread` | Succeeds, ~1.45 s | Worker-thread execution is safe |
+| Link successful direct executable to `rclcpp` without calling `rclcpp::init()` | Stalls | Loading ROS's native dependency set is sufficient |
+| Put ROS and Edge-LLM in separate processes | Succeeds repeatedly | Process co-loading is the supported failure boundary |
+| Restore `loadImageFromMemory()` in isolated worker | Succeeds repeatedly | Temporary-file workaround unnecessary |
 
-## Benign action-runner message
+## OpenCV ABI hazard
 
-Runtime initialization logs:
+The original ROS process loaded ROS `cv_bridge` with OpenCV 4.6 and the
+JetPack stack with NVIDIA OpenCV 4.8. Passing C++ OpenCV objects across mixed
+ABI versions is unsafe even though this did not uniquely explain the GPU
+stall. The production node removed `cv_bridge`, directly converts supported raw
+encodings, and no longer installs `ros-jazzy-cv-bridge`.
 
-```text
-Failed to load Action runner .../engine/action/action.engine: No such file or directory
-```
+This also avoids APT transactions that downgrade NVIDIA OpenCV and remove
+JetPack development packages.
 
-This is an optional engine probe. Cosmos-Reason2-8B was exported without an action head, and initialization intentionally continues. The same message appears in successful native inference, so it is unrelated to the stall.
+## Benign action-engine message
 
-## Current localization
-
-The best-supported boundary is now:
-
-```text
-NVIDIA native llm_inference executable
-  -> succeeds
-
-Repository libcosmos_trt_backend.so
-  -> TensorRT fused-attention prefill kernel remains active indefinitely
-
-Standalone consumer of libcosmos_trt_backend.so
-  -> reproduces without ROS
-```
-
-The leading hypothesis is a CUDA/TensorRT linkage or device-registration difference caused by embedding the static Edge-LLM core and CuTe DSL artifacts in a shared library. This is not yet proven. ABI differences, link order, symbol interposition, and executable-versus-shared-object CUDA device linking remain candidates.
-
-## Next RCA steps
-
-1. Build the production `cosmos_reasoner` executable with `tensorrt_edge_llm_backend.cpp` compiled directly into it.
-2. Link Edge-LLM core, CuTe DSL, TensorRT, and CUDA directly to `cosmos_reasoner`.
-3. Resolve CUDA device symbols for `sm_110a` at the final executable boundary.
-4. Verify that `ldd cosmos_reasoner` no longer resolves `libcosmos_trt_backend.so`.
-5. Verify the final executable contains an `sm_110a` cubin.
-6. Repeat the image-proc rosbag end-to-end test and confirm publication on `/cosmos/reasoning`.
-7. After validation, remove the obsolete shared backend or retain it only behind an explicit diagnostic build option.
-
-## Temporary diagnostic changes
-
-Some local Thor tests changed the backend to:
-
-- move message/request objects explicitly;
-- write `/tmp/cosmos_ros2_frame.jpg`;
-- use `loadImageFromFile()` instead of `loadImageFromMemory()`;
-- use a 512-pixel image-width limit;
-- use a 64-token generation limit.
-
-These changes were diagnostic and should not all be treated as the final production solution. In particular, writing every frame to `/tmp` is not acceptable for deployment. Revert or replace temporary diagnostics after the linkage root cause is confirmed.
-
-
-## OpenCV ABI conflict
-
-Linker and `ldd` inspection found that the ROS executable loaded two OpenCV C++ runtimes:
+Successful and failing runs both logged:
 
 ```text
-libcv_bridge.so
-libopencv_core.so.406
-libopencv_imgproc.so.406
-libopencv_imgcodecs.so.406
-libopencv_core.so.408
-libopencv_imgproc.so.408
-libopencv_imgcodecs.so.408
+Failed to load Action runner .../engine/action/action.engine:
+No such file or directory
 ```
 
-ROS Jazzy's binary `cv_bridge` package is built against Ubuntu OpenCV 4.6, while the Thor JetPack stack provides NVIDIA OpenCV 4.8. Passing `cv::Mat` objects across this mixed C++ ABI boundary is unsafe and may cause memory corruption or undefined behavior.
+The action runner is optional. The validated Cosmos-Reason2-8B bundle has no
+action head, and image reasoning completes without it.
 
-The production node therefore removes its `cv_bridge` runtime dependency and converts supported `sensor_msgs/msg/Image` encodings directly with the selected NVIDIA OpenCV runtime. Supported encodings are `bgr8`, `rgb8`, and `mono8`; row stride and payload size are validated before constructing an OpenCV view. This avoids downgrading NVIDIA OpenCV or removing JetPack packages.
+## Production fix
 
+Production launch starts `cosmos_reasoner` and `cosmos_inference_worker`.
 
-## ROS library-load isolation result
+The ROS process:
 
-A direct-linked smoke executable was validated in both main-thread and `std::thread` modes; both completed in approximately 1.45 seconds. The same executable was then linked to `rclcpp` without calling `rclcpp::init()` or constructing any ROS node. It stalled in the same TensorRT Blackwell fused-attention prefill kernel.
+- links ROS and OpenCV, but not CUDA, TensorRT, or Edge-LLM;
+- maintains a newest-frame queue of depth one;
+- converts raw ROS images to packed BGR8;
+- sends bounded requests over a Unix socket;
+- publishes `VisionReasoningResult`.
 
-This establishes that ROS executor behavior, DDS traffic, node creation, callback scheduling, and CUDA thread affinity are not required to reproduce the failure. Loading the transitive ROS 2 C++ dependency set into the Edge-LLM process is sufficient.
+The GPU worker:
 
-The production architecture must therefore isolate Edge-LLM from ROS in a separate process unless the exact conflicting shared object or symbol-interposition issue is identified and proven safe. The preferred deployment is a persistent ROS-free inference worker, direct-linked to Edge-LLM at its final executable boundary, with the ROS node using a bounded IPC protocol. Process isolation also allows a wedged GPU worker to be terminated and restarted without wedging ROS shutdown.
+- links Edge-LLM, CuTe DSL, TensorRT, CUDA, and NVIDIA OpenCV;
+- does not link ROS, RMW, DDS, or `cv_bridge`;
+- contains `sm_110a` CUDA images;
+- keeps engines and the CUDA context persistent;
+- performs in-memory JPEG loading and serial inference.
 
+Deployment verification checks both dynamic dependency boundaries.
 
-## Isolated C++ production architecture
+## End-to-end validation
 
-The draft fix now separates the runtime into two native processes:
-
-```text
-cosmos_reasoner (ROS 2 / rclcpp)
-  -> versioned Unix-domain socket protocol
-cosmos_inference_worker (ROS-free, direct-linked Edge-LLM)
-```
-
-The ROS process no longer links TensorRT, CUDA, Edge-LLM, CuTe DSL, or the Edge-LLM plugin. The worker does not link ROS, RMW, or DDS libraries. Engines and the CUDA context remain persistent in the worker.
-
-IPC requests carry a monotonically increasing request ID, packed BGR8 image bytes, dimensions, prompt, and generation parameters. Responses carry the matching request ID, success state, text or error, and inference duration. The ROS node retains its bounded newest-frame queue and publishes the existing `VisionReasoningResult` message.
-
-This process boundary is intended both to avoid the confirmed library-load interaction and to permit future worker timeout/restart supervision without wedging ROS shutdown.
-
-
-## Successful end-to-end isolated-worker validation
-
-On 2026-07-30, the isolated C++ worker architecture completed the NVIDIA image-proc rosbag test on Thor. The launch started two processes:
-
-```text
-cosmos_inference_worker
-cosmos_reasoner
-```
-
-The worker initialized Cosmos-Reason2-8B once, accepted multiple IPC requests, completed both TensorRT optimization-profile transitions for every frame, and returned coherent warehouse-scene descriptions. The ROS process logged and published successful results.
-
-Observed inference durations with the long default prompt and 256-token generation limit were approximately:
+The isolated worker completed repeated NVIDIA image-proc rosbag requests with
+the default long prompt and 256-token output limit:
 
 ```text
 frame 1: 3.259 seconds
@@ -277,9 +215,7 @@ frame 3: 5.913 seconds
 frame 5: 3.715 seconds
 ```
 
-The variation primarily reflects output length; the IPC transport is not implicated. Multiple sequential successful requests also confirm that the worker keeps its engines and CUDA context persistent.
-
-This validates the core fix: keep ROS and its transitive native libraries out of the Edge-LLM process. The isolated worker was then restored to the deployment-safe in-memory image path, using `loadImageFromMemory()` and move-only request construction. The same rosbag completed three sequential requests successfully:
+A later run using the final in-memory loading path completed:
 
 ```text
 frame 1: 3.202 seconds
@@ -287,36 +223,58 @@ frame 4: 3.915 seconds
 frame 5: 3.179 seconds
 ```
 
-This eliminates the temporary `/tmp/cosmos_ros2_frame.jpg` workaround and confirms that in-memory decoding is reliable once ROS libraries and Edge-LLM are separated by the process boundary.
+Both TensorRT optimization-profile transitions completed on every request, and
+the ROS process published coherent warehouse descriptions. Latency varied with
+output length; these observations are not a formal benchmark.
 
-## IPC timeout and restart policy
+## Crash-recovery validation
 
-The ROS-side IPC client now applies bounded send and receive timeouts to every worker connection. The default request deadline is 90 seconds, compared with observed inference times below 6 seconds in the validation runs. If a transport operation times out or fails, the client closes the connection and reports the current frame as failed. It does not automatically replay that frame because the worker may have partially executed it; the next sampled frame establishes a new connection.
+IPC writes use `send(..., MSG_NOSIGNAL)`. The automated recovery test:
 
-The launch description now respawns `cosmos_inference_worker` two seconds after an unexpected worker exit. This covers worker crashes and externally terminated wedged workers while preserving the ROS process. A future supervisor can add automatic termination of a still-alive GPU worker after a request deadline; the current deadline prevents the ROS inference thread from waiting indefinitely but does not itself kill a process stuck inside an uninterruptible GPU call.
+1. obtained a successful result;
+2. killed `cosmos_inference_worker` with `SIGKILL`;
+3. observed launch create a worker with a new PID;
+4. allowed the current frame to fail without replay;
+5. reconnected on a subsequent frame;
+6. received successful results without restarting `cosmos_reasoner`.
 
-Remaining production hardening includes clean shutdown and socket cleanup tests, IPC protocol tests, an active worker watchdog for live-but-wedged processes, and repeatable latency/throughput benchmarks.
-
-
-## Worker crash-recovery validation
-
-The automated recovery test was run on Thor after replacing IPC writes with `send(..., MSG_NOSIGNAL)`. The test obtained a successful result, terminated `cosmos_inference_worker` with `SIGKILL`, observed launch create a worker with a new PID, and then received another successful result without restarting `cosmos_reasoner`.
-
-Post-recovery inference continued across multiple frames:
+Post-recovery requests with a 64-token limit completed in approximately:
 
 ```text
-frame 5: 1.573 seconds
-frame 7: 1.537 seconds
-frame 8: 1.547 seconds
-frame 10: 1.576 seconds
+1.573 s
+1.537 s
+1.547 s
+1.576 s
 ```
 
-These measurements used a 64-token generation limit. The test confirms:
+This validates worker-exit recovery, socket-peer loss handling, respawn, and
+reconnection.
 
-- worker process respawn works;
-- the ROS process survives loss of the Unix-socket peer;
-- `SIGPIPE` is suppressed;
-- the IPC client reconnects on a subsequent frame;
-- the replacement worker reinitializes the engines and serves repeated requests.
+## Residual risk and follow-up
 
-This validates recovery from worker exit. It does not yet validate automatic recovery from a live worker wedged inside a GPU call. That case requires an external watchdog capable of terminating the worker after the ROS-side request deadline.
+A 90-second socket deadline prevents the ROS inference thread from waiting
+forever. It does not terminate a worker that remains alive while blocked inside
+a GPU call. Since launch only respawns an exited process, active watchdog
+termination remains future work in issue #6.
+
+Other follow-ups:
+
+- IPC protocol and fake-worker tests: issue #13;
+- repeatable performance benchmarks: issue #7;
+- temporal video reasoning: issue #8;
+- model portability and optimization: issue #9;
+- RViz2 visualization: issue #10;
+- task-level quality evaluation: issue #11;
+- configurable prompts and bounded context: issue #12.
+
+## Final conclusion
+
+The deployed rosbag-to-Cosmos pipeline is functional on the validated Thor
+stack. The evidence supports this precise conclusion:
+
+> TensorRT Edge-LLM and the ROS 2 native dependency set must remain in separate
+> processes on this validated platform.
+
+The evidence does not identify one exact ROS shared object, symbol, or TensorRT
+implementation defect. The isolated, direct-linked worker is the tested
+production solution and the correct basis for future work.
