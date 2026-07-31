@@ -157,7 +157,11 @@ This control establishes that the following artifacts are functional together:
 | Reduce maximum generation length to 64 | Still stalls | Generation length is not the cause |
 | CUDA-GDB attach during stall | Fused attention remains active; host waits in prefill | Failure is inside TensorRT base-model prefill |
 | Run standalone program linked to installed `libcosmos_trt_backend.so` without ROS initialization | Still stalls | ROS, DDS, rosbag playback, executor, and cv_bridge are not required to reproduce |
-| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |\n| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is a confirmed failure boundary |\n| Inspect production executable dependencies | OpenCV 4.6 and 4.8 loaded together through cv_bridge and NVIDIA OpenCV | A second C++ ABI hazard exists in the ROS image-conversion path |\n| Run direct-linked backend entirely on a `std::thread` without ROS libraries | Succeeds in approximately 1.45 seconds | Worker-thread execution is safe |\n| Link the successful direct smoke executable to `rclcpp` but do not call `rclcpp::init()` | Stalls in the same fused-attention prefill kernel | Loading the ROS dependency set is sufficient to trigger the failure |
+| Run NVIDIA native `llm_inference` with same engine and image | Succeeds | Failure follows this repository's embedded/shared backend path |
+| Compile the same backend implementation directly into a final executable | Succeeds in approximately 1.45 seconds | Intermediate shared-library CUDA device linking is a confirmed failure boundary |
+| Inspect production executable dependencies | OpenCV 4.6 and 4.8 loaded together through cv_bridge and NVIDIA OpenCV | A second C++ ABI hazard exists in the ROS image-conversion path |
+| Run direct-linked backend entirely on a `std::thread` without ROS libraries | Succeeds in approximately 1.45 seconds | Worker-thread execution is safe |
+| Link the successful direct smoke executable to `rclcpp` but do not call `rclcpp::init()` | Stalls in the same fused-attention prefill kernel | Loading the ROS dependency set is sufficient to trigger the failure |
 
 ## Benign action-runner message
 
@@ -275,4 +279,20 @@ frame 5: 3.715 seconds
 
 The variation primarily reflects output length; the IPC transport is not implicated. Multiple sequential successful requests also confirm that the worker keeps its engines and CUDA context persistent.
 
-This validates the core fix: keep ROS and its transitive native libraries out of the Edge-LLM process. Remaining production hardening includes removing temporary file-based image diagnostics, adding request deadlines, supervising/restarting the worker, and adding IPC protocol tests.
+This validates the core fix: keep ROS and its transitive native libraries out of the Edge-LLM process. The isolated worker was then restored to the deployment-safe in-memory image path, using `loadImageFromMemory()` and move-only request construction. The same rosbag completed three sequential requests successfully:
+
+```text
+frame 1: 3.202 seconds
+frame 4: 3.915 seconds
+frame 5: 3.179 seconds
+```
+
+This eliminates the temporary `/tmp/cosmos_ros2_frame.jpg` workaround and confirms that in-memory decoding is reliable once ROS libraries and Edge-LLM are separated by the process boundary.
+
+## IPC timeout and restart policy
+
+The ROS-side IPC client now applies bounded send and receive timeouts to every worker connection. The default request deadline is 90 seconds, compared with observed inference times below 6 seconds in the validation runs. If a transport operation times out or fails, the client closes the connection and reports the current frame as failed. It does not automatically replay that frame because the worker may have partially executed it; the next sampled frame establishes a new connection.
+
+The launch description now respawns `cosmos_inference_worker` two seconds after an unexpected worker exit. This covers worker crashes and externally terminated wedged workers while preserving the ROS process. A future supervisor can add automatic termination of a still-alive GPU worker after a request deadline; the current deadline prevents the ROS inference thread from waiting indefinitely but does not itself kill a process stuck inside an uninterruptible GPU call.
+
+Remaining production hardening includes clean shutdown and socket cleanup tests, IPC protocol tests, an active worker watchdog for live-but-wedged processes, and repeatable latency/throughput benchmarks.
