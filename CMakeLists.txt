@@ -282,18 +282,46 @@ if(BUILD_TENSORRT_BACKEND)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-  # ── Executable (uses TRT backend) ─────────────────────────────────────
-  add_executable(cosmos_reasoner src/main.cpp)
+  # ── Production executable with final CUDA device link ──────────────────
+  # Edge-LLM and CuTe contain CUDA device code that must be resolved at the
+  # final executable boundary on Thor. Embedding them in an intermediate
+  # shared library can leave TensorRT's Blackwell fused-attention prefill
+  # kernel active indefinitely. Compile the backend implementation directly
+  # into the ROS executable, matching the validated direct smoke target.
+  add_executable(cosmos_reasoner
+    src/main.cpp
+    src/tensorrt_edge_llm_backend.cpp
+  )
   target_include_directories(cosmos_reasoner PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TENSORRT_EDGE_LLM_ROOT}/cpp
+    ${TENSORRT_EDGE_LLM_ROOT}/examples
     ${TRT_INCLUDE_DIR}
     ${_NLOHMANN_JSON_INCLUDE}
+    ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/stb
+    ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/miniaudio
+    ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
   )
   target_link_libraries(cosmos_reasoner
-    cosmos_trt_backend
     cosmos_reasoner_node
+    ${EDGELLM_CORE_LIB}
+    ${CUTE_DSL_STATIC_LIB}
+    ${NVINFER_LIB}
+    ${NVONNXPARSER_LIB}
+    CUDA::cudart
+    CUDA::cuda_driver
+    dl
+    ${OpenCV_LIBRARIES}
   )
+  if(EXISTS "${CUTE_DSL_RUNTIME_LIB}")
+    target_link_libraries(cosmos_reasoner
+      ${CUTE_DSL_RUNTIME_LIB})
+  endif()
+  set_target_properties(cosmos_reasoner PROPERTIES
+    CUDA_ARCHITECTURES "${TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES}"
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    INSTALL_RPATH_USE_LINK_PATH TRUE
+    BUILD_RPATH_USE_ORIGIN TRUE)
   ament_target_dependencies(cosmos_reasoner rclcpp)
 
   install(TARGETS cosmos_trt_backend cosmos_reasoner cosmos_backend_direct_smoke
