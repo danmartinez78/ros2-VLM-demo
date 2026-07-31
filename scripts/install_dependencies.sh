@@ -116,7 +116,6 @@ sudo apt-get install -y \
   libopencv-dev \
   libnvinfer-dev \
   libnvonnxparsers-dev \
-  "ros-${ROS_DISTRO}-cv-bridge" \
   "ros-${ROS_DISTRO}-image-transport" \
   "ros-${ROS_DISTRO}-image-transport-plugins" \
   "ros-${ROS_DISTRO}-rosbag2" \
