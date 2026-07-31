@@ -1,0 +1,11 @@
+<library path="cosmos_reasoning_rviz_panel">
+  <class
+    type="cosmos_ros2_video_reasoner::VisionReasoningPanel"
+    base_class_type="rviz_common::Panel"
+    name="cosmos_ros2_video_reasoner/VisionReasoningPanel">
+    <description>
+      Displays VisionReasoningResult messages with their matching source image,
+      prompt/response text, and stale/failure state.
+    </description>
+  </class>
+</library>

@@ -117,6 +117,14 @@ source "$HOME/ros2_ws/install/setup.bash"
 ros2 topic echo /cosmos/reasoning
 ```
 
+Terminal 4, optional RViz2 panel:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source "$HOME/ros2_ws/install/setup.bash"
+rviz2 -d "$HOME/ros2-VLM-demo/rviz/vision_reasoning_results.rviz"
+```
+
 Paths supplied to ROS must be absolute; `~` is not expanded.
 
 ## NVIDIA test data
@@ -172,6 +180,32 @@ Example console output:
 
 The observed 1.5-second results used a 64-token output limit. Longer responses
 increase end-to-end latency.
+
+## RViz2 visualization panel (optional)
+
+This repository now includes an RViz2 panel plugin named
+`cosmos_ros2_video_reasoner/VisionReasoningPanel` for visual debugging and demos.
+The panel displays:
+
+- the camera image matched to the result message timestamp;
+- prompt and generated response text;
+- success/failure/stale status with distinct colors;
+- result stamp, latest image stamp, frame sequence, and latency.
+
+The plugin is optional and only builds when these dependencies are present:
+
+- `rviz_common`
+- `pluginlib`
+- Qt5 (`qtbase5-dev` or equivalent)
+
+If these are unavailable, the core inference package still builds and runs; CMake
+prints that the RViz2 panel target was skipped.
+
+When built, load the supplied config:
+
+```bash
+rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
+```
 
 ## Parameters
 
@@ -260,8 +294,6 @@ The production node accepts `bgr8`, `rgb8`, and `mono8` raw images.
   ([#8](https://github.com/danmartinez78/ros2-VLM-demo/issues/8)).
 - Batch size one; batching has not been shown beneficial for this live path.
 - Raw `sensor_msgs/msg/Image` only; compressed streams require decoding first.
-- No RViz2 result display yet
-  ([#10](https://github.com/danmartinez78/ros2-VLM-demo/issues/10)).
 - No task-level quality evaluation harness yet
   ([#11](https://github.com/danmartinez78/ros2-VLM-demo/issues/11)).
 

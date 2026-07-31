@@ -16,6 +16,9 @@ find_package(builtin_interfaces REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
+find_package(pluginlib QUIET)
+find_package(rviz_common QUIET)
+find_package(Qt5 QUIET COMPONENTS Core Gui Widgets)
 
 # ── Custom message ────────────────────────────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -202,6 +205,58 @@ rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
 target_link_libraries(cosmos_reasoner_node "${cpp_typesupport_target}")
 
+add_library(cosmos_reasoning_rviz_formatting SHARED
+  src/vision_reasoning_rviz_formatting.cpp
+)
+target_include_directories(cosmos_reasoning_rviz_formatting PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+ament_target_dependencies(cosmos_reasoning_rviz_formatting
+  rclcpp
+  std_msgs
+  builtin_interfaces
+)
+target_link_libraries(cosmos_reasoning_rviz_formatting "${cpp_typesupport_target}")
+
+set(BUILD_RVIZ2_PANEL FALSE)
+if(pluginlib_FOUND AND rviz_common_FOUND AND Qt5_FOUND)
+  set(BUILD_RVIZ2_PANEL TRUE)
+endif()
+
+if(BUILD_RVIZ2_PANEL)
+  set(CMAKE_AUTOMOC ON)
+  add_library(cosmos_reasoning_rviz_panel SHARED
+    src/vision_reasoning_rviz_panel.cpp
+  )
+  target_include_directories(cosmos_reasoning_rviz_panel PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  )
+  target_link_libraries(cosmos_reasoning_rviz_panel
+    cosmos_reasoning_rviz_formatting
+    Qt5::Core
+    Qt5::Gui
+    Qt5::Widgets
+  )
+  ament_target_dependencies(cosmos_reasoning_rviz_panel
+    pluginlib
+    rclcpp
+    rviz_common
+    sensor_msgs
+    std_msgs
+    builtin_interfaces
+  )
+  target_link_libraries(cosmos_reasoning_rviz_panel "${cpp_typesupport_target}")
+  pluginlib_export_plugin_description_file(
+    rviz_common
+    rviz/vision_reasoning_panel_plugins.xml)
+else()
+  message(STATUS
+    "RViz2 panel disabled. Install rviz_common + Qt5 + pluginlib to build "
+    "cosmos_reasoning_rviz_panel.")
+endif()
+
 # ── TensorRT backend library (hardware-dependent) ────────────────────────────
 if(BUILD_TENSORRT_BACKEND)
   add_library(cosmos_trt_backend SHARED
@@ -354,11 +409,29 @@ install(TARGETS cosmos_reasoner_node
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
+install(TARGETS cosmos_reasoning_rviz_formatting
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+if(BUILD_RVIZ2_PANEL)
+  install(TARGETS cosmos_reasoning_rviz_panel
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+
 install(DIRECTORY include/
   DESTINATION include
 )
 
 install(DIRECTORY launch config
+  DESTINATION share/${PROJECT_NAME}
+)
+
+install(DIRECTORY rviz
   DESTINATION share/${PROJECT_NAME}
 )
 
@@ -393,6 +466,18 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_node cosmos_reasoner_node)
   ament_target_dependencies(test_node rclcpp sensor_msgs)
+
+  ament_add_gtest(test_rviz_formatting
+    test/test_rviz_formatting.cpp
+  )
+  target_include_directories(test_rviz_formatting PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_rviz_formatting
+    cosmos_reasoning_rviz_formatting
+    "${cpp_typesupport_target}"
+  )
+  ament_target_dependencies(test_rviz_formatting rclcpp)
 endif()
 
 ament_export_targets(cosmos_reasoner_nodeTargets HAS_LIBRARY_TARGET)
