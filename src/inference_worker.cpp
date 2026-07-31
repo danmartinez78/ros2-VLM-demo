@@ -23,13 +23,25 @@ void stop_handler(int) {g_stop = 1;}
 
 int main(int argc, char ** argv)
 {
-  if (argc != 5) {
+  if (argc != 6) {
     std::cerr << "Usage: " << argv[0]
-              << " <llm-engine-dir> <multimodal-engine-dir> <plugin-path> <socket-path>\n";
+              << " <llm-engine-dir> <multimodal-engine-dir> <plugin-path> <socket-path>"
+              << " <jpeg-quality>\n";
     return 2;
   }
 
   const std::string socket_path = argv[4];
+  int jpeg_quality = 0;
+  try {
+    jpeg_quality = std::stoi(argv[5]);
+  } catch (std::exception const &) {
+    std::cerr << "JPEG quality must be an integer in [1, 100]\n";
+    return 2;
+  }
+  if (jpeg_quality < 1 || jpeg_quality > 100) {
+    std::cerr << "JPEG quality must be in [1, 100]\n";
+    return 2;
+  }
   if (socket_path.size() >= sizeof(sockaddr_un::sun_path)) {
     std::cerr << "Socket path is too long\n";
     return 2;
@@ -61,6 +73,7 @@ int main(int argc, char ** argv)
     config.llm_engine_dir = argv[1];
     config.multimodal_engine_dir = argv[2];
     config.edge_llm_plugin_path = argv[3];
+    config.jpeg_quality = jpeg_quality;
     cosmos_ros2_video_reasoner::TensorRTEdgeLLMBackend backend(config);
     backend.initialize();
     std::cout << "Cosmos inference worker ready on " << socket_path << std::endl;
@@ -80,10 +93,16 @@ int main(int argc, char ** argv)
         header.encoding != cosmos_ros2_video_reasoner::ipc::kEncodingBgr8 ||
         header.width == 0 || header.height == 0 ||
         header.step != header.width * 3 ||
-        header.image_bytes != header.step * header.height ||
         header.prompt_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)
       {
         throw std::runtime_error("invalid IPC request header");
+      }
+      const uint64_t expected_image_bytes =
+        static_cast<uint64_t>(header.step) * header.height;
+      if (expected_image_bytes != header.image_bytes ||
+        header.image_bytes > cosmos_ros2_video_reasoner::ipc::kMaxImageBytes)
+      {
+        throw std::runtime_error("invalid IPC image payload size");
       }
 
       std::vector<uint8_t> image_bytes(header.image_bytes);
@@ -109,6 +128,12 @@ int main(int argc, char ** argv)
       } catch (std::exception const & error) {
         result.success = false;
         result.error = error.what();
+      }
+
+      if (result.text.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
+        result.error.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)
+      {
+        throw std::runtime_error("inference response exceeds IPC protocol limits");
       }
 
       cosmos_ros2_video_reasoner::ipc::ResponseHeader response;
