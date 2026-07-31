@@ -123,7 +123,7 @@ fixed, trivially-copyable headers followed by bounded byte payloads.
 | --- | --- |
 | Identity | magic, protocol version, monotonically increasing request ID |
 | Image | encoding ID, width, height, packed step, byte length, BGR8 bytes |
-| Task | prompt length and prompt bytes |
+| Task | effective prompt length and prompt bytes |
 | Generation | maximum tokens, temperature, top-p, top-k |
 
 ### Response
@@ -224,4 +224,3 @@ process boundary has not regressed.
 - Model portability and measured optimization: issue #9.
 - RViz2 visualization: issue #10.
 - Task-level quality evaluation: issue #11.
-- Configurable prompts, agent behavior, and bounded context: issue #12.

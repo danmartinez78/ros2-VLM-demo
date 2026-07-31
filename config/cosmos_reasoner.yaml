@@ -26,6 +26,38 @@ cosmos_reasoner:
       Describe the scene in this camera frame. Identify important objects,
       people, animals, vehicles, terrain, hazards, and unusual conditions.
       Do not claim details that are not visually supported.
+    task_profile: legacy_prompt
+    prompt_version: v1
+
+    task_profiles:
+      scene_description:
+        template: >
+          Describe the scene in this camera frame. Identify important objects,
+          people, animals, vehicles, terrain, hazards, and unusual conditions.
+          Do not claim details that are not visually supported.
+      hazard_detection:
+        template: >
+          Detect hazards in this camera frame. Focus on immediate risks to people,
+          vehicles, and infrastructure. Report only visually supported hazards.
+      inventory:
+        template: >
+          Identify visible inventory items in this camera frame. Summarize counts,
+          locations, and notable missing or misplaced items based only on visible evidence.
+      navigation_assistance:
+        template: >
+          Provide navigation assistance from this camera frame. Describe traversable
+          space, obstacles, signage, and safe next-step guidance using only visible cues.
+
+    # Optional template variables:
+    #   {system_instruction} {task_instruction} {context}
+    #   {source_topic} {sample_period_seconds} {frame_sequence}
+    system_instruction: ""
+    task_instruction: ""
+    instruction_delivery_mode: inline
+    prompt_history_max_entries: 0
+    prompt_history_max_chars: 0
+    prompt_history_reset_policy: never
+    prompt_history_reset_interval_requests: 0
 
     # ── Sampling ──────────────────────────────────────────────────────────────
     # Time between frames sent for inference (uses ROS message timestamp,
