@@ -39,6 +39,8 @@ set(TENSORRT_EDGE_LLM_ROOT "" CACHE PATH
   "Root directory of the checked-out TensorRT-Edge-LLM repository")
 set(TENSORRT_EDGE_LLM_BUILD_DIR "" CACHE PATH
   "Build directory of TensorRT-Edge-LLM (contains libedgellmCore.a, etc.)")
+set(TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES "110a" CACHE STRING
+  "CUDA architectures used for the Edge-LLM device-link step (Thor: 110a)")
 
 set(BUILD_TENSORRT_BACKEND FALSE)
 
@@ -239,6 +241,7 @@ if(BUILD_TENSORRT_BACKEND)
   endif()
 
   set_target_properties(cosmos_trt_backend PROPERTIES
+    CUDA_ARCHITECTURES "${TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
