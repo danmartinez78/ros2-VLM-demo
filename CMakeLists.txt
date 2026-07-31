@@ -13,7 +13,6 @@ find_package(rcl_interfaces REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
-find_package(cv_bridge REQUIRED)
 find_package(image_transport REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
@@ -192,7 +191,6 @@ ament_target_dependencies(cosmos_reasoner_node
   sensor_msgs
   std_msgs
   builtin_interfaces
-  cv_bridge
   image_transport
 )
 
@@ -376,7 +374,7 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   target_link_libraries(test_frame_sampling cosmos_reasoner_node)
-  ament_target_dependencies(test_frame_sampling rclcpp sensor_msgs cv_bridge)
+  ament_target_dependencies(test_frame_sampling rclcpp sensor_msgs)
 
   # Node integration tests (no GPU)
   ament_add_gtest(test_node
@@ -387,10 +385,10 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   target_link_libraries(test_node cosmos_reasoner_node)
-  ament_target_dependencies(test_node rclcpp sensor_msgs cv_bridge)
+  ament_target_dependencies(test_node rclcpp sensor_msgs)
 endif()
 
 ament_export_targets(cosmos_reasoner_nodeTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(
-  rclcpp rcl_interfaces sensor_msgs std_msgs builtin_interfaces cv_bridge image_transport)
+  rclcpp rcl_interfaces sensor_msgs std_msgs builtin_interfaces image_transport)
 ament_package()
