@@ -14,11 +14,14 @@ int main(int argc, char ** argv)
   auto param_node = std::make_shared<rclcpp::Node>("cosmos_reasoner", options);
   param_node->declare_parameter("worker_socket_path", "/tmp/cosmos_edge_llm.sock");
   param_node->declare_parameter("worker_connect_timeout_seconds", 120);
+  param_node->declare_parameter("worker_request_timeout_seconds", 90);
 
   cosmos_ros2_video_reasoner::IpcInferenceConfig config;
   config.socket_path = param_node->get_parameter("worker_socket_path").as_string();
   config.connect_timeout_seconds = static_cast<int>(
     param_node->get_parameter("worker_connect_timeout_seconds").as_int());
+  config.request_timeout_seconds = static_cast<int>(
+    param_node->get_parameter("worker_request_timeout_seconds").as_int());
   param_node.reset();
 
   auto backend =
