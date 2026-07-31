@@ -3,6 +3,7 @@
 # The copied file is ignored by git.
 
 export ROS_DISTRO="jazzy"
+export ROS_WORKSPACE="${HOME}/ros2_ws"
 export TENSORRT_EDGE_LLM_ROOT="${HOME}/TensorRT-Edge-LLM"
 export TENSORRT_EDGE_LLM_BUILD_DIR="${TENSORRT_EDGE_LLM_ROOT}/build"
 export TRT_PACKAGE_DIR="/usr"
@@ -12,6 +13,3 @@ export COSMOS_WORKSPACE_DIR="${HOME}/tensorrt-edgellm-workspace"
 export COSMOS_LLM_ENGINE_DIR="${COSMOS_WORKSPACE_DIR}/${COSMOS_MODEL_NAME}/engine/llm"
 export COSMOS_MULTIMODAL_ENGINE_DIR="${COSMOS_WORKSPACE_DIR}/${COSMOS_MODEL_NAME}/engine"
 export EDGELLM_PLUGIN_PATH="${TENSORRT_EDGE_LLM_BUILD_DIR}/libNvInfer_edgellm_plugin.so"
-
-# Set this explicitly if the repository is not at <workspace>/src/<repository>.
-# export ROS_WORKSPACE="${HOME}/ros2_ws"
