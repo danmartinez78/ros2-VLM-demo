@@ -89,6 +89,64 @@ if(TENSORRT_EDGE_LLM_ROOT)
       PATH_SUFFIXES "" cpp lib
       REQUIRED)
 
+    # Edge-LLM's own CMake target carries the CuTe DSL AOT kernel archive as
+    # a transitive dependency. Consumers of the raw libedgellmCore.a archive
+    # must restore that dependency explicitly or the final executable link
+    # fails with unresolved _mlir_gemm_* symbols.
+    set(CUTE_DSL_ARTIFACT_TAG "" CACHE STRING
+      "CuTe DSL artifact tag (for Thor this is normally sm_110)")
+
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+      set(_CUTE_DSL_ARCH "aarch64")
+    else()
+      set(_CUTE_DSL_ARCH "x86_64")
+    endif()
+
+    set(_CUTE_DSL_ARTIFACT_ROOT
+      "${TENSORRT_EDGE_LLM_ROOT}/cpp/kernels/cuteDSLArtifact/${_CUTE_DSL_ARCH}")
+    set(_CUTE_DSL_ARTIFACT_DIR "")
+
+    if(CUTE_DSL_ARTIFACT_TAG)
+      set(_CUTE_DSL_ARTIFACT_DIR
+        "${_CUTE_DSL_ARTIFACT_ROOT}/${CUTE_DSL_ARTIFACT_TAG}")
+    elseif(EXISTS "${_CUTE_DSL_ARTIFACT_ROOT}/metadata.json")
+      set(_CUTE_DSL_ARTIFACT_DIR "${_CUTE_DSL_ARTIFACT_ROOT}")
+    else()
+      file(GLOB _CUTE_DSL_CANDIDATES LIST_DIRECTORIES TRUE
+        "${_CUTE_DSL_ARTIFACT_ROOT}/*")
+      set(_CUTE_DSL_MATCHES "")
+      foreach(_candidate IN LISTS _CUTE_DSL_CANDIDATES)
+        if(IS_DIRECTORY "${_candidate}"
+           AND EXISTS "${_candidate}/metadata.json")
+          list(APPEND _CUTE_DSL_MATCHES "${_candidate}")
+        endif()
+      endforeach()
+      list(LENGTH _CUTE_DSL_MATCHES _CUTE_DSL_MATCH_COUNT)
+      if(_CUTE_DSL_MATCH_COUNT EQUAL 1)
+        list(GET _CUTE_DSL_MATCHES 0 _CUTE_DSL_ARTIFACT_DIR)
+      elseif(_CUTE_DSL_MATCH_COUNT GREATER 1)
+        message(FATAL_ERROR
+          "Multiple CuTe DSL artifact directories found under "
+          "${_CUTE_DSL_ARTIFACT_ROOT}: ${_CUTE_DSL_MATCHES}\n"
+          "Set -DCUTE_DSL_ARTIFACT_TAG=sm_110 for Jetson AGX Thor.")
+      endif()
+    endif()
+
+    set(CUTE_DSL_STATIC_LIB
+      "${_CUTE_DSL_ARTIFACT_DIR}/libcutedsl_${_CUTE_DSL_ARCH}.a")
+    set(CUTE_DSL_RUNTIME_LIB
+      "${_CUTE_DSL_ARTIFACT_DIR}/libcute_dsl_runtime.so")
+
+    if(NOT _CUTE_DSL_ARTIFACT_DIR OR NOT EXISTS "${CUTE_DSL_STATIC_LIB}")
+      message(FATAL_ERROR
+        "TensorRT Edge-LLM was built with CuTe DSL, but its AOT kernel archive "
+        "was not found under ${_CUTE_DSL_ARTIFACT_ROOT}.\n"
+        "Rebuild Edge-LLM with -DENABLE_CUTE_DSL=ALL, or set "
+        "-DCUTE_DSL_ARTIFACT_TAG=sm_110 for Jetson AGX Thor.")
+    endif()
+
+    message(STATUS "CuTe DSL artifact   : ${_CUTE_DSL_ARTIFACT_DIR}")
+
     find_library(NVINFER_LIB nvinfer
       HINTS ${TRT_PACKAGE_DIR}
       PATH_SUFFIXES lib lib64 ${CMAKE_SYSTEM_PROCESSOR}-linux-gnu
@@ -165,6 +223,7 @@ if(BUILD_TENSORRT_BACKEND)
   target_link_libraries(cosmos_trt_backend
     cosmos_reasoner_node
     ${EDGELLM_CORE_LIB}
+    ${CUTE_DSL_STATIC_LIB}
     ${NVINFER_LIB}
     ${NVONNXPARSER_LIB}
     CUDA::cudart
@@ -174,8 +233,14 @@ if(BUILD_TENSORRT_BACKEND)
   )
 
   ament_target_dependencies(cosmos_trt_backend rclcpp rcl_interfaces)
+  if(EXISTS "${CUTE_DSL_RUNTIME_LIB}")
+    target_link_libraries(cosmos_trt_backend
+      ${CUTE_DSL_RUNTIME_LIB})
+  endif()
+
   set_target_properties(cosmos_trt_backend PROPERTIES
-    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    INSTALL_RPATH_USE_LINK_PATH TRUE)
 
   # ── Executable (uses TRT backend) ─────────────────────────────────────
   add_executable(cosmos_reasoner src/main.cpp)
