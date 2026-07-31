@@ -18,6 +18,7 @@
 #include "rclcpp/rclcpp.hpp"
 
 #include <condition_variable>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -107,6 +108,9 @@ private:
   // ── Worker thread and synchronisation ───────────────────────────────────
   std::thread worker_thread_;
   bool worker_running_{false};
+  bool backend_init_complete_{false};
+  std::exception_ptr backend_init_error_;
+  std::condition_variable backend_init_cv_;
 
   struct PendingFrame
   {
