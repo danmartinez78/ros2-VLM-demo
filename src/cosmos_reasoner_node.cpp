@@ -45,30 +45,34 @@ CosmosReasonerNode::CosmosReasonerNode(
   declare_parameters();
   validate_parameters();
 
-  // ── initialise backend (throws on failure → node does not finish constructing)
-  backend_->initialize();
-
-  // ── result publisher
   source_topic_ = this->get_parameter("image_topic").as_string();
   const std::string result_topic = this->get_parameter("result_topic").as_string();
 
-  if (publish_results_) {
-    result_pub_ = this->create_publisher<msg::VisionReasoningResult>(result_topic, 10);
-  }
+  // TensorRT, CUDA graph capture, and inference must stay on the same worker
+  // thread. start_worker() blocks until backend initialization succeeds.
+  start_worker();
 
-  // ── image subscriber (QoS: best effort, depth 1)
-  rclcpp::QoS sub_qos{rclcpp::KeepLast(1)};
-  sub_qos.best_effort();
-  image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-    source_topic_, sub_qos,
-    [this](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
-      image_callback(msg);
-    });
+  try {
+    // ── result publisher
+    if (publish_results_) {
+      result_pub_ = this->create_publisher<msg::VisionReasoningResult>(result_topic, 10);
+    }
+
+    // ── image subscriber (QoS: best effort, depth 1)
+    rclcpp::QoS sub_qos{rclcpp::KeepLast(1)};
+    sub_qos.best_effort();
+    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+      source_topic_, sub_qos,
+      [this](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
+        image_callback(msg);
+      });
+  } catch (...) {
+    stop_worker();
+    throw;
+  }
 
   RCLCPP_INFO(this->get_logger(), "Subscribed to %s", source_topic_.c_str());
   RCLCPP_INFO(this->get_logger(), "Publishing results to %s", result_topic.c_str());
-
-  start_worker();
 }
 
 CosmosReasonerNode::~CosmosReasonerNode()
@@ -232,8 +236,24 @@ void CosmosReasonerNode::validate_parameters()
 
 void CosmosReasonerNode::start_worker()
 {
-  worker_running_ = true;
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    worker_running_ = true;
+    backend_init_complete_ = false;
+    backend_init_error_ = nullptr;
+  }
   worker_thread_ = std::thread(&CosmosReasonerNode::worker_loop, this);
+
+  std::unique_lock<std::mutex> lock(queue_mutex_);
+  backend_init_cv_.wait(lock, [this] {return backend_init_complete_;});
+  if (backend_init_error_) {
+    auto error = backend_init_error_;
+    lock.unlock();
+    if (worker_thread_.joinable()) {
+      worker_thread_.join();
+    }
+    std::rethrow_exception(error);
+  }
 }
 
 void CosmosReasonerNode::stop_worker()
@@ -251,6 +271,25 @@ void CosmosReasonerNode::stop_worker()
 
 void CosmosReasonerNode::worker_loop()
 {
+  try {
+    backend_->initialize();
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      backend_init_error_ = std::current_exception();
+      backend_init_complete_ = true;
+      worker_running_ = false;
+    }
+    backend_init_cv_.notify_one();
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    backend_init_complete_ = true;
+  }
+  backend_init_cv_.notify_one();
+
   while (true) {
     PendingFrame frame;
 
