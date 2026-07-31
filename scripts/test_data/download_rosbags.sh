@@ -57,7 +57,7 @@ latest_compatible_version() {
     | select(test("^\\d+\\.\\d+\\.\\d+$"))
     | . as $version
     | split(".") | map(tonumber)
-    | select(.[0] == $major and .[1] == $minor)
+    | select(.[0] == $major and .[1] <= $minor)
     | $version
   ' <<<"${response}" | sort -V | tail -n 1
 }
@@ -74,6 +74,11 @@ download_asset() {
   version="$(latest_compatible_version "${resource}")"
   if [[ -z "${version}" ]]; then
     echo "No Isaac ROS ${ISAAC_ROS_MAJOR}.${ISAAC_ROS_MINOR}-compatible version found for ${resource}." >&2
+    echo "NGC versions returned:" >&2
+    curl -fsSL --retry 3 --retry-delay 2 \
+      -H "Accept: application/json" \
+      "https://api.ngc.nvidia.com/v2/resources/${NGC_ORG}/${NGC_TEAM}/${resource}/versions" \
+      | jq -r '.recipeVersions[].versionId' >&2 || true
     exit 1
   fi
 
