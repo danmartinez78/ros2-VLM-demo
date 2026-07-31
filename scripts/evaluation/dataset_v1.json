@@ -1,0 +1,70 @@
+{
+  "dataset_id": "thor-image-proc-task-eval",
+  "version": "v1",
+  "notes": "Representative image-proc rosbag segments for task-level scene understanding evaluation.",
+  "examples": [
+    {
+      "id": "aisle-static-scene-001",
+      "segment": {
+        "bag": "image-proc",
+        "topic": "/hawk_0_left_rgb_image",
+        "start_seconds": 12.0,
+        "end_seconds": 14.0
+      },
+      "rubrics": {
+        "object_presence": {
+          "required_observations": [
+            ["pallet", "box"],
+            ["shelf", "rack"]
+          ]
+        },
+        "hazard_recognition": {
+          "required_observations": [
+            ["clear", "no immediate hazard"]
+          ],
+          "forbidden_observations": [
+            "collision"
+          ]
+        },
+        "scene_state": {
+          "required_observations": [
+            ["indoor", "warehouse"]
+          ]
+        }
+      },
+      "unsupported_claim_terms": [
+        "fire",
+        "smoke"
+      ]
+    },
+    {
+      "id": "crosswalk-motion-002",
+      "segment": {
+        "bag": "image-proc",
+        "topic": "/hawk_0_left_rgb_image",
+        "start_seconds": 42.0,
+        "end_seconds": 44.0
+      },
+      "rubrics": {
+        "object_presence": {
+          "required_observations": [
+            ["pedestrian", "person"],
+            ["crosswalk", "crossing"]
+          ]
+        },
+        "hazard_recognition": {
+          "required_observations": [
+            ["yield", "caution"]
+          ]
+        },
+        "scene_state": {
+          "scoring": "human"
+        }
+      },
+      "unsupported_claim_terms": [
+        "explosion",
+        "gun"
+      ]
+    }
+  ]
+}

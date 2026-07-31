@@ -144,6 +144,17 @@ Test worker crash recovery:
 bash scripts/test_data/run_worker_recovery_test.sh
 ```
 
+Run task-level evaluation on recorded outputs:
+
+```bash
+python3 scripts/evaluation/evaluate_task_harness.py \
+  --dataset scripts/evaluation/dataset_v1.json \
+  --run /absolute/path/to/run.json \
+  --output /absolute/path/to/eval-report.json
+```
+
+See [docs/evaluation.md](docs/evaluation.md) for dataset and rubric details.
+
 That test obtains a successful result, kills only the inference worker,
 verifies launch respawns it, and confirms reasoning resumes without restarting
 the ROS node.
@@ -262,8 +273,8 @@ The production node accepts `bgr8`, `rgb8`, and `mono8` raw images.
 - Raw `sensor_msgs/msg/Image` only; compressed streams require decoding first.
 - No RViz2 result display yet
   ([#10](https://github.com/danmartinez78/ros2-VLM-demo/issues/10)).
-- No task-level quality evaluation harness yet
-  ([#11](https://github.com/danmartinez78/ros2-VLM-demo/issues/11)).
+- Task-level evaluation requires curated run outputs plus rubric review
+  ([docs/evaluation.md](docs/evaluation.md)).
 
 ## License
 
