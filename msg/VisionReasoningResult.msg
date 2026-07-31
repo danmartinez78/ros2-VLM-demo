@@ -1,5 +1,8 @@
 std_msgs/Header header
 string source_topic
+string task_profile
+string prompt_version
+string prompt_config_hash
 string prompt
 string response
 float64 inference_seconds
