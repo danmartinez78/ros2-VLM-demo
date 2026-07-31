@@ -393,6 +393,27 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_node cosmos_reasoner_node)
   ament_target_dependencies(test_node rclcpp sensor_msgs)
+
+  # IPC protocol tests (hardware-independent)
+  ament_add_gtest(test_ipc_protocol
+    test/test_ipc_protocol.cpp
+  )
+  target_include_directories(test_ipc_protocol PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/test
+  )
+  target_link_libraries(test_ipc_protocol ${OpenCV_LIBRARIES})
+
+  # IPC backend integration tests with a fake Unix socket worker (no GPU)
+  ament_add_gtest(test_ipc_inference_backend
+    test/test_ipc_inference_backend.cpp
+    src/ipc_inference_backend.cpp
+  )
+  target_include_directories(test_ipc_inference_backend PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/test
+  )
+  target_link_libraries(test_ipc_inference_backend ${OpenCV_LIBRARIES})
 endif()
 
 ament_export_targets(cosmos_reasoner_nodeTargets HAS_LIBRARY_TARGET)

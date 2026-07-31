@@ -2,6 +2,7 @@
 #include "cosmos_ros2_video_reasoner/ipc_inference_backend.hpp"
 #include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cerrno>
 #include <cstring>
@@ -94,7 +95,9 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
 
   cv::Mat packed = request.image.isContinuous() ? request.image : request.image.clone();
   const size_t image_size = packed.total() * packed.elemSize();
-  if (image_size > ipc::kMaxImageBytes || request.prompt.size() > ipc::kMaxTextBytes) {
+  const size_t max_image_bytes = std::min(config_.max_image_bytes, static_cast<size_t>(ipc::kMaxImageBytes));
+  const size_t max_text_bytes = std::min(config_.max_text_bytes, static_cast<size_t>(ipc::kMaxTextBytes));
+  if (image_size > max_image_bytes || request.prompt.size() > max_text_bytes) {
     throw std::runtime_error("IPC request exceeds protocol limits");
   }
 
