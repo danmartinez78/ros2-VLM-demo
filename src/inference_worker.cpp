@@ -5,11 +5,14 @@
 #include <opencv2/core.hpp>
 
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <sys/socket.h>
@@ -24,10 +27,10 @@ void stop_handler(int) {g_stop = 1;}
 
 int main(int argc, char ** argv)
 {
-  if (argc != 6) {
+  if (argc != 7) {
     std::cerr << "Usage: " << argv[0]
               << " <llm-engine-dir> <multimodal-engine-dir> <plugin-path> <socket-path>"
-              << " <jpeg-quality>\n";
+              << " <jpeg-quality> <inference-deadline-seconds>\n";
     return 2;
   }
 
@@ -41,6 +44,18 @@ int main(int argc, char ** argv)
   }
   if (jpeg_quality < 1 || jpeg_quality > 100) {
     std::cerr << "JPEG quality must be in [1, 100]\n";
+    return 2;
+  }
+
+  int inference_deadline_seconds = 0;
+  try {
+    inference_deadline_seconds = std::stoi(argv[6]);
+  } catch (std::exception const &) {
+    std::cerr << "inference-deadline-seconds must be a positive integer\n";
+    return 2;
+  }
+  if (inference_deadline_seconds <= 0) {
+    std::cerr << "inference-deadline-seconds must be > 0\n";
     return 2;
   }
   if (socket_path.size() >= sizeof(sockaddr_un::sun_path)) {
@@ -126,12 +141,47 @@ int main(int argc, char ** argv)
       request.top_p = header.top_p;
       request.top_k = header.top_k;
 
+      // ── Worker-side inference deadline watchdog ──────────────────────────
+      // If the TensorRT call wedges past the deadline, emit a diagnostic and
+      // self-terminate so ROS launch respawn creates a clean process and CUDA
+      // context.  The client IPC timeout must be longer than this deadline so
+      // the worker has time to exit and the client sees a clean EOF rather
+      // than a socket-level timeout.
+      std::promise<void> infer_done;
+      std::future<void> infer_done_future = infer_done.get_future();
+      const int watchdog_deadline = inference_deadline_seconds;
+      const uint64_t watchdog_request_id = header.request_id;
+
+      std::thread watchdog_thread(
+        [&infer_done_future, watchdog_deadline, watchdog_request_id]() {
+          if (infer_done_future.wait_for(std::chrono::seconds(watchdog_deadline)) ==
+          std::future_status::timeout)
+          {
+            std::cerr
+              << "[cosmos_inference_worker] WATCHDOG: inference deadline ("
+              << watchdog_deadline << "s) expired"
+              << " request_id=" << watchdog_request_id
+              << "; self-terminating for clean respawn\n";
+            std::cerr.flush();
+            // quick_exit bypasses C++ destructors to avoid hanging on wedged
+            // CUDA state.  The OS reclaims all file descriptors; the socket
+            // file is unlinked by the replacement worker at startup.
+            std::quick_exit(1);
+          }
+        });
+
       cosmos_ros2_video_reasoner::InferenceResponse result;
       try {
         result = backend.infer(request);
       } catch (std::exception const & error) {
         result.success = false;
         result.error = error.what();
+      }
+
+      // Signal the watchdog that inference completed within the deadline.
+      infer_done.set_value();
+      if (watchdog_thread.joinable()) {
+        watchdog_thread.join();
       }
 
       if (result.text.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||

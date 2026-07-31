@@ -40,7 +40,12 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'worker_request_timeout_seconds',
             default_value='90',
-            description='Maximum seconds to wait for one worker response',
+            description='Maximum seconds to wait for one worker response (must exceed worker_inference_deadline_seconds)',
+        ),
+        DeclareLaunchArgument(
+            'worker_inference_deadline_seconds',
+            default_value='60',
+            description='Worker-side inference deadline; worker self-terminates on expiry for clean respawn (must be less than worker_request_timeout_seconds)',
         ),
         DeclareLaunchArgument(
             'image_topic',
@@ -194,6 +199,7 @@ def generate_launch_description() -> LaunchDescription:
             LaunchConfiguration('edge_llm_plugin_path'),
             LaunchConfiguration('worker_socket_path'),
             LaunchConfiguration('jpeg_quality'),
+            LaunchConfiguration('worker_inference_deadline_seconds'),
         ],
         output='screen',
         respawn=True,

@@ -251,7 +251,8 @@ rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
 | `result_topic` | string | `/cosmos/reasoning` | Result topic |
 | `worker_socket_path` | string | `/tmp/cosmos_edge_llm.sock` | Worker Unix-socket path |
 | `worker_connect_timeout_seconds` | int | `120` | Initial/reconnect deadline |
-| `worker_request_timeout_seconds` | int | `90` | Per-request IPC send/receive deadline |
+| `worker_inference_deadline_seconds` | int | `60` | Worker-side inference deadline; worker self-terminates via watchdog on expiry (must be < `worker_request_timeout_seconds`) |
+| `worker_request_timeout_seconds` | int | `90` | Per-request IPC send/receive deadline (must be > `worker_inference_deadline_seconds`) |
 | `llm_engine_dir` | string | empty | Required LLM engine/tokenizer directory |
 | `multimodal_engine_dir` | string | empty | Required multimodal engine directory |
 | `edge_llm_plugin_path` | string | empty | Required Edge-LLM plugin path |
@@ -287,10 +288,12 @@ delivery modes fail fast with explicit errors.
 - Launch respawns a worker that exits unexpectedly after two seconds.
 - A failed IPC request is reported once and is not automatically replayed.
 - The next sampled frame reconnects to a replacement worker.
-
-The current timeout does not kill a worker that remains alive while wedged in a
-GPU call. Active watchdog recovery is tracked in
-[#6](https://github.com/danmartinez78/ros2-VLM-demo/issues/6).
+- If the worker is alive but wedged in a GPU call, its internal watchdog fires
+  after `worker_inference_deadline_seconds` (default 60 s): the worker emits a
+  diagnostic, calls `quick_exit`, and launch respawns it. The client IPC timeout
+  (`worker_request_timeout_seconds`, default 90 s) is kept longer than the
+  worker deadline so the worker exits cleanly before the client-side timeout
+  fires. One error result is published; the request is not replayed.
 
 ## Troubleshooting
 

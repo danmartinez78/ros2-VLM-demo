@@ -523,3 +523,66 @@ TEST(IpcInferenceBackend, ReconnectsAfterWorkerRestart)
   EXPECT_EQ(second.text, "second");
   restarted_worker.join_and_rethrow();
 }
+
+// Simulates the watchdog recovery path:
+//   1. Worker reads the request, then hangs (wedged inference).
+//   2. Client IPC timeout fires — one error is reported, connection is closed.
+//   3. Fake worker exits ("self-terminates").
+//   4. A replacement worker becomes available on the same socket.
+//   5. The client's next infer() call reconnects and succeeds.
+//
+// This is the CPU-only analogue of the Thor hardware test that verifies the
+// full timeout → disconnect → respawn → reconnect cycle (issue #6).
+TEST(IpcInferenceBackend, TimesOutThenReconnectsAfterWorkerSelfTermination)
+{
+  std::string socket_path = make_socket_path();
+
+  IpcInferenceConfig config;
+  config.socket_path = socket_path;
+  config.connect_timeout_seconds = 3;
+  config.request_timeout_seconds = 1;   // short client timeout; fires before hang ends
+
+  auto backend = std::make_unique<IpcInferenceBackend>(config);
+
+  // Worker 1: reads the request, hangs for 4 s (longer than the 1 s client
+  // timeout), then exits — simulating the watchdog-triggered self-termination.
+  {
+    OneClientWorker wedged_worker([](int client_fd) {
+      ipc::RequestHeader request_header;
+      std::vector<uint8_t> image;
+      std::string prompt;
+      read_request_frame(client_fd, request_header, image, prompt);
+      // Simulate a wedged TensorRT call; the worker eventually self-terminates.
+      std::this_thread::sleep_for(std::chrono::seconds(3));
+    }, socket_path);
+
+    backend->initialize();
+
+    auto start = std::chrono::steady_clock::now();
+    // The client must time out and throw exactly once; the request is NOT replayed.
+    EXPECT_THROW(backend->infer(make_request("wedged")), std::runtime_error);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // Verify the timeout fired within a reasonable window (1 s ± 500 ms).
+    EXPECT_GT(elapsed, std::chrono::milliseconds(700));
+    EXPECT_LT(elapsed, std::chrono::milliseconds(2000));
+
+    wedged_worker.join_and_rethrow();
+  }
+  // Worker 1 has exited (socket unlinked by OneClientWorker destructor).
+
+  // Worker 2: replacement worker — available immediately on the same path.
+  OneClientWorker replacement_worker([](int client_fd) {
+    ipc::RequestHeader request_header;
+    std::vector<uint8_t> image;
+    std::string prompt;
+    read_request_frame(client_fd, request_header, image, prompt);
+    send_success_response(client_fd, request_header.request_id, "recovered");
+  }, socket_path);
+
+  // The client must reconnect and succeed without restarting cosmos_reasoner.
+  auto recovered = backend->infer(make_request("after recovery"));
+  EXPECT_TRUE(recovered.success);
+  EXPECT_EQ(recovered.text, "recovered");
+  replacement_worker.join_and_rethrow();
+}

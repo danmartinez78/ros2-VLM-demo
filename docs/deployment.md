@@ -218,6 +218,56 @@ The final line should be:
 PASS: worker respawned and reasoning resumed without restarting the ROS node.
 ```
 
+### Thor hardware validation: watchdog-triggered recovery (requires hardware)
+
+> **Draft — requires Thor validation before merging to main.**
+
+This test forces a request past its inference deadline and verifies the worker
+PID changes and reasoning resumes without restarting `cosmos_reasoner`.
+
+```bash
+# Start the pipeline with a short deadline to force the watchdog to fire.
+ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+  llm_engine_dir:="$COSMOS_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$COSMOS_MULTIMODAL_ENGINE_DIR" \
+  edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH" \
+  worker_inference_deadline_seconds:=5 \
+  worker_request_timeout_seconds:=20 \
+  use_sim_time:=true &
+
+LAUNCH_PID=$!
+sleep 5  # wait for worker to be ready
+
+# Record the initial worker PID.
+WORKER_PID_BEFORE=$(pgrep -n cosmos_inference_worker)
+echo "Worker PID before: $WORKER_PID_BEFORE"
+
+# Start bag playback; the first frame will trigger inference.
+ros2 bag play "$HOME/tensorrt-edgellm-workspace/image-proc-rosbag" --clock &
+BAG_PID=$!
+
+# Wait for the watchdog to fire and the worker to restart.
+sleep 30
+
+# Verify the worker PID has changed (launch respawned it).
+WORKER_PID_AFTER=$(pgrep -n cosmos_inference_worker)
+echo "Worker PID after:  $WORKER_PID_AFTER"
+
+if [ "$WORKER_PID_BEFORE" != "$WORKER_PID_AFTER" ] && [ -n "$WORKER_PID_AFTER" ]; then
+  echo "PASS: worker respawned (PID changed) and reasoning can resume."
+else
+  echo "FAIL: worker PID did not change or worker is not running."
+fi
+
+kill $BAG_PID $LAUNCH_PID 2>/dev/null
+```
+
+Expected evidence:
+- Worker stderr prints the WATCHDOG diagnostic line.
+- `cosmos_reasoner` stderr prints one IPC error for the timed-out frame.
+- Launch respawns the worker (new PID).
+- Reasoning resumes on the next sampled frame without restarting `cosmos_reasoner`.
+
 ## 8. Run a custom bag or camera
 
 Inspect the source:
@@ -261,7 +311,7 @@ streams must be decoded to `sensor_msgs/msg/Image` first.
 | APT proposes removing JetPack/OpenCV packages | Cancel the transaction; do not downgrade NVIDIA OpenCV |
 | No results | Confirm the exact topic, raw encoding, subscriber count, and `--clock`/`use_sim_time` pairing |
 | Worker exits | Launch respawns it; one frame may fail before IPC reconnects |
-| Worker remains alive but wedged | Active watchdog is not implemented yet; see issue #6 |
+| Worker alive but wedged | Watchdog fires after `worker_inference_deadline_seconds` (default 60 s); worker self-terminates; launch respawns it; one error is published; reasoning resumes on next frame |
 
 For the full historical investigation, see
 [thor-edge-llm-prefill-stall-rca.md](thor-edge-llm-prefill-stall-rca.md).
