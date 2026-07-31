@@ -16,9 +16,11 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <string>
+#include <thread>
 
 int main(int argc, char ** argv)
 {
@@ -29,8 +31,9 @@ int main(int argc, char ** argv)
     return 2;
   }
 
-  try {
-    cosmos_ros2_video_reasoner::TensorRTEdgeLLMConfig config;
+  auto run_backend = [&]() -> int {
+    try {
+      cosmos_ros2_video_reasoner::TensorRTEdgeLLMConfig config;
     config.llm_engine_dir = argv[1];
     config.multimodal_engine_dir = argv[2];
     config.edge_llm_plugin_path = argv[3];
@@ -66,9 +69,21 @@ int main(int argc, char ** argv)
 
     std::cout << "Inference time: " << response.inference_seconds << " seconds\n";
     std::cout << "Response: " << response.text << '\n';
-    return 0;
-  } catch (std::exception const & error) {
-    std::cerr << "Exception: " << error.what() << '\n';
-    return 5;
+      return 0;
+    } catch (std::exception const & error) {
+      std::cerr << "Exception: " << error.what() << '\n';
+      return 5;
+    }
+  };
+
+  if (std::getenv("COSMOS_SMOKE_THREADED") == nullptr) {
+    std::cout << "Execution mode: main thread\n";
+    return run_backend();
   }
+
+  std::cout << "Execution mode: std::thread worker\n";
+  int result = 5;
+  std::thread worker([&]() {result = run_backend();});
+  worker.join();
+  return result;
 }
