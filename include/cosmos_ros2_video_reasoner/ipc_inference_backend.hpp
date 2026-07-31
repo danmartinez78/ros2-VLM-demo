@@ -3,6 +3,7 @@
 
 #include "cosmos_ros2_video_reasoner/inference_backend.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -13,6 +14,8 @@ struct IpcInferenceConfig
   std::string socket_path{"/tmp/cosmos_edge_llm.sock"};
   int connect_timeout_seconds{120};
   int request_timeout_seconds{90};
+  size_t max_image_bytes{256U * 1024U * 1024U};
+  size_t max_text_bytes{1024U * 1024U};
 };
 
 class IpcInferenceBackend : public InferenceBackend

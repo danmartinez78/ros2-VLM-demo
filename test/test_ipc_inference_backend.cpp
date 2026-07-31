@@ -6,10 +6,12 @@
 #include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <functional>
 #include <future>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -20,6 +22,7 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <poll.h>
 #include <unistd.h>
 
 namespace
@@ -59,54 +62,123 @@ public:
   : path_(std::move(path)), handler_(std::move(handler))
   {
     thread_ = std::thread([this]() {run();});
-    if (ready_future_.wait_for(std::chrono::seconds(5)) != std::future_status::ready ||
-      !ready_future_.get())
-    {
+    if (ready_future_.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+      request_stop();
+      join_thread();
+      throw std::runtime_error("failed to start test worker");
+    }
+    if (!ready_future_.get()) {
+      request_stop();
+      join_thread();
       throw std::runtime_error("failed to start test worker");
     }
   }
 
   ~OneClientWorker()
   {
-    if (thread_.joinable()) {
-      thread_.join();
-    }
+    request_stop();
+    join_thread();
     ::unlink(path_.c_str());
   }
 
   std::string const & socket_path() const {return path_;}
 
+  void join_and_rethrow()
+  {
+    request_stop();
+    join_thread();
+    if (worker_exception_) {
+      std::rethrow_exception(worker_exception_);
+    }
+  }
+
 private:
+  void request_stop() noexcept
+  {
+    stop_requested_.store(true, std::memory_order_relaxed);
+    const int fd = server_fd_.exchange(-1, std::memory_order_relaxed);
+    if (fd >= 0) {
+      ::shutdown(fd, SHUT_RDWR);
+      ::close(fd);
+    }
+  }
+
+  void join_thread()
+  {
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
   void run()
   {
-    ::unlink(path_.c_str());
-    int server_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (server_fd < 0) {
-      ready_promise_.set_value(false);
-      return;
+    bool ready_reported = false;
+    try {
+      ::unlink(path_.c_str());
+      int server_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+      if (server_fd < 0) {
+        ready_promise_.set_value(false);
+        return;
+      }
+      server_fd_.store(server_fd, std::memory_order_relaxed);
+
+      sockaddr_un address{};
+      address.sun_family = AF_UNIX;
+      std::strncpy(address.sun_path, path_.c_str(), sizeof(address.sun_path) - 1);
+
+      if (::bind(server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+        ::listen(server_fd, 1) != 0)
+      {
+        ready_promise_.set_value(false);
+        request_stop();
+        return;
+      }
+
+      ready_promise_.set_value(true);
+      ready_reported = true;
+
+      while (!stop_requested_.load(std::memory_order_relaxed)) {
+        pollfd waiter{};
+        waiter.fd = server_fd;
+        waiter.events = POLLIN;
+        const int poll_result = ::poll(&waiter, 1, 100);
+        if (poll_result == 0) {
+          continue;
+        }
+        if (poll_result < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          throw std::runtime_error("poll failed in test worker");
+        }
+        if ((waiter.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+          break;
+        }
+        int client_fd = ::accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC);
+        if (client_fd < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          if (stop_requested_.load(std::memory_order_relaxed)) {
+            break;
+          }
+          throw std::runtime_error("accept failed in test worker");
+        }
+        handler_(client_fd);
+        ::close(client_fd);
+        break;
+      }
+      request_stop();
+    } catch (...) {
+      if (!ready_reported) {
+        try {
+          ready_promise_.set_value(false);
+        } catch (...) {
+        }
+      }
+      worker_exception_ = std::current_exception();
+      request_stop();
     }
-
-    sockaddr_un address{};
-    address.sun_family = AF_UNIX;
-    std::strncpy(address.sun_path, path_.c_str(), sizeof(address.sun_path) - 1);
-
-    if (::bind(server_fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
-      ::listen(server_fd, 1) != 0)
-    {
-      ::close(server_fd);
-      ready_promise_.set_value(false);
-      return;
-    }
-
-    ready_promise_.set_value(true);
-
-    int client_fd = ::accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC);
-    if (client_fd >= 0) {
-      handler_(client_fd);
-      ::close(client_fd);
-    }
-
-    ::close(server_fd);
   }
 
   std::string path_;
@@ -114,6 +186,9 @@ private:
   std::thread thread_;
   std::promise<bool> ready_promise_;
   std::future<bool> ready_future_{ready_promise_.get_future()};
+  std::atomic<int> server_fd_{-1};
+  std::atomic<bool> stop_requested_{false};
+  std::exception_ptr worker_exception_;
 };
 
 void read_request_frame(int fd, ipc::RequestHeader & header, std::vector<uint8_t> & image, std::string & prompt)
@@ -158,6 +233,7 @@ TEST(IpcInferenceBackend, SendsExpectedRequestHeader)
   backend.initialize();
 
   InferenceRequest request = make_request("inspect scene");
+  ASSERT_TRUE(request.image.isContinuous());
   auto response = backend.infer(request);
 
   ASSERT_TRUE(response.success);
@@ -170,6 +246,10 @@ TEST(IpcInferenceBackend, SendsExpectedRequestHeader)
   EXPECT_EQ(seen_header.step, static_cast<uint32_t>(request.image.cols * 3));
   EXPECT_EQ(seen_header.image_bytes, request.image.total() * request.image.elemSize());
   EXPECT_EQ(seen_prompt, request.prompt);
+  std::vector<uint8_t> expected_image(
+    request.image.data, request.image.data + (request.image.total() * request.image.elemSize()));
+  EXPECT_EQ(seen_image, expected_image);
+  worker.join_and_rethrow();
 }
 
 TEST(IpcInferenceBackend, RejectsOversizedPromptAndImage)
@@ -183,22 +263,19 @@ TEST(IpcInferenceBackend, RejectsOversizedPromptAndImage)
   config.socket_path = worker.socket_path();
   config.connect_timeout_seconds = 2;
   config.request_timeout_seconds = 1;
+  config.max_text_bytes = 32;
+  config.max_image_bytes = 32;
 
   IpcInferenceBackend backend(config);
   backend.initialize();
 
   InferenceRequest oversized_prompt = make_request();
-  oversized_prompt.prompt.assign(ipc::kMaxTextBytes + 1U, 'x');
+  oversized_prompt.prompt.assign(config.max_text_bytes + 1U, 'x');
   EXPECT_THROW(backend.infer(oversized_prompt), std::runtime_error);
 
-  std::vector<uint8_t> one_byte(1, 0);
   InferenceRequest oversized_image = make_request();
-  oversized_image.image = cv::Mat(
-    1,
-    static_cast<int>(ipc::kMaxImageBytes / 3U + 1U),
-    CV_8UC3,
-    one_byte.data());
   EXPECT_THROW(backend.infer(oversized_image), std::runtime_error);
+  worker.join_and_rethrow();
 }
 
 TEST(IpcInferenceBackend, RejectsInvalidResponseHeaders)
@@ -227,6 +304,7 @@ TEST(IpcInferenceBackend, RejectsInvalidResponseHeaders)
   backend.initialize();
 
   EXPECT_THROW(backend.infer(make_request()), std::runtime_error);
+  worker.join_and_rethrow();
 }
 
 TEST(IpcInferenceBackend, RejectsVersionMismatchResponseHeaders)
@@ -255,6 +333,35 @@ TEST(IpcInferenceBackend, RejectsVersionMismatchResponseHeaders)
   backend.initialize();
 
   EXPECT_THROW(backend.infer(make_request()), std::runtime_error);
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, RejectsMismatchedRequestIdResponseHeaders)
+{
+  OneClientWorker worker([&](int client_fd) {
+    ipc::RequestHeader request_header;
+    std::vector<uint8_t> image;
+    std::string prompt;
+    read_request_frame(client_fd, request_header, image, prompt);
+
+    ipc::ResponseHeader response;
+    response.request_id = request_header.request_id + 1U;
+    response.success = 1;
+    response.text_bytes = 0;
+    response.error_bytes = 0;
+    ipc::write_all(client_fd, &response, sizeof(response));
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  EXPECT_THROW(backend.infer(make_request()), std::runtime_error);
+  worker.join_and_rethrow();
 }
 
 TEST(IpcInferenceBackend, RejectsOversizedResponseFields)
@@ -282,6 +389,40 @@ TEST(IpcInferenceBackend, RejectsOversizedResponseFields)
   backend.initialize();
 
   EXPECT_THROW(backend.infer(make_request()), std::runtime_error);
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, ReturnsWorkerErrorResponse)
+{
+  OneClientWorker worker([&](int client_fd) {
+    ipc::RequestHeader request_header;
+    std::vector<uint8_t> image;
+    std::string prompt;
+    read_request_frame(client_fd, request_header, image, prompt);
+
+    const std::string error = "worker failed";
+    ipc::ResponseHeader response;
+    response.request_id = request_header.request_id;
+    response.success = 0;
+    response.text_bytes = 0;
+    response.error_bytes = static_cast<uint32_t>(error.size());
+    ipc::write_all(client_fd, &response, sizeof(response));
+    ipc::write_all(client_fd, error.data(), error.size());
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  auto response = backend.infer(make_request());
+  EXPECT_FALSE(response.success);
+  EXPECT_TRUE(response.text.empty());
+  EXPECT_EQ(response.error, "worker failed");
+  worker.join_and_rethrow();
 }
 
 TEST(IpcInferenceBackend, FailsCleanlyOnTruncatedResponsePayload)
@@ -312,6 +453,7 @@ TEST(IpcInferenceBackend, FailsCleanlyOnTruncatedResponsePayload)
   backend.initialize();
 
   EXPECT_THROW(backend.infer(make_request()), std::runtime_error);
+  worker.join_and_rethrow();
 }
 
 TEST(IpcInferenceBackend, TimesOutWhenWorkerDoesNotRespond)
@@ -336,35 +478,37 @@ TEST(IpcInferenceBackend, TimesOutWhenWorkerDoesNotRespond)
   EXPECT_THROW(backend.infer(make_request()), std::runtime_error);
   auto elapsed = std::chrono::steady_clock::now() - start;
 
-  EXPECT_LT(elapsed, std::chrono::seconds(3));
+  EXPECT_GT(elapsed, std::chrono::milliseconds(700));
+  EXPECT_LT(elapsed, std::chrono::milliseconds(2200));
+  worker.join_and_rethrow();
 }
 
 TEST(IpcInferenceBackend, ReconnectsAfterWorkerRestart)
 {
   std::string socket_path = make_socket_path();
-
-  OneClientWorker worker([&](int client_fd) {
-    ipc::RequestHeader request_header;
-    std::vector<uint8_t> image;
-    std::string prompt;
-    read_request_frame(client_fd, request_header, image, prompt);
-    send_success_response(client_fd, request_header.request_id, "first");
-    ::shutdown(client_fd, SHUT_RDWR);
-  }, socket_path);
-
   IpcInferenceConfig config;
   config.socket_path = socket_path;
   config.connect_timeout_seconds = 2;
   config.request_timeout_seconds = 2;
+  auto backend = std::make_unique<IpcInferenceBackend>(config);
+  {
+    OneClientWorker worker([&](int client_fd) {
+      ipc::RequestHeader request_header;
+      std::vector<uint8_t> image;
+      std::string prompt;
+      read_request_frame(client_fd, request_header, image, prompt);
+      send_success_response(client_fd, request_header.request_id, "first");
+      ::shutdown(client_fd, SHUT_RDWR);
+    }, socket_path);
+    backend->initialize();
 
-  IpcInferenceBackend backend(config);
-  backend.initialize();
+    auto first = backend->infer(make_request("first request"));
+    ASSERT_TRUE(first.success);
+    EXPECT_EQ(first.text, "first");
 
-  auto first = backend.infer(make_request("first request"));
-  ASSERT_TRUE(first.success);
-  EXPECT_EQ(first.text, "first");
-
-  EXPECT_THROW(backend.infer(make_request("expected disconnect")), std::runtime_error);
+    EXPECT_THROW(backend->infer(make_request("expected disconnect")), std::runtime_error);
+    worker.join_and_rethrow();
+  }
 
   OneClientWorker restarted_worker([&](int client_fd) {
     ipc::RequestHeader request_header;
@@ -374,7 +518,8 @@ TEST(IpcInferenceBackend, ReconnectsAfterWorkerRestart)
     send_success_response(client_fd, request_header.request_id, "second");
   }, socket_path);
 
-  auto second = backend.infer(make_request("after restart"));
+  auto second = backend->infer(make_request("after restart"));
   EXPECT_TRUE(second.success);
   EXPECT_EQ(second.text, "second");
+  restarted_worker.join_and_rethrow();
 }

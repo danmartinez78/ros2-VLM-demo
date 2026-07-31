@@ -98,20 +98,24 @@ TEST(IpcProtocol, WriteAllHandlesSlowReader)
 {
   int fds[2]{};
   ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  int send_buffer = 4096;
+  ASSERT_EQ(
+    ::setsockopt(fds[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)),
+    0);
 
-  std::vector<uint8_t> payload(1U << 20, 0x5A);
+  std::vector<uint8_t> payload(128U * 1024U, 0x5A);
   std::vector<uint8_t> received;
   received.reserve(payload.size());
 
   std::thread reader([&]() {
-    std::vector<uint8_t> chunk(64);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    std::vector<uint8_t> chunk(2048);
     while (received.size() < payload.size()) {
       const ssize_t n = ::read(fds[1], chunk.data(), chunk.size());
       if (n <= 0) {
         break;
       }
       received.insert(received.end(), chunk.begin(), chunk.begin() + n);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ::close(fds[1]);
   });
