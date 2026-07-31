@@ -281,17 +281,12 @@ if(BUILD_TENSORRT_BACKEND)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-  # ── Production executable with final CUDA device link ──────────────────
-  # Edge-LLM and CuTe contain CUDA device code that must be resolved at the
-  # final executable boundary on Thor. Embedding them in an intermediate
-  # shared library can leave TensorRT's Blackwell fused-attention prefill
-  # kernel active indefinitely. Compile the backend implementation directly
-  # into the ROS executable, matching the validated direct smoke target.
-  add_executable(cosmos_reasoner
-    src/main.cpp
+  # ── ROS-free persistent inference worker ──────────────────────────────
+  add_executable(cosmos_inference_worker
+    src/inference_worker.cpp
     src/tensorrt_edge_llm_backend.cpp
   )
-  target_include_directories(cosmos_reasoner PRIVATE
+  target_include_directories(cosmos_inference_worker PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TENSORRT_EDGE_LLM_ROOT}/cpp
     ${TENSORRT_EDGE_LLM_ROOT}/examples
@@ -301,8 +296,7 @@ if(BUILD_TENSORRT_BACKEND)
     ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/miniaudio
     ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
   )
-  target_link_libraries(cosmos_reasoner
-    cosmos_reasoner_node
+  target_link_libraries(cosmos_inference_worker
     ${EDGELLM_CORE_LIB}
     ${CUTE_DSL_STATIC_LIB}
     ${NVINFER_LIB}
@@ -313,17 +307,29 @@ if(BUILD_TENSORRT_BACKEND)
     ${OpenCV_LIBRARIES}
   )
   if(EXISTS "${CUTE_DSL_RUNTIME_LIB}")
-    target_link_libraries(cosmos_reasoner
-      ${CUTE_DSL_RUNTIME_LIB})
+    target_link_libraries(cosmos_inference_worker ${CUTE_DSL_RUNTIME_LIB})
   endif()
-  set_target_properties(cosmos_reasoner PROPERTIES
+  set_target_properties(cosmos_inference_worker PROPERTIES
     CUDA_ARCHITECTURES "${TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
-    INSTALL_RPATH_USE_LINK_PATH TRUE
-    BUILD_RPATH_USE_ORIGIN TRUE)
+    INSTALL_RPATH_USE_LINK_PATH TRUE)
+
+  # ── ROS executable: IPC only, never links Edge-LLM ─────────────────────
+  add_library(cosmos_ipc_backend STATIC src/ipc_inference_backend.cpp)
+  target_include_directories(cosmos_ipc_backend PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>)
+  target_link_libraries(cosmos_ipc_backend ${OpenCV_LIBRARIES})
+
+  add_executable(cosmos_reasoner src/main.cpp)
+  target_include_directories(cosmos_reasoner PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(cosmos_reasoner
+    cosmos_ipc_backend
+    cosmos_reasoner_node)
   ament_target_dependencies(cosmos_reasoner rclcpp)
 
-  install(TARGETS cosmos_trt_backend cosmos_reasoner cosmos_backend_direct_smoke
+  install(TARGETS cosmos_trt_backend cosmos_reasoner cosmos_backend_direct_smoke cosmos_inference_worker cosmos_ipc_backend
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION lib/${PROJECT_NAME}
