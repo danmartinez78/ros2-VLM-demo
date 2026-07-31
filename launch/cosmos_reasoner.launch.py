@@ -17,7 +17,7 @@
 
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -26,9 +26,17 @@ from ament_index_python.packages import get_package_share_directory
 def generate_launch_description() -> LaunchDescription:
     pkg_share = get_package_share_directory('cosmos_ros2_video_reasoner')
     default_config = os.path.join(pkg_share, 'config', 'cosmos_reasoner.yaml')
+    package_prefix = os.path.dirname(os.path.dirname(pkg_share))
+    worker_executable = os.path.join(
+        package_prefix, 'lib', 'cosmos_ros2_video_reasoner', 'cosmos_inference_worker')
 
     # ── Launch arguments ──────────────────────────────────────────────────────
     args = [
+        DeclareLaunchArgument(
+            'worker_socket_path',
+            default_value='/tmp/cosmos_edge_llm.sock',
+            description='Unix-domain socket used by the isolated inference worker',
+        ),
         DeclareLaunchArgument(
             'image_topic',
             default_value='/camera/image_raw',
@@ -96,6 +104,7 @@ def generate_launch_description() -> LaunchDescription:
             default_config,
             {
                 'use_sim_time': LaunchConfiguration('use_sim_time'),
+                'worker_socket_path': LaunchConfiguration('worker_socket_path'),
                 'image_topic': LaunchConfiguration('image_topic'),
                 'result_topic': LaunchConfiguration('result_topic'),
                 'llm_engine_dir': LaunchConfiguration('llm_engine_dir'),
@@ -109,4 +118,15 @@ def generate_launch_description() -> LaunchDescription:
         ],
     )
 
-    return LaunchDescription(args + [cosmos_node])
+    worker = ExecuteProcess(
+        cmd=[
+            worker_executable,
+            LaunchConfiguration('llm_engine_dir'),
+            LaunchConfiguration('multimodal_engine_dir'),
+            LaunchConfiguration('edge_llm_plugin_path'),
+            LaunchConfiguration('worker_socket_path'),
+        ],
+        output='screen',
+    )
+
+    return LaunchDescription(args + [worker, cosmos_node])
