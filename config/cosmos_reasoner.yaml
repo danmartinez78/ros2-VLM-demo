@@ -7,6 +7,8 @@ cosmos_reasoner:
   ros__parameters:
     # ── Topics ────────────────────────────────────────────────────────────────
     image_topic: /camera/image_raw
+    worker_socket_path: /tmp/cosmos_edge_llm.sock
+    worker_connect_timeout_seconds: 120
     result_topic: /cosmos/reasoning
 
     # ── Engine paths (REQUIRED on hardware — set absolute paths) ─────────────
