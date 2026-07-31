@@ -1,6 +1,6 @@
 # Jetson AGX Thor Edge-LLM prefill stall RCA
 
-Status: root cause localized; production fix under validation  
+Status: isolated-worker production path validated on Thor  
 Platform: NVIDIA Jetson AGX Thor  
 Date opened: 2026-07-30
 
@@ -252,3 +252,27 @@ The ROS process no longer links TensorRT, CUDA, Edge-LLM, CuTe DSL, or the Edge-
 IPC requests carry a monotonically increasing request ID, packed BGR8 image bytes, dimensions, prompt, and generation parameters. Responses carry the matching request ID, success state, text or error, and inference duration. The ROS node retains its bounded newest-frame queue and publishes the existing `VisionReasoningResult` message.
 
 This process boundary is intended both to avoid the confirmed library-load interaction and to permit future worker timeout/restart supervision without wedging ROS shutdown.
+
+
+## Successful end-to-end isolated-worker validation
+
+On 2026-07-30, the isolated C++ worker architecture completed the NVIDIA image-proc rosbag test on Thor. The launch started two processes:
+
+```text
+cosmos_inference_worker
+cosmos_reasoner
+```
+
+The worker initialized Cosmos-Reason2-8B once, accepted multiple IPC requests, completed both TensorRT optimization-profile transitions for every frame, and returned coherent warehouse-scene descriptions. The ROS process logged and published successful results.
+
+Observed inference durations with the long default prompt and 256-token generation limit were approximately:
+
+```text
+frame 1: 3.259 seconds
+frame 3: 5.913 seconds
+frame 5: 3.715 seconds
+```
+
+The variation primarily reflects output length; the IPC transport is not implicated. Multiple sequential successful requests also confirm that the worker keeps its engines and CUDA context persistent.
+
+This validates the core fix: keep ROS and its transitive native libraries out of the Edge-LLM process. Remaining production hardening includes removing temporary file-based image diagnostics, adding request deadlines, supervising/restarting the worker, and adding IPC protocol tests.
