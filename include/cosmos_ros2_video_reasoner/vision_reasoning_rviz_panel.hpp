@@ -23,6 +23,7 @@
 #include <QImage>
 #include <QLabel>
 #include <QLineEdit>
+#include <QSize>
 #include <QTextEdit>
 #include <QTimer>
 #include <QWidget>
@@ -77,6 +78,9 @@ private:
   std::optional<rclcpp::Time> latest_image_stamp_;
   std::deque<std::pair<rclcpp::Time, QImage>> image_cache_;
   static constexpr size_t kImageCacheLimit = 32;
+
+  std::optional<rclcpp::Time> displayed_result_stamp_;
+  QSize displayed_label_size_;
 };
 
 }  // namespace cosmos_ros2_video_reasoner

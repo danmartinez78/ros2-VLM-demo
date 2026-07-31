@@ -203,10 +203,21 @@ void VisionReasoningPanel::refresh_display()
 
   auto maybe_image = find_cached_image_for_stamp(latest_result->header.stamp);
   if (maybe_image.has_value()) {
-    image_label_->setPixmap(QPixmap::fromImage(maybe_image.value()).scaled(
-      image_label_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    const rclcpp::Time result_stamp(latest_result->header.stamp, RCL_ROS_TIME);
+    const QSize current_size = image_label_->size();
+    const bool stamp_changed = !displayed_result_stamp_.has_value() ||
+      displayed_result_stamp_.value() != result_stamp;
+    const bool size_changed = current_size != displayed_label_size_;
+
+    if (stamp_changed || size_changed) {
+      image_label_->setPixmap(QPixmap::fromImage(maybe_image.value()).scaled(
+        current_size, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+      displayed_result_stamp_ = result_stamp;
+      displayed_label_size_ = current_size;
+    }
     image_label_->setText("");
   } else {
+    displayed_result_stamp_ = std::nullopt;
     image_label_->setPixmap(QPixmap());
     image_label_->setText("No cached image for result stamp");
   }

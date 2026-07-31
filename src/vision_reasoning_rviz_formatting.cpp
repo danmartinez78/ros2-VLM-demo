@@ -66,7 +66,7 @@ ResultPresentation build_result_presentation(
           << "  latency_s=" << std::fixed << std::setprecision(3) << result->inference_seconds
           << "  age_s=" << std::fixed << std::setprecision(3) << age_seconds;
   if (stale_by_newer_image && latest_image_stamp.has_value()) {
-    details << "  newer_image_stamp=" << latest_image_stamp.value().seconds();
+    details << "  newer_image_stamp=" << format_stamp(latest_image_stamp.value().to_msg());
   }
   presentation.details_text = details.str();
   return presentation;

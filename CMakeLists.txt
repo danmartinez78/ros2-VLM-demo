@@ -225,10 +225,10 @@ if(pluginlib_FOUND AND rviz_common_FOUND AND Qt5_FOUND)
 endif()
 
 if(BUILD_RVIZ2_PANEL)
-  set(CMAKE_AUTOMOC ON)
   add_library(cosmos_reasoning_rviz_panel SHARED
     src/vision_reasoning_rviz_panel.cpp
   )
+  set_target_properties(cosmos_reasoning_rviz_panel PROPERTIES AUTOMOC ON)
   target_include_directories(cosmos_reasoning_rviz_panel PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
