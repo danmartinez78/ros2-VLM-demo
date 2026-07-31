@@ -27,16 +27,23 @@ if [[ ! -f "${ros_setup}" ]]; then
   echo "ROS 2 ${ros_distro} is not installed. Run scripts/install_dependencies.sh first." >&2
   exit 1
 fi
+# ROS-generated setup scripts may read optional variables without defaults.
+set +u
 # shellcheck disable=SC1090
 source "${ros_setup}"
+set -u
 
 if [[ -n "${ROS_WORKSPACE:-}" && -f "${ROS_WORKSPACE}/install/setup.bash" ]]; then
+  set +u
   # shellcheck disable=SC1090
   source "${ROS_WORKSPACE}/install/setup.bash"
+  set -u
 elif [[ -f "${repo_root}/../../install/setup.bash" ]]; then
   # Repository is normally checked out at <workspace>/src/<repo>.
+  set +u
   # shellcheck disable=SC1090
   source "${repo_root}/../../install/setup.bash"
+  set -u
 fi
 
 for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGIN_PATH; do
