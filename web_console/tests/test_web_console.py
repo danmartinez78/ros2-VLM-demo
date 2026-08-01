@@ -42,6 +42,7 @@ from web_console.server import (
     _validate_ros_params,
     _build_ros_env,
 )
+from web_console.__main__ import _parse_args, _is_loopback
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -924,6 +925,66 @@ class TestBuildRosEnv(unittest.TestCase):
     def test_inherits_existing_env(self):
         env = _build_ros_env({}, {})
         self.assertIn("PATH", env)
+
+
+
+
+# ── startup bind / warning tests ──────────────────────────────────────────────
+
+class TestStartupBind(unittest.TestCase):
+    """CPU-only tests for default loopback bind and non-loopback warning."""
+
+    def test_default_host_is_loopback(self):
+        """Parsing args with no --host flag must yield 127.0.0.1 (loopback)."""
+        args = _parse_args([])
+        self.assertEqual(args.host, "127.0.0.1")
+        self.assertTrue(_is_loopback(args.host))
+
+    def test_explicit_loopback_ipv4(self):
+        self.assertTrue(_is_loopback("127.0.0.1"))
+
+    def test_explicit_loopback_ipv6(self):
+        self.assertTrue(_is_loopback("::1"))
+
+    def test_localhost_hostname_is_loopback(self):
+        self.assertTrue(_is_loopback("localhost"))
+
+    def test_all_interfaces_is_not_loopback(self):
+        self.assertFalse(_is_loopback("0.0.0.0"))
+
+    def test_lan_ip_is_not_loopback(self):
+        self.assertFalse(_is_loopback("192.168.1.10"))
+
+    def test_non_loopback_warning_printed(self):
+        """main() must print a warning when --host is a non-loopback address."""
+        import io
+        from unittest.mock import patch as _patch
+
+        captured = io.StringIO()
+        # Patch serve_forever so the server does not actually start.
+        with _patch("web_console.server.ConsoleServer.serve_forever", return_value=None), \
+             _patch("sys.stdout", captured):
+            from web_console.__main__ import main
+            main(["--host", "0.0.0.0", "--port", "19999"])
+
+        output = captured.getvalue()
+        self.assertIn("WARNING", output)
+        self.assertIn("NO AUTHENTICATION", output)
+
+    def test_loopback_no_warning_printed(self):
+        """main() must NOT print a security warning when --host is loopback."""
+        import io
+        from unittest.mock import patch as _patch
+
+        captured = io.StringIO()
+        with _patch("web_console.server.ConsoleServer.serve_forever", return_value=None), \
+             _patch("sys.stdout", captured):
+            from web_console.__main__ import main
+            main(["--host", "127.0.0.1", "--port", "19998"])
+
+        output = captured.getvalue()
+        self.assertNotIn("WARNING", output)
+        self.assertNotIn("NO AUTHENTICATION", output)
 
 
 if __name__ == "__main__":

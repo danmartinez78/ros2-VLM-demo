@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import signal
 import sys
 import pathlib
@@ -49,8 +50,33 @@ def _parse_args(argv=None):
     return parser.parse_args(argv)
 
 
+def _is_loopback(host: str) -> bool:
+    """Return True if *host* resolves to a loopback address."""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Hostname — conservative: treat as non-loopback unless it is "localhost".
+        return host.lower() == "localhost"
+
+
 def main(argv=None) -> None:
     args = _parse_args(argv)
+
+    if not _is_loopback(args.host):
+        print(
+            "\n"
+            "╔══════════════════════════════════════════════════════════════════╗\n"
+            "║  WARNING: web_console is listening on a non-loopback interface  ║\n"
+            "║                                                                  ║\n"
+            "║  The console has NO AUTHENTICATION.  Any client that can reach  ║\n"
+            "║  this address can trigger inference and control ROS processes.   ║\n"
+            "║                                                                  ║\n"
+            "║  Restrict TCP port 8765 to the trusted LAN subnet via the host  ║\n"
+            "║  firewall (e.g. ufw or iptables).  Do NOT expose this port via  ║\n"
+            "║  router port-forwarding or on a public / shared network.        ║\n"
+            "╚══════════════════════════════════════════════════════════════════╝\n",
+            flush=True,
+        )
     config = {
         "socket_path": args.socket,
         "cli_path": args.cli,

@@ -69,6 +69,33 @@ the same tailnet at `http://100.x.y.z:8765/`.
 > use. There is no authentication. Do not expose it on a public or shared
 > network interface.
 
+### Trusted-LAN access
+
+For direct browser access from another machine on the same private network
+(e.g. a laptop on the same lab switch as the Jetson), bind to all interfaces:
+
+```bash
+python3 -m web_console --host 0.0.0.0 --port 8765
+# Then open http://<thor-lan-ip>:8765/ from the other machine.
+```
+
+When the configured host is not a loopback address, the console prints a
+conspicuous warning at startup reminding you that the API is unauthenticated.
+
+**Firewall guidance (Ubuntu / Jetson):**
+
+```bash
+# Allow access only from the trusted LAN subnet (replace with your subnet):
+sudo ufw allow from 192.168.1.0/24 to any port 8765 proto tcp
+sudo ufw deny 8765
+sudo ufw reload
+```
+
+> ⚠️ **Do not** open port 8765 through a router NAT rule or expose it on a
+> public or shared network interface. There is no authentication — any reachable
+> client can trigger inference requests and control ROS experiment processes.
+> `127.0.0.1` remains the recommended default for all single-machine use.
+
 ## Architecture and trust boundary
 
 ```

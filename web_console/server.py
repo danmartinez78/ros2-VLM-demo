@@ -2,8 +2,9 @@
 """
 HTTP server for the local web experiment console.
 
-Binds to 127.0.0.1 by default. Never exposes an unauthenticated
-process-control API on all interfaces.
+Binds to 127.0.0.1 by default. Passing ``--host 0.0.0.0`` (or any
+non-loopback address) exposes an unauthenticated process-control API on
+that interface; a conspicuous warning is printed at startup in that case.
 
 Routes
 ------
