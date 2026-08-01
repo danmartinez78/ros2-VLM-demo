@@ -22,12 +22,22 @@ def parse_records(text: str) -> list[dict]:
         sequence_match = re.search(r"^frame_sequence:\s*(\d+)\s*$", block, re.MULTILINE)
         response_match = re.search(r"^response:\s*(.*)$", block, re.MULTILINE)
         error_match = re.search(r"^error:\s*(.*)$", block, re.MULTILINE)
+        sec_match = re.search(r"^\s+sec:\s*(\d+)\s*$", block, re.MULTILINE)
+        nanosec_match = re.search(r"^\s+nanosec:\s*(\d+)\s*$", block, re.MULTILINE)
+        response = response_match.group(1).strip() if response_match else ""
+        source_timestamp_ns = None
+        if sec_match and nanosec_match:
+            source_timestamp_ns = (
+                int(sec_match.group(1)) * 1_000_000_000 + int(nanosec_match.group(1))
+            )
         records.append(
             {
                 "success": success_match.group(1) == "true",
                 "inference_seconds": float(latency_match.group(1)) if latency_match else None,
                 "frame_sequence": int(sequence_match.group(1)) if sequence_match else None,
-                "response": response_match.group(1).strip() if response_match else "",
+                "source_timestamp_ns": source_timestamp_ns,
+                "response": response,
+                "response_chars": len(response),
                 "error": error_match.group(1).strip() if error_match else "",
             }
         )
@@ -51,6 +61,8 @@ def summarize(records: list[dict]) -> dict:
         "responses": [
             {
                 "frame_sequence": record["frame_sequence"],
+                "source_timestamp_ns": record["source_timestamp_ns"],
+                "response_chars": record["response_chars"],
                 "response": record["response"],
             }
             for record in successful
