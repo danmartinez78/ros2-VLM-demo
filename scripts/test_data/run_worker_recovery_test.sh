@@ -40,7 +40,9 @@ client_timeout="${WORKER_REQUEST_TIMEOUT_SECONDS:-90}"
 
 launch_pid=""
 bag_pid=""
+result_echo_pid=""
 launch_log="$(mktemp /tmp/cosmos-recovery-launch.XXXXXX.log)"
+result_log="$(mktemp /tmp/cosmos-recovery-results.XXXXXX.log)"
 
 wait_for_process_exit() {
   local pid="$1"
@@ -60,6 +62,11 @@ test_sentinel="$(mktemp -u /tmp/cosmos-test-sentinel-XXXXXX.flag)"
 export COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL="${test_sentinel}"
 
 cleanup() {
+  if [[ -n "${result_echo_pid}" ]] && kill -0 "${result_echo_pid}" 2>/dev/null; then
+    kill -TERM "${result_echo_pid}" 2>/dev/null || true
+    wait_for_process_exit "${result_echo_pid}" 2 || kill -KILL "${result_echo_pid}" 2>/dev/null || true
+    wait "${result_echo_pid}" 2>/dev/null || true
+  fi
   if [[ -n "${bag_pid}" ]] && kill -0 "${bag_pid}" 2>/dev/null; then
     kill -INT "${bag_pid}" 2>/dev/null || true
     wait_for_process_exit "${bag_pid}" 3 || kill -TERM "${bag_pid}" 2>/dev/null || true
@@ -84,7 +91,7 @@ cleanup() {
     fi
     wait "${launch_pid}" 2>/dev/null || true
   fi
-  rm -f "${launch_log}" "${test_sentinel}"
+  rm -f "${launch_log}" "${result_log}" "${test_sentinel}"
 }
 trap cleanup EXIT INT TERM
 
@@ -191,26 +198,25 @@ wait_for_success_result() {
 }
 
 count_failure_results() {
-  # Count consecutive failed results before the first success.  Returns the
-  # count in the caller's "failure_count" variable.
+  # A single long-lived subscriber is started before playback. Poll its output
+  # so no result can be lost in gaps between repeated --once subscriptions.
   failure_count=0
-  # Overall bound: fail fast if no success arrives within 5 minutes.
   local deadline=$((SECONDS + 300))
-  local output=""
+  local observed_count=""
   while (( SECONDS < deadline )); do
-    output="$(mktemp /tmp/cosmos-recovery-count.XXXXXX)"
-    if timeout 30 ros2 topic echo "${result_topic}" --once >"${output}" 2>&1; then
-      if grep -q '^success: true$' "${output}"; then
-        cat "${output}"
-        rm -f "${output}"
-        return 0
-      fi
-      failure_count=$(( failure_count + 1 ))
+    observed_count="$(awk '
+      /^success: false$/ { failures++ }
+      /^success: true$/ { print failures + 0; exit }
+    ' "${result_log}")"
+    if [[ -n "${observed_count}" ]]; then
+      failure_count="${observed_count}"
+      awk '
+        { print }
+        /^success: true$/ { exit }
+      ' "${result_log}"
+      return 0
     fi
-    rm -f "${output}"
-    if (( failure_count >= 5 )); then
-      return 1   # more than expected — something is wrong
-    fi
+    sleep 0.5
   done
   echo "count_failure_results: overall 5-minute deadline exceeded." >&2
   return 1
@@ -290,6 +296,26 @@ while (( SECONDS < deadline )); do
 done
 if [[ "${ready}" != true ]]; then
   echo "Timed out waiting for the reasoner subscription." >&2
+  exit 1
+fi
+
+# Subscribe once for the whole recovery window. Repeated `topic echo --once`
+# calls leave discovery gaps and can miss the brief watchdog failure result.
+ros2 topic echo "${result_topic}" >"${result_log}" 2>&1 &
+result_echo_pid=$!
+
+result_subscriber_ready=false
+deadline=$((SECONDS + 30))
+while (( SECONDS < deadline )); do
+  if ros2 topic info "${result_topic}" 2>/dev/null \
+      | grep -Eq 'Subscription count: [1-9][0-9]*'; then
+    result_subscriber_ready=true
+    break
+  fi
+  sleep 0.5
+done
+if [[ "${result_subscriber_ready}" != true ]]; then
+  echo "Timed out waiting for the result-topic test subscriber." >&2
   exit 1
 fi
 
