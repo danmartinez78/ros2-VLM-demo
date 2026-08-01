@@ -21,6 +21,7 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -156,6 +157,12 @@ private:
     uint64_t success{0};
     uint64_t failure{0};
   } stats_;
+
+  // ── Benchmark output (optional) ───────────────────────────────────────────
+  // When benchmark_output_file is non-empty, per-frame timing JSON lines are
+  // written to this file. Disabled by default; no runtime overhead when empty.
+  std::string benchmark_output_file_;
+  std::unique_ptr<std::ofstream> benchmark_out_;
 };
 
 }  // namespace cosmos_ros2_video_reasoner
