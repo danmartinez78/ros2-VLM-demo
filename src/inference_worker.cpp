@@ -23,7 +23,21 @@
 namespace
 {
 volatile std::sig_atomic_t g_stop = 0;
-void stop_handler(int) {g_stop = 1;}
+volatile std::sig_atomic_t g_server_fd = -1;
+volatile std::sig_atomic_t g_client_fd = -1;
+
+void stop_handler(int)
+{
+  g_stop = 1;
+  if (g_client_fd >= 0) {
+    ::close(static_cast<int>(g_client_fd));
+    g_client_fd = -1;
+  }
+  if (g_server_fd >= 0) {
+    ::close(static_cast<int>(g_server_fd));
+    g_server_fd = -1;
+  }
+}
 }
 
 int main(int argc, char ** argv)
@@ -69,6 +83,7 @@ int main(int argc, char ** argv)
   ::unlink(socket_path.c_str());
 
   int server_fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  g_server_fd = server_fd;
   if (server_fd < 0) {
     std::cerr << "Could not create worker socket\n";
     return 3;
@@ -107,10 +122,20 @@ int main(int argc, char ** argv)
     const char * const test_sentinel_path =
       std::getenv("COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL");
 
-    int client_fd = ::accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC);
-    if (client_fd < 0) {throw std::runtime_error("worker accept failed");}
-
+    // The service outlives individual clients. This permits a CLI, experiment
+    // harness, and ROS adapter to connect sequentially without reloading engines.
     while (!g_stop) {
+      int client_fd = ::accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC);
+      if (client_fd < 0) {
+        if (g_stop || errno == EINTR || errno == EBADF) {
+          break;
+        }
+        throw std::runtime_error(
+                "worker accept failed: " + std::string(std::strerror(errno)));
+      }
+      g_client_fd = client_fd;
+
+      while (!g_stop) {
       cosmos_ros2_video_reasoner::ipc::RequestHeader header;
       try {
         cosmos_ros2_video_reasoner::ipc::read_all(client_fd, &header, sizeof(header));
@@ -263,16 +288,28 @@ int main(int argc, char ** argv)
       cosmos_ros2_video_reasoner::ipc::write_all(client_fd, result.text.data(), result.text.size());
       cosmos_ros2_video_reasoner::ipc::write_all(
         client_fd, result.error.data(), result.error.size());
+      }
+      ::close(client_fd);
+      g_client_fd = -1;
     }
-    ::close(client_fd);
   } catch (std::exception const & error) {
     std::cerr << "Inference worker failed: " << error.what() << '\n';
-    ::close(server_fd);
+    if (g_client_fd >= 0) {
+      ::close(static_cast<int>(g_client_fd));
+      g_client_fd = -1;
+    }
+    if (g_server_fd >= 0) {
+      ::close(static_cast<int>(g_server_fd));
+      g_server_fd = -1;
+    }
     ::unlink(socket_path.c_str());
     return 4;
   }
 
-  ::close(server_fd);
+  if (g_server_fd >= 0) {
+    ::close(static_cast<int>(g_server_fd));
+    g_server_fd = -1;
+  }
   ::unlink(socket_path.c_str());
   return 0;
 }
