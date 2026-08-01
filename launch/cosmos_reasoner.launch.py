@@ -124,7 +124,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'instruction_delivery_mode',
             default_value='inline',
-            description='Instruction delivery mode (currently only inline is supported)',
+            description='Instruction delivery mode: inline or structured',
         ),
         DeclareLaunchArgument(
             'observation_history_max_entries',
