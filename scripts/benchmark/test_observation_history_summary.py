@@ -16,6 +16,9 @@ class ObservationHistorySummaryTests(unittest.TestCase):
     def test_parses_success_failure_and_latency(self):
         records = MODULE.parse_records(
             """header:
+  stamp:
+    sec: 10
+    nanosec: 25
   frame_id: camera
 response: first observation
 inference_seconds: 1.5
@@ -45,6 +48,10 @@ error: ''
         self.assertEqual(summary["latency_seconds"]["mean"], 2.0)
         self.assertEqual(summary["latency_seconds"]["median"], 2.0)
         self.assertEqual(summary["errors"], ["worker unavailable"])
+        self.assertEqual(summary["responses"][0]["source_timestamp_ns"], 10_000_000_025)
+        self.assertEqual(
+            summary["responses"][0]["response_chars"], len("first observation")
+        )
 
     def test_empty_input_is_valid(self):
         summary = MODULE.summarize([])
