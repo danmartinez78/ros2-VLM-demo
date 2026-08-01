@@ -955,7 +955,16 @@ void CosmosReasonerNode::image_callback(
   const rclcpp::Time msg_time(msg->header.stamp, RCL_ROS_TIME);
   if (have_last_time_) {
     const double elapsed = (msg_time - last_sampled_time_).seconds();
-    if (elapsed < sample_period_seconds_) {
+    if (elapsed < 0.0) {
+      // rosbag --loop and simulation resets can move ROS time backwards.
+      // Treat the first frame in the new epoch as immediately due instead of
+      // rejecting every replayed frame until timestamps catch up.
+      RCLCPP_WARN(
+        this->get_logger(),
+        "Image timestamp moved backwards by %.3f s; resetting frame sampler.",
+        -elapsed);
+      have_last_time_ = false;
+    } else if (elapsed < sample_period_seconds_) {
       return;  // not yet due
     }
   }
