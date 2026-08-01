@@ -257,6 +257,30 @@ else()
     "cosmos_reasoning_rviz_panel.")
 endif()
 
+# ── IPC clients (hardware-independent) ──────────────────────────────────────
+# These targets never link TensorRT, CUDA, or Edge-LLM. Keeping them outside the
+# hardware condition lets CI compile the service contract and client tools.
+add_library(cosmos_ipc_backend STATIC src/ipc_inference_backend.cpp)
+target_include_directories(cosmos_ipc_backend PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(cosmos_ipc_backend ${OpenCV_LIBRARIES})
+
+add_executable(cosmos_reasoner src/main.cpp)
+target_include_directories(cosmos_reasoner PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(cosmos_reasoner
+  cosmos_ipc_backend
+  cosmos_reasoner_node)
+ament_target_dependencies(cosmos_reasoner rclcpp)
+
+add_executable(cosmos_reasoning_cli src/reasoning_cli.cpp)
+target_include_directories(cosmos_reasoning_cli PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(cosmos_reasoning_cli
+  cosmos_ipc_backend
+  ${OpenCV_LIBRARIES})
+
 # ── TensorRT backend library (hardware-dependent) ────────────────────────────
 if(BUILD_TENSORRT_BACKEND)
   add_library(cosmos_trt_backend SHARED
@@ -369,22 +393,7 @@ if(BUILD_TENSORRT_BACKEND)
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-  # ── ROS executable: IPC only, never links Edge-LLM ─────────────────────
-  add_library(cosmos_ipc_backend STATIC src/ipc_inference_backend.cpp)
-  target_include_directories(cosmos_ipc_backend PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>)
-  target_link_libraries(cosmos_ipc_backend ${OpenCV_LIBRARIES})
-
-  add_executable(cosmos_reasoner src/main.cpp)
-  target_include_directories(cosmos_reasoner PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(cosmos_reasoner
-    cosmos_ipc_backend
-    cosmos_reasoner_node)
-  ament_target_dependencies(cosmos_reasoner rclcpp)
-
-  install(TARGETS cosmos_trt_backend cosmos_reasoner cosmos_backend_direct_smoke cosmos_inference_worker cosmos_ipc_backend
+  install(TARGETS cosmos_trt_backend cosmos_backend_direct_smoke cosmos_inference_worker
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -402,6 +411,12 @@ else()
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
+install(TARGETS cosmos_reasoner cosmos_reasoning_cli cosmos_ipc_backend
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
 install(TARGETS cosmos_reasoner_node
   EXPORT cosmos_reasoner_nodeTargets
   ARCHIVE DESTINATION lib

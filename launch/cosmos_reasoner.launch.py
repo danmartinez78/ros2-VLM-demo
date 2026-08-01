@@ -18,6 +18,7 @@
 import os
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
+from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
@@ -55,6 +56,14 @@ def generate_launch_description() -> LaunchDescription:
             'worker_socket_path',
             default_value='/tmp/cosmos_edge_llm.sock',
             description='Unix-domain socket used by the isolated inference worker',
+        ),
+        DeclareLaunchArgument(
+            'start_worker',
+            default_value='true',
+            description=(
+                'Start and supervise the local inference worker. Set false to '
+                'connect the ROS adapter to an independently managed service.'
+            ),
         ),
         DeclareLaunchArgument(
             'worker_request_timeout_seconds',
@@ -232,6 +241,7 @@ def generate_launch_description() -> LaunchDescription:
             LaunchConfiguration('worker_inference_deadline_seconds'),
         ],
         output='screen',
+        condition=IfCondition(LaunchConfiguration('start_worker')),
         respawn=True,
         respawn_delay=2.0,
     )
