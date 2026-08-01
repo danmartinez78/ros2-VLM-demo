@@ -1,0 +1,174 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "ros_benchmark_result.schema.json",
+  "title": "ROS Pipeline Benchmark Result",
+  "description": "Machine-readable report from collect_ros_metrics.py. Contains per-frame timing records and aggregate statistics for the ROS pipeline overhead over a benchmark run.",
+  "type": "object",
+  "required": ["metadata", "aggregate", "frames"],
+  "additionalProperties": false,
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "description": "System, model, engine, token-budget, and ROS configuration metadata.",
+      "required": ["recorded_at"],
+      "properties": {
+        "recorded_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "ISO 8601 timestamp when the report was generated."
+        },
+        "hostname": {"type": ["string", "null"]},
+        "arch": {"type": ["string", "null"]},
+        "os": {"type": ["string", "null"]},
+        "os_release": {"type": ["string", "null"]},
+        "kernel": {"type": ["string", "null"]},
+        "l4t_release": {"type": ["string", "null"]},
+        "jetpack_version": {"type": ["string", "null"]},
+        "cuda_version": {"type": ["string", "null"]},
+        "cuda_driver_version": {"type": ["string", "null"]},
+        "tensorrt_version": {"type": ["string", "null"]},
+        "gpu_name": {"type": ["string", "null"]},
+        "gpu_compute_capability": {"type": ["string", "null"]},
+        "nvpmodel_mode": {"type": ["string", "null"]},
+        "jetson_clocks_active": {"type": ["boolean", "null"]},
+        "model_name": {"type": ["string", "null"]},
+        "quantization": {"type": ["string", "null"]},
+        "llm_engine_dir": {"type": ["string", "null"]},
+        "multimodal_engine_dir": {"type": ["string", "null"]},
+        "edge_llm_commit": {"type": ["string", "null"]},
+        "edge_llm_version_tag": {"type": ["string", "null"]},
+        "engine_config": {"description": "Contents of the engine config.json, if present."},
+        "task_profile": {"type": ["string", "null"]},
+        "prompt_version": {"type": ["string", "null"]},
+        "prompt_config_hash": {"type": ["string", "null"]},
+        "max_generate_length": {"type": ["integer", "null"]},
+        "sample_period_seconds": {"type": ["number", "null"]},
+        "image_max_width": {"type": ["integer", "null"]},
+        "jpeg_quality": {"type": ["integer", "null"]},
+        "drop_old_frames": {"type": ["boolean", "null"]},
+        "ros_distro": {"type": ["string", "null"]},
+        "image_topic": {"type": ["string", "null"]},
+        "warmup_frames": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of leading frames excluded from timing statistics."
+        },
+        "measured_frames": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Number of frames included in timing statistics."
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "description": "Aggregate statistics across measured frames (warmup excluded).",
+      "required": ["total_frames", "measured_frames", "successful_frames", "failed_frames"],
+      "properties": {
+        "total_frames": {"type": "integer", "minimum": 0},
+        "warmup_frames": {"type": "integer", "minimum": 0},
+        "measured_frames": {"type": "integer", "minimum": 0},
+        "successful_frames": {"type": "integer", "minimum": 0},
+        "failed_frames": {"type": "integer", "minimum": 0},
+        "total_dropped": {"type": ["integer", "null"], "minimum": 0},
+        "ready_to_first_frame_ms": {
+          "type": ["number", "null"],
+          "description": "Time from worker-ready to first frame dequeued (ms). Null when session_start record is absent."
+        },
+        "inference_ms": {"$ref": "#/definitions/timing_stats"},
+        "ros_overhead_ms": {"$ref": "#/definitions/timing_stats"},
+        "ipc_overhead_ms": {"$ref": "#/definitions/timing_stats"},
+        "image_convert_ms": {"$ref": "#/definitions/timing_stats"},
+        "publication_ms": {"$ref": "#/definitions/timing_stats"},
+        "total_worker_ms": {"$ref": "#/definitions/timing_stats"}
+      }
+    },
+    "frames": {
+      "type": "array",
+      "description": "Per-frame timing records (all frames including warmup).",
+      "items": {"$ref": "#/definitions/frame_record"}
+    }
+  },
+  "definitions": {
+    "timing_stats": {
+      "type": "object",
+      "description": "Statistical summary for a timing metric.",
+      "properties": {
+        "mean": {"type": ["number", "null"]},
+        "p50":  {"type": ["number", "null"]},
+        "p95":  {"type": ["number", "null"]},
+        "max":  {"type": ["number", "null"]},
+        "min":  {"type": ["number", "null"]}
+      }
+    },
+    "frame_record": {
+      "type": "object",
+      "required": ["frame_seq", "success", "inference_ms"],
+      "properties": {
+        "frame_seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based sampled-frame sequence number."
+        },
+        "image_stamp_ns": {
+          "type": "integer",
+          "description": "ROS image message header timestamp in nanoseconds."
+        },
+        "dequeue_wall_ns": {
+          "type": "integer",
+          "description": "Monotonic wall-clock nanoseconds when frame was dequeued from the bounded queue."
+        },
+        "convert_done_ns": {
+          "type": "integer",
+          "description": "Monotonic wall-clock nanoseconds after image format conversion and optional resize."
+        },
+        "infer_done_ns": {
+          "type": "integer",
+          "description": "Monotonic wall-clock nanoseconds after backend infer() returned (IPC round-trip complete)."
+        },
+        "publish_done_ns": {
+          "type": "integer",
+          "description": "Monotonic wall-clock nanoseconds after ROS result message published."
+        },
+        "inference_ms": {
+          "type": "number",
+          "description": "Native engine inference time in milliseconds, derived from inference_seconds reported by the TensorRT worker. NOT recomputed by this repository."
+        },
+        "image_convert_ms": {
+          "type": "number",
+          "description": "Time for image format conversion + optional resize (ms)."
+        },
+        "ipc_overhead_ms": {
+          "type": "number",
+          "minimum": 0,
+          "description": "IPC socket serialization overhead: total IPC round-trip minus native inference time (ms)."
+        },
+        "publication_ms": {
+          "type": "number",
+          "description": "Time from IPC response received to ROS message published (ms)."
+        },
+        "ros_overhead_ms": {
+          "type": "number",
+          "description": "Total ROS pipeline overhead: image_convert_ms + ipc_overhead_ms + publication_ms (ms)."
+        },
+        "total_worker_ms": {
+          "type": "number",
+          "description": "Total worker time: from frame dequeue to result published (ms)."
+        },
+        "success": {
+          "type": "boolean",
+          "description": "Whether inference succeeded for this frame."
+        },
+        "error": {
+          "type": "string",
+          "description": "Error message if success is false, empty string otherwise."
+        },
+        "dropped_before": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cumulative dropped-frame count at the time this frame was dequeued."
+        }
+      }
+    }
+  }
+}
