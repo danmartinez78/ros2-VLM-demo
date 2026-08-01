@@ -175,14 +175,67 @@ Cosmos Reason2 deployments and does not fail initialization.
 | Socket read/write fails | Current frame fails; client disconnects |
 | Replacement worker becomes ready | Next sampled frame reconnects |
 | Invalid response | Connection is discarded and frame fails |
-| Worker is alive but GPU call is wedged | ROS IPC deadline expires, but external termination is not yet automatic |
+| Worker is alive but GPU call is wedged | Worker-side watchdog fires after `worker_inference_deadline_seconds`; worker emits diagnostic and calls `std::_Exit`; client sees EOF and reports one error; launch respawns the worker |
 
 Crash recovery has been validated by killing the worker with `SIGKILL` during
 looping rosbag playback. The ROS node survived, launch created a new worker PID,
 and inference resumed.
 
-Active termination of a live-but-wedged worker is tracked in
-[issue #6](https://github.com/danmartinez78/ros2-VLM-demo/issues/6).
+## Watchdog recovery for a wedged worker
+
+When the TensorRT call inside the worker does not return within
+`worker_inference_deadline_seconds` (default 60 s), a watchdog thread:
+
+1. emits a structured diagnostic to `stderr`:
+   ```
+   [cosmos_inference_worker] WATCHDOG: inference deadline (60s) expired request_id=N; self-terminating for clean respawn
+   ```
+2. calls `std::_Exit(1)`, which bypasses **all** C++ destructors, `std::atexit`
+   handlers, and `std::at_quick_exit` handlers. The OS reclaims all file
+   descriptors immediately.
+
+The socket file is not removed by `_Exit`. The replacement worker calls
+`::unlink()` at startup before creating the new listener socket.
+
+### Process-termination primitive: `_Exit` vs `quick_exit`
+
+`std::_Exit` is used instead of `std::quick_exit` for two reasons:
+
+1. **`quick_exit` still invokes `at_quick_exit` handlers.** If the CUDA runtime
+   or TensorRT registers an `at_quick_exit` handler (which is permitted by the
+   SDK), that handler could attempt to tear down the wedged CUDA context and
+   block indefinitely — exactly the hang we are trying to escape.
+
+2. **`_Exit` provides a hard process boundary.** No third-party cleanup code
+   runs; the OS reclaims all resources atomically. This is the correct isolation
+   primitive when the only known-safe action is to exit and let the process
+   supervisor restart a fresh worker.
+
+### Deadline relationship
+
+```
+worker_inference_deadline_seconds  <  worker_request_timeout_seconds
+       (default: 60 s)                       (default: 90 s)
+```
+
+The 30-second gap gives the worker time to print the diagnostic and exit before
+the client-side `SO_RCVTIMEO` fires. When the worker exits cleanly, the client
+sees an EOF (`IPC peer closed`) rather than a socket timeout. Either error path
+closes the client connection; only one error is reported for the timed-out
+request, which is not automatically replayed.
+
+The deadline constraint is validated at two levels:
+- **Launch time**: `cosmos_reasoner.launch.py` raises a `RuntimeError` before
+  starting either process if `worker_inference_deadline_seconds >= worker_request_timeout_seconds`.
+- **Node startup**: `cosmos_reasoner` logs `FATAL` and exits if the constraint
+  is violated (defense-in-depth for non-launch invocations).
+
+### TensorRT Edge-LLM cancellation API
+
+The TensorRT Edge-LLM SDK in the pinned version does not expose a supported
+request-cancellation or in-flight deadline API for `LLMInferenceRuntime::handleRequest()`.
+Process termination via `_Exit` is therefore the isolation mechanism. This note
+should be revisited if a future SDK version adds cancellation support.
 
 ## Shutdown
 
@@ -193,6 +246,12 @@ frames, wakes its inference thread, and joins it before destruction.
 A CUDA call already executing in the worker may not respond promptly to a
 normal signal. Because it is a separate process, it can be escalated to
 `SIGKILL` without wedging ROS shutdown.
+
+If the worker self-terminates via the inference deadline watchdog, the socket
+file is left in place until the replacement worker removes it at startup.
+Launch respawns the worker after `respawn_delay` (default 2 s), then the
+replacement worker creates a new socket and becomes ready for the next sampled
+frame.
 
 ## Build boundaries
 
@@ -218,7 +277,6 @@ process boundary has not regressed.
 ## Known limitations and follow-ups
 
 - Independent frames rather than temporal video windows: issue #8.
-- No automatic watchdog termination for a live wedged worker: issue #6.
 - IPC protocol tests and a fake CPU worker: issue #13.
 - Formal latency/resource benchmarks: issue #7.
 - Model portability and measured optimization: issue #9.

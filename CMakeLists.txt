@@ -499,6 +499,25 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   target_link_libraries(test_ipc_inference_backend ${OpenCV_LIBRARIES})
+
+  # InferenceWatchdog component tests (no GPU, no TensorRT)
+  ament_add_gtest(test_inference_watchdog
+    test/test_inference_watchdog.cpp
+  )
+  target_include_directories(test_inference_watchdog PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  # Shell-level unit tests for the PID-match helpers and PGID isolation safety
+  # checks used in the worker-recovery hardware validation script.
+  # Runs without ROS, hardware, or network access.
+  find_program(BASH_EXECUTABLE bash REQUIRED)
+  ament_add_test(test_worker_recovery_helpers
+    COMMAND "${BASH_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/test_worker_recovery_helpers.sh"
+    TIMEOUT 30
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
 endif()
 
 ament_export_targets(cosmos_reasoner_nodeTargets HAS_LIBRARY_TARGET)

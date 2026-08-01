@@ -10,6 +10,11 @@ cosmos_reasoner:
     worker_socket_path: /tmp/cosmos_edge_llm.sock
     worker_connect_timeout_seconds: 120
     worker_request_timeout_seconds: 90
+    # Note: worker_inference_deadline_seconds (default 60 s) is a worker binary
+    # launch argument, not a ROS parameter.  Configure it via:
+    #   ros2 launch ... worker_inference_deadline_seconds:=60
+    # It must be less than worker_request_timeout_seconds so the worker self-
+    # terminates before the client-side SO_RCVTIMEO fires.
     result_topic: /cosmos/reasoning
 
     # ── Engine paths (REQUIRED on hardware — set absolute paths) ─────────────

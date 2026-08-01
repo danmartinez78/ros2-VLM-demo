@@ -523,3 +523,76 @@ TEST(IpcInferenceBackend, ReconnectsAfterWorkerRestart)
   EXPECT_EQ(second.text, "second");
   restarted_worker.join_and_rethrow();
 }
+
+// Simulates the watchdog recovery path matching production semantics:
+//   1. Worker reads the request, hangs for 1 s (the "worker-side deadline"),
+//      then closes the connection and exits — simulating InferenceWatchdog
+//      expiry and the resulting std::_Exit(1).
+//   2. The client sees an EOF (not a SO_RCVTIMEO timeout) because the worker
+//      exits within the 3-second client timeout.  Exactly one error is
+//      reported; the request is NOT replayed.
+//   3. A replacement worker becomes available on the same socket path.
+//   4. The client reconnects and succeeds without restarting cosmos_reasoner.
+//
+// Worker-side deadline (1 s) < client timeout (3 s) matches the production
+// relationship: worker_inference_deadline_seconds < worker_request_timeout_seconds.
+TEST(IpcInferenceBackend, TimesOutThenReconnectsAfterWorkerSelfTermination)
+{
+  std::string socket_path = make_socket_path();
+
+  IpcInferenceConfig config;
+  config.socket_path = socket_path;
+  config.connect_timeout_seconds = 3;
+  config.request_timeout_seconds = 3;   // client timeout > worker-side deadline
+
+  auto backend = std::make_unique<IpcInferenceBackend>(config);
+
+  // Worker 1: reads the request, waits 1 s (simulating the watchdog deadline
+  // expiring), then closes the connection and exits.  The client timeout (3 s)
+  // is intentionally longer so the client sees an EOF rather than a
+  // SO_RCVTIMEO error — matching production semantics.
+  {
+    OneClientWorker wedged_worker([](int client_fd) {
+      ipc::RequestHeader request_header;
+      std::vector<uint8_t> image;
+      std::string prompt;
+      read_request_frame(client_fd, request_header, image, prompt);
+      // Simulate the watchdog firing after its 1-second deadline: worker
+      // stops responding and closes the socket, giving the client a clean EOF.
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      // Worker exits here (OneClientWorker closes client_fd on return).
+    }, socket_path);
+
+    backend->initialize();
+
+    auto start = std::chrono::steady_clock::now();
+    // Client must receive exactly one error (EOF from the exited worker).
+    // The request is NOT replayed.
+    EXPECT_THROW(backend->infer(make_request("wedged")), std::runtime_error);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    // Must complete after the 1-second worker hang but well before the 3-second
+    // client timeout.
+    EXPECT_GT(elapsed, std::chrono::milliseconds(700));
+    EXPECT_LT(elapsed, std::chrono::milliseconds(2500));
+
+    wedged_worker.join_and_rethrow();
+  }
+  // Worker 1 has exited (socket unlinked by OneClientWorker destructor).
+
+  // Worker 2: replacement worker available immediately on the same path.
+  OneClientWorker replacement_worker([](int client_fd) {
+    ipc::RequestHeader request_header;
+    std::vector<uint8_t> image;
+    std::string prompt;
+    read_request_frame(client_fd, request_header, image, prompt);
+    send_success_response(client_fd, request_header.request_id, "recovered");
+  }, socket_path);
+
+  // Client must reconnect automatically and succeed without restarting
+  // cosmos_reasoner — exactly one successful result for the next request.
+  auto recovered = backend->infer(make_request("after recovery"));
+  EXPECT_TRUE(recovered.success);
+  EXPECT_EQ(recovered.text, "recovered");
+  replacement_worker.join_and_rethrow();
+}

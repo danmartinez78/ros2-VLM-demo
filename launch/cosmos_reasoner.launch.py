@@ -17,10 +17,29 @@
 
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from ament_index_python.packages import get_package_share_directory
+
+
+def _validate_deadline_constraint(context, *args, **kwargs):
+    """Fail fast if deadline >= client timeout — must validate before starting either process."""
+    deadline = int(
+        LaunchConfiguration('worker_inference_deadline_seconds').perform(context))
+    timeout = int(
+        LaunchConfiguration('worker_request_timeout_seconds').perform(context))
+    if deadline <= 0:
+        raise RuntimeError(
+            f'worker_inference_deadline_seconds ({deadline}) must be > 0.')
+    if deadline >= timeout:
+        raise RuntimeError(
+            f'worker_inference_deadline_seconds ({deadline}) must be less than '
+            f'worker_request_timeout_seconds ({timeout}). '
+            f'The gap allows the worker to exit cleanly before the client '
+            f'SO_RCVTIMEO fires, so the client sees a clean EOF rather than '
+            f'a socket-level timeout error.')
+    return []
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -40,7 +59,12 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             'worker_request_timeout_seconds',
             default_value='90',
-            description='Maximum seconds to wait for one worker response',
+            description='Maximum seconds to wait for one worker response (must exceed worker_inference_deadline_seconds)',
+        ),
+        DeclareLaunchArgument(
+            'worker_inference_deadline_seconds',
+            default_value='60',
+            description='Worker-side inference deadline; worker self-terminates on expiry for clean respawn (must be less than worker_request_timeout_seconds)',
         ),
         DeclareLaunchArgument(
             'image_topic',
@@ -170,6 +194,8 @@ def generate_launch_description() -> LaunchDescription:
                 'worker_socket_path': LaunchConfiguration('worker_socket_path'),
                 'worker_request_timeout_seconds': LaunchConfiguration(
                     'worker_request_timeout_seconds'),
+                'worker_inference_deadline_seconds': LaunchConfiguration(
+                    'worker_inference_deadline_seconds'),
                 'image_topic': LaunchConfiguration('image_topic'),
                 'result_topic': LaunchConfiguration('result_topic'),
                 'llm_engine_dir': LaunchConfiguration('llm_engine_dir'),
@@ -203,10 +229,11 @@ def generate_launch_description() -> LaunchDescription:
             LaunchConfiguration('edge_llm_plugin_path'),
             LaunchConfiguration('worker_socket_path'),
             LaunchConfiguration('jpeg_quality'),
+            LaunchConfiguration('worker_inference_deadline_seconds'),
         ],
         output='screen',
         respawn=True,
         respawn_delay=2.0,
     )
 
-    return LaunchDescription(args + [worker, cosmos_node])
+    return LaunchDescription(args + [OpaqueFunction(function=_validate_deadline_constraint), worker, cosmos_node])

@@ -1,17 +1,21 @@
 // Copyright 2025 cosmos_ros2_video_reasoner contributors
+#include "cosmos_ros2_video_reasoner/inference_watchdog.hpp"
 #include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
 #include "cosmos_ros2_video_reasoner/tensorrt_edge_llm_backend.hpp"
 
 #include <opencv2/core.hpp>
 
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -24,10 +28,10 @@ void stop_handler(int) {g_stop = 1;}
 
 int main(int argc, char ** argv)
 {
-  if (argc != 6) {
+  if (argc != 7) {
     std::cerr << "Usage: " << argv[0]
               << " <llm-engine-dir> <multimodal-engine-dir> <plugin-path> <socket-path>"
-              << " <jpeg-quality>\n";
+              << " <jpeg-quality> <inference-deadline-seconds>\n";
     return 2;
   }
 
@@ -41,6 +45,18 @@ int main(int argc, char ** argv)
   }
   if (jpeg_quality < 1 || jpeg_quality > 100) {
     std::cerr << "JPEG quality must be in [1, 100]\n";
+    return 2;
+  }
+
+  int inference_deadline_seconds = 0;
+  try {
+    inference_deadline_seconds = std::stoi(argv[6]);
+  } catch (std::exception const &) {
+    std::cerr << "inference-deadline-seconds must be a positive integer\n";
+    return 2;
+  }
+  if (inference_deadline_seconds <= 0) {
+    std::cerr << "inference-deadline-seconds must be > 0\n";
     return 2;
   }
   if (socket_path.size() >= sizeof(sockaddr_un::sun_path)) {
@@ -78,6 +94,18 @@ int main(int argc, char ** argv)
     cosmos_ros2_video_reasoner::TensorRTEdgeLLMBackend backend(config);
     backend.initialize();
     std::cout << "Cosmos inference worker ready on " << socket_path << std::endl;
+
+    // ── Test-only one-shot injected hang ─────────────────────────────────
+    // COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL names a sentinel file path.
+    // The first inference request will atomically create the sentinel and
+    // then sleep past the watchdog deadline so the watchdog fires and calls
+    // std::_Exit(1).  Subsequent workers find the sentinel already present
+    // and skip the hang, allowing normal inference to proceed.
+    //
+    // DISABLED by default (env var unset).  Set only for hardware recovery
+    // validation — never in production.
+    const char * const test_sentinel_path =
+      std::getenv("COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL");
 
     int client_fd = ::accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (client_fd < 0) {throw std::runtime_error("worker accept failed");}
@@ -126,13 +154,50 @@ int main(int argc, char ** argv)
       request.top_p = header.top_p;
       request.top_k = header.top_k;
 
-      cosmos_ros2_video_reasoner::InferenceResponse result;
-      try {
-        result = backend.infer(request);
-      } catch (std::exception const & error) {
-        result.success = false;
-        result.error = error.what();
+      // ── Test-only: check whether to inject a one-shot hang ───────────────
+      // O_CREAT|O_EXCL is atomic: only the first worker to process a request
+      // succeeds in creating the sentinel.  All later workers (or later
+      // requests from the same worker) find the file already present and
+      // proceed normally.  The sleep below exceeds the watchdog deadline so
+      // the watchdog fires and calls std::_Exit(1) before the sleep ends.
+      bool inject_hang = false;
+      if (test_sentinel_path != nullptr && *test_sentinel_path != '\0') {
+        int sfd = ::open(test_sentinel_path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (sfd >= 0) {
+          ::close(sfd);
+          inject_hang = true;
+        }
       }
+
+      // ── Worker-side inference deadline watchdog ──────────────────────────
+      // Guards the TensorRT call with a configurable deadline. If the call
+      // wedges past the deadline, the watchdog emits a diagnostic and calls
+      // std::_Exit(1) — see watchdog_exit_on_expire for the rationale for
+      // _Exit over quick_exit.
+      cosmos_ros2_video_reasoner::InferenceWatchdog watchdog(
+        inference_deadline_seconds, header.request_id,
+        cosmos_ros2_video_reasoner::watchdog_exit_on_expire);
+
+      cosmos_ros2_video_reasoner::InferenceResponse result;
+      if (inject_hang) {
+        // Intentionally sleep past the watchdog deadline so the watchdog
+        // fires and calls std::_Exit(1).  The sleep_for call is unreachable
+        // past _Exit(1) — the lines after are defensive dead code only.
+        std::this_thread::sleep_for(
+          std::chrono::seconds(inference_deadline_seconds + 30));
+        result.success = false;
+        result.error = "injected hang (unreachable after watchdog)";
+      } else {
+        try {
+          result = backend.infer(request);
+        } catch (std::exception const & error) {
+          result.success = false;
+          result.error = error.what();
+        }
+      }
+
+      // Signal the watchdog that inference completed within the deadline.
+      watchdog.cancel();
 
       if (result.text.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
         result.error.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)

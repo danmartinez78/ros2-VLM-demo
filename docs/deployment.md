@@ -215,8 +215,36 @@ bash scripts/test_data/run_worker_recovery_test.sh
 The final line should be:
 
 ```text
-PASS: worker respawned and reasoning resumed without restarting the ROS node.
+PASS: all 6 verifications passed — watchdog fires, worker PID changes, exactly
+      one failure published, reasoning resumes, cosmos_reasoner PID unchanged,
+      and no orphan worker or socket remains after shutdown.
 ```
+
+### Thor hardware validation: watchdog-triggered recovery (requires hardware)
+
+> **Requires Thor hardware to run. Validated Cosmos configuration reliably
+> exceeds the 1-second test deadline, making the watchdog fire deterministically
+> without injecting an artificial hang.**
+
+The script `scripts/test_data/run_worker_recovery_test.sh` runs the full
+end-to-end test automatically and verifies all six required properties.
+
+Manual recipe (same as the script):
+
+```bash
+# The 1-second deadline is shorter than any real Cosmos inference call on Thor.
+# worker_request_timeout_seconds (20 s) must exceed the deadline (1 s) — the
+# launch file validates this relationship and fails fast if it is violated.
+bash scripts/test_data/run_worker_recovery_test.sh
+```
+
+The script verifies:
+1. The `WATCHDOG: inference deadline` diagnostic appears in the launch log.
+2. The worker PID changes after launch respawns it.
+3. Exactly one failure result is published for the expired request.
+4. A successful reasoning result is received after the replacement worker starts.
+5. The `cosmos_reasoner` PID does not change (supervisor survives).
+6. No orphan worker process or socket file remains after shutdown.
 
 ## 8. Run a custom bag or camera
 
@@ -261,7 +289,7 @@ streams must be decoded to `sensor_msgs/msg/Image` first.
 | APT proposes removing JetPack/OpenCV packages | Cancel the transaction; do not downgrade NVIDIA OpenCV |
 | No results | Confirm the exact topic, raw encoding, subscriber count, and `--clock`/`use_sim_time` pairing |
 | Worker exits | Launch respawns it; one frame may fail before IPC reconnects |
-| Worker remains alive but wedged | Active watchdog is not implemented yet; see issue #6 |
+| Worker alive but wedged | Watchdog fires after `worker_inference_deadline_seconds` (default 60 s); worker self-terminates; launch respawns it; one error is published; reasoning resumes on next frame |
 
 For the full historical investigation, see
 [thor-edge-llm-prefill-stall-rca.md](thor-edge-llm-prefill-stall-rca.md).
