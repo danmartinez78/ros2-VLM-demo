@@ -39,9 +39,12 @@ done
 # ALLOWLIST_FRAGMENT is a substring of the file path that exempts the file.
 #
 RULES=(
-  # Generic env vars renamed to EDGE_VLM_*
-  "COSMOS_MODEL_NAME"
-  "COSMOS_WORKSPACE_DIR"
+  # Generic COSMOS_* env var family renamed to EDGE_VLM_* — allowlisted only in
+  # the migration section of deployment.md and the historical RCA document.
+  "COSMOS_|docs/deployment.md|docs/thor-edge-llm-prefill-stall-rca.md"
+
+  # Executable / ROS node name renamed from cosmos_reasoner to edge_vlm_ros_node
+  "cosmos_reasoner|docs/deployment.md|docs/thor-edge-llm-prefill-stall-rca.md"
 
   # Class renamed from CosmosReasonerNode to VlmReasonerNode
   "CosmosReasonerNode"
