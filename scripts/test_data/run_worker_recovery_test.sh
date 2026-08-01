@@ -408,7 +408,7 @@ fi
 echo "PASS (verification 6, socket): socket file removed after shutdown."
 
 echo ""
-echo "PASS: all 6 verifications passed — watchdog fires, worker PID changes, exactly"
-echo "      bounded failures published, reasoning resumes, cosmos_reasoner PID unchanged,"
+echo "PASS: all 6 verifications passed — watchdog fires, worker PID changes,"
+echo "      recovery failures stay bounded, reasoning resumes, cosmos_reasoner PID unchanged,"
 echo "      and no orphan worker or socket remains after shutdown."
 
