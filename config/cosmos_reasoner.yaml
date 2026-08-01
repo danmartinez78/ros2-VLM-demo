@@ -75,10 +75,10 @@ cosmos_reasoner:
     # Requires validation on Thor with the pinned TensorRT Edge-LLM version before
     # enabling.  Silently ignored when the runtime does not support caching.
     enable_system_prompt_cache: false
-    prompt_history_max_entries: 0
-    prompt_history_max_chars: 0
-    prompt_history_reset_policy: never
-    prompt_history_reset_interval_requests: 0
+    observation_history_max_entries: 0
+    observation_history_max_chars: 0
+    observation_history_reset_policy: never
+    observation_history_reset_interval_requests: 0
 
     # ── Sampling ──────────────────────────────────────────────────────────────
     # Time between frames sent for inference (uses ROS message timestamp,
