@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 #pragma once
 
 #include <chrono>
@@ -9,7 +9,7 @@
 #include <iostream>
 #include <thread>
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 /// Worker-side inference deadline watchdog.
@@ -98,7 +98,7 @@ private:
 inline void watchdog_exit_on_expire(int deadline_seconds, uint64_t request_id)
 {
   std::cerr
-    << "[cosmos_inference_worker] WATCHDOG: inference deadline ("
+    << "[edge_vlm_server] WATCHDOG: inference deadline ("
     << deadline_seconds << "s) expired"
     << " request_id=" << request_id
     << "; self-terminating for clean respawn\n";
@@ -106,4 +106,4 @@ inline void watchdog_exit_on_expire(int deadline_seconds, uint64_t request_id)
   std::_Exit(1);
 }
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

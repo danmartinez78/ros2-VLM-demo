@@ -17,10 +17,10 @@ set -Eeuo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 asset_root="${ROSBAG_DIR:-${repo_root}/test_data/rosbags}/image-proc"
-env_file="${COSMOS_ENV_FILE:-${repo_root}/scripts/cosmos_env.sh}"
+env_file="${EDGE_VLM_ENV_FILE:-${repo_root}/scripts/edge_vlm_env.sh}"
 image_topic="/hawk_0_left_rgb_image"
-result_topic="/cosmos/reasoning"
-worker_socket="${WORKER_SOCKET_PATH:-/tmp/cosmos_edge_llm.sock}"
+result_topic="/vlm/result"
+worker_socket="${WORKER_SOCKET_PATH:-/tmp/edge_vlm.sock}"
 playback_duration="${PLAYBACK_DURATION_SECONDS:-20}"
 result_timeout="${RESULT_TIMEOUT_SECONDS:-120}"
 max_generate_length="${MAX_GENERATE_LENGTH:-64}"
@@ -62,8 +62,8 @@ launch_pid=""
 bag_pid=""
 result_echo_pid=""
 test_passed=false
-launch_log="$(mktemp /tmp/cosmos-image-proc-launch.XXXXXX.log)"
-result_log="$(mktemp /tmp/cosmos-image-proc-results.XXXXXX.log)"
+launch_log="$(mktemp /tmp/edge-vlm-image-proc-launch.XXXXXX.log)"
+result_log="$(mktemp /tmp/edge-vlm-image-proc-results.XXXXXX.log)"
 
 wait_for_pid_exit() {
   local pid="$1"
@@ -158,7 +158,7 @@ elif [[ -f "${repo_root}/../../install/setup.bash" ]]; then
 fi
 set -u
 
-for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGIN_PATH; do
+for variable in EDGE_VLM_LLM_ENGINE_DIR EDGE_VLM_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGIN_PATH; do
   if [[ -z "${!variable:-}" ]]; then
     echo "Missing ${variable}; configure ${env_file} first." >&2
     exit 1
@@ -167,8 +167,8 @@ done
 
 # Refuse to attach assertions or automatic cleanup to an existing deployment.
 # Print process-group commands because killing only the worker may let ros2 launch respawn it.
-existing_reasoners="$(pgrep -f '/cosmos_reasoner($| )' 2>/dev/null || true)"
-existing_workers="$(pgrep -f '/cosmos_inference_worker($| )' 2>/dev/null || true)"
+existing_reasoners="$(pgrep -f '/edge_vlm_ros_node($| )' 2>/dev/null || true)"
+existing_workers="$(pgrep -f '/edge_vlm_server($| )' 2>/dev/null || true)"
 if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
   detected_pids="$(
     printf '%s\n%s\n' "${existing_reasoners}" "${existing_workers}" |
@@ -185,7 +185,7 @@ if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
       awk -v own="${own_pgid}" '$1 != 0 && $1 != own'
   )"
 
-  echo "Existing Cosmos deployment processes detected; stop them before testing." >&2
+  echo "Existing edge_vlm_ros deployment processes detected; stop them before testing." >&2
   ps -o pid,ppid,pgid,sid,etime,stat,cmd -p "${detected_pid_csv}" >&2 || true
   echo >&2
   echo "Run the following commands, then rerun this test:" >&2
@@ -208,13 +208,13 @@ if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
 fi
 if [[ -e "${worker_socket}" ]]; then
   echo "Stale worker socket exists: ${worker_socket}" >&2
-  echo "No Cosmos process was found. Remove the stale socket with:" >&2
+  echo "No edge_vlm_ros process was found. Remove the stale socket with:" >&2
   printf 'rm -f -- %q\n' "${worker_socket}" >&2
   test_passed=true
   exit 1
 fi
 
-echo "Starting Cosmos reasoner on ${image_topic}..."
+echo "Starting edge_vlm_ros reasoner on ${image_topic}..."
 echo "  playback duration:    ${playback_duration} s maximum"
 echo "  result timeout:       ${result_timeout} s"
 echo "  max generate length:  ${max_generate_length}"
@@ -225,8 +225,8 @@ echo "  observation history:  ${observation_history_max_entries} entries / ${obs
 launch_args=(
   image_topic:="${image_topic}"
   result_topic:="${result_topic}"
-  llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}"
-  multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}"
+  llm_engine_dir:="${EDGE_VLM_LLM_ENGINE_DIR}"
+  multimodal_engine_dir:="${EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
   edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}"
   max_generate_length:="${max_generate_length}"
   instruction_delivery_mode:="${instruction_delivery_mode}"
@@ -238,7 +238,7 @@ launch_args=(
 [[ -n "${test_prompt}" ]] && launch_args+=(prompt:="${test_prompt}")
 [[ -n "${benchmark_output_file}" ]] && launch_args+=(benchmark_output_file:="${benchmark_output_file}")
 
-setsid ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+setsid ros2 launch edge_vlm_ros edge_vlm.launch.py \
   "${launch_args[@]}" >"${launch_log}" 2>&1 &
 launch_pid=$!
 
@@ -247,7 +247,7 @@ ready=false
 deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
   if ! kill -0 "${launch_pid}" 2>/dev/null; then
-    echo "The Cosmos reasoner exited before playback started." >&2
+    echo "The edge_vlm_ros reasoner exited before playback started." >&2
     tail -40 "${launch_log}" >&2
     exit 1
   fi
@@ -297,7 +297,7 @@ while (( SECONDS < deadline )); do
     break
   fi
   if ! kill -0 "${launch_pid}" 2>/dev/null; then
-    echo "The Cosmos reasoner exited before producing the required successful results." >&2
+    echo "The edge_vlm_ros reasoner exited before producing the required successful results." >&2
     tail -40 "${launch_log}" >&2
     exit 1
   fi
@@ -341,8 +341,8 @@ manifest = {
     "bag_path": """${bag_path}""",
     "image_topic": """${image_topic}""",
     "result_topic": """${result_topic}""",
-    "llm_engine_dir": """${COSMOS_LLM_ENGINE_DIR}""",
-    "multimodal_engine_dir": """${COSMOS_MULTIMODAL_ENGINE_DIR}""",
+    "llm_engine_dir": """${EDGE_VLM_LLM_ENGINE_DIR}""",
+    "multimodal_engine_dir": """${EDGE_VLM_MULTIMODAL_ENGINE_DIR}""",
     "instruction_delivery_mode": """${instruction_delivery_mode}""",
     "observation_history_max_entries": int("""${observation_history_max_entries}"""),
     "observation_history_max_chars": int("""${observation_history_max_chars}"""),
@@ -361,7 +361,7 @@ test_passed=true
 cleanup
 trap - EXIT INT TERM
 
-orphan_workers="$(pgrep -f "cosmos_inference_worker.*${worker_socket}" 2>/dev/null || true)"
+orphan_workers="$(pgrep -f "edge_vlm_server.*${worker_socket}" 2>/dev/null || true)"
 if [[ -n "${orphan_workers}" ]]; then
   echo "FAIL: orphan inference worker(s) remain: ${orphan_workers}" >&2
   exit 1

@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,15 @@
 
 #include <rclcpp/rclcpp.hpp>
 
-#include "cosmos_ros2_video_reasoner/msg/vision_reasoning_result.hpp"
-#include "cosmos_ros2_video_reasoner/vision_reasoning_rviz_formatting.hpp"
+#include "edge_vlm_ros/msg/vlm_result.hpp"
+#include "edge_vlm_ros/vision_reasoning_rviz_formatting.hpp"
 
-using cosmos_ros2_video_reasoner::msg::VisionReasoningResult;
-using cosmos_ros2_video_reasoner::rviz::ResultState;
+using edge_vlm_ros::msg::VlmResult;
+using edge_vlm_ros::rviz::ResultState;
 
 TEST(RvizFormatting, NoResultShowsWaiting)
 {
-  auto presentation = cosmos_ros2_video_reasoner::rviz::build_result_presentation(
+  auto presentation = edge_vlm_ros::rviz::build_result_presentation(
     nullptr,
     std::nullopt,
     rclcpp::Time(10, 0, RCL_ROS_TIME),
@@ -38,13 +38,13 @@ TEST(RvizFormatting, NoResultShowsWaiting)
 
 TEST(RvizFormatting, RecentSuccessfulResultIsFresh)
 {
-  VisionReasoningResult result;
+  VlmResult result;
   result.header.stamp = rclcpp::Time(9, 500000000, RCL_ROS_TIME);
   result.success = true;
   result.frame_sequence = 5;
   result.inference_seconds = 0.75;
 
-  auto presentation = cosmos_ros2_video_reasoner::rviz::build_result_presentation(
+  auto presentation = edge_vlm_ros::rviz::build_result_presentation(
     &result,
     std::optional<rclcpp::Time>(rclcpp::Time(9, 500000000, RCL_ROS_TIME)),
     rclcpp::Time(10, 0, RCL_ROS_TIME),
@@ -56,11 +56,11 @@ TEST(RvizFormatting, RecentSuccessfulResultIsFresh)
 
 TEST(RvizFormatting, NewerImageMarksResultStale)
 {
-  VisionReasoningResult result;
+  VlmResult result;
   result.header.stamp = rclcpp::Time(8, 0, RCL_ROS_TIME);
   result.success = true;
 
-  auto presentation = cosmos_ros2_video_reasoner::rviz::build_result_presentation(
+  auto presentation = edge_vlm_ros::rviz::build_result_presentation(
     &result,
     std::optional<rclcpp::Time>(rclcpp::Time(9, 0, RCL_ROS_TIME)),
     rclcpp::Time(9, 0, RCL_ROS_TIME),
@@ -72,12 +72,12 @@ TEST(RvizFormatting, NewerImageMarksResultStale)
 
 TEST(RvizFormatting, FailedResultOverridesFreshness)
 {
-  VisionReasoningResult result;
+  VlmResult result;
   result.header.stamp = rclcpp::Time(9, 0, RCL_ROS_TIME);
   result.success = false;
   result.error = "backend failed";
 
-  auto presentation = cosmos_ros2_video_reasoner::rviz::build_result_presentation(
+  auto presentation = edge_vlm_ros::rviz::build_result_presentation(
     &result,
     std::optional<rclcpp::Time>(rclcpp::Time(9, 500000000, RCL_ROS_TIME)),
     rclcpp::Time(10, 0, RCL_ROS_TIME),

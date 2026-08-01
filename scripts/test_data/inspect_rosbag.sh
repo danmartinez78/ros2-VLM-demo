@@ -41,7 +41,7 @@ if [[ -n "${raw_topics}" ]]; then
   first_topic="$(head -n 1 <<<"${raw_topics}")"
   echo
   echo "Suggested test commands:"
-  echo "  ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py image_topic:=${first_topic} use_sim_time:=true"
+  echo "  ros2 launch edge_vlm_ros edge_vlm.launch.py image_topic:=${first_topic} use_sim_time:=true"
   printf '  ros2 bag play %q --clock\n' "${bag_path}"
 else
   echo "No sensor_msgs/msg/Image topic was found."

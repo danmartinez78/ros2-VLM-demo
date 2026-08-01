@@ -22,14 +22,14 @@ On a prepared Thor:
 
 ```bash
 cd "$HOME/ros2-VLM-demo"
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 
-SOCKET_PATH=/tmp/cosmos_edge_llm.sock
+SOCKET_PATH=/tmp/edge_vlm.sock
 
-"$ROS_WORKSPACE/install/cosmos_ros2_video_reasoner/lib/cosmos_ros2_video_reasoner/cosmos_inference_worker" \
-  "$COSMOS_LLM_ENGINE_DIR" \
-  "$COSMOS_MULTIMODAL_ENGINE_DIR" \
+"$ROS_WORKSPACE/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_server" \
+  "$EDGE_VLM_LLM_ENGINE_DIR" \
+  "$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
   "$EDGELLM_PLUGIN_PATH" \
   "$SOCKET_PATH" \
   90 \
@@ -50,8 +50,8 @@ In another terminal:
 ```bash
 source "$HOME/ros2_ws/install/setup.bash"
 
-"$HOME/ros2_ws/install/cosmos_ros2_video_reasoner/lib/cosmos_ros2_video_reasoner/cosmos_reasoning_cli" \
-  --socket /tmp/cosmos_edge_llm.sock \
+"$HOME/ros2_ws/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_cli" \
+  --socket /tmp/edge_vlm.sock \
   --image /absolute/path/to/image.jpg \
   --prompt "Describe the current scene concisely." \
   --max-generate-length 64
@@ -64,7 +64,7 @@ For a one-command Thor smoke test that starts the service, invokes two sequentia
 clients, verifies that the service PID remains unchanged, and cleans up:
 
 ```bash
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 bash scripts/test_data/run_standalone_service_smoke.sh /absolute/path/to/image.jpg
 ```
@@ -75,9 +75,9 @@ bash scripts/test_data/run_standalone_service_smoke.sh /absolute/path/to/image.j
 source /opt/ros/jazzy/setup.bash
 source "$HOME/ros2_ws/install/setup.bash"
 
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+ros2 launch edge_vlm_ros edge_vlm.launch.py \
   start_worker:=false \
-  worker_socket_path:=/tmp/cosmos_edge_llm.sock \
+  worker_socket_path:=/tmp/edge_vlm.sock \
   image_topic:=/camera/image_raw
 ```
 

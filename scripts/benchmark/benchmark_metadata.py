@@ -110,7 +110,7 @@ def collect_model_metadata(
 ) -> dict[str, Any]:
     """Return model/engine/token-budget configuration fields."""
     meta: dict[str, Any] = {
-        "model_name": model_name or os.environ.get("COSMOS_MODEL_NAME", ""),
+        "model_name": model_name or os.environ.get("EDGE_VLM_MODEL_NAME", ""),
         "quantization": quantization or "",
         "llm_engine_dir": llm_engine_dir,
         "multimodal_engine_dir": multimodal_engine_dir,

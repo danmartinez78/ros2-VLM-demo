@@ -1,7 +1,7 @@
 # Jetson AGX Thor deployment recipe
 
 This is the canonical deployment and validation recipe for
-`cosmos_ros2_video_reasoner` on NVIDIA Jetson AGX Thor.
+`edge_vlm_ros` on NVIDIA Jetson AGX Thor.
 
 ## Validated baseline
 
@@ -10,7 +10,7 @@ This is the canonical deployment and validation recipe for
 - CUDA 13.2
 - ROS 2 Jazzy
 - TensorRT Edge-LLM built on the target Thor for `sm_110a`
-- Cosmos-Reason2-8B NVFP4 engine bundle
+- Cosmos-Reason2-8B NVFP4 engine bundle (model-specific)
 
 Do not treat nearby JetPack, CUDA, TensorRT, or engine versions as binary
 compatible. TensorRT engines and CUDA-linked Edge-LLM artifacts should be built
@@ -142,13 +142,13 @@ If Docker group membership changes, log out and back in before continuing.
 
 ## 5. Configure paths
 
-The first setup run creates `scripts/cosmos_env.sh` from the tracked example.
+The first setup run creates `scripts/edge_vlm_env.sh` from the tracked example.
 Review it:
 
 ```bash
 cd "$HOME/ros2_ws/src/ros2-VLM-demo"
-cp -n scripts/cosmos_env.sh.example scripts/cosmos_env.sh
-${EDITOR:-nano} scripts/cosmos_env.sh
+cp -n scripts/edge_vlm_env.sh.example scripts/edge_vlm_env.sh
+${EDITOR:-nano} scripts/edge_vlm_env.sh
 ```
 
 A typical Thor configuration is:
@@ -159,10 +159,10 @@ export ROS_WORKSPACE="$HOME/ros2_ws"
 export TENSORRT_EDGE_LLM_ROOT="$HOME/TensorRT-Edge-LLM"
 export TENSORRT_EDGE_LLM_BUILD_DIR="$TENSORRT_EDGE_LLM_ROOT/build"
 export TRT_PACKAGE_DIR="/usr"
-export COSMOS_MODEL_NAME="Cosmos-Reason2-8B"
-export COSMOS_WORKSPACE_DIR="$HOME/tensorrt-edgellm-workspace"
-export COSMOS_LLM_ENGINE_DIR="$COSMOS_WORKSPACE_DIR/$COSMOS_MODEL_NAME/engine/llm"
-export COSMOS_MULTIMODAL_ENGINE_DIR="$COSMOS_WORKSPACE_DIR/$COSMOS_MODEL_NAME/engine"
+export EDGE_VLM_MODEL_NAME="Cosmos-Reason2-8B"
+export EDGE_VLM_WORKSPACE_DIR="$HOME/tensorrt-edgellm-workspace"
+export EDGE_VLM_LLM_ENGINE_DIR="$EDGE_VLM_WORKSPACE_DIR/$EDGE_VLM_MODEL_NAME/engine/llm"
+export EDGE_VLM_MULTIMODAL_ENGINE_DIR="$EDGE_VLM_WORKSPACE_DIR/$EDGE_VLM_MODEL_NAME/engine"
 export EDGELLM_PLUGIN_PATH="$TENSORRT_EDGE_LLM_BUILD_DIR/libNvInfer_edgellm_plugin.so"
 ```
 
@@ -170,7 +170,7 @@ export EDGELLM_PLUGIN_PATH="$TENSORRT_EDGE_LLM_BUILD_DIR/libNvInfer_edgellm_plug
 
 ```bash
 cd "$HOME/ros2_ws/src/ros2-VLM-demo"
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 bash scripts/build_workspace.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 bash scripts/verify_deployment.sh
@@ -183,7 +183,7 @@ Confirm Thor CUDA images if diagnosing architecture errors:
 
 ```bash
 /usr/local/cuda/bin/cuobjdump --list-elf \
-  "$ROS_WORKSPACE/install/cosmos_ros2_video_reasoner/lib/cosmos_ros2_video_reasoner/cosmos_inference_worker" \
+  "$ROS_WORKSPACE/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_server" \
   | grep -E 'sm_[0-9]+'
 ```
 
@@ -194,17 +194,17 @@ The Thor worker should include `sm_110a`. A stale `sm_75` image will fail with
 
 ```bash
 cd "$HOME/ros2_ws/src/ros2-VLM-demo"
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 bash scripts/test_data/run_image_proc_test.sh
 ```
 
 Expected behavior:
 
-1. launch starts `cosmos_inference_worker` and `cosmos_reasoner`;
+1. launch starts `edge_vlm_server` and `edge_vlm_ros_node`;
 2. the worker loads the LLM, tokenizer, and visual engine once;
 3. the bag publishes `/hawk_0_left_rgb_image`;
-4. the ROS process prints coherent results and publishes `/cosmos/reasoning`.
+4. the ROS process prints coherent results and publishes `/vlm/result`.
 
 Run the crash-recovery integration test:
 
@@ -216,7 +216,7 @@ The final line should be:
 
 ```text
 PASS: all 6 verifications passed — watchdog fires, worker PID changes, exactly
-      one failure published, reasoning resumes, cosmos_reasoner PID unchanged,
+      one failure published, reasoning resumes, edge_vlm_ros_node PID unchanged,
       and no orphan worker or socket remains after shutdown.
 ```
 
@@ -243,7 +243,7 @@ The script verifies:
 2. The worker PID changes after launch respawns it.
 3. Exactly one failure result is published for the expired request.
 4. A successful reasoning result is received after the replacement worker starts.
-5. The `cosmos_reasoner` PID does not change (supervisor survives).
+5. The `edge_vlm_ros_node` PID does not change (supervisor survives).
 6. No orphan worker process or socket file remains after shutdown.
 
 ## 8. Run a custom bag or camera
@@ -257,10 +257,10 @@ bash scripts/test_data/inspect_rosbag.sh /absolute/path/to/bag
 Start the pipeline:
 
 ```bash
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+ros2 launch edge_vlm_ros edge_vlm.launch.py \
   image_topic:=/actual/raw/image/topic \
-  llm_engine_dir:="$COSMOS_LLM_ENGINE_DIR" \
-  multimodal_engine_dir:="$COSMOS_MULTIMODAL_ENGINE_DIR" \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
   edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH" \
   use_sim_time:=true
 ```
@@ -293,3 +293,47 @@ streams must be decoded to `sensor_msgs/msg/Image` first.
 
 For the full historical investigation, see
 [thor-edge-llm-prefill-stall-rca.md](thor-edge-llm-prefill-stall-rca.md).
+
+## Migration from `cosmos_ros2_video_reasoner`
+
+This package was renamed from `cosmos_ros2_video_reasoner` to `edge_vlm_ros`.
+ROS package renames cannot safely reuse old colcon artifacts.
+
+Run these commands on an existing Thor checkout **before** rebuilding:
+
+```bash
+# Validate ROS_WORKSPACE before any recursive deletion.
+# It must be a non-empty absolute path that contains a src/ directory.
+if [[ -z "${ROS_WORKSPACE:-}" || "${ROS_WORKSPACE}" != /* || ! -d "${ROS_WORKSPACE}/src" ]]; then
+  echo "ERROR: ROS_WORKSPACE must be a non-empty absolute path to a ROS workspace" \
+       "(one that contains a src/ directory)." >&2
+  echo "       Got: '${ROS_WORKSPACE:-<unset>}'" >&2
+  exit 1
+fi
+
+# Remove stale colcon artifacts for the old and new package
+rm -rf "${ROS_WORKSPACE}/build/cosmos_ros2_video_reasoner"
+rm -rf "${ROS_WORKSPACE}/install/cosmos_ros2_video_reasoner"
+rm -rf "${ROS_WORKSPACE}/build/edge_vlm_ros"
+rm -rf "${ROS_WORKSPACE}/install/edge_vlm_ros"
+
+# Clear workspace logs (optional but recommended)
+rm -rf "${ROS_WORKSPACE}/log"
+
+# Rebuild — use build_workspace.sh so the required TensorRT CMake arguments
+# are preserved and rosdep dependencies are re-checked automatically.
+cd "${ROS_WORKSPACE}/src/ros2-VLM-demo"
+bash scripts/build_workspace.sh
+```
+
+Also rename your local environment file:
+
+```bash
+# If you have a customised env file from the old name, carry it over
+if [[ -f scripts/cosmos_env.sh && ! -f scripts/edge_vlm_env.sh ]]; then
+  cp scripts/cosmos_env.sh scripts/edge_vlm_env.sh
+fi
+```
+
+Update any `COSMOS_*` environment variables in your env file to the new
+`EDGE_VLM_*` equivalents (see `scripts/edge_vlm_env.sh.example`).

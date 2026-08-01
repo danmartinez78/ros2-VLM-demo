@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cosmos_ros2_video_reasoner/cosmos_reasoner_node.hpp"
+#include "edge_vlm_ros/vlm_reasoner_node.hpp"
 
 #include <chrono>
 #include <cstddef>
@@ -34,9 +34,9 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 
-#include "cosmos_ros2_video_reasoner/inference_backend.hpp"
+#include "edge_vlm_ros/inference_backend.hpp"
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 namespace
@@ -208,10 +208,10 @@ std::string fnv1a64_hex(const std::string & input)
 // Construction / destruction
 // ─────────────────────────────────────────────────────────────────────────────
 
-CosmosReasonerNode::CosmosReasonerNode(
+VlmReasonerNode::VlmReasonerNode(
   std::unique_ptr<InferenceBackend> backend,
   const rclcpp::NodeOptions & options)
-: rclcpp::Node("cosmos_reasoner", options),
+: rclcpp::Node("edge_vlm_ros_node", options),
   backend_(std::move(backend))
 {
   // Capture node initialisation start time before any heavyweight work.
@@ -232,7 +232,7 @@ CosmosReasonerNode::CosmosReasonerNode(
   try {
     // ── result publisher
     if (publish_results_) {
-      result_pub_ = this->create_publisher<msg::VisionReasoningResult>(result_topic, 10);
+      result_pub_ = this->create_publisher<msg::VlmResult>(result_topic, 10);
     }
 
     // ── image subscriber (QoS: best effort, depth 1)
@@ -284,7 +284,7 @@ CosmosReasonerNode::CosmosReasonerNode(
   }
 }
 
-CosmosReasonerNode::~CosmosReasonerNode()
+VlmReasonerNode::~VlmReasonerNode()
 {
   stop_worker();
 
@@ -312,7 +312,7 @@ CosmosReasonerNode::~CosmosReasonerNode()
 // Parameter declarations
 // ─────────────────────────────────────────────────────────────────────────────
 
-void CosmosReasonerNode::declare_parameters()
+void VlmReasonerNode::declare_parameters()
 {
   auto desc = [](const std::string & description) {
       rcl_interfaces::msg::ParameterDescriptor d;
@@ -325,8 +325,8 @@ void CosmosReasonerNode::declare_parameters()
     desc("Input image topic (sensor_msgs/msg/Image)"));
 
   this->declare_parameter(
-    "result_topic", "/cosmos/reasoning",
-    desc("Output result topic (VisionReasoningResult)"));
+    "result_topic", "/vlm/result",
+    desc("Output result topic (VlmResult)"));
 
   this->declare_parameter(
     "llm_engine_dir", "",
@@ -454,14 +454,14 @@ void CosmosReasonerNode::declare_parameters()
 
   this->declare_parameter(
     "publish_results", true,
-    desc("Publish VisionReasoningResult messages (disable for benchmark-only mode)"));
+    desc("Publish VlmResult messages (disable for benchmark-only mode)"));
 
   this->declare_parameter(
     "dump_profile", false,
     desc("Enable TensorRT Edge-LLM profiling output"));
 
   this->declare_parameter(
-    "profile_output_directory", "/tmp/cosmos_ros2_profiles",
+    "profile_output_directory", "/tmp/edge_vlm_ros_profiles",
     desc("Directory for profiling output files"));
 
   this->declare_parameter(
@@ -475,7 +475,7 @@ void CosmosReasonerNode::declare_parameters()
 // Parameter validation / caching
 // ─────────────────────────────────────────────────────────────────────────────
 
-void CosmosReasonerNode::validate_parameters()
+void VlmReasonerNode::validate_parameters()
 {
   sample_period_seconds_ = this->get_parameter("sample_period_seconds").as_double();
   if (sample_period_seconds_ <= 0.0) {
@@ -656,7 +656,7 @@ void CosmosReasonerNode::validate_parameters()
   }
 }
 
-void CosmosReasonerNode::validate_template_variables(
+void VlmReasonerNode::validate_template_variables(
   const std::string & name,
   const std::string & templ) const
 {
@@ -680,7 +680,7 @@ void CosmosReasonerNode::validate_template_variables(
   }
 }
 
-std::string CosmosReasonerNode::render_effective_prompt(
+std::string VlmReasonerNode::render_effective_prompt(
   uint64_t frame_seq,
   bool suppress_system_and_context) const
 {
@@ -711,7 +711,7 @@ std::string CosmosReasonerNode::render_effective_prompt(
   return render_template(active_prompt_template_, vars);
 }
 
-void CosmosReasonerNode::maybe_reset_observation_history_before_request()
+void VlmReasonerNode::maybe_reset_observation_history_before_request()
 {
   if (observation_history_.empty()) {
     return;
@@ -727,7 +727,7 @@ void CosmosReasonerNode::maybe_reset_observation_history_before_request()
   }
 }
 
-size_t CosmosReasonerNode::observation_history_size_chars() const
+size_t VlmReasonerNode::observation_history_size_chars() const
 {
   size_t total = 0;
   const bool structured = instruction_delivery_mode_ == "structured";
@@ -743,7 +743,7 @@ size_t CosmosReasonerNode::observation_history_size_chars() const
   return total;
 }
 
-void CosmosReasonerNode::update_observation_history_after_response(
+void VlmReasonerNode::update_observation_history_after_response(
   const InferenceResponse & resp, const std::string & user_text)
 {
   ++requests_since_observation_history_reset_;
@@ -776,7 +776,7 @@ void CosmosReasonerNode::update_observation_history_after_response(
 // Worker thread
 // ─────────────────────────────────────────────────────────────────────────────
 
-void CosmosReasonerNode::start_worker()
+void VlmReasonerNode::start_worker()
 {
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -784,7 +784,7 @@ void CosmosReasonerNode::start_worker()
     backend_init_complete_ = false;
     backend_init_error_ = nullptr;
   }
-  worker_thread_ = std::thread(&CosmosReasonerNode::worker_loop, this);
+  worker_thread_ = std::thread(&VlmReasonerNode::worker_loop, this);
 
   std::unique_lock<std::mutex> lock(queue_mutex_);
   backend_init_cv_.wait(lock, [this] {return backend_init_complete_;});
@@ -798,7 +798,7 @@ void CosmosReasonerNode::start_worker()
   }
 }
 
-void CosmosReasonerNode::stop_worker()
+void VlmReasonerNode::stop_worker()
 {
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -811,7 +811,7 @@ void CosmosReasonerNode::stop_worker()
   }
 }
 
-void CosmosReasonerNode::worker_loop()
+void VlmReasonerNode::worker_loop()
 {
   try {
     backend_->initialize();
@@ -992,7 +992,7 @@ void CosmosReasonerNode::worker_loop()
 // Image subscription callback
 // ─────────────────────────────────────────────────────────────────────────────
 
-void CosmosReasonerNode::image_callback(
+void VlmReasonerNode::image_callback(
   const sensor_msgs::msg::Image::ConstSharedPtr & msg)
 {
   ++stats_.received;
@@ -1041,7 +1041,7 @@ void CosmosReasonerNode::image_callback(
 // Result publication
 // ─────────────────────────────────────────────────────────────────────────────
 
-void CosmosReasonerNode::publish_result(
+void VlmReasonerNode::publish_result(
   const std_msgs::msg::Header & header,
   uint64_t frame_seq,
   const InferenceResponse & resp,
@@ -1051,7 +1051,7 @@ void CosmosReasonerNode::publish_result(
     return;
   }
 
-  msg::VisionReasoningResult out;
+  msg::VlmResult out;
   out.header = header;
   out.source_topic = source_topic_;
   out.task_profile = task_profile_;
@@ -1067,4 +1067,4 @@ void CosmosReasonerNode::publish_result(
   result_pub_->publish(out);
 }
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

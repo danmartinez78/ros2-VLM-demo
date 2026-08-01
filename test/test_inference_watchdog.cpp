@@ -1,8 +1,8 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 
 #include <gtest/gtest.h>
 
-#include "cosmos_ros2_video_reasoner/inference_watchdog.hpp"
+#include "edge_vlm_ros/inference_watchdog.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -12,7 +12,7 @@
 
 namespace
 {
-using cosmos_ros2_video_reasoner::InferenceWatchdog;
+using edge_vlm_ros::InferenceWatchdog;
 
 // Helper: build a custom expire handler that records the callback arguments
 // and signals a future without terminating the process.

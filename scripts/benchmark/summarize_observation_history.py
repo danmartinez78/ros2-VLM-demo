@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize ROS VisionReasoningResult output from an observation-history run."""
+"""Summarize ROS VlmResult output from an observation-history run."""
 
 from __future__ import annotations
 

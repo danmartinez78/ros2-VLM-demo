@@ -14,7 +14,7 @@ Build and source the current branch, then run:
 
 ```bash
 cd "$HOME/ros2-VLM-demo"
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 source "$HOME/ros2_ws/install/setup.bash"
 
 bash scripts/benchmark/run_observation_history_experiment.sh \
@@ -34,7 +34,7 @@ preflight refusal rather than being killed automatically.
 Each `history_N` directory contains:
 
 - `manifest.json`: commit, engine paths, bag path, and exact run configuration;
-- `results.log`: raw `VisionReasoningResult` messages;
+- `results.log`: raw `VlmResult` messages;
 - `result_summary.json`: success rate, latency summary, errors, and responses;
 - `benchmark.jsonl`: per-frame ROS pipeline timings;
 - `ros_metrics.json`: computed pipeline metrics;

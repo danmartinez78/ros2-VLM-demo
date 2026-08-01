@@ -2,9 +2,9 @@
 
 ## Purpose
 
-`cosmos_ros2_video_reasoner` connects a ROS 2 Jazzy raw-image topic to a
-persistent NVIDIA Cosmos Reason2 TensorRT Edge-LLM runtime on Jetson AGX Thor.
-It publishes a structured `VisionReasoningResult` for each sampled frame.
+`edge_vlm_ros` connects a ROS 2 Jazzy raw-image topic to a
+persistent TensorRT Edge-LLM runtime on Jetson AGX Thor.
+It publishes a structured `VlmResult` for each sampled frame.
 
 The production design uses two processes. This is a correctness requirement on
 the validated Thor stack, not merely a deployment preference.
@@ -15,7 +15,7 @@ the validated Thor stack, not merely a deployment preference.
 flowchart TD
     SOURCE[ROS bag or live camera] -->|sensor_msgs/Image| NODE
     subgraph RP[ROS process]
-      NODE[cosmos_reasoner]
+      NODE[edge_vlm_ros_node]
       QUEUE[Newest-frame queue]
       IPC[IpcInferenceBackend]
       NODE --> QUEUE --> IPC
@@ -24,15 +24,15 @@ flowchart TD
     CLI[ROS-free CLI] <-->|same IPC contract| SERVER
     EXPERIMENT[Evaluation harness] -.->|same IPC contract| SERVER
     subgraph GP[ROS-free GPU process]
-      SERVER[cosmos_inference_worker]
+      SERVER[edge_vlm_server]
       BACKEND[TensorRTEdgeLLMBackend]
       ENGINE[Persistent LLM and visual engines]
       SERVER --> BACKEND --> ENGINE
     end
-    NODE -->|VisionReasoningResult| RESULT[/cosmos/reasoning]
+    NODE -->|VlmResult| RESULT[/vlm/result]
 ```
 
-### `cosmos_reasoner`
+### `edge_vlm_ros_node`
 
 The ROS process:
 
@@ -45,9 +45,9 @@ The ROS process:
 - publishes results and failure information.
 
 It does not link CUDA, TensorRT, Edge-LLM, RMW-specific GPU code, or
-`libcosmos_trt_backend.so`.
+`libedge_vlm_trt_backend.so`.
 
-### `cosmos_inference_worker`
+### `edge_vlm_server`
 
 The worker process:
 
@@ -118,7 +118,7 @@ C++ ABIs into the production process is unnecessary and unsafe.
 
 ## IPC protocol
 
-The socket defaults to `/tmp/cosmos_edge_llm.sock`. Requests and responses use
+The socket defaults to `/tmp/edge_vlm.sock`. Requests and responses use
 fixed, trivially-copyable headers followed by bounded byte payloads.
 The current schema version is **2** (`kVersion = 2`).
 
@@ -164,13 +164,13 @@ Cache eligibility rules:
 - Multimodal (image-containing) system prompts are not cache-eligible.
 - The flag is **silently ignored** when the runtime or model does not support
   the feature.  Always falls back to uncached delivery.
-- Enable via `enable_system_prompt_cache: true` in `cosmos_reasoner.yaml`, only
+- Enable via `enable_system_prompt_cache: true` in `edge_vlm.yaml`, only
   valid together with `instruction_delivery_mode: structured`.
 
 > **Thor validation required**: System-prompt caching has not been benchmarked
 > on the validated Jetson AGX Thor stack.  Enable it only after measuring
 > cache-hit TTFT using NVIDIA native profiling and the methodology from
-> issue #7.  To measure: run `cosmos_inference_worker --benchmark-session` with
+> issue #7.  To measure: run `edge_vlm_server --benchmark-session` with
 > the cache enabled and disabled across a representative prompt set.
 
 ### Response
@@ -250,7 +250,7 @@ When the TensorRT call inside the worker does not return within
 
 1. emits a structured diagnostic to `stderr`:
    ```
-   [cosmos_inference_worker] WATCHDOG: inference deadline (60s) expired request_id=N; self-terminating for clean respawn
+   [edge_vlm_server] WATCHDOG: inference deadline (60s) expired request_id=N; self-terminating for clean respawn
    ```
 2. calls `std::_Exit(1)`, which bypasses **all** C++ destructors, `std::atexit`
    handlers, and `std::at_quick_exit` handlers. The OS reclaims all file
@@ -287,9 +287,9 @@ closes the client connection; only one error is reported for the timed-out
 request, which is not automatically replayed.
 
 The deadline constraint is validated at two levels:
-- **Launch time**: `cosmos_reasoner.launch.py` raises a `RuntimeError` before
+- **Launch time**: `edge_vlm.launch.py` raises a `RuntimeError` before
   starting either process if `worker_inference_deadline_seconds >= worker_request_timeout_seconds`.
-- **Node startup**: `cosmos_reasoner` logs `FATAL` and exits if the constraint
+- **Node startup**: `edge_vlm_ros_node` logs `FATAL` and exits if the constraint
   is violated (defense-in-depth for non-launch invocations).
 
 ### TensorRT Edge-LLM cancellation API
@@ -321,17 +321,17 @@ Production targets:
 
 | Target | Role |
 | --- | --- |
-| `cosmos_reasoner_node` | Hardware-independent ROS node library |
-| `cosmos_ipc_backend` | ROS-side Unix-socket client |
-| `cosmos_reasoner` | ROS executable; IPC only |
-| `cosmos_inference_worker` | ROS-free, direct-linked GPU executable |
+| `vlm_reasoner_node` | Hardware-independent ROS node library |
+| `edge_vlm_ipc_client` | ROS-side Unix-socket client |
+| `edge_vlm_ros_node` | ROS executable; IPC only |
+| `edge_vlm_server` | ROS-free, direct-linked GPU executable |
 
 Diagnostic targets retained for RCA and future compatibility work:
 
 | Target | Role |
 | --- | --- |
-| `cosmos_trt_backend` | Shared Edge-LLM backend that reproduced the failing boundary; not used by production launch |
-| `cosmos_backend_direct_smoke` | Standalone diagnostic for link and ROS-library-load experiments |
+| `edge_vlm_trt_backend` | Shared Edge-LLM backend that reproduced the failing boundary; not used by production launch |
+| `edge_vlm_backend_direct_smoke` | Standalone diagnostic for link and ROS-library-load experiments |
 
 Deployment verification checks dynamic dependencies to ensure the production
 process boundary has not regressed.

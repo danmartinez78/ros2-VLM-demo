@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(cosmos_ros2_video_reasoner LANGUAGES C CXX)
+project(edge_vlm_ros LANGUAGES C CXX)
 
 # ── C++ standard ─────────────────────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 20)
@@ -22,7 +22,7 @@ find_package(Qt5 QUIET COMPONENTS Core Gui Widgets)
 
 # ── Custom message ────────────────────────────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/VisionReasoningResult.msg"
+  "msg/VlmResult.msg"
   DEPENDENCIES std_msgs builtin_interfaces
 )
 
@@ -179,16 +179,16 @@ if(TENSORRT_EDGE_LLM_ROOT)
 endif()
 
 # ── Node library (hardware-independent) ──────────────────────────────────────
-add_library(cosmos_reasoner_node SHARED
-  src/cosmos_reasoner_node.cpp
+add_library(vlm_reasoner_node SHARED
+  src/vlm_reasoner_node.cpp
 )
 
-target_include_directories(cosmos_reasoner_node PUBLIC
+target_include_directories(vlm_reasoner_node PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 
-ament_target_dependencies(cosmos_reasoner_node
+ament_target_dependencies(vlm_reasoner_node
   rclcpp
   rcl_interfaces
   sensor_msgs
@@ -197,27 +197,27 @@ ament_target_dependencies(cosmos_reasoner_node
   image_transport
 )
 
-target_link_libraries(cosmos_reasoner_node
+target_link_libraries(vlm_reasoner_node
   ${OpenCV_LIBRARIES}
 )
 
 rosidl_get_typesupport_target(cpp_typesupport_target
   ${PROJECT_NAME} "rosidl_typesupport_cpp")
-target_link_libraries(cosmos_reasoner_node "${cpp_typesupport_target}")
+target_link_libraries(vlm_reasoner_node "${cpp_typesupport_target}")
 
-add_library(cosmos_reasoning_rviz_formatting SHARED
+add_library(edge_vlm_rviz_formatting SHARED
   src/vision_reasoning_rviz_formatting.cpp
 )
-target_include_directories(cosmos_reasoning_rviz_formatting PUBLIC
+target_include_directories(edge_vlm_rviz_formatting PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-ament_target_dependencies(cosmos_reasoning_rviz_formatting
+ament_target_dependencies(edge_vlm_rviz_formatting
   rclcpp
   std_msgs
   builtin_interfaces
 )
-target_link_libraries(cosmos_reasoning_rviz_formatting "${cpp_typesupport_target}")
+target_link_libraries(edge_vlm_rviz_formatting "${cpp_typesupport_target}")
 
 set(BUILD_RVIZ2_PANEL FALSE)
 if(pluginlib_FOUND AND rviz_common_FOUND AND Qt5_FOUND)
@@ -225,21 +225,21 @@ if(pluginlib_FOUND AND rviz_common_FOUND AND Qt5_FOUND)
 endif()
 
 if(BUILD_RVIZ2_PANEL)
-  add_library(cosmos_reasoning_rviz_panel SHARED
+  add_library(edge_vlm_rviz_panel SHARED
     src/vision_reasoning_rviz_panel.cpp
   )
-  set_target_properties(cosmos_reasoning_rviz_panel PROPERTIES AUTOMOC ON)
-  target_include_directories(cosmos_reasoning_rviz_panel PUBLIC
+  set_target_properties(edge_vlm_rviz_panel PROPERTIES AUTOMOC ON)
+  target_include_directories(edge_vlm_rviz_panel PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
   )
-  target_link_libraries(cosmos_reasoning_rviz_panel
-    cosmos_reasoning_rviz_formatting
+  target_link_libraries(edge_vlm_rviz_panel
+    edge_vlm_rviz_formatting
     Qt5::Core
     Qt5::Gui
     Qt5::Widgets
   )
-  ament_target_dependencies(cosmos_reasoning_rviz_panel
+  ament_target_dependencies(edge_vlm_rviz_panel
     pluginlib
     rclcpp
     rviz_common
@@ -247,47 +247,47 @@ if(BUILD_RVIZ2_PANEL)
     std_msgs
     builtin_interfaces
   )
-  target_link_libraries(cosmos_reasoning_rviz_panel "${cpp_typesupport_target}")
+  target_link_libraries(edge_vlm_rviz_panel "${cpp_typesupport_target}")
   pluginlib_export_plugin_description_file(
     rviz_common
     rviz/vision_reasoning_panel_plugins.xml)
 else()
   message(STATUS
     "RViz2 panel disabled. Install rviz_common + Qt5 + pluginlib to build "
-    "cosmos_reasoning_rviz_panel.")
+    "edge_vlm_rviz_panel.")
 endif()
 
 # ── IPC clients (hardware-independent) ──────────────────────────────────────
 # These targets never link TensorRT, CUDA, or Edge-LLM. Keeping them outside the
 # hardware condition lets CI compile the service contract and client tools.
-add_library(cosmos_ipc_backend STATIC src/ipc_inference_backend.cpp)
-target_include_directories(cosmos_ipc_backend PUBLIC
+add_library(edge_vlm_ipc_client STATIC src/ipc_inference_backend.cpp)
+target_include_directories(edge_vlm_ipc_client PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(cosmos_ipc_backend ${OpenCV_LIBRARIES})
+target_link_libraries(edge_vlm_ipc_client ${OpenCV_LIBRARIES})
 
-add_executable(cosmos_reasoner src/main.cpp)
-target_include_directories(cosmos_reasoner PRIVATE
+add_executable(edge_vlm_ros_node src/main.cpp)
+target_include_directories(edge_vlm_ros_node PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(cosmos_reasoner
-  cosmos_ipc_backend
-  cosmos_reasoner_node)
-ament_target_dependencies(cosmos_reasoner rclcpp)
+target_link_libraries(edge_vlm_ros_node
+  edge_vlm_ipc_client
+  vlm_reasoner_node)
+ament_target_dependencies(edge_vlm_ros_node rclcpp)
 
-add_executable(cosmos_reasoning_cli src/reasoning_cli.cpp)
-target_include_directories(cosmos_reasoning_cli PRIVATE
+add_executable(edge_vlm_cli src/reasoning_cli.cpp)
+target_include_directories(edge_vlm_cli PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(cosmos_reasoning_cli
-  cosmos_ipc_backend
+target_link_libraries(edge_vlm_cli
+  edge_vlm_ipc_client
   ${OpenCV_LIBRARIES})
 
 # ── TensorRT backend library (hardware-dependent) ────────────────────────────
 if(BUILD_TENSORRT_BACKEND)
-  add_library(cosmos_trt_backend SHARED
+  add_library(edge_vlm_trt_backend SHARED
     src/tensorrt_edge_llm_backend.cpp
   )
 
-  target_include_directories(cosmos_trt_backend PUBLIC
+  target_include_directories(edge_vlm_trt_backend PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
     ${TENSORRT_EDGE_LLM_ROOT}/cpp
@@ -299,8 +299,8 @@ if(BUILD_TENSORRT_BACKEND)
     ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
   )
 
-  target_link_libraries(cosmos_trt_backend
-    cosmos_reasoner_node
+  target_link_libraries(edge_vlm_trt_backend
+    vlm_reasoner_node
     ${EDGELLM_CORE_LIB}
     ${CUTE_DSL_STATIC_LIB}
     ${NVINFER_LIB}
@@ -311,26 +311,26 @@ if(BUILD_TENSORRT_BACKEND)
     ${OpenCV_LIBRARIES}
   )
 
-  ament_target_dependencies(cosmos_trt_backend rclcpp rcl_interfaces)
+  ament_target_dependencies(edge_vlm_trt_backend rclcpp rcl_interfaces)
   if(EXISTS "${CUTE_DSL_RUNTIME_LIB}")
-    target_link_libraries(cosmos_trt_backend
+    target_link_libraries(edge_vlm_trt_backend
       ${CUTE_DSL_RUNTIME_LIB})
   endif()
 
-  set_target_properties(cosmos_trt_backend PROPERTIES
+  set_target_properties(edge_vlm_trt_backend PROPERTIES
     CUDA_ARCHITECTURES "${TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
   # ── Direct-linked diagnostic executable ───────────────────────────────
   # Compiles the backend implementation into the final executable instead of
-  # consuming libcosmos_trt_backend.so. This isolates CUDA device-link and
+  # consuming libedge_vlm_trt_backend.so. This isolates CUDA device-link and
   # shared-library behavior from the backend implementation itself.
-  add_executable(cosmos_backend_direct_smoke
+  add_executable(edge_vlm_backend_direct_smoke
     src/backend_direct_smoke.cpp
     src/tensorrt_edge_llm_backend.cpp
   )
-  target_include_directories(cosmos_backend_direct_smoke PRIVATE
+  target_include_directories(edge_vlm_backend_direct_smoke PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TENSORRT_EDGE_LLM_ROOT}/cpp
     ${TENSORRT_EDGE_LLM_ROOT}/examples
@@ -340,8 +340,8 @@ if(BUILD_TENSORRT_BACKEND)
     ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/miniaudio
     ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
   )
-  ament_target_dependencies(cosmos_backend_direct_smoke rclcpp)
-  target_link_libraries(cosmos_backend_direct_smoke
+  ament_target_dependencies(edge_vlm_backend_direct_smoke rclcpp)
+  target_link_libraries(edge_vlm_backend_direct_smoke
     ${EDGELLM_CORE_LIB}
     ${CUTE_DSL_STATIC_LIB}
     ${NVINFER_LIB}
@@ -352,20 +352,20 @@ if(BUILD_TENSORRT_BACKEND)
     ${OpenCV_LIBRARIES}
   )
   if(EXISTS "${CUTE_DSL_RUNTIME_LIB}")
-    target_link_libraries(cosmos_backend_direct_smoke
+    target_link_libraries(edge_vlm_backend_direct_smoke
       ${CUTE_DSL_RUNTIME_LIB})
   endif()
-  set_target_properties(cosmos_backend_direct_smoke PROPERTIES
+  set_target_properties(edge_vlm_backend_direct_smoke PROPERTIES
     CUDA_ARCHITECTURES "${TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
   # ── ROS-free persistent inference worker ──────────────────────────────
-  add_executable(cosmos_inference_worker
+  add_executable(edge_vlm_server
     src/inference_worker.cpp
     src/tensorrt_edge_llm_backend.cpp
   )
-  target_include_directories(cosmos_inference_worker PRIVATE
+  target_include_directories(edge_vlm_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${TENSORRT_EDGE_LLM_ROOT}/cpp
     ${TENSORRT_EDGE_LLM_ROOT}/examples
@@ -375,7 +375,7 @@ if(BUILD_TENSORRT_BACKEND)
     ${TENSORRT_EDGE_LLM_ROOT}/3rdParty/miniaudio
     ${TENSORRT_EDGE_LLM_ROOT}/examples/multimodal
   )
-  target_link_libraries(cosmos_inference_worker
+  target_link_libraries(edge_vlm_server
     ${EDGELLM_CORE_LIB}
     ${CUTE_DSL_STATIC_LIB}
     ${NVINFER_LIB}
@@ -386,21 +386,21 @@ if(BUILD_TENSORRT_BACKEND)
     ${OpenCV_LIBRARIES}
   )
   if(EXISTS "${CUTE_DSL_RUNTIME_LIB}")
-    target_link_libraries(cosmos_inference_worker ${CUTE_DSL_RUNTIME_LIB})
+    target_link_libraries(edge_vlm_server ${CUTE_DSL_RUNTIME_LIB})
   endif()
-  set_target_properties(cosmos_inference_worker PROPERTIES
+  set_target_properties(edge_vlm_server PROPERTIES
     CUDA_ARCHITECTURES "${TENSORRT_EDGE_LLM_CUDA_ARCHITECTURES}"
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-  install(TARGETS cosmos_trt_backend cosmos_backend_direct_smoke cosmos_inference_worker
+  install(TARGETS edge_vlm_trt_backend edge_vlm_backend_direct_smoke edge_vlm_server
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 
   # Set RPATH so the plugin library is found at runtime without LD_LIBRARY_PATH
-  set_target_properties(cosmos_reasoner PROPERTIES
+  set_target_properties(edge_vlm_ros_node PROPERTIES
     INSTALL_RPATH_USE_LINK_PATH TRUE
     BUILD_RPATH_USE_ORIGIN TRUE
   )
@@ -411,27 +411,27 @@ else()
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install(TARGETS cosmos_reasoner cosmos_reasoning_cli cosmos_ipc_backend
+install(TARGETS edge_vlm_ros_node edge_vlm_cli edge_vlm_ipc_client
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
-install(TARGETS cosmos_reasoner_node
-  EXPORT cosmos_reasoner_nodeTargets
+install(TARGETS vlm_reasoner_node
+  EXPORT vlm_reasoner_nodeTargets
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
-install(TARGETS cosmos_reasoning_rviz_formatting
+install(TARGETS edge_vlm_rviz_formatting
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_RVIZ2_PANEL)
-  install(TARGETS cosmos_reasoning_rviz_panel
+  install(TARGETS edge_vlm_rviz_panel
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -468,7 +468,7 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
-  target_link_libraries(test_frame_sampling cosmos_reasoner_node)
+  target_link_libraries(test_frame_sampling vlm_reasoner_node)
   ament_target_dependencies(test_frame_sampling rclcpp sensor_msgs)
 
   # Node integration tests (no GPU)
@@ -479,7 +479,7 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
-  target_link_libraries(test_node cosmos_reasoner_node)
+  target_link_libraries(test_node vlm_reasoner_node)
   ament_target_dependencies(test_node rclcpp sensor_msgs)
 
   ament_add_gtest(test_rviz_formatting
@@ -489,7 +489,7 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
   target_link_libraries(test_rviz_formatting
-    cosmos_reasoning_rviz_formatting
+    edge_vlm_rviz_formatting
     "${cpp_typesupport_target}"
   )
   ament_target_dependencies(test_rviz_formatting rclcpp)
@@ -535,7 +535,7 @@ if(BUILD_TESTING)
   )
 endif()
 
-ament_export_targets(cosmos_reasoner_nodeTargets HAS_LIBRARY_TARGET)
+ament_export_targets(vlm_reasoner_nodeTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(
   rclcpp rcl_interfaces sensor_msgs std_msgs builtin_interfaces image_transport)
 ament_package()

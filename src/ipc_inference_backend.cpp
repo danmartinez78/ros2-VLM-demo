@@ -1,6 +1,6 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
-#include "cosmos_ros2_video_reasoner/ipc_inference_backend.hpp"
-#include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
+// Copyright 2025 edge_vlm_ros contributors
+#include "edge_vlm_ros/ipc_inference_backend.hpp"
+#include "edge_vlm_ros/ipc_protocol.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -14,7 +14,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 IpcInferenceBackend::IpcInferenceBackend(IpcInferenceConfig config)
 : config_(std::move(config))
@@ -190,4 +190,4 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   }
   return response;
 }
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

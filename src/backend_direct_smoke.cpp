@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cosmos_ros2_video_reasoner/tensorrt_edge_llm_backend.hpp"
+#include "edge_vlm_ros/tensorrt_edge_llm_backend.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -33,18 +33,18 @@ int main(int argc, char ** argv)
     return 2;
   }
 
-  const char * ros_mode = std::getenv("COSMOS_SMOKE_ROS_MODE");
+  const char * ros_mode = std::getenv("EDGE_VLM_SMOKE_ROS_MODE");
   const bool use_ros = ros_mode != nullptr;
   if (use_ros) {
     std::cout << "ROS mode: " << ros_mode << '\n';
     rclcpp::init(argc, argv);
     if (std::string(ros_mode) == "node") {
-      auto node = std::make_shared<rclcpp::Node>("cosmos_smoke_parameter_node");
+      auto node = std::make_shared<rclcpp::Node>("edge_vlm_smoke_parameter_node");
       std::cout << "Temporary ROS node constructed\n";
       node.reset();
       std::cout << "Temporary ROS node destroyed\n";
     } else if (std::string(ros_mode) != "init") {
-      std::cerr << "COSMOS_SMOKE_ROS_MODE must be 'init' or 'node'\n";
+      std::cerr << "EDGE_VLM_SMOKE_ROS_MODE must be 'init' or 'node'\n";
       rclcpp::shutdown();
       return 2;
     }
@@ -54,7 +54,7 @@ int main(int argc, char ** argv)
 
   auto run_backend = [&]() -> int {
     try {
-      cosmos_ros2_video_reasoner::TensorRTEdgeLLMConfig config;
+      edge_vlm_ros::TensorRTEdgeLLMConfig config;
       config.llm_engine_dir = argv[1];
       config.multimodal_engine_dir = argv[2];
       config.edge_llm_plugin_path = argv[3];
@@ -69,10 +69,10 @@ int main(int argc, char ** argv)
       std::cout << "Image: " << image.cols << "x" << image.rows << '\n';
       std::cout << "Initializing direct-linked backend...\n";
 
-      cosmos_ros2_video_reasoner::TensorRTEdgeLLMBackend backend(config);
+      edge_vlm_ros::TensorRTEdgeLLMBackend backend(config);
       backend.initialize();
 
-      cosmos_ros2_video_reasoner::InferenceRequest request;
+      edge_vlm_ros::InferenceRequest request;
       request.image = image;
       request.prompt = "Describe what you see in this image.";
       request.max_generate_length = 64;
@@ -98,7 +98,7 @@ int main(int argc, char ** argv)
   };
 
   int result = 5;
-  if (std::getenv("COSMOS_SMOKE_THREADED") == nullptr) {
+  if (std::getenv("EDGE_VLM_SMOKE_THREADED") == nullptr) {
     std::cout << "Execution mode: main thread\n";
     result = run_backend();
   } else {

@@ -5,7 +5,7 @@ Panels:
     Name: Help
   - Class: rviz_common/Views
     Name: Views
-  - Class: cosmos_ros2_video_reasoner/VisionReasoningPanel
+  - Class: edge_vlm_ros/VisionReasoningPanel
     Name: Vision Reasoning
 Visualization Manager:
   Class: ""

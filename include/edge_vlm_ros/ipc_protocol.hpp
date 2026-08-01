@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 #pragma once
 
 #include <cerrno>
@@ -12,9 +12,9 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace cosmos_ros2_video_reasoner::ipc
+namespace edge_vlm_ros::ipc
 {
-constexpr uint32_t kMagic = 0x434F534D;  // COSM
+constexpr uint32_t kMagic = 0x45564C4D;  // EVLM
 /// IPC schema version.
 /// v1: prompt_bytes only, single inline user message.
 /// v2: schema_flags, system_bytes, history_count — adds structured message roles.
@@ -113,4 +113,4 @@ inline void read_all(int fd, void * data, size_t size)
     size -= static_cast<size_t>(received);
   }
 }
-}  // namespace cosmos_ros2_video_reasoner::ipc
+}  // namespace edge_vlm_ros::ipc

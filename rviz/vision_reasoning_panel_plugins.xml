@@ -1,10 +1,10 @@
-<library path="cosmos_reasoning_rviz_panel">
+<library path="edge_vlm_rviz_panel">
   <class
-    type="cosmos_ros2_video_reasoner::VisionReasoningPanel"
+    type="edge_vlm_ros::VisionReasoningPanel"
     base_class_type="rviz_common::Panel"
-    name="cosmos_ros2_video_reasoner/VisionReasoningPanel">
+    name="edge_vlm_ros/VisionReasoningPanel">
     <description>
-      Displays VisionReasoningResult messages with their matching source image,
+      Displays VlmResult messages with their matching source image,
       prompt/response text, and stale/failure state.
     </description>
   </class>

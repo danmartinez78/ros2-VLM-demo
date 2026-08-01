@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 /// A single prior conversation turn carried through IPC into native message structures.
@@ -89,4 +89,4 @@ public:
   virtual InferenceResponse infer(const InferenceRequest & request) = 0;
 };
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

@@ -2,7 +2,7 @@
 """
 Compute ROS pipeline overhead metrics from per-frame timing records.
 
-Reads the JSON-Lines file written by cosmos_reasoner when the
+Reads the JSON-Lines file written by edge_vlm_ros_node when the
 `benchmark_output_file` parameter is set, then computes and reports:
 
   - Per-frame: queue delay, image-convert time, IPC/encoding overhead, native
@@ -21,7 +21,7 @@ Timing breakdown per frame
 
 Cold-start reference
 ────────────────────
-  node_init_wall_ns    : captured at start of CosmosReasonerNode constructor
+  node_init_wall_ns    : captured at start of VlmReasonerNode constructor
   worker_ready_wall_ns : captured after backend.initialize() completes
   ready_to_first_frame_ms : worker_ready → first dequeue (pipeline latency after readiness)
   backend_init_ms      : node_init → worker_ready (backend initialisation cost)
@@ -32,7 +32,7 @@ TensorRT worker — it is NOT recomputed here.
 Usage
 -----
   python3 collect_ros_metrics.py \\
-      --input /tmp/cosmos_bench.jsonl \\
+      --input /tmp/edge_vlm_bench.jsonl \\
       --metadata metadata.json \\
       --warmup 3 \\
       --output ros_report.json \\
@@ -319,7 +319,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--input", required=True, type=Path,
-        help="JSONL file written by cosmos_reasoner benchmark_output_file parameter"
+        help="JSONL file written by edge_vlm_ros_node benchmark_output_file parameter"
     )
     parser.add_argument(
         "--metadata", type=Path, default=None,

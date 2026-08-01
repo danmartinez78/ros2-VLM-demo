@@ -1,13 +1,13 @@
-# cosmos_ros2_video_reasoner — default parameters
+# edge_vlm_ros — default parameters
 #
 # Copy to your workspace or override via launch arguments.
 # All path parameters must be absolute (~ is not expanded by rclcpp::Node).
 
-cosmos_reasoner:
+edge_vlm_ros_node:
   ros__parameters:
     # ── Topics ────────────────────────────────────────────────────────────────
     image_topic: /camera/image_raw
-    worker_socket_path: /tmp/cosmos_edge_llm.sock
+    worker_socket_path: /tmp/edge_vlm.sock
     worker_connect_timeout_seconds: 120
     worker_request_timeout_seconds: 90
     # Note: worker_inference_deadline_seconds (default 60 s) is a worker binary
@@ -15,7 +15,7 @@ cosmos_reasoner:
     #   ros2 launch ... worker_inference_deadline_seconds:=60
     # It must be less than worker_request_timeout_seconds so the worker self-
     # terminates before the client-side SO_RCVTIMEO fires.
-    result_topic: /cosmos/reasoning
+    result_topic: /vlm/result
 
     # ── Engine paths (REQUIRED on hardware — set absolute paths) ─────────────
     # Example:
@@ -104,4 +104,4 @@ cosmos_reasoner:
 
     # ── Profiling (developer option) ──────────────────────────────────────────
     dump_profile: false
-    profile_output_directory: /tmp/cosmos_ros2_profiles
+    profile_output_directory: /tmp/edge_vlm_ros_profiles

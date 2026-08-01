@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Copyright 2025 cosmos_ros2_video_reasoner contributors
+# Copyright 2025 edge_vlm_ros contributors
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Launch cosmos_reasoner with configurable engine paths and topics."""
+"""Launch edge_vlm_ros with configurable engine paths and topics."""
 
 import os
 from launch import LaunchDescription
@@ -44,17 +44,17 @@ def _validate_deadline_constraint(context, *args, **kwargs):
 
 
 def generate_launch_description() -> LaunchDescription:
-    pkg_share = get_package_share_directory('cosmos_ros2_video_reasoner')
-    default_config = os.path.join(pkg_share, 'config', 'cosmos_reasoner.yaml')
+    pkg_share = get_package_share_directory('edge_vlm_ros')
+    default_config = os.path.join(pkg_share, 'config', 'edge_vlm.yaml')
     package_prefix = os.path.dirname(os.path.dirname(pkg_share))
     worker_executable = os.path.join(
-        package_prefix, 'lib', 'cosmos_ros2_video_reasoner', 'cosmos_inference_worker')
+        package_prefix, 'lib', 'edge_vlm_ros', 'edge_vlm_server')
 
     # ── Launch arguments ──────────────────────────────────────────────────────
     args = [
         DeclareLaunchArgument(
             'worker_socket_path',
-            default_value='/tmp/cosmos_edge_llm.sock',
+            default_value='/tmp/edge_vlm.sock',
             description='Unix-domain socket used by the isolated inference worker',
         ),
         DeclareLaunchArgument(
@@ -82,8 +82,8 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             'result_topic',
-            default_value='/cosmos/reasoning',
-            description='Output result topic (VisionReasoningResult)',
+            default_value='/vlm/result',
+            description='Output result topic (VlmResult)',
         ),
         DeclareLaunchArgument(
             'llm_engine_dir',
@@ -191,10 +191,10 @@ def generate_launch_description() -> LaunchDescription:
     ]
 
     # ── Node ──────────────────────────────────────────────────────────────────
-    cosmos_node = Node(
-        package='cosmos_ros2_video_reasoner',
-        executable='cosmos_reasoner',
-        name='cosmos_reasoner',
+    vlm_node = Node(
+        package='edge_vlm_ros',
+        executable='edge_vlm_ros_node',
+        name='edge_vlm_ros_node',
         output='screen',
         parameters=[
             default_config,
@@ -246,4 +246,4 @@ def generate_launch_description() -> LaunchDescription:
         respawn_delay=2.0,
     )
 
-    return LaunchDescription(args + [OpaqueFunction(function=_validate_deadline_constraint), worker, cosmos_node])
+    return LaunchDescription(args + [OpaqueFunction(function=_validate_deadline_constraint), worker, vlm_node])

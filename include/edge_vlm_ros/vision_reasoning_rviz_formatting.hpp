@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,9 @@
 
 #include <rclcpp/rclcpp.hpp>
 
-#include "cosmos_ros2_video_reasoner/msg/vision_reasoning_result.hpp"
+#include "edge_vlm_ros/msg/vlm_result.hpp"
 
-namespace cosmos_ros2_video_reasoner::rviz
+namespace edge_vlm_ros::rviz
 {
 
 enum class ResultState
@@ -43,9 +43,9 @@ std::string format_stamp(const builtin_interfaces::msg::Time & stamp);
 std::string format_stamp(const rclcpp::Time & stamp);
 
 ResultPresentation build_result_presentation(
-  const msg::VisionReasoningResult * result,
+  const msg::VlmResult * result,
   const std::optional<rclcpp::Time> & latest_image_stamp,
   const rclcpp::Time & now,
   double stale_after_seconds);
 
-}  // namespace cosmos_ros2_video_reasoner::rviz
+}  // namespace edge_vlm_ros::rviz

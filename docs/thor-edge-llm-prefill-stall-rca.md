@@ -22,9 +22,9 @@ Two independent integration problems were found:
 The supported fix separates the system into two native processes:
 
 ```text
-cosmos_reasoner          ROS 2 only
+edge_vlm_ros_node          ROS 2 only
         <-> bounded Unix-domain socket
-cosmos_inference_worker  ROS-free, direct-linked TensorRT Edge-LLM
+edge_vlm_server  ROS-free, direct-linked TensorRT Edge-LLM
 ```
 
 This architecture completed repeated rosbag inference, retained in-memory
@@ -184,7 +184,7 @@ action head, and image reasoning completes without it.
 
 ## Production fix
 
-Production launch starts `cosmos_reasoner` and `cosmos_inference_worker`.
+Production launch starts `edge_vlm_ros_node` and `edge_vlm_server`.
 
 The ROS process:
 
@@ -192,7 +192,7 @@ The ROS process:
 - maintains a newest-frame queue of depth one;
 - converts raw ROS images to packed BGR8;
 - sends bounded requests over a Unix socket;
-- publishes `VisionReasoningResult`.
+- publishes `VlmResult`.
 
 The GPU worker:
 
@@ -232,11 +232,11 @@ output length; these observations are not a formal benchmark.
 IPC writes use `send(..., MSG_NOSIGNAL)`. The automated recovery test:
 
 1. obtained a successful result;
-2. killed `cosmos_inference_worker` with `SIGKILL`;
+2. killed `edge_vlm_server` with `SIGKILL`;
 3. observed launch create a worker with a new PID;
 4. allowed the current frame to fail without replay;
 5. reconnected on a subsequent frame;
-6. received successful results without restarting `cosmos_reasoner`.
+6. received successful results without restarting `edge_vlm_ros_node`.
 
 Post-recovery requests with a 64-token limit completed in approximately:
 

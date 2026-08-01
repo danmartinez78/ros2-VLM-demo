@@ -1,8 +1,9 @@
-# cosmos_ros2_video_reasoner
+# edge_vlm_ros
 
 ROS 2 Jazzy pipeline for NVIDIA Jetson AGX Thor that samples raw camera frames,
-runs NVIDIA Cosmos Reason2 through TensorRT Edge-LLM, and publishes structured
-vision-reasoning results.
+runs a TensorRT Edge-LLM VLM through a model-neutral IPC worker, and publishes
+structured vision-language results. Validated model configurations include
+NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
 The hardware path has been validated on JetPack 7.2 / Jetson Linux R39.2 with a
 Cosmos-Reason2-8B NVFP4 engine and an NVIDIA Isaac ROS image-proc rosbag.
@@ -11,13 +12,13 @@ Cosmos-Reason2-8B NVFP4 engine and an NVIDIA Isaac ROS image-proc rosbag.
 
 ```mermaid
 flowchart LR
-    CAMERA[ROS bag or camera] -->|sensor_msgs/Image| ROS[cosmos_reasoner]
+    CAMERA[ROS bag or camera] -->|sensor_msgs/Image| ROS[edge_vlm_ros_node]
     ROS -->|bounded BGR8 IPC| IPC[(Unix socket)]
-    IPC --> WORKER[cosmos_inference_worker]
+    IPC --> WORKER[edge_vlm_server]
     WORKER -->|in-memory JPEG| TRT[TensorRT Edge-LLM]
     TRT --> WORKER
     WORKER --> IPC
-    ROS -->|VisionReasoningResult| RESULT[/cosmos/reasoning]
+    ROS -->|VlmResult| RESULT[/vlm/result]
 ```
 
 The ROS and GPU runtimes intentionally run in separate processes. Loading ROS
@@ -70,13 +71,13 @@ bash scripts/setup_deployment.sh
 On its first run, setup installs the system dependencies and creates:
 
 ```text
-scripts/cosmos_env.sh
+scripts/edge_vlm_env.sh
 ```
 
 Review the paths in that file, then run:
 
 ```bash
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 bash scripts/build_workspace.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 bash scripts/verify_deployment.sh
@@ -85,8 +86,8 @@ bash scripts/verify_deployment.sh
 The verifier confirms both executables are installed and enforces the process
 boundary:
 
-- `cosmos_reasoner` must not load CUDA, TensorRT, or the Edge-LLM backend;
-- `cosmos_inference_worker` must not load ROS, RMW, or DDS libraries.
+- `edge_vlm_ros_node` must not load CUDA, TensorRT, or the Edge-LLM backend;
+- `edge_vlm_server` must not load ROS, RMW, or DDS libraries.
 
 For a fresh system and engine preparation, follow the full
 [Thor deployment recipe](docs/deployment.md).
@@ -97,13 +98,13 @@ Terminal 1:
 
 ```bash
 cd "$HOME/ros2-VLM-demo"
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+ros2 launch edge_vlm_ros edge_vlm.launch.py \
   image_topic:=/camera/image_raw \
-  llm_engine_dir:="$COSMOS_LLM_ENGINE_DIR" \
-  multimodal_engine_dir:="$COSMOS_MULTIMODAL_ENGINE_DIR" \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
   edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH" \
   use_sim_time:=true
 ```
@@ -120,7 +121,7 @@ Terminal 3, optional:
 ```bash
 source /opt/ros/jazzy/setup.bash
 source "$HOME/ros2_ws/install/setup.bash"
-ros2 topic echo /cosmos/reasoning
+ros2 topic echo /vlm/result
 ```
 
 Terminal 4, optional RViz2 panel:
@@ -147,7 +148,7 @@ bash scripts/test_data/inspect_rosbag.sh /path/to/bag
 Run the validated end-to-end image test:
 
 ```bash
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 bash scripts/test_data/run_image_proc_test.sh
 ```
@@ -211,10 +212,10 @@ Benchmarks are separated into two layers that must not be conflated:
 ### Native engine baseline (Thor only)
 
 ```bash
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 
 bash scripts/benchmark/run_native_benchmarks.sh \
-  --input-vlm-json "$COSMOS_WORKSPACE_DIR/input_vlm.json"
+  --input-vlm-json "$EDGE_VLM_WORKSPACE_DIR/input_vlm.json"
 ```
 
 Defaults match the NVIDIA published workload: `--batch-size 1 --input-len 2048
@@ -231,10 +232,10 @@ Artifacts are written to `/tmp/cosmos_native_bench_YYYYMMDD_HHMMSS/`.
 Enable benchmark output via the `benchmark_output_file` parameter:
 
 ```bash
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+ros2 launch edge_vlm_ros edge_vlm.launch.py \
   image_topic:=/hawk_0_left_rgb_image \
-  llm_engine_dir:="$COSMOS_LLM_ENGINE_DIR" \
-  multimodal_engine_dir:="$COSMOS_MULTIMODAL_ENGINE_DIR" \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
   edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH" \
   benchmark_output_file:="/tmp/cosmos_ros_bench.jsonl" \
   use_sim_time:=true
@@ -279,7 +280,7 @@ behavior, and reconnect logic using a fake Unix-socket worker.
 Run the IPC-focused tests with:
 
 ```bash
-colcon test --packages-select cosmos_ros2_video_reasoner \
+colcon test --packages-select edge_vlm_ros \
   --ctest-args -R "test_(ipc_protocol|ipc_inference_backend)" --output-on-failure
 ```
 
@@ -299,8 +300,8 @@ The H.264 asset is not directly consumable. Decode it to
 ## Output
 
 Results are published as
-`cosmos_ros2_video_reasoner/msg/VisionReasoningResult` on
-`/cosmos/reasoning` by default. Each result includes:
+`edge_vlm_ros/msg/VlmResult` on
+`/vlm/result` by default. Each result includes:
 
 - source image header and topic;
 - effective prompt, selected task profile, prompt-version label, and prompt-configuration hash;
@@ -312,7 +313,7 @@ Results are published as
 Example console output:
 
 ```text
-[cosmos_reasoner]: [frame 5 | 1.573 s] The scene shows a warehouse aisle...
+[edge_vlm_ros_node]: [frame 5 | 1.573 s] The scene shows a warehouse aisle...
 ```
 
 The observed 1.5-second results used a 64-token output limit. Longer responses
@@ -321,7 +322,7 @@ increase end-to-end latency.
 ## RViz2 visualization panel (optional)
 
 This repository now includes an RViz2 panel plugin named
-`cosmos_ros2_video_reasoner/VisionReasoningPanel` for visual debugging and demos.
+`edge_vlm_ros/VisionReasoningPanel` is the RViz panel class name for visual debugging and demos.
 The panel displays:
 
 - the camera image matched to the result message timestamp;
@@ -349,8 +350,8 @@ rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | `image_topic` | string | `/camera/image_raw` | Raw image input topic |
-| `result_topic` | string | `/cosmos/reasoning` | Result topic |
-| `worker_socket_path` | string | `/tmp/cosmos_edge_llm.sock` | Worker Unix-socket path |
+| `result_topic` | string | `/vlm/result` | Result topic |
+| `worker_socket_path` | string | `/tmp/edge_vlm.sock` | Worker Unix-socket path |
 | `start_worker` | launch argument | `true` | Start and supervise the worker from ROS launch; set `false` to use a standalone service |
 | `worker_connect_timeout_seconds` | int | `120` | Initial/reconnect deadline |
 | `worker_inference_deadline_seconds` | int | `60` | Worker-side inference deadline; worker self-terminates via watchdog on expiry (must be < `worker_request_timeout_seconds`) |
