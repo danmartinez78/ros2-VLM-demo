@@ -73,6 +73,23 @@ _CONTENT_TYPES: Dict[str, str] = {
     ".ico": "image/x-icon",
 }
 
+# Pre-load the static file allowlist at import time so that file paths used in
+# I/O operations are never derived from user-provided request paths.
+# This is also the fix for CodeQL py/path-injection: the values in the map are
+# resolved from the known static directory, not from any user input.
+def _build_static_map() -> Dict[str, pathlib.Path]:
+    mapping: Dict[str, pathlib.Path] = {}
+    try:
+        for entry in _STATIC_DIR.iterdir():
+            if entry.is_file():
+                mapping[entry.name] = entry.resolve()
+    except OSError:
+        pass
+    return mapping
+
+
+_STATIC_MAP: Dict[str, pathlib.Path] = _build_static_map()
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -189,32 +206,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._send_response(200, body, "text/html; charset=utf-8")
 
     def _serve_static(self, rel_path: str) -> None:
-        # Prevent path traversal.  Accept only simple filename or one-level
-        # directory/filename paths; then resolve to an absolute real path and
-        # verify the result sits inside the static directory before reading.
-        safe = pathlib.PurePosixPath(rel_path)
-        if ".." in safe.parts or safe.is_absolute():
-            self._send_error(400, "Bad path")
-            return
-        candidate = _STATIC_DIR / safe
-        try:
-            resolved = candidate.resolve()
-            static_resolved = _STATIC_DIR.resolve()
-        except OSError:
+        # Use the pre-computed static-file map so the path used for I/O is
+        # never derived from user input — this avoids py/path-injection.
+        # Only the bare filename is matched; no subdirectory traversal is allowed.
+        filename = pathlib.PurePosixPath(rel_path).name
+        static_path = _STATIC_MAP.get(filename)
+        if static_path is None:
             self._send_error(404, "Static file not found")
             return
-        # Confirm the resolved path is inside the static directory.
-        try:
-            resolved.relative_to(static_resolved)
-        except ValueError:
-            self._send_error(400, "Bad path")
-            return
-        if not resolved.is_file():
-            self._send_error(404, "Static file not found")
-            return
-        ext = resolved.suffix.lower()
+        ext = static_path.suffix.lower()
         ctype = _CONTENT_TYPES.get(ext, "application/octet-stream")
-        self._send_response(200, resolved.read_bytes(), ctype)
+        self._send_response(200, static_path.read_bytes(), ctype)
 
     # ── API ───────────────────────────────────────────────────────────────────
 
