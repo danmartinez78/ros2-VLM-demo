@@ -730,8 +730,15 @@ void CosmosReasonerNode::maybe_reset_prompt_history_before_request()
 size_t CosmosReasonerNode::prompt_history_size_chars() const
 {
   size_t total = 0;
+  const bool structured = instruction_delivery_mode_ == "structured";
   for (const auto & entry : prompt_history_) {
-    total += entry.user_text.size() + entry.asst_text.size();
+    // Inline delivery injects only assistant observations into {context}, preserving
+    // the legacy character-limit contract. Structured delivery transmits both sides
+    // of every historical turn, so both must count against the wire-size budget.
+    total += entry.asst_text.size();
+    if (structured) {
+      total += entry.user_text.size();
+    }
   }
   return total;
 }
