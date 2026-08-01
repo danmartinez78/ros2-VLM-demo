@@ -78,19 +78,3 @@ jobs:
           else
             echo "No build directory; test results are unavailable."
           fi
-
-  benchmark-parser-tests:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-
-    defaults:
-      run:
-        shell: bash
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Run benchmark parser and schema tests (CPU-only, no hardware required)
-        run: |
-          python3 scripts/benchmark/test_benchmark_parsers.py -v

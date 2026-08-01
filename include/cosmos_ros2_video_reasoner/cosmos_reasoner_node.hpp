@@ -21,7 +21,6 @@
 #include <condition_variable>
 #include <deque>
 #include <exception>
-#include <fstream>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -140,7 +139,6 @@ private:
   {
     sensor_msgs::msg::Image::ConstSharedPtr msg;
     uint64_t seq{0};
-    int64_t subscribe_wall_ns{0};  // wall time when frame was accepted in image_callback
   };
 
   mutable std::mutex queue_mutex_;
@@ -158,14 +156,6 @@ private:
     uint64_t success{0};
     uint64_t failure{0};
   } stats_;
-
-  // ── Benchmark output (optional) ───────────────────────────────────────────
-  // When benchmark_output_file is non-empty, per-frame timing JSON lines are
-  // written to this file. Disabled by default; no runtime overhead when empty.
-  std::string benchmark_output_file_;
-  std::unique_ptr<std::ofstream> benchmark_out_;
-  int64_t node_init_wall_ns_{0};    // wall time captured at the start of the constructor
-  int64_t worker_ready_wall_ns_{0}; // wall time when inference worker finished initialising
 };
 
 }  // namespace cosmos_ros2_video_reasoner
