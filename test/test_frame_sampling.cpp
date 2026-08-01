@@ -168,6 +168,22 @@ TEST_F(FrameSamplingTest, SamplingIsDeterministicWithBagTimestamps)
     << "With period=2s, timestamps 0,1,2,3,4,5 should yield 3 sampled frames";
 }
 
+/// The first frame after a rosbag loop or simulation reset is sampled.
+TEST_F(FrameSamplingTest, BackwardTimestampResetsSampler)
+{
+  auto pub = make_pub();
+  std::this_thread::sleep_for(50ms);
+
+  publish_and_spin(pub, node_, make_image(rclcpp::Time(10, 0, RCL_ROS_TIME)));
+  const uint64_t before_rewind = node_->sampled_count();
+  ASSERT_GE(before_rewind, 1u);
+
+  // A looped bag restarts at an earlier timestamp. This frame begins a new
+  // sampling epoch and must not be suppressed by the previous loop's time.
+  publish_and_spin(pub, node_, make_image(rclcpp::Time(1, 0, RCL_ROS_TIME)));
+  EXPECT_EQ(node_->sampled_count(), before_rewind + 1);
+}
+
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
