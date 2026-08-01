@@ -11,6 +11,7 @@ result_timeout=180
 max_generate_length=96
 history_max_chars=1500
 output_dir=""
+resume=false
 
 usage() {
   cat <<'EOF'
@@ -24,6 +25,7 @@ Options:
   --result-timeout N        Maximum result wait seconds per run (default: 180)
   --max-generate-length N   Output token limit (default: 96)
   --history-max-chars N     Observation-history character budget (default: 1500)
+  --resume                  Skip configurations with complete summaries
   --help                    Show this help
 EOF
 }
@@ -37,6 +39,7 @@ while (($#)); do
     --result-timeout) result_timeout="$2"; shift 2 ;;
     --max-generate-length) max_generate_length="$2"; shift 2 ;;
     --history-max-chars) history_max_chars="$2"; shift 2 ;;
+    --resume) resume=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -78,6 +81,11 @@ echo "Configurations: ${history_entries_csv}"
 for entries in "${history_entries[@]}"; do
   run_dir="${output_dir}/history_${entries}"
   echo
+  if [[ "${resume}" == true && -s "${run_dir}/manifest.json" &&
+        -s "${run_dir}/result_summary.json" && -s "${run_dir}/ros_metrics.json" ]]; then
+    echo "==> Reusing completed run with ${entries} retained observation(s)"
+    continue
+  fi
   echo "==> Running with ${entries} retained observation(s)"
   PLAYBACK_DURATION_SECONDS="${playback_duration}" \
   RESULT_TIMEOUT_SECONDS="${result_timeout}" \
