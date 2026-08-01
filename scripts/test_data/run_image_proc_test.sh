@@ -5,6 +5,13 @@
 #   PLAYBACK_DURATION_SECONDS  Maximum wall-clock bag playback (default: 20)
 #   RESULT_TIMEOUT_SECONDS     Maximum wait for a successful result (default: 120)
 #   MAX_GENERATE_LENGTH        Output token limit used by the smoke test (default: 64)
+#   SUCCESS_RESULTS_REQUIRED    Successful results required before exit (default: 1)
+#   INSTRUCTION_DELIVERY_MODE  inline or structured (default: inline)
+#   OBSERVATION_HISTORY_MAX_ENTRIES  Retained successful observations (default: 0)
+#   OBSERVATION_HISTORY_MAX_CHARS    Retained observation character budget (default: 0)
+#   SYSTEM_INSTRUCTION         Optional structured system message
+#   TEST_PROMPT                Optional per-frame prompt override
+#   ARTIFACT_DIR               Preserve logs, timing JSONL, and run manifest here
 set -Eeuo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,14 +24,39 @@ worker_socket="${WORKER_SOCKET_PATH:-/tmp/cosmos_edge_llm.sock}"
 playback_duration="${PLAYBACK_DURATION_SECONDS:-20}"
 result_timeout="${RESULT_TIMEOUT_SECONDS:-120}"
 max_generate_length="${MAX_GENERATE_LENGTH:-64}"
+success_results_required="${SUCCESS_RESULTS_REQUIRED:-1}"
+instruction_delivery_mode="${INSTRUCTION_DELIVERY_MODE:-inline}"
+observation_history_max_entries="${OBSERVATION_HISTORY_MAX_ENTRIES:-0}"
+observation_history_max_chars="${OBSERVATION_HISTORY_MAX_CHARS:-0}"
+system_instruction="${SYSTEM_INSTRUCTION:-}"
+test_prompt="${TEST_PROMPT:-}"
+artifact_dir="${ARTIFACT_DIR:-}"
+benchmark_output_file=""
 
-for value_name in playback_duration result_timeout max_generate_length; do
+for value_name in playback_duration result_timeout max_generate_length success_results_required; do
   value="${!value_name}"
   if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
     echo "${value_name} must be a positive integer; got '${value}'." >&2
     exit 2
   fi
 done
+for value_name in observation_history_max_entries observation_history_max_chars; do
+  value="${!value_name}"
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    echo "${value_name} must be a non-negative integer; got '${value}'." >&2
+    exit 2
+  fi
+done
+if [[ "${instruction_delivery_mode}" != "inline" && "${instruction_delivery_mode}" != "structured" ]]; then
+  echo "INSTRUCTION_DELIVERY_MODE must be inline or structured." >&2
+  exit 2
+fi
+if [[ -n "${artifact_dir}" ]]; then
+  mkdir -p "${artifact_dir}"
+  artifact_dir="$(cd -- "${artifact_dir}" && pwd)"
+  benchmark_output_file="${artifact_dir}/benchmark.jsonl"
+  : > "${benchmark_output_file}"
+fi
 
 launch_pid=""
 bag_pid=""
@@ -186,15 +218,28 @@ echo "Starting Cosmos reasoner on ${image_topic}..."
 echo "  playback duration:    ${playback_duration} s maximum"
 echo "  result timeout:       ${result_timeout} s"
 echo "  max generate length:  ${max_generate_length}"
+echo "  successful results:   ${success_results_required}"
+echo "  delivery mode:        ${instruction_delivery_mode}"
+echo "  observation history:  ${observation_history_max_entries} entries / ${observation_history_max_chars} chars"
+
+launch_args=(
+  image_topic:="${image_topic}"
+  result_topic:="${result_topic}"
+  llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}"
+  multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}"
+  edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}"
+  max_generate_length:="${max_generate_length}"
+  instruction_delivery_mode:="${instruction_delivery_mode}"
+  observation_history_max_entries:="${observation_history_max_entries}"
+  observation_history_max_chars:="${observation_history_max_chars}"
+  use_sim_time:=true
+)
+[[ -n "${system_instruction}" ]] && launch_args+=(system_instruction:="${system_instruction}")
+[[ -n "${test_prompt}" ]] && launch_args+=(prompt:="${test_prompt}")
+[[ -n "${benchmark_output_file}" ]] && launch_args+=(benchmark_output_file:="${benchmark_output_file}")
 
 setsid ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
-  image_topic:="${image_topic}" \
-  result_topic:="${result_topic}" \
-  llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}" \
-  multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}" \
-  edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}" \
-  max_generate_length:="${max_generate_length}" \
-  use_sim_time:=true >"${launch_log}" 2>&1 &
+  "${launch_args[@]}" >"${launch_log}" 2>&1 &
 launch_pid=$!
 
 echo "Waiting for Cosmos reasoner initialization..."
@@ -243,9 +288,88 @@ setsid timeout --signal=INT --kill-after=5 "${playback_duration}" \
 bag_pid=$!
 
 success=false
+successful_results=0
 deadline=$((SECONDS + result_timeout))
 while (( SECONDS < deadline )); do
-  if grep -q '^success: true$' "${result_log}"; then
+  successful_results="$(grep -c '^success: true
+  if ! kill -0 "${launch_pid}" 2>/dev/null; then
+    echo "The Cosmos reasoner exited before producing a successful result." >&2
+    tail -40 "${launch_log}" >&2
+    exit 1
+  fi
+  if ! kill -0 "${bag_pid}" 2>/dev/null && (( successful_results < success_results_required )); then
+    echo "Bag playback ended after ${successful_results}/${success_results_required} successful results." >&2
+    tail -40 "${launch_log}" >&2
+    exit 1
+  fi
+  sleep 0.5
+done
+
+if [[ "${success}" != true ]]; then
+  echo "Timed out after ${successful_results}/${success_results_required} successful results." >&2
+  tail -40 "${launch_log}" >&2
+  exit 1
+fi
+
+echo "--- First successful result ---"
+awk 'BEGIN {RS="---\\n"; ORS="---\n"} /success: true/ {print; exit}' "${result_log}"
+
+if [[ -n "${artifact_dir}" ]]; then
+  cp "${launch_log}" "${artifact_dir}/launch.log"
+  cp "${result_log}" "${artifact_dir}/results.log"
+  python3 - "${artifact_dir}/manifest.json" <<PY
+import json
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+def git_value(*args):
+    try:
+        return subprocess.check_output(["git", *args], text=True).strip()
+    except Exception:
+        return None
+
+manifest = {
+    "schema_version": 1,
+    "created_at": datetime.now(timezone.utc).isoformat(),
+    "git_commit": git_value("rev-parse", "HEAD"),
+    "git_branch": git_value("branch", "--show-current"),
+    "bag_path": """${bag_path}""",
+    "image_topic": """${image_topic}""",
+    "result_topic": """${result_topic}""",
+    "llm_engine_dir": """${COSMOS_LLM_ENGINE_DIR}""",
+    "multimodal_engine_dir": """${COSMOS_MULTIMODAL_ENGINE_DIR}""",
+    "instruction_delivery_mode": """${instruction_delivery_mode}""",
+    "observation_history_max_entries": int("""${observation_history_max_entries}"""),
+    "observation_history_max_chars": int("""${observation_history_max_chars}"""),
+    "max_generate_length": int("""${max_generate_length}"""),
+    "successful_results_required": int("""${success_results_required}"""),
+    "successful_results_observed": int("""${successful_results}"""),
+}
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(manifest, stream, indent=2)
+    stream.write("\\n")
+PY
+  echo "Artifacts preserved at: ${artifact_dir}"
+fi
+
+test_passed=true
+cleanup
+trap - EXIT INT TERM
+
+orphan_workers="$(pgrep -f "cosmos_inference_worker.*${worker_socket}" 2>/dev/null || true)"
+if [[ -n "${orphan_workers}" ]]; then
+  echo "FAIL: orphan inference worker(s) remain: ${orphan_workers}" >&2
+  exit 1
+fi
+if [[ -e "${worker_socket}" ]]; then
+  echo "FAIL: worker socket remains after shutdown: ${worker_socket}" >&2
+  exit 1
+fi
+
+echo "PASS: successful reasoning result received and all test processes cleaned up."
+ "${result_log}" 2>/dev/null || true)"
+  if (( successful_results >= success_results_required )); then
     success=true
     break
   fi
