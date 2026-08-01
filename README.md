@@ -174,6 +174,25 @@ python3 scripts/evaluation/evaluate_task_harness.py \
 
 See [docs/evaluation.md](docs/evaluation.md) for dataset and rubric details.
 
+## Observation-history experiment
+
+Prior model outputs can be retained as **unverified semantic observations** and
+delivered as native user/assistant message history. This is disabled by default
+and is not equivalent to visual motion evidence or persistent scene state.
+
+Compare zero, one, and three retained observations against the same rosbag:
+
+```bash
+bash scripts/benchmark/run_observation_history_experiment.sh \
+  --history-entries 0,1,3 \
+  --success-results 4
+```
+
+The runner preserves raw results, ROS timing JSONL, per-run manifests, and a
+combined experiment manifest. See
+[docs/observation-history-experiment.md](docs/observation-history-experiment.md)
+for the Thor recipe and review rubric.
+
 ## Performance benchmarking
 
 Benchmarks are separated into two layers that must not be conflated:
