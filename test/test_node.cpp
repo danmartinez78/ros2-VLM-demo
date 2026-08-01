@@ -36,6 +36,7 @@ using namespace std::chrono_literals;
 using cosmos_ros2_video_reasoner::CosmosReasonerNode;
 using cosmos_ros2_video_reasoner::FakeInferenceBackend;
 using cosmos_ros2_video_reasoner::FailingFakeInferenceBackend;
+using cosmos_ros2_video_reasoner::HistoryEntry;
 using cosmos_ros2_video_reasoner::InferenceRequest;
 using cosmos_ros2_video_reasoner::InferenceResponse;
 using cosmos_ros2_video_reasoner::SlowFakeInferenceBackend;
