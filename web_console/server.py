@@ -189,18 +189,32 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._send_response(200, body, "text/html; charset=utf-8")
 
     def _serve_static(self, rel_path: str) -> None:
-        # Prevent path traversal.
+        # Prevent path traversal.  Accept only simple filename or one-level
+        # directory/filename paths; then resolve to an absolute real path and
+        # verify the result sits inside the static directory before reading.
         safe = pathlib.PurePosixPath(rel_path)
         if ".." in safe.parts or safe.is_absolute():
             self._send_error(400, "Bad path")
             return
-        full = _STATIC_DIR / safe
-        if not full.is_file():
+        candidate = _STATIC_DIR / safe
+        try:
+            resolved = candidate.resolve()
+            static_resolved = _STATIC_DIR.resolve()
+        except OSError:
             self._send_error(404, "Static file not found")
             return
-        ext = full.suffix.lower()
+        # Confirm the resolved path is inside the static directory.
+        try:
+            resolved.relative_to(static_resolved)
+        except ValueError:
+            self._send_error(400, "Bad path")
+            return
+        if not resolved.is_file():
+            self._send_error(404, "Static file not found")
+            return
+        ext = resolved.suffix.lower()
         ctype = _CONTENT_TYPES.get(ext, "application/octet-stream")
-        self._send_response(200, full.read_bytes(), ctype)
+        self._send_response(200, resolved.read_bytes(), ctype)
 
     # ── API ───────────────────────────────────────────────────────────────────
 
