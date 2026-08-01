@@ -1,10 +1,95 @@
 #!/usr/bin/env bash
+# Bounded Thor smoke test using NVIDIA's image-proc rosbag.
+#
+# Environment overrides:
+#   PLAYBACK_DURATION_SECONDS  Maximum wall-clock bag playback (default: 20)
+#   RESULT_TIMEOUT_SECONDS     Maximum wait for a successful result (default: 120)
+#   MAX_GENERATE_LENGTH        Output token limit used by the smoke test (default: 64)
 set -Eeuo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 asset_root="${ROSBAG_DIR:-${repo_root}/test_data/rosbags}/image-proc"
 env_file="${COSMOS_ENV_FILE:-${repo_root}/scripts/cosmos_env.sh}"
+image_topic="/hawk_0_left_rgb_image"
+result_topic="/cosmos/reasoning"
+worker_socket="${WORKER_SOCKET_PATH:-/tmp/cosmos_edge_llm.sock}"
+playback_duration="${PLAYBACK_DURATION_SECONDS:-20}"
+result_timeout="${RESULT_TIMEOUT_SECONDS:-120}"
+max_generate_length="${MAX_GENERATE_LENGTH:-64}"
+
+for value_name in playback_duration result_timeout max_generate_length; do
+  value="${!value_name}"
+  if [[ ! "${value}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "${value_name} must be a positive integer; got '${value}'." >&2
+    exit 2
+  fi
+done
+
+launch_pid=""
+bag_pid=""
+result_echo_pid=""
+test_passed=false
+launch_log="$(mktemp /tmp/cosmos-image-proc-launch.XXXXXX.log)"
+result_log="$(mktemp /tmp/cosmos-image-proc-results.XXXXXX.log)"
+
+wait_for_pid_exit() {
+  local pid="$1"
+  local deadline=$((SECONDS + ${2:-3}))
+  while kill -0 "${pid}" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.2
+  done
+  ! kill -0 "${pid}" 2>/dev/null
+}
+
+wait_for_group_exit() {
+  local pgid="$1"
+  local deadline=$((SECONDS + ${2:-3}))
+  while kill -0 -- "-${pgid}" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.2
+  done
+  ! kill -0 -- "-${pgid}" 2>/dev/null
+}
+
+stop_isolated_group() {
+  local leader_pid="$1"
+  [[ -z "${leader_pid}" ]] && return 0
+
+  local pgid own_pgid
+  pgid="$(ps -o pgid= -p "${leader_pid}" 2>/dev/null | tr -d ' ')" || true
+  own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || true
+
+  if [[ -n "${pgid}" && "${pgid}" != "0" && -n "${own_pgid}" && "${pgid}" != "${own_pgid}" ]]; then
+    kill -INT -- "-${pgid}" 2>/dev/null || true
+    wait_for_group_exit "${pgid}" 3 || kill -TERM -- "-${pgid}" 2>/dev/null || true
+    wait_for_group_exit "${pgid}" 3 || kill -KILL -- "-${pgid}" 2>/dev/null || true
+  else
+    kill -INT "${leader_pid}" 2>/dev/null || true
+    wait_for_pid_exit "${leader_pid}" 3 || kill -TERM "${leader_pid}" 2>/dev/null || true
+    wait_for_pid_exit "${leader_pid}" 3 || kill -KILL "${leader_pid}" 2>/dev/null || true
+  fi
+  wait "${leader_pid}" 2>/dev/null || true
+}
+
+cleanup() {
+  if [[ -n "${result_echo_pid}" ]] && kill -0 "${result_echo_pid}" 2>/dev/null; then
+    kill -TERM "${result_echo_pid}" 2>/dev/null || true
+    wait_for_pid_exit "${result_echo_pid}" 2 || kill -KILL "${result_echo_pid}" 2>/dev/null || true
+    wait "${result_echo_pid}" 2>/dev/null || true
+  fi
+
+  stop_isolated_group "${bag_pid}"
+  stop_isolated_group "${launch_pid}"
+
+  if [[ "${test_passed}" == true ]]; then
+    rm -f "${launch_log}" "${result_log}"
+  else
+    echo "Diagnostic launch log: ${launch_log}" >&2
+    echo "Diagnostic result log: ${result_log}" >&2
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 if [[ ! -d "${asset_root}" ]]; then
   bash "${script_dir}/download_rosbags.sh" download image-proc
@@ -21,30 +106,25 @@ if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090
   source "${env_file}"
 fi
+
 ros_distro="${ROS_DISTRO:-jazzy}"
 ros_setup="/opt/ros/${ros_distro}/setup.bash"
 if [[ ! -f "${ros_setup}" ]]; then
   echo "ROS 2 ${ros_distro} is not installed. Run scripts/install_dependencies.sh first." >&2
   exit 1
 fi
-# ROS-generated setup scripts may read optional variables without defaults.
+
 set +u
 # shellcheck disable=SC1090
 source "${ros_setup}"
-set -u
-
 if [[ -n "${ROS_WORKSPACE:-}" && -f "${ROS_WORKSPACE}/install/setup.bash" ]]; then
-  set +u
   # shellcheck disable=SC1090
   source "${ROS_WORKSPACE}/install/setup.bash"
-  set -u
 elif [[ -f "${repo_root}/../../install/setup.bash" ]]; then
-  # Repository is normally checked out at <workspace>/src/<repo>.
-  set +u
   # shellcheck disable=SC1090
   source "${repo_root}/../../install/setup.bash"
-  set -u
 fi
+set -u
 
 for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGIN_PATH; do
   if [[ -z "${!variable:-}" ]]; then
@@ -53,18 +133,68 @@ for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGI
   fi
 done
 
-image_topic="/hawk_0_left_rgb_image"
-launch_pid=""
-cleanup() {
-  if [[ -n "${launch_pid}" ]] && kill -0 "${launch_pid}" 2>/dev/null; then
-    kill -INT "${launch_pid}" 2>/dev/null || true
-    wait "${launch_pid}" 2>/dev/null || true
+# Refuse to attach assertions or automatic cleanup to an existing deployment.
+# Print process-group commands because killing only the worker may let ros2 launch respawn it.
+existing_reasoners="$(pgrep -f '/cosmos_reasoner($| )' 2>/dev/null || true)"
+existing_workers="$(pgrep -f '/cosmos_inference_worker($| )' 2>/dev/null || true)"
+if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
+  detected_pids="$(
+    printf '%s\n%s\n' "${existing_reasoners}" "${existing_workers}" |
+      sed '/^[[:space:]]*$/d' |
+      sort -nu
+  )"
+  detected_pid_csv="$(printf '%s\n' "${detected_pids}" | paste -sd, -)"
+  own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || true
+  detected_pgids="$(
+    ps -o pgid= -p "${detected_pid_csv}" 2>/dev/null |
+      tr -d ' ' |
+      sed '/^$/d' |
+      sort -nu |
+      awk -v own="${own_pgid}" '$1 != 0 && $1 != own'
+  )"
+
+  echo "Existing Cosmos deployment processes detected; stop them before testing." >&2
+  ps -o pid,ppid,pgid,sid,etime,stat,cmd -p "${detected_pid_csv}" >&2 || true
+  echo >&2
+  echo "Run the following commands, then rerun this test:" >&2
+  if [[ -n "${detected_pgids}" ]]; then
+    while IFS= read -r pgid; do
+      printf 'kill -TERM -- -%q\n' "${pgid}" >&2
+    done <<< "${detected_pgids}"
+    echo "sleep 3" >&2
+    while IFS= read -r pgid; do
+      printf 'kill -KILL -- -%q 2>/dev/null || true\n' "${pgid}" >&2
+    done <<< "${detected_pgids}"
+  else
+    echo "# Could not identify a safe process group; inspect the process table above." >&2
   fi
-}
-trap cleanup EXIT INT TERM
+  printf 'rm -f -- %q\n' "${worker_socket}" >&2
+
+  # A preflight refusal is not a launched-test failure, so discard empty logs.
+  test_passed=true
+  exit 1
+fi
+if [[ -e "${worker_socket}" ]]; then
+  echo "Stale worker socket exists: ${worker_socket}" >&2
+  echo "No Cosmos process was found. Remove the stale socket with:" >&2
+  printf 'rm -f -- %q\n' "${worker_socket}" >&2
+  test_passed=true
+  exit 1
+fi
 
 echo "Starting Cosmos reasoner on ${image_topic}..."
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py   image_topic:="${image_topic}"   llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}"   multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}"   edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}"   use_sim_time:=true &
+echo "  playback duration:    ${playback_duration} s maximum"
+echo "  result timeout:       ${result_timeout} s"
+echo "  max generate length:  ${max_generate_length}"
+
+setsid ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+  image_topic:="${image_topic}" \
+  result_topic:="${result_topic}" \
+  llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}" \
+  multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}" \
+  edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}" \
+  max_generate_length:="${max_generate_length}" \
+  use_sim_time:=true >"${launch_log}" 2>&1 &
 launch_pid=$!
 
 echo "Waiting for Cosmos reasoner initialization..."
@@ -73,14 +203,9 @@ deadline=$((SECONDS + 120))
 while (( SECONDS < deadline )); do
   if ! kill -0 "${launch_pid}" 2>/dev/null; then
     echo "The Cosmos reasoner exited before playback started." >&2
-    wait_status=0
-    wait "${launch_pid}" || wait_status=$?
-    if [[ "${wait_status}" -eq 0 ]]; then
-      wait_status=1
-    fi
-    exit "${wait_status}"
+    tail -40 "${launch_log}" >&2
+    exit 1
   fi
-
   if ros2 topic info "${image_topic}" 2>/dev/null \
       | grep -Eq 'Subscription count: [1-9][0-9]*'; then
     ready=true
@@ -88,12 +213,76 @@ while (( SECONDS < deadline )); do
   fi
   sleep 1
 done
-
 if [[ "${ready}" != true ]]; then
-  echo "Timed out waiting 120 seconds for a subscriber on ${image_topic}." >&2
+  echo "Timed out waiting for the reasoner subscription." >&2
+  tail -40 "${launch_log}" >&2
   exit 1
 fi
 
-echo "Cosmos reasoner is ready."
+ros2 topic echo "${result_topic}" >"${result_log}" 2>&1 &
+result_echo_pid=$!
+
+subscriber_ready=false
+deadline=$((SECONDS + 30))
+while (( SECONDS < deadline )); do
+  if ros2 topic info "${result_topic}" 2>/dev/null \
+      | grep -Eq 'Subscription count: [1-9][0-9]*'; then
+    subscriber_ready=true
+    break
+  fi
+  sleep 0.5
+done
+if [[ "${subscriber_ready}" != true ]]; then
+  echo "Timed out waiting for the result-topic subscriber." >&2
+  exit 1
+fi
+
 echo "Playing NVIDIA image-proc bag: ${bag_path}"
-ros2 bag play "${bag_path}" --clock
+setsid timeout --signal=INT --kill-after=5 "${playback_duration}" \
+  ros2 bag play "${bag_path}" --clock > /dev/null 2>&1 &
+bag_pid=$!
+
+success=false
+deadline=$((SECONDS + result_timeout))
+while (( SECONDS < deadline )); do
+  if grep -q '^success: true$' "${result_log}"; then
+    success=true
+    break
+  fi
+  if ! kill -0 "${launch_pid}" 2>/dev/null; then
+    echo "The Cosmos reasoner exited before producing a successful result." >&2
+    tail -40 "${launch_log}" >&2
+    exit 1
+  fi
+  if ! kill -0 "${bag_pid}" 2>/dev/null && ! grep -q '^success: true$' "${result_log}"; then
+    echo "Bag playback ended without a successful reasoning result." >&2
+    tail -40 "${launch_log}" >&2
+    exit 1
+  fi
+  sleep 0.5
+done
+
+if [[ "${success}" != true ]]; then
+  echo "Timed out waiting for a successful reasoning result." >&2
+  tail -40 "${launch_log}" >&2
+  exit 1
+fi
+
+echo "--- First successful result ---"
+awk 'BEGIN {RS="---\\n"; ORS="---\\n"} /success: true/ {print; exit}' "${result_log}"
+
+test_passed=true
+cleanup
+trap - EXIT INT TERM
+
+orphan_workers="$(pgrep -f "cosmos_inference_worker.*${worker_socket}" 2>/dev/null || true)"
+if [[ -n "${orphan_workers}" ]]; then
+  echo "FAIL: orphan inference worker(s) remain: ${orphan_workers}" >&2
+  exit 1
+fi
+if [[ -e "${worker_socket}" ]]; then
+  echo "FAIL: worker socket remains after shutdown: ${worker_socket}" >&2
+  exit 1
+fi
+
+echo "PASS: successful reasoning result received and all test processes cleaned up."

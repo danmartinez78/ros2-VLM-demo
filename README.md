@@ -146,6 +146,11 @@ source "$ROS_WORKSPACE/install/setup.bash"
 bash scripts/test_data/run_image_proc_test.sh
 ```
 
+The smoke test stops after the first successful reasoning result and performs
+bounded cleanup. Set `PLAYBACK_DURATION_SECONDS`, `RESULT_TIMEOUT_SECONDS`,
+or `MAX_GENERATE_LENGTH` to override its 20-second playback, 120-second
+result timeout, and 64-token defaults.
+
 Test worker crash recovery:
 
 ```bash
