@@ -401,7 +401,7 @@ TEST_F(NodeTest, InstructionVariablesAreNotDuplicated)
   EXPECT_EQ(prompt.find("Bulleted response.", task_first + 1), std::string::npos);
 }
 
-/// Prompt-history injection stays bounded by prompt_history_max_entries.
+/// Observation-history injection stays bounded by observation_history_max_entries.
 TEST_F(NodeTest, PromptHistoryIsBoundedByEntries)
 {
   std::mutex prompts_mutex;
@@ -423,7 +423,7 @@ TEST_F(NodeTest, PromptHistoryIsBoundedByEntries)
     });
 
   rclcpp::NodeOptions opts = make_options(false);
-  opts.append_parameter_override("prompt_history_max_entries", 1);
+  opts.append_parameter_override("observation_history_max_entries", 1);
   opts.append_parameter_override(
     "task_profiles.scene_description.template",
     "Current frame. Prior context:\n{context}");
@@ -452,7 +452,7 @@ TEST_F(NodeTest, PromptHistoryIsBoundedByEntries)
   EXPECT_EQ(captured_prompts[2].find("response 1"), std::string::npos);
 }
 
-/// Prompt history is reset when a failed inference occurs under on_error policy.
+/// Observation history is reset when a failed inference occurs under on_error policy.
 TEST_F(NodeTest, PromptHistoryResetsOnError)
 {
   std::mutex prompts_mutex;
@@ -479,8 +479,8 @@ TEST_F(NodeTest, PromptHistoryResetsOnError)
     });
 
   rclcpp::NodeOptions opts = make_options(false);
-  opts.append_parameter_override("prompt_history_max_entries", 2);
-  opts.append_parameter_override("prompt_history_reset_policy", "on_error");
+  opts.append_parameter_override("observation_history_max_entries", 2);
+  opts.append_parameter_override("observation_history_reset_policy", "on_error");
   opts.append_parameter_override(
     "task_profiles.scene_description.template",
     "Current frame. Prior context:\n{context}");
@@ -528,9 +528,9 @@ TEST_F(NodeTest, PromptHistoryEveryNRequestsBoundary)
     });
 
   rclcpp::NodeOptions opts = make_options(false);
-  opts.append_parameter_override("prompt_history_max_entries", 4);
-  opts.append_parameter_override("prompt_history_reset_policy", "every_n_requests");
-  opts.append_parameter_override("prompt_history_reset_interval_requests", 2);
+  opts.append_parameter_override("observation_history_max_entries", 4);
+  opts.append_parameter_override("observation_history_reset_policy", "every_n_requests");
+  opts.append_parameter_override("observation_history_reset_interval_requests", 2);
   opts.append_parameter_override(
     "task_profiles.scene_description.template",
     "Current frame. Prior context:\n{context}");
@@ -579,7 +579,7 @@ TEST_F(NodeTest, HistoryEnabledWithoutContextVariableDoesNotInjectHistory)
     });
 
   rclcpp::NodeOptions opts = make_options(false);
-  opts.append_parameter_override("prompt_history_max_entries", 2);
+  opts.append_parameter_override("observation_history_max_entries", 2);
   opts.append_parameter_override(
     "task_profiles.scene_description.template",
     "Describe the current frame only.");
@@ -602,7 +602,7 @@ TEST_F(NodeTest, HistoryEnabledWithoutContextVariableDoesNotInjectHistory)
   EXPECT_EQ(captured_prompts[1].find("response 1"), std::string::npos);
 }
 
-/// Prompt history is bounded by total character size.
+/// Observation history is bounded by total character size.
 TEST_F(NodeTest, PromptHistoryIsBoundedByCharacterSize)
 {
   std::mutex prompts_mutex;
@@ -632,8 +632,8 @@ TEST_F(NodeTest, PromptHistoryIsBoundedByCharacterSize)
     });
 
   rclcpp::NodeOptions opts = make_options(false);
-  opts.append_parameter_override("prompt_history_max_entries", 4);
-  opts.append_parameter_override("prompt_history_max_chars", 20);
+  opts.append_parameter_override("observation_history_max_entries", 4);
+  opts.append_parameter_override("observation_history_max_chars", 20);
   opts.append_parameter_override(
     "task_profiles.scene_description.template",
     "Current frame. Prior context:\n{context}");
@@ -693,10 +693,10 @@ TEST_F(NodeTest, StructuredPromptHistoryCountsBothSidesOfEachTurn)
 
   rclcpp::NodeOptions opts = make_options(false);
   opts.append_parameter_override("instruction_delivery_mode", "structured");
-  opts.append_parameter_override("prompt_history_max_entries", 4);
+  opts.append_parameter_override("observation_history_max_entries", 4);
   // The rendered user text is one character and each response is ten characters.
   // Two complete structured turns fit exactly; a third evicts the oldest.
-  opts.append_parameter_override("prompt_history_max_chars", 22);
+  opts.append_parameter_override("observation_history_max_chars", 22);
   opts.append_parameter_override("task_profiles.scene_description.template", "x");
   opts.append_parameter_override("task_profile", "scene_description");
 
