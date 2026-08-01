@@ -133,18 +133,52 @@ for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGI
   fi
 done
 
-# Refuse to attach assertions or cleanup to an existing deployment.
+# Refuse to attach assertions or automatic cleanup to an existing deployment.
+# Print process-group commands because killing only the worker may let ros2 launch respawn it.
 existing_reasoners="$(pgrep -f '/cosmos_reasoner($| )' 2>/dev/null || true)"
 existing_workers="$(pgrep -f '/cosmos_inference_worker($| )' 2>/dev/null || true)"
 if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
+  detected_pids="$(
+    printf '%s\n%s\n' "${existing_reasoners}" "${existing_workers}" |
+      sed '/^[[:space:]]*$/d' |
+      sort -nu
+  )"
+  detected_pid_csv="$(printf '%s\n' "${detected_pids}" | paste -sd, -)"
+  own_pgid="$(ps -o pgid= -p "$" 2>/dev/null | tr -d ' ')" || true
+  detected_pgids="$(
+    ps -o pgid= -p "${detected_pid_csv}" 2>/dev/null |
+      tr -d ' ' |
+      sed '/^$/d' |
+      sort -nu |
+      awk -v own="${own_pgid}" '$1 != 0 && $1 != own'
+  )"
+
   echo "Existing Cosmos deployment processes detected; stop them before testing." >&2
-  [[ -n "${existing_reasoners}" ]] && printf '  reasoner PID(s):\n%s\n' "${existing_reasoners}" >&2
-  [[ -n "${existing_workers}" ]] && printf '  worker PID(s):\n%s\n' "${existing_workers}" >&2
+  ps -o pid,ppid,pgid,sid,etime,stat,cmd -p "${detected_pid_csv}" >&2 || true
+  echo >&2
+  echo "Run the following commands, then rerun this test:" >&2
+  if [[ -n "${detected_pgids}" ]]; then
+    while IFS= read -r pgid; do
+      printf 'kill -TERM -- -%q\n' "${pgid}" >&2
+    done <<< "${detected_pgids}"
+    echo "sleep 3" >&2
+    while IFS= read -r pgid; do
+      printf 'kill -KILL -- -%q 2>/dev/null || true\n' "${pgid}" >&2
+    done <<< "${detected_pgids}"
+  else
+    echo "# Could not identify a safe process group; inspect the process table above." >&2
+  fi
+  printf 'rm -f -- %q\n' "${worker_socket}" >&2
+
+  # A preflight refusal is not a launched-test failure, so discard empty logs.
+  test_passed=true
   exit 1
 fi
 if [[ -e "${worker_socket}" ]]; then
   echo "Stale worker socket exists: ${worker_socket}" >&2
-  echo "Remove it only after confirming no Cosmos worker is running." >&2
+  echo "No Cosmos process was found. Remove the stale socket with:" >&2
+  printf 'rm -f -- %q\n' "${worker_socket}" >&2
+  test_passed=true
   exit 1
 fi
 
