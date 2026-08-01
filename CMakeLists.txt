@@ -384,7 +384,15 @@ if(BUILD_TENSORRT_BACKEND)
     cosmos_reasoner_node)
   ament_target_dependencies(cosmos_reasoner rclcpp)
 
-  install(TARGETS cosmos_trt_backend cosmos_reasoner cosmos_backend_direct_smoke cosmos_inference_worker cosmos_ipc_backend
+  # ROS-free client for native image experiments and service diagnostics.
+  add_executable(cosmos_reasoning_cli src/reasoning_cli.cpp)
+  target_include_directories(cosmos_reasoning_cli PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(cosmos_reasoning_cli
+    cosmos_ipc_backend
+    ${OpenCV_LIBRARIES})
+
+  install(TARGETS cosmos_trt_backend cosmos_reasoner cosmos_reasoning_cli cosmos_backend_direct_smoke cosmos_inference_worker cosmos_ipc_backend
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION lib/${PROJECT_NAME}
