@@ -54,7 +54,7 @@ public:
     std::unique_ptr<InferenceBackend> backend,
     const rclcpp::NodeOptions & options = rclcpp::NodeOptions{});
 
-  ~CosmosReasonerNode() override;
+  ~VlmReasonerNode() override;
 
   // ── Counters (primarily for unit testing and shutdown logging) ──────────
   uint64_t received_count() const noexcept {return stats_.received;}
