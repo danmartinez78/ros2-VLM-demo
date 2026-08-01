@@ -291,9 +291,13 @@ success=false
 successful_results=0
 deadline=$((SECONDS + result_timeout))
 while (( SECONDS < deadline )); do
-  successful_results="$(grep -c '^success: true
+  successful_results="$(grep -c '^success: true$' "${result_log}" 2>/dev/null || true)"
+  if (( successful_results >= success_results_required )); then
+    success=true
+    break
+  fi
   if ! kill -0 "${launch_pid}" 2>/dev/null; then
-    echo "The Cosmos reasoner exited before producing a successful result." >&2
+    echo "The Cosmos reasoner exited before producing the required successful results." >&2
     tail -40 "${launch_log}" >&2
     exit 1
   fi
