@@ -16,19 +16,50 @@
 
 #include <opencv2/core.hpp>
 #include <string>
+#include <vector>
 
 namespace cosmos_ros2_video_reasoner
 {
+
+/// A single prior conversation turn carried through IPC into native message structures.
+///
+/// user_text: the effective user-message text rendered for that frame (may be the full
+///   inline prompt when the entry was created in inline mode, or the task portion only
+///   when created in structured mode — either is safe as a historical user turn).
+/// asst_text: the model output for that frame.  This is an untrusted observation;
+///   it must never be promoted into a system message.
+struct HistoryEntry
+{
+  std::string user_text;
+  std::string asst_text;
+};
 
 /// Parameters for a single inference call.
 struct InferenceRequest
 {
   cv::Mat image;            //!< BGR image (OpenCV convention; backend converts as needed)
-  std::string prompt;       //!< Text prompt forwarded to the VLM
+  std::string prompt;       //!< User-message text (task prompt or full inline prompt)
   int max_generate_length;  //!< Maximum number of tokens to generate
   float temperature;        //!< Sampling temperature
   float top_p;              //!< Nucleus sampling probability
   int top_k;                //!< Top-k sampling parameter
+
+  /// Optional system-role message (empty = no system message / inline delivery).
+  /// When non-empty, the backend maps this to a native system Message.
+  /// Must not contain prior model outputs; system instructions only.
+  std::string system_message;
+
+  /// Prior conversation turns, ordered oldest-first.
+  /// Only populated when instruction_delivery_mode is "structured" and
+  /// prompt_history_max_entries > 0.  Each entry represents one (user, assistant)
+  /// exchange prior to the current frame.  The assistant text is an untrusted
+  /// observation and must not be promoted to system-level authority.
+  std::vector<HistoryEntry> history;
+
+  /// When true, request the worker to attempt system-prompt caching for this
+  /// request.  Valid only when system_message is non-empty and the runtime/model
+  /// supports the feature.  Silently ignored when unavailable.
+  bool use_system_prompt_cache{false};
 };
 
 /// Result returned from a single inference call.

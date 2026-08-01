@@ -15,10 +15,26 @@
 namespace cosmos_ros2_video_reasoner::ipc
 {
 constexpr uint32_t kMagic = 0x434F534D;  // COSM
-constexpr uint32_t kVersion = 1;
+/// IPC schema version.
+/// v1: prompt_bytes only, single inline user message.
+/// v2: schema_flags, system_bytes, history_count — adds structured message roles.
+constexpr uint32_t kVersion = 2;
 constexpr uint32_t kEncodingBgr8 = 1;
 constexpr uint32_t kMaxTextBytes = 1024 * 1024;
 constexpr uint32_t kMaxImageBytes = 256 * 1024 * 1024;
+constexpr uint32_t kMaxHistoryEntries = 256;
+
+/// schema_flags bit definitions.
+/// kSchemaFlagInline (0): legacy inline delivery — payload is [image][prompt].
+/// kSchemaFlagStructured: structured delivery — payload is
+///   [image][system_bytes bytes][prompt_bytes bytes][history_count × entry].
+/// kSchemaFlagSysCache: worker should attempt system-prompt caching for this
+///   request (only valid when kSchemaFlagStructured is set and system_bytes > 0).
+///   Cache eligibility and availability are validated on the worker side; the
+///   flag is silently ignored when the runtime does not support caching.
+constexpr uint32_t kSchemaFlagInline = 0U;
+constexpr uint32_t kSchemaFlagStructured = 1U << 0;
+constexpr uint32_t kSchemaFlagSysCache = 1U << 1;
 
 struct RequestHeader
 {
@@ -30,11 +46,27 @@ struct RequestHeader
   uint32_t step{0};
   uint32_t encoding{kEncodingBgr8};
   uint32_t image_bytes{0};
+  /// User-message bytes (or full inline prompt bytes when schema_flags == kSchemaFlagInline).
   uint32_t prompt_bytes{0};
   int32_t max_generate_length{0};
   float temperature{0.0F};
   float top_p{0.0F};
   int32_t top_k{0};
+  /// Delivery-mode flags (see kSchemaFlag* constants). Default 0 = inline.
+  uint32_t schema_flags{kSchemaFlagInline};
+  /// System-message byte count (0 when schema_flags == kSchemaFlagInline).
+  uint32_t system_bytes{0};
+  /// Number of prior (user, assistant) history turns that follow the prompt payload.
+  uint32_t history_count{0};
+  uint32_t _reserved{0};
+};
+
+/// Fixed-size header preceding each history entry in the v2 wire format.
+/// Layout per entry: [HistoryEntryHeader][user_bytes bytes][asst_bytes bytes]
+struct HistoryEntryHeader
+{
+  uint32_t user_bytes{0};
+  uint32_t asst_bytes{0};
 };
 
 struct ResponseHeader
@@ -50,6 +82,7 @@ struct ResponseHeader
 
 static_assert(std::is_trivially_copyable_v<RequestHeader>);
 static_assert(std::is_trivially_copyable_v<ResponseHeader>);
+static_assert(std::is_trivially_copyable_v<HistoryEntryHeader>);
 
 inline void write_all(int fd, void const * data, size_t size)
 {

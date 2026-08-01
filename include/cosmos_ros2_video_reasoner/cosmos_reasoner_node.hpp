@@ -16,7 +16,6 @@
 
 #include "cosmos_ros2_video_reasoner/inference_backend.hpp"
 #include "rclcpp/rclcpp.hpp"
-
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
@@ -87,10 +86,13 @@ private:
     const std::string & effective_prompt);
 
   // ── Prompt/history configuration helpers ─────────────────────────────────
-  std::string render_effective_prompt(uint64_t frame_seq) const;
+  std::string render_effective_prompt(
+    uint64_t frame_seq,
+    bool suppress_system_and_context = false) const;
   void validate_template_variables(const std::string & name, const std::string & templ) const;
   void maybe_reset_prompt_history_before_request();
-  void update_prompt_history_after_response(const InferenceResponse & resp);
+  void update_prompt_history_after_response(
+    const InferenceResponse & resp, const std::string & user_text);
   size_t prompt_history_size_chars() const;
 
   // ── Backend ─────────────────────────────────────────────────────────────
@@ -128,6 +130,7 @@ private:
   int jpeg_quality_{90};
   bool drop_old_frames_{true};
   bool publish_results_{true};
+  bool enable_system_prompt_cache_{false};
 
   // ── Worker thread and synchronisation ───────────────────────────────────
   std::thread worker_thread_;
@@ -146,7 +149,7 @@ private:
   mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::optional<PendingFrame> pending_frame_;  // bounded queue of depth 1
-  std::deque<std::string> prompt_history_;
+  std::deque<HistoryEntry> prompt_history_;
   uint64_t requests_since_prompt_history_reset_{0};
 
   // ── Counters ─────────────────────────────────────────────────────────────

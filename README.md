@@ -332,7 +332,8 @@ rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
 | `prompt_version` | string | `v1` | Version label attached to every result for reproducibility |
 | `system_instruction` | string | empty | Optional system instruction text |
 | `task_instruction` | string | empty | Optional task instruction text |
-| `instruction_delivery_mode` | string | `inline` | Currently only `inline` is supported by the IPC protocol |
+| `instruction_delivery_mode` | string | `inline` | Prompt delivery mode: `inline` (legacy, all text in one user message) or `structured` (system message, user message, and history as native Edge-LLM Message roles) |
+| `enable_system_prompt_cache` | bool | `false` | Request system-prompt caching for stable system messages (only valid with `instruction_delivery_mode: structured`; silently ignored when the runtime does not support caching — see Thor validation note in architecture docs) |
 | `prompt_history_max_entries` | int | `0` | Bound on prior successful responses retained for prompt-history injection |
 | `prompt_history_max_chars` | int | `0` | Maximum total retained prompt-history characters (`0` disables size limit) |
 | `prompt_history_reset_policy` | string | `never` | Prompt-history reset policy: `never`, `on_error`, `every_n_requests` |
