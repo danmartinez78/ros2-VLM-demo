@@ -599,6 +599,8 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
         self.assertIn("--imageSize", out)
         self.assertIn("448x448", out)
         self.assertIn("--mode visual", out)
+        self.assertIn("--engineDir /fake/mm_engine/visual", out)
+        self.assertNotIn("--multimodalEngineDir", out)
 
     def test_llm_bench_uses_warmup_and_iterations_flags(self):
         out = self._run_dry(["--warmup", "5", "--iterations", "20"])
@@ -638,6 +640,7 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
         # Default must contain 2048; quick must not
         self.assertIn("2048", out_default)
         self.assertNotIn("2048", out_quick)
+        self.assertIn("--imageSize 320x320", out_quick)
 
 
 class TestNativeBenchmarkDefaultFlags(unittest.TestCase):
@@ -690,6 +693,8 @@ class TestNativeBenchmarkDefaultFlags(unittest.TestCase):
         self.assertIn("--warmup 3", out)
         self.assertIn("--iterations 10", out)
         self.assertIn("--profile", out)
+        self.assertIn("--engineDir /fake/mm_engine/visual", out)
+        self.assertNotIn("--multimodalEngineDir", out)
         # --inputImage must not appear; only --imageSize is used for the synthetic benchmark
         self.assertNotIn("--inputImage", out)
 

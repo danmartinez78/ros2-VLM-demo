@@ -44,7 +44,8 @@ bash scripts/benchmark/run_native_benchmarks.sh \
 Default parameters match the NVIDIA published workload:
 `--batch-size 1`, `--input-len 2048`, `--past-kv-len 2048`, `--image-size 1024x2048`,
 `--warmup 3`, `--iterations 10`, `--inference-warmup 10`.
-Use `--quick` for faster smoke-test runs (smaller sizes, fewer iterations).
+Use `--quick` for faster smoke-test runs (128-token lengths, a 320x320
+visual input, one warmup, and three measured iterations).
 
 This calls, in order:
 
@@ -67,8 +68,7 @@ llm_bench --mode decode \
 
 # Vision-encoder latency / throughput
 llm_bench --mode visual \
-  --engineDir "$COSMOS_LLM_ENGINE_DIR" \
-  --multimodalEngineDir "$COSMOS_MULTIMODAL_ENGINE_DIR" \
+  --engineDir "$COSMOS_MULTIMODAL_ENGINE_DIR/visual" \
   --imageSize 1024x2048 \
   --warmup 3 --iterations 10 \
   --profile
@@ -302,4 +302,40 @@ python3 scripts/benchmark/test_benchmark_parsers.py -v
 | `ipc_overhead_ms` is negative | Clock skew between node and worker; `collect_ros_metrics.py` clamps to 0 |
 | `ready_to_first_frame_ms` is None | `session_start` record was not written; check node startup succeeded |
 | `llm_bench` not found | Build TensorRT Edge-LLM with `--cmake-args -DBUILD_BENCHMARKS=ON` |
+| `unrecognized option '--multimodalEngineDir'` | `llm_bench --mode visual` accepts only `--engineDir`; point it directly at `$COSMOS_MULTIMODAL_ENGINE_DIR/visual` |
+| `Image data must be 4D [T, H, W, C]` | The pinned `llm_bench` creates a 3D dummy tensor for visual mode. Apply the source workaround below and rebuild `llm_bench` |
+| Image dimensions are not divisible by `patchSize * mergeSize` | Use dimensions compatible with the visual model. Cosmos/Qwen3-VL requires multiples of 32; quick mode uses 320x320 |
 | Native profile JSON missing | Pass `--profileOutputFile`; verify `--dumpProfile` flag is supported in your Edge-LLM version |
+
+### Cosmos/Qwen3-VL visual benchmark workaround
+
+The TensorRT Edge-LLM revision validated on Thor constructs its synthetic
+visual input as `[H, W, C]`, while the Qwen3-VL runner requires
+`[T, H, W, C]`. This is an upstream `llm_bench` defect; normal
+`llm_inference` is unaffected because its image loader supplies the temporal
+dimension.
+
+In `TensorRT-Edge-LLM/examples/llm/llm_bench.cpp`, change the synthetic tensor
+near the visual benchmark setup from:
+
+```cpp
+rt::Tensor fakeImage({static_cast<int64_t>(args.imageHeight),
+    static_cast<int64_t>(args.imageWidth), 3}, ...);
+```
+
+to:
+
+```cpp
+rt::Tensor fakeImage({1, static_cast<int64_t>(args.imageHeight),
+    static_cast<int64_t>(args.imageWidth), 3}, ...);
+```
+
+Then rebuild only the native benchmark target:
+
+```bash
+cmake --build "$TENSORRT_EDGE_LLM_ROOT/build" --target llm_bench -j"$(nproc)"
+```
+
+This repository deliberately does not patch or replace NVIDIA's benchmark
+implementation. The wrapper reports the known failure and preserves its native
+output for diagnosis.
