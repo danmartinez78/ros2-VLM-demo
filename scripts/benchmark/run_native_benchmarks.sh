@@ -25,7 +25,7 @@
 #   --batch-size N          Batch size for prefill and decode (default: 1)
 #   --input-len N           Input token length for prefill benchmark (default: 2048)
 #   --past-kv-len N         Past KV-cache length for decode benchmark (default: 2048)
-#   --image-size WxH        Image dimensions for visual encoder benchmark (default: 1024x2048)
+#   --image-size HxW        Image dimensions for visual encoder benchmark (default: 1024x2048)
 #   --warmup N              Warmup iterations for llm_bench modes (default: 3)
 #   --iterations N          Measured iterations for llm_bench modes (default: 10)
 #   --inference-warmup N    Warmup runs for llm_inference (default: 10)
@@ -79,7 +79,7 @@ while [[ $# -gt 0 ]]; do
     --skip-profile)        SKIP_PROFILE=true;           shift   ;;
     --quick)
       # Smoke-test parameters — faster iteration, NOT the NVIDIA published workload.
-      INPUT_LEN=128; PAST_KV_LEN=128; IMAGE_SIZE="336x336"
+      INPUT_LEN=128; PAST_KV_LEN=128; IMAGE_SIZE="320x320"
       WARMUP=1; ITERATIONS=3; INFERENCE_WARMUP=3
       shift ;;
     --dry-run)             DRY_RUN=true;                shift   ;;
@@ -96,6 +96,7 @@ done
 
 LLM_BENCH="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_bench"
 LLM_INFERENCE="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_inference"
+VISUAL_ENGINE_DIR="${COSMOS_VISUAL_ENGINE_DIR:-${COSMOS_MULTIMODAL_ENGINE_DIR}/visual}"
 
 if [[ "${DRY_RUN}" == "false" ]]; then
   if [[ ! -x "${LLM_BENCH}" ]]; then
@@ -105,6 +106,11 @@ if [[ "${DRY_RUN}" == "false" ]]; then
   fi
   if [[ ! -x "${LLM_INFERENCE}" ]]; then
     echo "ERROR: llm_inference not found or not executable: ${LLM_INFERENCE}" >&2
+    exit 1
+  fi
+  if [[ "${SKIP_VISUAL}" == "false" && ! -f "${VISUAL_ENGINE_DIR}/visual.engine" ]]; then
+    echo "ERROR: visual.engine not found: ${VISUAL_ENGINE_DIR}/visual.engine" >&2
+    echo "       Set COSMOS_VISUAL_ENGINE_DIR to the visual engine directory." >&2
     exit 1
   fi
 fi
@@ -275,8 +281,7 @@ else
   VISUAL_CMD=(
     "${LLM_BENCH}"
     --mode visual
-    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
-    --multimodalEngineDir "${COSMOS_MULTIMODAL_ENGINE_DIR}"
+    --engineDir "${VISUAL_ENGINE_DIR}"
     --imageSize "${IMAGE_SIZE}"
     --warmup "${WARMUP}"
     --iterations "${ITERATIONS}"
@@ -294,6 +299,12 @@ else
       echo "OK: visual benchmark written to ${VISUAL_OUT}"
     else
       echo "ERROR: visual benchmark failed" >&2
+      if grep -qF "Image data must be 4D [T, H, W, C]" "${VISUAL_OUT}"; then
+        echo "       The pinned TensorRT Edge-LLM llm_bench constructs a 3D dummy image." >&2
+        echo "       Apply the documented Qwen3-VL visual benchmark workaround in docs/benchmarking.md." >&2
+      elif grep -qF "not divisible by patchSize * mergeSize" "${VISUAL_OUT}"; then
+        echo "       Choose an HxW image size divisible by patch_size * spatial_merge_size." >&2
+      fi
       ERRORS+=("visual failed")
       VISUAL_OUT=""
     fi
