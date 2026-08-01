@@ -116,15 +116,58 @@ C++ ABIs into the production process is unnecessary and unsafe.
 
 The socket defaults to `/tmp/cosmos_edge_llm.sock`. Requests and responses use
 fixed, trivially-copyable headers followed by bounded byte payloads.
+The current schema version is **2** (`kVersion = 2`).
 
-### Request
+### Request (v2)
 
 | Field group | Contents |
 | --- | --- |
-| Identity | magic, protocol version, monotonically increasing request ID |
+| Identity | magic, protocol version (2), monotonically increasing request ID |
 | Image | encoding ID, width, height, packed step, byte length, BGR8 bytes |
-| Task | effective prompt length and prompt bytes |
+| Schema | `schema_flags` (delivery mode bits), `system_bytes`, `history_count` |
+| Task | user-message text length and bytes |
 | Generation | maximum tokens, temperature, top-p, top-k |
+
+#### Delivery modes (`schema_flags`)
+
+| Value | Constant | Wire layout after the image bytes |
+| --- | --- | --- |
+| `0` | `kSchemaFlagInline` | `[prompt_bytes bytes]` — legacy inline delivery |
+| `1` | `kSchemaFlagStructured` | `[system_bytes bytes][prompt_bytes bytes][history_count × entry]` |
+| `3` | `kSchemaFlagStructured \| kSchemaFlagSysCache` | structured + request system-prompt caching |
+
+Each history entry is preceded by a `HistoryEntryHeader` containing
+`user_bytes` and `asst_bytes`, followed immediately by the user text and
+assistant text bytes:
+```
+[HistoryEntryHeader][user_bytes bytes][asst_bytes bytes]
+```
+
+Prior assistant outputs are carried as untrusted observations in the history
+user/assistant turn pairs. They are **never** promoted to system-role authority.
+
+#### System-prompt cache (`kSchemaFlagSysCache`)
+
+When `kSchemaFlagSysCache` is set, the worker may attempt system-prompt caching
+for the associated system message using the TensorRT Edge-LLM runtime API.
+Cache eligibility rules:
+
+- The flag is only meaningful when `kSchemaFlagStructured` is also set and
+  `system_bytes > 0`.
+- Caching is only attempted for exact, stable system prompt text.  Any change
+  to the system prompt invalidates the cache key.
+- Cache keys are in-memory only and do not survive worker restart.
+- Multimodal (image-containing) system prompts are not cache-eligible.
+- The flag is **silently ignored** when the runtime or model does not support
+  the feature.  Always falls back to uncached delivery.
+- Enable via `enable_system_prompt_cache: true` in `cosmos_reasoner.yaml`, only
+  valid together with `instruction_delivery_mode: structured`.
+
+> **Thor validation required**: System-prompt caching has not been benchmarked
+> on the validated Jetson AGX Thor stack.  Enable it only after measuring
+> cache-hit TTFT using NVIDIA native profiling and the methodology from
+> issue #7.  To measure: run `cosmos_inference_worker --benchmark-session` with
+> the cache enabled and disabled across a representative prompt set.
 
 ### Response
 
@@ -137,7 +180,8 @@ fixed, trivially-copyable headers followed by bounded byte payloads.
 Limits are enforced before allocation or transfer:
 
 - image payload: 256 MiB;
-- prompt, response, and error text: 1 MiB each;
+- prompt, system message, history entry, response, and error text: 1 MiB each;
+- history entries: 256 maximum;
 - socket path: `sockaddr_un::sun_path` capacity.
 
 IPC writes suppress `SIGPIPE`. A transport failure closes the client socket.
@@ -145,8 +189,8 @@ The current frame fails once; the next sampled frame attempts a new connection.
 Requests are not automatically replayed because execution state is uncertain
 after a connection failure.
 
-The protocol currently uses native POD layout and is intended only for the two
-binaries built from the same package on one host. It is not a network API or a
+The protocol uses native POD layout and is intended only for the two binaries
+built from the same package on one host. It is not a network API or a
 cross-version serialization format.
 
 ## Startup
@@ -277,8 +321,10 @@ process boundary has not regressed.
 ## Known limitations and follow-ups
 
 - Independent frames rather than temporal video windows: issue #8.
-- IPC protocol tests and a fake CPU worker: issue #13.
 - Formal latency/resource benchmarks: issue #7.
 - Model portability and measured optimization: issue #9.
 - RViz2 visualization: issue #10.
 - Task-level quality evaluation: issue #11.
+- System-prompt cache Thor benchmark: requires measuring cache-hit TTFT on the
+  validated stack before enabling `enable_system_prompt_cache` in production
+  (see IPC protocol section above).

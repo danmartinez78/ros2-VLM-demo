@@ -125,7 +125,9 @@ int main(int argc, char ** argv)
         header.height > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
         static_cast<uint64_t>(header.step) !=
         static_cast<uint64_t>(header.width) * 3U ||
-        header.prompt_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)
+        header.prompt_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
+        header.system_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
+        header.history_count > cosmos_ros2_video_reasoner::ipc::kMaxHistoryEntries)
       {
         throw std::runtime_error("invalid IPC request header");
       }
@@ -137,10 +139,52 @@ int main(int argc, char ** argv)
         throw std::runtime_error("invalid IPC image payload size");
       }
 
+      // ── Read image ────────────────────────────────────────────────────────
       std::vector<uint8_t> image_bytes(header.image_bytes);
-      std::string prompt(header.prompt_bytes, '\0');
-      cosmos_ros2_video_reasoner::ipc::read_all(client_fd, image_bytes.data(), image_bytes.size());
-      cosmos_ros2_video_reasoner::ipc::read_all(client_fd, prompt.data(), prompt.size());
+      cosmos_ros2_video_reasoner::ipc::read_all(
+        client_fd, image_bytes.data(), image_bytes.size());
+
+      // ── Read structured or inline payload ─────────────────────────────────
+      const bool is_structured =
+        (header.schema_flags & cosmos_ros2_video_reasoner::ipc::kSchemaFlagStructured) != 0;
+
+      std::string system_message;
+      std::string prompt;
+      std::vector<cosmos_ros2_video_reasoner::HistoryEntry> history;
+
+      if (is_structured) {
+        // Read system message (may be empty).
+        if (header.system_bytes > 0) {
+          system_message.resize(header.system_bytes);
+          cosmos_ros2_video_reasoner::ipc::read_all(
+            client_fd, system_message.data(), system_message.size());
+        }
+        // Read user message.
+        prompt.resize(header.prompt_bytes);
+        cosmos_ros2_video_reasoner::ipc::read_all(client_fd, prompt.data(), prompt.size());
+        // Read history entries.
+        history.resize(header.history_count);
+        for (auto & entry : history) {
+          cosmos_ros2_video_reasoner::ipc::HistoryEntryHeader entry_header;
+          cosmos_ros2_video_reasoner::ipc::read_all(
+            client_fd, &entry_header, sizeof(entry_header));
+          if (entry_header.user_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
+            entry_header.asst_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)
+          {
+            throw std::runtime_error("IPC history entry exceeds protocol limits");
+          }
+          entry.user_text.resize(entry_header.user_bytes);
+          entry.asst_text.resize(entry_header.asst_bytes);
+          cosmos_ros2_video_reasoner::ipc::read_all(
+            client_fd, entry.user_text.data(), entry.user_text.size());
+          cosmos_ros2_video_reasoner::ipc::read_all(
+            client_fd, entry.asst_text.data(), entry.asst_text.size());
+        }
+      } else {
+        // Inline mode: single prompt string, no system message, no history.
+        prompt.resize(header.prompt_bytes);
+        cosmos_ros2_video_reasoner::ipc::read_all(client_fd, prompt.data(), prompt.size());
+      }
 
       cv::Mat view(
         static_cast<int>(header.height), static_cast<int>(header.width),
@@ -149,6 +193,10 @@ int main(int argc, char ** argv)
       cosmos_ros2_video_reasoner::InferenceRequest request;
       request.image = view;
       request.prompt = std::move(prompt);
+      request.system_message = std::move(system_message);
+      request.history = std::move(history);
+      request.use_system_prompt_cache =
+        (header.schema_flags & cosmos_ros2_video_reasoner::ipc::kSchemaFlagSysCache) != 0;
       request.max_generate_length = header.max_generate_length;
       request.temperature = header.temperature;
       request.top_p = header.top_p;
@@ -213,7 +261,8 @@ int main(int argc, char ** argv)
       response.inference_seconds = result.inference_seconds;
       cosmos_ros2_video_reasoner::ipc::write_all(client_fd, &response, sizeof(response));
       cosmos_ros2_video_reasoner::ipc::write_all(client_fd, result.text.data(), result.text.size());
-      cosmos_ros2_video_reasoner::ipc::write_all(client_fd, result.error.data(), result.error.size());
+      cosmos_ros2_video_reasoner::ipc::write_all(
+        client_fd, result.error.data(), result.error.size());
     }
     ::close(client_fd);
   } catch (std::exception const & error) {

@@ -36,6 +36,7 @@ using namespace std::chrono_literals;
 using cosmos_ros2_video_reasoner::CosmosReasonerNode;
 using cosmos_ros2_video_reasoner::FakeInferenceBackend;
 using cosmos_ros2_video_reasoner::FailingFakeInferenceBackend;
+using cosmos_ros2_video_reasoner::HistoryEntry;
 using cosmos_ros2_video_reasoner::InferenceRequest;
 using cosmos_ros2_video_reasoner::InferenceResponse;
 using cosmos_ros2_video_reasoner::SlowFakeInferenceBackend;
@@ -659,6 +660,69 @@ TEST_F(NodeTest, PromptHistoryIsBoundedByCharacterSize)
   EXPECT_EQ(captured_prompts[3].find("AAAAAAAAAA"), std::string::npos);
   EXPECT_NE(captured_prompts[3].find("BBBBBBBBBB"), std::string::npos);
   EXPECT_NE(captured_prompts[3].find("CCCCCCCCCC"), std::string::npos);
+}
+
+/// Structured history accounts for both user and assistant text when enforcing the limit.
+TEST_F(NodeTest, StructuredPromptHistoryCountsBothSidesOfEachTurn)
+{
+  std::mutex histories_mutex;
+  std::vector<std::vector<HistoryEntry>> captured_histories;
+  std::atomic<int> calls{0};
+
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest & req) {
+      {
+        std::lock_guard<std::mutex> lock(histories_mutex);
+        captured_histories.push_back(req.history);
+      }
+      const int index = ++calls;
+      InferenceResponse resp;
+      resp.success = true;
+      if (index == 1) {
+        resp.text = "AAAAAAAAAA";
+      } else if (index == 2) {
+        resp.text = "BBBBBBBBBB";
+      } else if (index == 3) {
+        resp.text = "CCCCCCCCCC";
+      } else {
+        resp.text = "DD";
+      }
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("instruction_delivery_mode", "structured");
+  opts.append_parameter_override("prompt_history_max_entries", 4);
+  // The rendered user text is one character and each response is ten characters.
+  // Two complete structured turns fit exactly; a third evicts the oldest.
+  opts.append_parameter_override("prompt_history_max_chars", 22);
+  opts.append_parameter_override("task_profiles.scene_description.template", "x");
+  opts.append_parameter_override("task_profile", "scene_description");
+
+  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  std::this_thread::sleep_for(50ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  std::this_thread::sleep_for(50ms);
+
+  pub->publish(*make_image(rclcpp::Time(650, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 1;}));
+  pub->publish(*make_image(rclcpp::Time(651, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 2;}));
+  pub->publish(*make_image(rclcpp::Time(652, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 3;}));
+  pub->publish(*make_image(rclcpp::Time(653, 0, RCL_ROS_TIME)));
+  ASSERT_TRUE(spin_until(node_, nullptr, [&] {return calls.load() >= 4;}));
+
+  std::lock_guard<std::mutex> lock(histories_mutex);
+  ASSERT_GE(captured_histories.size(), 4u);
+  ASSERT_EQ(captured_histories[3].size(), 2u);
+  EXPECT_EQ(captured_histories[3][0].user_text, "x");
+  EXPECT_EQ(captured_histories[3][0].asst_text, "BBBBBBBBBB");
+  EXPECT_EQ(captured_histories[3][1].user_text, "x");
+  EXPECT_EQ(captured_histories[3][1].asst_text, "CCCCCCCCCC");
 }
 
 /// Malformed templates fail validation and doubled braces render literal braces.

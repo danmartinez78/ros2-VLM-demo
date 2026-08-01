@@ -159,3 +159,26 @@ TEST(IpcProtocol, WriteAllDoesNotRaiseSigpipeWhenPeerClosed)
 
   ::close(fds[0]);
 }
+
+TEST(IpcProtocol, RequestHeaderV2FieldsDefaultToInlineMode)
+{
+  ipc::RequestHeader header;
+
+  // Schema v2 request header defaults must match inline (backward-compatible) delivery.
+  EXPECT_EQ(header.version, ipc::kVersion);
+  EXPECT_EQ(header.schema_flags, ipc::kSchemaFlagInline);
+  EXPECT_EQ(header.system_bytes, 0U);
+  EXPECT_EQ(header.history_count, 0U);
+
+  // Verify the structured and cache flags are distinct and non-zero.
+  EXPECT_NE(ipc::kSchemaFlagStructured, ipc::kSchemaFlagInline);
+  EXPECT_NE(ipc::kSchemaFlagSysCache, ipc::kSchemaFlagInline);
+  EXPECT_EQ(ipc::kSchemaFlagStructured & ipc::kSchemaFlagSysCache, 0U);
+}
+
+TEST(IpcProtocol, HistoryEntryHeaderDefaultsToZero)
+{
+  ipc::HistoryEntryHeader entry{};
+  EXPECT_EQ(entry.user_bytes, 0U);
+  EXPECT_EQ(entry.asst_bytes, 0U);
+}

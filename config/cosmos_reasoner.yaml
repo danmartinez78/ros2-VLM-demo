@@ -58,7 +58,23 @@ cosmos_reasoner:
     #   {source_topic} {sample_period_seconds} {frame_sequence}
     system_instruction: ""
     task_instruction: ""
+    # instruction_delivery_mode: inline — legacy flat prompt; all fields concatenated
+    #   into a single user message.  The {system_instruction} and {context} template
+    #   variables are expanded inline.
+    # instruction_delivery_mode: structured — native Edge-LLM message roles.
+    #   system_instruction → system Message; task prompt → user Message;
+    #   retained history → prior (user, assistant) turn pairs.
+    #   The {system_instruction} and {context} template variables are suppressed
+    #   (they expand to empty strings) since those roles are delivered separately.
     instruction_delivery_mode: inline
+    # enable_system_prompt_cache: opt-in system-prompt caching for stable, identical
+    # system prompts.  Only valid with instruction_delivery_mode: structured and a
+    # non-empty system_instruction.  Cache keys are derived from the system prompt
+    # text (and LoRA identity where applicable); they live in device memory and do
+    # not persist across worker restarts.  Multimodal system prompts are not cached.
+    # Requires validation on Thor with the pinned TensorRT Edge-LLM version before
+    # enabling.  Silently ignored when the runtime does not support caching.
+    enable_system_prompt_cache: false
     prompt_history_max_entries: 0
     prompt_history_max_chars: 0
     prompt_history_reset_policy: never

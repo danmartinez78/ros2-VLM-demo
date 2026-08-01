@@ -95,10 +95,38 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
 
   cv::Mat packed = request.image.isContinuous() ? request.image : request.image.clone();
   const size_t image_size = packed.total() * packed.elemSize();
-  const size_t max_image_bytes = std::min(config_.max_image_bytes, static_cast<size_t>(ipc::kMaxImageBytes));
-  const size_t max_text_bytes = std::min(config_.max_text_bytes, static_cast<size_t>(ipc::kMaxTextBytes));
-  if (image_size > max_image_bytes || request.prompt.size() > max_text_bytes) {
+  const size_t max_image_bytes = std::min(
+    config_.max_image_bytes, static_cast<size_t>(ipc::kMaxImageBytes));
+  const size_t max_text_bytes = std::min(
+    config_.max_text_bytes, static_cast<size_t>(ipc::kMaxTextBytes));
+
+  if (image_size > max_image_bytes) {
     throw std::runtime_error("IPC request exceeds protocol limits");
+  }
+  if (request.prompt.size() > max_text_bytes) {
+    throw std::runtime_error("IPC request exceeds protocol limits");
+  }
+  if (request.system_message.size() > max_text_bytes) {
+    throw std::runtime_error("IPC request exceeds protocol limits");
+  }
+  if (request.history.size() > ipc::kMaxHistoryEntries) {
+    throw std::runtime_error("IPC request history exceeds protocol limits");
+  }
+  for (const auto & entry : request.history) {
+    if (entry.user_text.size() > max_text_bytes || entry.asst_text.size() > max_text_bytes) {
+      throw std::runtime_error("IPC request history entry exceeds protocol limits");
+    }
+  }
+
+  // Determine schema flags based on request content.
+  // Structured mode is used whenever a system message or history is present.
+  const bool has_structured = !request.system_message.empty() || !request.history.empty();
+  uint32_t schema_flags = ipc::kSchemaFlagInline;
+  if (has_structured) {
+    schema_flags |= ipc::kSchemaFlagStructured;
+    if (request.use_system_prompt_cache && !request.system_message.empty()) {
+      schema_flags |= ipc::kSchemaFlagSysCache;
+    }
   }
 
   ipc::RequestHeader header;
@@ -112,12 +140,28 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   header.temperature = request.temperature;
   header.top_p = request.top_p;
   header.top_k = request.top_k;
+  header.schema_flags = schema_flags;
+  header.system_bytes = static_cast<uint32_t>(request.system_message.size());
+  header.history_count = static_cast<uint32_t>(request.history.size());
 
   ipc::ResponseHeader response_header;
   try {
     ipc::write_all(socket_fd_, &header, sizeof(header));
     ipc::write_all(socket_fd_, packed.data, image_size);
+    if (has_structured && !request.system_message.empty()) {
+      ipc::write_all(socket_fd_, request.system_message.data(), request.system_message.size());
+    }
     ipc::write_all(socket_fd_, request.prompt.data(), request.prompt.size());
+    if (has_structured) {
+      for (const auto & entry : request.history) {
+        ipc::HistoryEntryHeader entry_header;
+        entry_header.user_bytes = static_cast<uint32_t>(entry.user_text.size());
+        entry_header.asst_bytes = static_cast<uint32_t>(entry.asst_text.size());
+        ipc::write_all(socket_fd_, &entry_header, sizeof(entry_header));
+        ipc::write_all(socket_fd_, entry.user_text.data(), entry.user_text.size());
+        ipc::write_all(socket_fd_, entry.asst_text.data(), entry.asst_text.size());
+      }
+    }
     ipc::read_all(socket_fd_, &response_header, sizeof(response_header));
   } catch (...) {
     close_connection();

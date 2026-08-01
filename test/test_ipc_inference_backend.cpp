@@ -27,6 +27,7 @@
 
 namespace
 {
+using cosmos_ros2_video_reasoner::HistoryEntry;
 using cosmos_ros2_video_reasoner::InferenceRequest;
 using cosmos_ros2_video_reasoner::IpcInferenceBackend;
 using cosmos_ros2_video_reasoner::IpcInferenceConfig;
@@ -198,6 +199,42 @@ void read_request_frame(int fd, ipc::RequestHeader & header, std::vector<uint8_t
   prompt.resize(header.prompt_bytes);
   ipc::read_all(fd, image.data(), image.size());
   ipc::read_all(fd, prompt.data(), prompt.size());
+}
+
+/// Read a full v2 structured request from the test worker side.
+/// Inline mode (schema_flags == kSchemaFlagInline): reads [image][prompt] only.
+/// Structured mode: reads [image][system_message][prompt][history entries].
+struct ParsedRequest
+{
+  ipc::RequestHeader header;
+  std::vector<uint8_t> image;
+  std::string system_message;
+  std::string prompt;
+  std::vector<std::pair<std::string, std::string>> history;  // {user_text, asst_text}
+};
+
+ParsedRequest read_full_request(int fd)
+{
+  ParsedRequest parsed;
+  ipc::read_all(fd, &parsed.header, sizeof(parsed.header));
+  parsed.image.resize(parsed.header.image_bytes);
+  ipc::read_all(fd, parsed.image.data(), parsed.image.size());
+  if (parsed.header.system_bytes > 0) {
+    parsed.system_message.resize(parsed.header.system_bytes);
+    ipc::read_all(fd, parsed.system_message.data(), parsed.system_message.size());
+  }
+  parsed.prompt.resize(parsed.header.prompt_bytes);
+  ipc::read_all(fd, parsed.prompt.data(), parsed.prompt.size());
+  for (uint32_t i = 0; i < parsed.header.history_count; ++i) {
+    ipc::HistoryEntryHeader entry_hdr{};
+    ipc::read_all(fd, &entry_hdr, sizeof(entry_hdr));
+    std::string user_text(entry_hdr.user_bytes, '\0');
+    std::string asst_text(entry_hdr.asst_bytes, '\0');
+    ipc::read_all(fd, user_text.data(), user_text.size());
+    ipc::read_all(fd, asst_text.data(), asst_text.size());
+    parsed.history.emplace_back(std::move(user_text), std::move(asst_text));
+  }
+  return parsed;
 }
 
 void send_success_response(int fd, uint64_t request_id, std::string text)
@@ -595,4 +632,201 @@ TEST(IpcInferenceBackend, TimesOutThenReconnectsAfterWorkerSelfTermination)
   EXPECT_TRUE(recovered.success);
   EXPECT_EQ(recovered.text, "recovered");
   replacement_worker.join_and_rethrow();
+}
+
+// ── Structured-message round-trip tests (IPC schema v2) ──────────────────────
+
+TEST(IpcInferenceBackend, InlineModeEmitsSchemaFlagsZero)
+{
+  ParsedRequest seen;
+
+  OneClientWorker worker([&](int client_fd) {
+    seen = read_full_request(client_fd);
+    send_success_response(client_fd, seen.header.request_id, "ok");
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  // make_request() has no system_message and no history → inline mode.
+  auto response = backend.infer(make_request("hello"));
+  ASSERT_TRUE(response.success);
+
+  EXPECT_EQ(seen.header.version, ipc::kVersion);
+  EXPECT_EQ(seen.header.schema_flags, ipc::kSchemaFlagInline);
+  EXPECT_EQ(seen.header.system_bytes, 0U);
+  EXPECT_EQ(seen.header.history_count, 0U);
+  EXPECT_EQ(seen.prompt, "hello");
+  EXPECT_TRUE(seen.system_message.empty());
+  EXPECT_TRUE(seen.history.empty());
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, StructuredModeSystemMessageRoundTrip)
+{
+  ParsedRequest seen;
+
+  OneClientWorker worker([&](int client_fd) {
+    seen = read_full_request(client_fd);
+    send_success_response(client_fd, seen.header.request_id, "ok");
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  InferenceRequest request = make_request("describe scene");
+  request.system_message = "You are a robot vision assistant.";
+
+  auto response = backend.infer(request);
+  ASSERT_TRUE(response.success);
+
+  EXPECT_EQ(seen.header.version, ipc::kVersion);
+  EXPECT_TRUE(seen.header.schema_flags & ipc::kSchemaFlagStructured);
+  EXPECT_EQ(seen.header.system_bytes, static_cast<uint32_t>(request.system_message.size()));
+  EXPECT_EQ(seen.header.history_count, 0U);
+  EXPECT_EQ(seen.system_message, request.system_message);
+  EXPECT_EQ(seen.prompt, "describe scene");
+  EXPECT_TRUE(seen.history.empty());
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, StructuredModeHistoryRoundTrip)
+{
+  ParsedRequest seen;
+
+  OneClientWorker worker([&](int client_fd) {
+    seen = read_full_request(client_fd);
+    send_success_response(client_fd, seen.header.request_id, "ok");
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  InferenceRequest request = make_request("current frame");
+  request.system_message = "Be precise.";
+  request.history.push_back(HistoryEntry{"first user turn", "first assistant reply"});
+  request.history.push_back(HistoryEntry{"second user turn", "second assistant reply"});
+
+  auto response = backend.infer(request);
+  ASSERT_TRUE(response.success);
+
+  EXPECT_EQ(seen.header.version, ipc::kVersion);
+  EXPECT_TRUE(seen.header.schema_flags & ipc::kSchemaFlagStructured);
+  EXPECT_EQ(seen.header.system_bytes, static_cast<uint32_t>(request.system_message.size()));
+  EXPECT_EQ(seen.header.history_count, 2U);
+  EXPECT_EQ(seen.system_message, "Be precise.");
+  EXPECT_EQ(seen.prompt, "current frame");
+
+  ASSERT_EQ(seen.history.size(), 2U);
+  EXPECT_EQ(seen.history[0].first, "first user turn");
+  EXPECT_EQ(seen.history[0].second, "first assistant reply");
+  EXPECT_EQ(seen.history[1].first, "second user turn");
+  EXPECT_EQ(seen.history[1].second, "second assistant reply");
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, SysCacheFlagSetOnlyWhenRequested)
+{
+  ParsedRequest seen_cached, seen_uncached;
+
+  // First request: cache flag requested.
+  {
+    OneClientWorker worker([&](int client_fd) {
+      seen_cached = read_full_request(client_fd);
+      send_success_response(client_fd, seen_cached.header.request_id, "ok");
+    });
+
+    IpcInferenceConfig config;
+    config.socket_path = worker.socket_path();
+    config.connect_timeout_seconds = 2;
+    config.request_timeout_seconds = 2;
+
+    IpcInferenceBackend backend(config);
+    backend.initialize();
+
+    InferenceRequest request = make_request("inspect");
+    request.system_message = "Sys prompt.";
+    request.use_system_prompt_cache = true;
+
+    ASSERT_TRUE(backend.infer(request).success);
+    worker.join_and_rethrow();
+  }
+
+  // Second request: cache flag NOT requested.
+  {
+    OneClientWorker worker([&](int client_fd) {
+      seen_uncached = read_full_request(client_fd);
+      send_success_response(client_fd, seen_uncached.header.request_id, "ok");
+    });
+
+    IpcInferenceConfig config;
+    config.socket_path = worker.socket_path();
+    config.connect_timeout_seconds = 2;
+    config.request_timeout_seconds = 2;
+
+    IpcInferenceBackend backend(config);
+    backend.initialize();
+
+    InferenceRequest request = make_request("inspect");
+    request.system_message = "Sys prompt.";
+    request.use_system_prompt_cache = false;
+
+    ASSERT_TRUE(backend.infer(request).success);
+    worker.join_and_rethrow();
+  }
+
+  // Cache flag should be set in the first request, not in the second.
+  EXPECT_TRUE(seen_cached.header.schema_flags & ipc::kSchemaFlagStructured);
+  EXPECT_TRUE(seen_cached.header.schema_flags & ipc::kSchemaFlagSysCache);
+  EXPECT_TRUE(seen_uncached.header.schema_flags & ipc::kSchemaFlagStructured);
+  EXPECT_FALSE(seen_uncached.header.schema_flags & ipc::kSchemaFlagSysCache);
+}
+
+TEST(IpcInferenceBackend, StructuredModeHistoryOnlyNoSystemMessage)
+{
+  ParsedRequest seen;
+
+  OneClientWorker worker([&](int client_fd) {
+    seen = read_full_request(client_fd);
+    send_success_response(client_fd, seen.header.request_id, "ok");
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  // No system_message, but history present → structured mode, no SysCache flag.
+  InferenceRequest request = make_request("now");
+  request.history.push_back(HistoryEntry{"prev user", "prev asst"});
+
+  ASSERT_TRUE(backend.infer(request).success);
+
+  EXPECT_TRUE(seen.header.schema_flags & ipc::kSchemaFlagStructured);
+  EXPECT_FALSE(seen.header.schema_flags & ipc::kSchemaFlagSysCache);
+  EXPECT_EQ(seen.header.system_bytes, 0U);
+  EXPECT_EQ(seen.header.history_count, 1U);
+  EXPECT_TRUE(seen.system_message.empty());
+  ASSERT_EQ(seen.history.size(), 1U);
+  EXPECT_EQ(seen.history[0].first, "prev user");
+  EXPECT_EQ(seen.history[0].second, "prev asst");
+  worker.join_and_rethrow();
 }

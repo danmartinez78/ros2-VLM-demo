@@ -158,6 +158,48 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   }
 
   // ── Build multimodal generation request ──────────────────────────────
+  trt_edgellm::rt::LLMGenerationRequest::Request inner_req;
+
+  // ── System message (structured delivery only) ─────────────────────────
+  // When a system message is present it is mapped to a native system Message.
+  // Prior model outputs must not appear here — only operator-authored
+  // instructions are eligible.
+  // System prompts must be text-only; multimodal system messages are not
+  // supported by the system-prompt cache and are rejected by the runtime.
+  if (!request.system_message.empty()) {
+    trt_edgellm::rt::Message sys_msg;
+    sys_msg.role = "system";
+    trt_edgellm::rt::Message::MessageContent sys_content;
+    sys_content.type = "text";
+    sys_content.content = request.system_message;
+    sys_msg.contents.push_back(sys_content);
+    inner_req.messages.push_back(std::move(sys_msg));
+  }
+
+  // ── Prior conversation turns (structured history) ─────────────────────
+  // Each HistoryEntry represents one (user, assistant) exchange from prior
+  // frames.  Historical user turns carry only text — no image — because we
+  // do not retain image buffers across frames.  Assistant turns are untrusted
+  // observations and must not influence system-level authority.
+  for (const auto & entry : request.history) {
+    trt_edgellm::rt::Message hist_user_msg;
+    hist_user_msg.role = "user";
+    trt_edgellm::rt::Message::MessageContent hist_user_content;
+    hist_user_content.type = "text";
+    hist_user_content.content = entry.user_text;
+    hist_user_msg.contents.push_back(hist_user_content);
+    inner_req.messages.push_back(std::move(hist_user_msg));
+
+    trt_edgellm::rt::Message hist_asst_msg;
+    hist_asst_msg.role = "assistant";
+    trt_edgellm::rt::Message::MessageContent hist_asst_content;
+    hist_asst_content.type = "text";
+    hist_asst_content.content = entry.asst_text;
+    hist_asst_msg.contents.push_back(hist_asst_content);
+    inner_req.messages.push_back(std::move(hist_asst_msg));
+  }
+
+  // ── Current user message (image + task text) ──────────────────────────
   trt_edgellm::rt::Message user_msg;
   user_msg.role = "user";
 
@@ -171,7 +213,6 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   text_content.content = request.prompt;
   user_msg.contents.push_back(text_content);
 
-  trt_edgellm::rt::LLMGenerationRequest::Request inner_req;
   inner_req.messages.push_back(std::move(user_msg));
   inner_req.imageBuffers.push_back(std::move(image_data));
 
@@ -183,6 +224,32 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   gen_req.maxGenerateLength = static_cast<int64_t>(request.max_generate_length);
   gen_req.applyChatTemplate = true;
   gen_req.addGenerationPrompt = true;
+
+  // ── System-prompt cache (opt-in, hardware-validated) ──────────────────
+  // The system-prompt cache accelerates TTFT for repeated requests that share
+  // an identical, stable system prompt.  Cache keys are derived from the
+  // system prompt text (and LoRA identity when applicable) and live in device
+  // memory.  Multimodal system prompts are not cached.
+  //
+  // This flag is only effective when:
+  //   1. request.system_message is non-empty,
+  //   2. the pinned Edge-LLM version exposes the cache API, and
+  //   3. the model engine was built with KV-cache reuse support.
+  //
+  // When the runtime does not support caching (older SDK or unsupported model),
+  // the flag should be silently ignored — do not treat absence as a fatal error.
+  //
+  // Thor hardware validation is required to confirm the exact field name and
+  // semantics exposed by the pinned TensorRT Edge-LLM version.
+  // Uncomment and adapt the following block once the API is confirmed:
+  //
+  //   if (request.use_system_prompt_cache && !request.system_message.empty()) {
+  //     gen_req.useSystemPromptCache = true;  // field name TBD; verify on Thor
+  //   }
+  //
+  // Until validated, system-prompt caching is accepted by the configuration but
+  // is not activated here.  The flag is propagated through IPC and is observable
+  // in the prompt_config_hash for reproducibility.
 
   // ── Run inference ─────────────────────────────────────────────────────
   trt_edgellm::rt::LLMGenerationResponse gen_resp;
