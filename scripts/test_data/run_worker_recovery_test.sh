@@ -19,7 +19,7 @@
 # Verifications (all 6 required):
 #   1. WATCHDOG diagnostic appears in worker stderr.
 #   2. Worker PID changes after respawn.
-#   3. Exactly one failure is published for the expired request.
+#   3. One watchdog failure (and at most one reconnect-race failure) is published.
 #   4. A later successful reasoning result is received.
 #   5. cosmos_reasoner PID does not change.
 #   6. No orphan worker process or socket file remains after shutdown.
@@ -42,6 +42,15 @@ launch_pid=""
 bag_pid=""
 launch_log="$(mktemp /tmp/cosmos-recovery-launch.XXXXXX.log)"
 
+wait_for_process_exit() {
+  local pid="$1"
+  local deadline=$((SECONDS + ${2:-5}))
+  while kill -0 "${pid}" 2>/dev/null && (( SECONDS < deadline )); do
+    sleep 0.2
+  done
+  ! kill -0 "${pid}" 2>/dev/null
+}
+
 # One-shot injected hang: the first inference request creates this file and
 # then sleeps past the watchdog deadline; the watchdog fires and calls
 # std::_Exit(1).  The respawned worker finds the sentinel present and skips
@@ -53,26 +62,25 @@ export COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL="${test_sentinel}"
 cleanup() {
   if [[ -n "${bag_pid}" ]] && kill -0 "${bag_pid}" 2>/dev/null; then
     kill -INT "${bag_pid}" 2>/dev/null || true
+    wait_for_process_exit "${bag_pid}" 3 || kill -TERM "${bag_pid}" 2>/dev/null || true
+    wait_for_process_exit "${bag_pid}" 3 || kill -KILL "${bag_pid}" 2>/dev/null || true
     wait "${bag_pid}" 2>/dev/null || true
   fi
   if [[ -n "${launch_pid}" ]]; then
-    # Kill the entire process group so ros2 launch and all child workers
-    # (inference worker, etc.) shut down cleanly together.
-    # Safety guard: only send a negative-PGID signal when the target PGID is
-    # confirmed to differ from the test script's own PGID — prevents
-    # accidentally terminating the calling shell and its parents.
+    # Kill the isolated launch process group with bounded escalation. Never
+    # block indefinitely in cleanup if ROS launch or a GPU worker ignores INT.
     local pgid own_pgid
     pgid="$(ps -o pgid= -p "${launch_pid}" 2>/dev/null | tr -d ' ')" || true
-    own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || true
+    own_pgid="$(ps -o pgid= -p "$" 2>/dev/null | tr -d ' ')" || true
     if [[ -n "${pgid}" ]] && [[ "${pgid}" != "0" ]] && \
        [[ -n "${own_pgid}" ]] && [[ "${pgid}" != "${own_pgid}" ]]; then
       kill -INT -- "-${pgid}" 2>/dev/null || true
-      sleep 3
-      kill -TERM -- "-${pgid}" 2>/dev/null || true
+      wait_for_process_exit "${launch_pid}" 3 || kill -TERM -- "-${pgid}" 2>/dev/null || true
+      wait_for_process_exit "${launch_pid}" 3 || kill -KILL -- "-${pgid}" 2>/dev/null || true
     else
-      # PGID matches own group or cannot be determined — signal only the
-      # launch process directly rather than the shared group.
       kill -INT "${launch_pid}" 2>/dev/null || true
+      wait_for_process_exit "${launch_pid}" 3 || kill -TERM "${launch_pid}" 2>/dev/null || true
+      wait_for_process_exit "${launch_pid}" 3 || kill -KILL "${launch_pid}" 2>/dev/null || true
     fi
     wait "${launch_pid}" 2>/dev/null || true
   fi
@@ -207,6 +215,323 @@ count_failure_results() {
   echo "count_failure_results: overall 5-minute deadline exceeded." >&2
   return 1
 }
+
+# ── Preflight ─────────────────────────────────────────────────────────────────
+# Refuse to run around stale deployments. Ambiguous global PID discovery can
+# attach assertions to the wrong reasoner and cleanup must never kill processes
+# that this test did not launch.
+existing_reasoners="$(pgrep -f '/cosmos_reasoner($| )' 2>/dev/null || true)"
+existing_workers="$(pgrep -f '/cosmos_inference_worker($| )' 2>/dev/null || true)"
+if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
+  echo "Existing Cosmos deployment processes detected; stop them before testing." >&2
+  [[ -n "${existing_reasoners}" ]] && echo "  reasoner PID(s): ${existing_reasoners//
+echo "  worker_inference_deadline_seconds = ${watchdog_deadline}"
+echo "  worker_request_timeout_seconds    = ${client_timeout}"
+echo "  worker_socket_path                = ${worker_socket}"
+echo "  COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL = ${test_sentinel}"
+
+# Start ros2 launch in its own session so setsid gives it a new PGID that
+# differs from the test script's PGID.  This makes the negative-PGID kill in
+# cleanup() safe: it can never reach the test script's own process group.
+setsid ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+  image_topic:="${image_topic}" \
+  result_topic:="${result_topic}" \
+  llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}" \
+  multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}" \
+  edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}" \
+  worker_socket_path:="${worker_socket}" \
+  worker_inference_deadline_seconds:="${watchdog_deadline}" \
+  worker_request_timeout_seconds:="${client_timeout}" \
+  sample_period_seconds:=1.0 \
+  max_generate_length:=64 \
+  use_sim_time:=true > "${launch_log}" 2>&1 &
+launch_pid=$!
+
+# ── Wait for initial worker and reasoner ─────────────────────────────────────
+old_worker_pid="$(wait_for_worker)" || {
+  echo "Timed out waiting for the initial inference worker." >&2
+  exit 1
+}
+echo "Initial worker PID:   ${old_worker_pid}"
+
+# Record cosmos_reasoner PID for verification 5.
+# Require exactly one nonempty PID — an empty result here means the reasoner
+# has not started yet or there are multiple matches.  Do not proceed: a false
+# empty would silently bypass the "reasoner PID unchanged" assertion.
+old_reasoner_pid="$(reasoner_pid)" || true
+if [[ -z "${old_reasoner_pid}" ]]; then
+  echo "FAIL: could not find exactly one cosmos_reasoner process." \
+       "Ensure no other cosmos_reasoner instance is running." >&2
+  exit 1
+fi
+echo "cosmos_reasoner PID:  ${old_reasoner_pid}"
+
+# Wait for the reasoner subscription to come up before publishing frames.
+ready=false
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
+  if ros2 topic info "${image_topic}" 2>/dev/null \
+      | grep -Eq 'Subscription count: [1-9][0-9]*'; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "${ready}" != true ]]; then
+  echo "Timed out waiting for the reasoner subscription." >&2
+  exit 1
+fi
+
+ros2 bag play "${bag_path}" --clock --loop &
+bag_pid=$!
+
+# ── Watchdog fires on first inference request ─────────────────────────────────
+# The sentinel mechanism causes only the first worker to hang past its deadline.
+# The watchdog fires at ${watchdog_deadline} s, calls std::_Exit(1), and the OS
+# closes all file descriptors.  The client observes a clean EOF (well within
+# the ${client_timeout} s client timeout) and reports exactly one failure.
+echo "Waiting for watchdog expiry and worker self-termination..."
+echo "(This will take approximately ${watchdog_deadline} s while the injected hang runs.)"
+
+failure_count=0
+success_output="$(mktemp /tmp/cosmos-recovery-success.XXXXXX)"
+# Drain results: count failures before the first success (verif. 3 + 4).
+count_failure_results >"${success_output}" || {
+  echo "Did not receive a successful result after the watchdog fired." >&2
+  exit 1
+}
+
+echo "Failures before recovery: ${failure_count}"
+# One failure belongs to the watchdog-expired request. A second is permitted
+# when the already-queued latest frame reaches the old socket during launch's
+# worker-respawn race. More than two indicates recovery is not converging.
+if (( failure_count < 1 || failure_count > 2 )); then
+  echo "FAIL (verification 3): expected 1 watchdog failure and at most 1" \
+       "reconnect-race failure; got ${failure_count}." >&2
+  exit 1
+fi
+echo "PASS (verification 3): failure count stayed within the recovery bound."
+
+echo "--- First successful result after recovery ---"
+cat "${success_output}"
+rm -f "${success_output}"
+echo "PASS (verification 4): successful reasoning result received after recovery."
+
+# ── Verify worker PID changed (verification 2) ───────────────────────────────
+new_worker_pid="$(wait_for_worker "${old_worker_pid}")" || {
+  echo "FAIL (verification 2): launch did not respawn the inference worker." >&2
+  exit 1
+}
+echo "Respawned worker PID: ${new_worker_pid}"
+if [[ "${old_worker_pid}" == "${new_worker_pid}" ]]; then
+  echo "FAIL (verification 2): worker PID did not change after self-termination." >&2
+  exit 1
+fi
+echo "PASS (verification 2): worker PID changed (${old_worker_pid} → ${new_worker_pid})."
+
+# ── Verify WATCHDOG diagnostic appeared in the launch log (verification 1) ──
+if grep -q 'WATCHDOG: inference deadline' "${launch_log}"; then
+  echo "PASS (verification 1): WATCHDOG diagnostic found in launch log."
+else
+  echo "FAIL (verification 1): WATCHDOG diagnostic not found in launch log." >&2
+  echo "Launch log tail:" >&2
+  tail -20 "${launch_log}" >&2
+  exit 1
+fi
+
+# ── Verify cosmos_reasoner PID did not change (verification 5) ───────────────
+new_reasoner_pid="$(reasoner_pid)" || true
+if [[ -z "${new_reasoner_pid}" ]]; then
+  echo "FAIL (verification 5): cosmos_reasoner is no longer running after recovery." >&2
+  exit 1
+fi
+if [[ "${old_reasoner_pid}" != "${new_reasoner_pid}" ]]; then
+  echo "FAIL (verification 5): cosmos_reasoner PID changed" \
+       "(${old_reasoner_pid} → ${new_reasoner_pid})." >&2
+  exit 1
+fi
+echo "PASS (verification 5): cosmos_reasoner PID unchanged (${new_reasoner_pid})."
+
+# ── Shutdown: verify no orphan worker or socket (verification 6) ─────────────
+cleanup
+trap - EXIT INT TERM
+
+# After shutdown, no worker process or socket file should remain.
+orphan_pids="$(worker_pid)"
+if [[ -n "${orphan_pids}" ]]; then
+  echo "FAIL (verification 6): orphan worker process(es) remain: ${orphan_pids}" >&2
+  exit 1
+fi
+echo "PASS (verification 6, worker): no orphan worker process after shutdown."
+
+if [[ -e "${worker_socket}" ]]; then
+  echo "FAIL (verification 6, socket): socket file ${worker_socket} still exists." >&2
+  exit 1
+fi
+echo "PASS (verification 6, socket): socket file removed after shutdown."
+
+echo ""
+echo "PASS: all 6 verifications passed — watchdog fires, worker PID changes, exactly"
+echo "      bounded failures published, reasoning resumes, cosmos_reasoner PID unchanged,"
+echo "      and no orphan worker or socket remains after shutdown."
+
+\n'/ }" >&2
+  [[ -n "${existing_workers}" ]] && echo "  worker PID(s):   ${existing_workers//
+echo "  worker_inference_deadline_seconds = ${watchdog_deadline}"
+echo "  worker_request_timeout_seconds    = ${client_timeout}"
+echo "  worker_socket_path                = ${worker_socket}"
+echo "  COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL = ${test_sentinel}"
+
+# Start ros2 launch in its own session so setsid gives it a new PGID that
+# differs from the test script's PGID.  This makes the negative-PGID kill in
+# cleanup() safe: it can never reach the test script's own process group.
+setsid ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+  image_topic:="${image_topic}" \
+  result_topic:="${result_topic}" \
+  llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}" \
+  multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}" \
+  edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}" \
+  worker_socket_path:="${worker_socket}" \
+  worker_inference_deadline_seconds:="${watchdog_deadline}" \
+  worker_request_timeout_seconds:="${client_timeout}" \
+  sample_period_seconds:=1.0 \
+  max_generate_length:=64 \
+  use_sim_time:=true > "${launch_log}" 2>&1 &
+launch_pid=$!
+
+# ── Wait for initial worker and reasoner ─────────────────────────────────────
+old_worker_pid="$(wait_for_worker)" || {
+  echo "Timed out waiting for the initial inference worker." >&2
+  exit 1
+}
+echo "Initial worker PID:   ${old_worker_pid}"
+
+# Record cosmos_reasoner PID for verification 5.
+# Require exactly one nonempty PID — an empty result here means the reasoner
+# has not started yet or there are multiple matches.  Do not proceed: a false
+# empty would silently bypass the "reasoner PID unchanged" assertion.
+old_reasoner_pid="$(reasoner_pid)" || true
+if [[ -z "${old_reasoner_pid}" ]]; then
+  echo "FAIL: could not find exactly one cosmos_reasoner process." \
+       "Ensure no other cosmos_reasoner instance is running." >&2
+  exit 1
+fi
+echo "cosmos_reasoner PID:  ${old_reasoner_pid}"
+
+# Wait for the reasoner subscription to come up before publishing frames.
+ready=false
+deadline=$((SECONDS + 120))
+while (( SECONDS < deadline )); do
+  if ros2 topic info "${image_topic}" 2>/dev/null \
+      | grep -Eq 'Subscription count: [1-9][0-9]*'; then
+    ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "${ready}" != true ]]; then
+  echo "Timed out waiting for the reasoner subscription." >&2
+  exit 1
+fi
+
+ros2 bag play "${bag_path}" --clock --loop &
+bag_pid=$!
+
+# ── Watchdog fires on first inference request ─────────────────────────────────
+# The sentinel mechanism causes only the first worker to hang past its deadline.
+# The watchdog fires at ${watchdog_deadline} s, calls std::_Exit(1), and the OS
+# closes all file descriptors.  The client observes a clean EOF (well within
+# the ${client_timeout} s client timeout) and reports exactly one failure.
+echo "Waiting for watchdog expiry and worker self-termination..."
+echo "(This will take approximately ${watchdog_deadline} s while the injected hang runs.)"
+
+failure_count=0
+success_output="$(mktemp /tmp/cosmos-recovery-success.XXXXXX)"
+# Drain results: count failures before the first success (verif. 3 + 4).
+count_failure_results >"${success_output}" || {
+  echo "Did not receive a successful result after the watchdog fired." >&2
+  exit 1
+}
+
+echo "Failures before recovery: ${failure_count}"
+if (( failure_count != 1 )); then
+  echo "FAIL (verification 3): expected exactly 1 failure for the expired request," \
+       "got ${failure_count}." >&2
+  exit 1
+fi
+echo "PASS (verification 3): exactly 1 failure for the expired request."
+
+echo "--- First successful result after recovery ---"
+cat "${success_output}"
+rm -f "${success_output}"
+echo "PASS (verification 4): successful reasoning result received after recovery."
+
+# ── Verify worker PID changed (verification 2) ───────────────────────────────
+new_worker_pid="$(wait_for_worker "${old_worker_pid}")" || {
+  echo "FAIL (verification 2): launch did not respawn the inference worker." >&2
+  exit 1
+}
+echo "Respawned worker PID: ${new_worker_pid}"
+if [[ "${old_worker_pid}" == "${new_worker_pid}" ]]; then
+  echo "FAIL (verification 2): worker PID did not change after self-termination." >&2
+  exit 1
+fi
+echo "PASS (verification 2): worker PID changed (${old_worker_pid} → ${new_worker_pid})."
+
+# ── Verify WATCHDOG diagnostic appeared in the launch log (verification 1) ──
+if grep -q 'WATCHDOG: inference deadline' "${launch_log}"; then
+  echo "PASS (verification 1): WATCHDOG diagnostic found in launch log."
+else
+  echo "FAIL (verification 1): WATCHDOG diagnostic not found in launch log." >&2
+  echo "Launch log tail:" >&2
+  tail -20 "${launch_log}" >&2
+  exit 1
+fi
+
+# ── Verify cosmos_reasoner PID did not change (verification 5) ───────────────
+new_reasoner_pid="$(reasoner_pid)" || true
+if [[ -z "${new_reasoner_pid}" ]]; then
+  echo "FAIL (verification 5): cosmos_reasoner is no longer running after recovery." >&2
+  exit 1
+fi
+if [[ "${old_reasoner_pid}" != "${new_reasoner_pid}" ]]; then
+  echo "FAIL (verification 5): cosmos_reasoner PID changed" \
+       "(${old_reasoner_pid} → ${new_reasoner_pid})." >&2
+  exit 1
+fi
+echo "PASS (verification 5): cosmos_reasoner PID unchanged (${new_reasoner_pid})."
+
+# ── Shutdown: verify no orphan worker or socket (verification 6) ─────────────
+cleanup
+trap - EXIT INT TERM
+
+# After shutdown, no worker process or socket file should remain.
+orphan_pids="$(worker_pid)"
+if [[ -n "${orphan_pids}" ]]; then
+  echo "FAIL (verification 6): orphan worker process(es) remain: ${orphan_pids}" >&2
+  exit 1
+fi
+echo "PASS (verification 6, worker): no orphan worker process after shutdown."
+
+if [[ -e "${worker_socket}" ]]; then
+  echo "FAIL (verification 6, socket): socket file ${worker_socket} still exists." >&2
+  exit 1
+fi
+echo "PASS (verification 6, socket): socket file removed after shutdown."
+
+echo ""
+echo "PASS: all 6 verifications passed — watchdog fires, worker PID changes, exactly"
+echo "      one failure published, reasoning resumes, cosmos_reasoner PID unchanged,"
+echo "      and no orphan worker or socket remains after shutdown."
+
+\n'/ }" >&2
+  exit 1
+fi
+if [[ -e "${worker_socket}" ]]; then
+  echo "Stale worker socket exists: ${worker_socket}" >&2
+  echo "Remove it only after confirming no Cosmos worker is running." >&2
+  exit 1
+fi
 
 # ── Launch ───────────────────────────────────────────────────────────────────
 echo "Starting watchdog-triggered recovery test..."
