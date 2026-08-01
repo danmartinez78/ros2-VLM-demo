@@ -184,11 +184,12 @@ Benchmarks are separated into two layers that must not be conflated:
 source scripts/cosmos_env.sh
 
 bash scripts/benchmark/run_native_benchmarks.sh \
-  --warmup 3 \
-  --iterations 10 \
-  --max-generate-length 64 \
   --input-vlm-json "$COSMOS_WORKSPACE_DIR/input_vlm.json"
 ```
+
+Defaults match the NVIDIA published workload: `--batch-size 1 --input-len 2048
+--past-kv-len 2048 --image-size 1024x2048 --warmup 3 --iterations 10
+--inference-warmup 10`. Pass `--quick` for faster smoke-test runs.
 
 Artifacts are written to `/tmp/cosmos_native_bench_YYYYMMDD_HHMMSS/`.
 

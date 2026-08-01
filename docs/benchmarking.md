@@ -38,11 +38,13 @@ cd "$HOME/ros2_ws/src/ros2-VLM-demo"
 source scripts/cosmos_env.sh
 
 bash scripts/benchmark/run_native_benchmarks.sh \
-  --warmup 3 \
-  --iterations 10 \
-  --max-generate-length 64 \
   --input-vlm-json "$COSMOS_WORKSPACE_DIR/input_vlm.json"
 ```
+
+Default parameters match the NVIDIA published workload:
+`--batch-size 1`, `--input-len 2048`, `--past-kv-len 2048`, `--image-size 1024x2048`,
+`--warmup 3`, `--iterations 10`, `--inference-warmup 10`.
+Use `--quick` for faster smoke-test runs (smaller sizes, fewer iterations).
 
 This calls, in order:
 
@@ -50,18 +52,26 @@ This calls, in order:
 # Prefill latency / throughput
 llm_bench --mode prefill \
   --engineDir "$COSMOS_LLM_ENGINE_DIR" \
-  --warmUp 3 --numRuns 10
+  --batchSize 1 \
+  --inputLen 2048 \
+  --warmup 3 --iterations 10 \
+  --profile
 
 # Generation (decode) throughput
 llm_bench --mode decode \
   --engineDir "$COSMOS_LLM_ENGINE_DIR" \
-  --warmUp 3 --numRuns 10 --maxGenerateLength 64
+  --batchSize 1 \
+  --pastKVLen 2048 \
+  --warmup 3 --iterations 10 \
+  --profile
 
 # Vision-encoder latency / throughput
 llm_bench --mode visual \
   --engineDir "$COSMOS_LLM_ENGINE_DIR" \
   --multimodalEngineDir "$COSMOS_MULTIMODAL_ENGINE_DIR" \
-  --warmUp 3 --numRuns 10
+  --imageSize 1024x2048 \
+  --warmup 3 --iterations 10 \
+  --profile
 
 # End-to-end profiling with representative input
 llm_inference \
@@ -70,6 +80,7 @@ llm_inference \
   --inputFile "$COSMOS_WORKSPACE_DIR/input_vlm.json" \
   --outputFile /tmp/cosmos_native_bench_*/llm_inference_output.json \
   --maxGenerateLength 64 \
+  --warmup 10 \
   --dumpProfile \
   --profileOutputFile /tmp/cosmos_native_bench_*/llm_inference_profile.json
 ```
@@ -124,8 +135,8 @@ The `benchmark_output_file` parameter writes one JSON line per sampled frame plu
 `session_start` and `session_end` records:
 
 ```jsonc
-{"record_type":"session_start","node_start_wall_ns":1720000000000000000,"task_profile":"scene_description",...}
-{"record_type":"frame","frame_seq":1,"dequeue_wall_ns":1720000003000000000,"convert_done_ns":1720000003005000000,"infer_done_ns":1720000004510000000,"publish_done_ns":1720000004511000000,"inference_seconds":1.500,"success":true,"error":"","dropped_before":0,...}
+{"record_type":"session_start","node_init_wall_ns":1720000000000000000,"worker_ready_wall_ns":1720000002000000000,"task_profile":"scene_description",...}
+{"record_type":"frame","frame_seq":1,"subscribe_wall_ns":1720000003000000000,"dequeue_wall_ns":1720000003002000000,"convert_done_ns":1720000003007000000,"infer_done_ns":1720000004510000000,"publish_done_ns":1720000004511000000,"inference_seconds":1.500,"success":true,"error":"","dropped_before":0,...}
 ...
 {"record_type":"session_end","received":120,"sampled":60,"dropped":3,"success":58,"failure":2}
 ```
@@ -193,7 +204,7 @@ ROS Pipeline Overhead  (repository instrumentation)
   IPC overhead mean:   2.8 ms
   Publication mean:    0.9 ms
   Total ROS mean:      7.9 ms
-  Cold start:          2100.0 ms
+  Ready to first frame: 2100.0 ms
 
 End-to-End Pipeline  (native engine + ROS overhead)
 -----------------------------------------------------
@@ -289,6 +300,6 @@ python3 scripts/benchmark/test_benchmark_parsers.py -v
 | Empty JSONL file | Confirm `benchmark_output_file` is set and frames are being sampled |
 | `inference_ms` is zero | The worker did not report `inference_seconds`; check TRT backend version |
 | `ipc_overhead_ms` is negative | Clock skew between node and worker; `collect_ros_metrics.py` clamps to 0 |
-| `cold_start_ms` is None | `session_start` record was not written; check node startup succeeded |
+| `ready_to_first_frame_ms` is None | `session_start` record was not written; check node startup succeeded |
 | `llm_bench` not found | Build TensorRT Edge-LLM with `--cmake-args -DBUILD_BENCHMARKS=ON` |
 | Native profile JSON missing | Pass `--profileOutputFile`; verify `--dumpProfile` flag is supported in your Edge-LLM version |

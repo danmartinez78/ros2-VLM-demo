@@ -191,7 +191,7 @@ def generate_comparison(
             "ros_overhead_ms_p95": ros_overhead.get("p95"),
             "total_dropped": agg.get("total_dropped"),
             "failed_frames": agg.get("failed_frames"),
-            "cold_start_ms": agg.get("cold_start_ms"),
+            "ready_to_first_frame_ms": agg.get("ready_to_first_frame_ms"),
         },
         "pipeline_total": {
             "total_worker_ms_mean": total_mean,
@@ -257,7 +257,7 @@ def format_text_report(comparison: dict[str, Any]) -> str:
         f"  Publication mean:    {_fmt(ros.get('publication_ms_mean'))}",
         f"  Total ROS mean:      {_fmt(ros.get('ros_overhead_ms_mean'))}",
         f"  Total ROS p95:       {_fmt(ros.get('ros_overhead_ms_p95'))}",
-        f"  Cold start:          {_fmt(ros.get('cold_start_ms'))}",
+        f"  Ready to first frame: {_fmt(ros.get('ready_to_first_frame_ms'))}",
         f"  Dropped frames:      {ros.get('total_dropped', 'n/a')}",
         f"  Failed frames:       {ros.get('failed_frames', 'n/a')}",
         "",

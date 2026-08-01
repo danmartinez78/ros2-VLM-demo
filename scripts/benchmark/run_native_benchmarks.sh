@@ -23,19 +23,19 @@
 # Options
 #   --output-dir DIR        Directory to write artifacts (default: /tmp/cosmos_native_bench_TIMESTAMP)
 #   --batch-size N          Batch size for prefill and decode (default: 1)
-#   --input-len N           Input token length for prefill benchmark (default: 128)
-#   --past-kv-len N         Past KV-cache length for decode benchmark (default: 128)
-#   --image-size WxH        Image dimensions for visual encoder benchmark (default: 336x336)
+#   --input-len N           Input token length for prefill benchmark (default: 2048)
+#   --past-kv-len N         Past KV-cache length for decode benchmark (default: 2048)
+#   --image-size WxH        Image dimensions for visual encoder benchmark (default: 1024x2048)
 #   --warmup N              Warmup iterations for llm_bench modes (default: 3)
 #   --iterations N          Measured iterations for llm_bench modes (default: 10)
-#   --inference-warmup N    Warmup runs for llm_inference (default: 3)
+#   --inference-warmup N    Warmup runs for llm_inference (default: 10)
 #   --max-generate-length N Token budget for decode/end-to-end (default: 64)
-#   --input-image PATH      Path to a representative input image (default: env IMAGE_PATH or skip)
 #   --input-vlm-json PATH   Path to llm_inference input JSON (default: env INPUT_VLM_JSON or skip)
 #   --skip-prefill          Skip llm_bench --mode prefill
 #   --skip-decode           Skip llm_bench --mode decode
 #   --skip-visual           Skip llm_bench --mode visual
 #   --skip-profile          Skip llm_inference --dumpProfile
+#   --quick                 Use faster smoke-test parameters (not the NVIDIA published workload)
 #   --dry-run               Print commands without executing them
 
 set -euo pipefail
@@ -45,14 +45,13 @@ set -euo pipefail
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 OUTPUT_DIR="/tmp/cosmos_native_bench_${TIMESTAMP}"
 BATCH_SIZE=1
-INPUT_LEN=128
-PAST_KV_LEN=128
-IMAGE_SIZE="336x336"
+INPUT_LEN=2048
+PAST_KV_LEN=2048
+IMAGE_SIZE="1024x2048"
 WARMUP=3
 ITERATIONS=10
-INFERENCE_WARMUP=3
+INFERENCE_WARMUP=10
 MAX_GENERATE_LENGTH=64
-INPUT_IMAGE="${IMAGE_PATH:-}"
 INPUT_VLM_JSON="${INPUT_VLM_JSON:-}"
 SKIP_PREFILL=false
 SKIP_DECODE=false
@@ -73,12 +72,16 @@ while [[ $# -gt 0 ]]; do
     --iterations)          ITERATIONS="$2";             shift 2 ;;
     --inference-warmup)    INFERENCE_WARMUP="$2";       shift 2 ;;
     --max-generate-length) MAX_GENERATE_LENGTH="$2";    shift 2 ;;
-    --input-image)         INPUT_IMAGE="$2";            shift 2 ;;
     --input-vlm-json)      INPUT_VLM_JSON="$2";         shift 2 ;;
     --skip-prefill)        SKIP_PREFILL=true;           shift   ;;
     --skip-decode)         SKIP_DECODE=true;            shift   ;;
     --skip-visual)         SKIP_VISUAL=true;            shift   ;;
     --skip-profile)        SKIP_PROFILE=true;           shift   ;;
+    --quick)
+      # Smoke-test parameters — faster iteration, NOT the NVIDIA published workload.
+      INPUT_LEN=128; PAST_KV_LEN=128; IMAGE_SIZE="336x336"
+      WARMUP=1; ITERATIONS=3; INFERENCE_WARMUP=3
+      shift ;;
     --dry-run)             DRY_RUN=true;                shift   ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -158,7 +161,6 @@ collect_metadata() {
   ITERATIONS_V="${ITERATIONS}" \
   INFERENCE_WARMUP_V="${INFERENCE_WARMUP}" \
   MAX_GENERATE_LENGTH_V="${MAX_GENERATE_LENGTH}" \
-  INPUT_IMAGE_V="${INPUT_IMAGE}" \
   INPUT_VLM_JSON_V="${INPUT_VLM_JSON}" \
   python3 <<'PYEOF'
 import json, os
@@ -194,7 +196,6 @@ print(json.dumps({
     "warmup_iterations": _i(os.environ.get("WARMUP_V")),
     "measured_iterations": _i(os.environ.get("ITERATIONS_V")),
     "inference_warmup_runs": _i(os.environ.get("INFERENCE_WARMUP_V")),
-    "input_image_path": _n(os.environ.get("INPUT_IMAGE_V")),
     "input_vlm_json": _n(os.environ.get("INPUT_VLM_JSON_V")),
 }, indent=2, sort_keys=True))
 PYEOF
@@ -281,9 +282,6 @@ else
     --iterations "${ITERATIONS}"
     --profile
   )
-  if [[ -n "${INPUT_IMAGE}" ]]; then
-    VISUAL_CMD+=(--inputImage "${INPUT_IMAGE}")
-  fi
 
   if [[ "${DRY_RUN}" == "true" ]]; then
     echo "[DRY RUN] ${VISUAL_CMD[*]}"

@@ -23,7 +23,7 @@ Cold-start reference
 ────────────────────
   node_init_wall_ns    : captured at start of CosmosReasonerNode constructor
   worker_ready_wall_ns : captured after backend.initialize() completes
-  cold_start_ms        : worker_ready → first dequeue (pipeline latency after readiness)
+  ready_to_first_frame_ms : worker_ready → first dequeue (pipeline latency after readiness)
   backend_init_ms      : node_init → worker_ready (backend initialisation cost)
 
 Native engine timing (inference_seconds) is passed through unmodified from the
@@ -209,18 +209,18 @@ def compute_aggregate(
         (frame_metrics[-1]["dropped_before"] if frame_metrics else 0)
     )
 
-    # Cold start: time from worker-ready to first frame dequeued.
+    # Ready-to-first-frame delay: time from worker-ready to first frame dequeued.
     # worker_ready_wall_ns marks when the inference backend finished initialising
     # (the point at which the pipeline can actually accept frames).
     # node_init_wall_ns is also recorded for reference but is NOT used as the
-    # cold-start baseline; time between node_init and worker_ready is backend
-    # initialisation time, not cold-start.
-    cold_start_ms: float | None = None
+    # ready_to_first_frame baseline; time between node_init and worker_ready is
+    # backend initialisation time.
+    ready_to_first_frame_ms: float | None = None
     if session_start and frame_metrics:
         worker_ready = session_start.get("worker_ready_wall_ns", 0)
         first_dequeue = frame_metrics[0].get("dequeue_wall_ns", 0)
         if worker_ready and first_dequeue:
-            cold_start_ms = (first_dequeue - worker_ready) / _NS_PER_MS
+            ready_to_first_frame_ms = (first_dequeue - worker_ready) / _NS_PER_MS
 
     # Backend initialisation time: node_init → worker_ready
     backend_init_ms: float | None = None
@@ -237,7 +237,7 @@ def compute_aggregate(
         "successful_frames": len(successful),
         "failed_frames": len(measured) - len(successful),
         "total_dropped": total_dropped,
-        "cold_start_ms": cold_start_ms,
+        "ready_to_first_frame_ms": ready_to_first_frame_ms,
         "backend_init_ms": backend_init_ms,
         "inference_ms": _stats(inference_ms_vals),
         "ros_overhead_ms": _stats(ros_overhead_vals),
