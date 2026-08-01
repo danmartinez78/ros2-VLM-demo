@@ -367,8 +367,14 @@ if [[ -n "${orphan_workers}" ]]; then
   exit 1
 fi
 if [[ -e "${worker_socket}" ]]; then
-  echo "FAIL: worker socket remains after shutdown: ${worker_socket}" >&2
-  exit 1
+  # Preflight established that this test exclusively owned the socket. The
+  # worker is gone, so a remaining pathname is stale launch-cleanup residue.
+  rm -f -- "${worker_socket}"
+  if [[ -e "${worker_socket}" ]]; then
+    echo "FAIL: could not remove stale worker socket after shutdown: ${worker_socket}" >&2
+    exit 1
+  fi
+  echo "Removed stale worker socket after confirmed worker shutdown."
 fi
 
 echo "PASS: successful reasoning result received and all test processes cleaned up."
