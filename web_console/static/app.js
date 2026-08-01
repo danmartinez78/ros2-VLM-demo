@@ -79,6 +79,11 @@ async function _fetchLogs(runId) {
       el.textContent = data.log_lines.join("\n");
       el.scrollTop = el.scrollHeight;
     }
+    // Stop polling when the run has reached a terminal state.
+    if (data.terminal) {
+      if (_rosLogInterval) { clearInterval(_rosLogInterval); _rosLogInterval = null; }
+      refreshHistory();
+    }
   } catch (_) {}
 }
 

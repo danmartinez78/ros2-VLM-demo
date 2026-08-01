@@ -33,7 +33,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT))
 
 from web_console.process_manager import ProcessManager
-from web_console.run_store import RunStore, _is_safe_run_id
+from web_console.run_store import RunStore, _is_safe_run_id, _TERMINAL_STATUSES
 from web_console.status_collector import check_server_reachable, get_gpu_status, collect_status
 from web_console.inference_client import run_inference, ALLOWED_IMAGE_EXTENSIONS, MAX_IMAGE_BYTES
 from web_console.server import (
@@ -349,6 +349,81 @@ class TestRunStore(unittest.TestCase):
             for rid in ids[-3:]:
                 self.assertIn(rid, remaining)
             RunStore._MAX_RUNS = 100  # restore
+
+    def test_concurrent_save_read_no_corruption(self):
+        """Concurrent saves and reads must never observe partial JSON or lose run_id."""
+        with _TempDir() as d:
+            store = RunStore(d)
+            run_id = RunStore.new_run_id()
+            store.save_run(run_id, {"run_id": run_id, "value": 0})
+
+            errors: list = []
+
+            def _writer(value_start: int) -> None:
+                for i in range(50):
+                    try:
+                        store.save_run(
+                            run_id,
+                            {"run_id": run_id, "value": value_start + i, "data": "x" * 200},
+                        )
+                    except Exception as exc:
+                        errors.append(f"writer: {exc}")
+
+            def _reader() -> None:
+                for _ in range(50):
+                    try:
+                        rec = store.get_run(run_id)
+                        if rec is not None:
+                            assert "run_id" in rec, f"Corrupt record missing run_id: {rec!r}"
+                    except Exception as exc:
+                        errors.append(f"reader: {exc}")
+
+            def _updater() -> None:
+                for i in range(50):
+                    try:
+                        store.update_run_if_status(run_id, "running", {"status": "running"})
+                    except Exception as exc:
+                        errors.append(f"updater: {exc}")
+
+            threads = (
+                [threading.Thread(target=_writer, args=(i * 100,)) for i in range(2)]
+                + [threading.Thread(target=_reader) for _ in range(2)]
+                + [threading.Thread(target=_updater)]
+            )
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15.0)
+
+            self.assertEqual(errors, [], f"Concurrent errors: {errors}")
+            final = store.get_run(run_id)
+            self.assertIsNotNone(final)
+            self.assertEqual(final.get("run_id"), run_id)
+
+    def test_finalize_run_no_overwrite_terminal(self):
+        """finalize_run must not overwrite an already-terminal status."""
+        with _TempDir() as d:
+            store = RunStore(d)
+            run_id = RunStore.new_run_id()
+            store.save_run(run_id, {"run_id": run_id, "status": "completed", "success": True})
+            applied = store.finalize_run(run_id, {"status": "failed", "success": False})
+            self.assertFalse(applied, "finalize_run must be a no-op on a terminal record")
+            rec = store.get_run(run_id)
+            self.assertEqual(rec.get("status"), "completed")
+            self.assertTrue(rec.get("success"))
+
+    def test_update_run_if_status_atomic(self):
+        """update_run_if_status must only update when status matches."""
+        with _TempDir() as d:
+            store = RunStore(d)
+            run_id = RunStore.new_run_id()
+            store.save_run(run_id, {"run_id": run_id, "status": "starting"})
+            # Correct expected status → update applied.
+            result = store.update_run_if_status(run_id, "starting", {"status": "running", "pid": 1})
+            self.assertEqual(result.get("status"), "running")
+            # Wrong expected status → no-op.
+            result2 = store.update_run_if_status(run_id, "starting", {"status": "completed"})
+            self.assertEqual(result2.get("status"), "running")  # unchanged
 
 
 # ── status_collector tests ─────────────────────────────────────────────────────
@@ -1079,6 +1154,17 @@ class TestBuildRosEnv(unittest.TestCase):
         env = _build_ros_env({}, {})
         self.assertIn("PATH", env)
 
+    def test_artifact_dir_set_in_env(self):
+        """artifact_dir parameter must be forwarded as ARTIFACT_DIR."""
+        with _TempDir() as d:
+            env = _build_ros_env({}, {}, artifact_dir=d)
+            self.assertEqual(env.get("ARTIFACT_DIR"), str(d))
+
+    def test_artifact_dir_not_set_without_param(self):
+        """ARTIFACT_DIR must not appear when neither artifact_dir nor cfg key is given."""
+        env = _build_ros_env({}, {})
+        self.assertNotIn("ARTIFACT_DIR", env)
+
 
 
 
@@ -1132,7 +1218,7 @@ class TestRosRunFinalization(unittest.TestCase):
                 self._srv.config["ros_script_path"] = old
 
     def _poll_terminal(self, run_id: str, timeout: float = 10.0) -> dict:
-        """Poll GET /api/runs/<id> until status is not 'running', or timeout."""
+        """Poll GET /api/runs/<id> until status is terminal (completed/failed/stopped)."""
         deadline = time.monotonic() + timeout
         data = {}
         while time.monotonic() < deadline:
@@ -1141,7 +1227,7 @@ class TestRosRunFinalization(unittest.TestCase):
             resp = conn.getresponse()
             data = json.loads(resp.read())
             conn.close()
-            if data.get("status") != "running":
+            if data.get("status") in _TERMINAL_STATUSES:
                 return data
             time.sleep(0.1)
         return data
@@ -1208,9 +1294,127 @@ class TestRosRunFinalization(unittest.TestCase):
         fresh_store = RunStore(self._tmpdir / "runs")
         record = fresh_store.get_run(run_id)
         self.assertIsNotNone(record)
-        self.assertNotEqual(record.get("status"), "running",
-                            "Persisted manifest must reflect terminal state")
+        self.assertNotIn(record.get("status"), ("running", "starting"),
+                         "Persisted manifest must reflect terminal state")
         self.assertIn("completed_at", record)
+
+    def test_artifact_captured_in_manifest(self):
+        """Artifacts written to $ARTIFACT_DIR are included in the finalized manifest."""
+        script = (
+            "#!/bin/bash\n"
+            'mkdir -p "$ARTIFACT_DIR"\n'
+            'echo \'{"score": 1.0, "pass": true}\' > "$ARTIFACT_DIR/result.json"\n'
+            "exit 0\n"
+        )
+        status, data = self._start_ros(script)
+        self.assertEqual(status, 202)
+        run_id = data["run_id"]
+        # Verify ARTIFACT_DIR was set to the run's directory in the store.
+        self.assertIn("artifact_dir", data)
+
+        record = self._poll_terminal(run_id, timeout=10.0)
+        self.assertEqual(record.get("status"), "completed")
+        artifacts = record.get("artifacts", {})
+        self.assertIn(
+            "result.json", artifacts,
+            "result.json written to ARTIFACT_DIR must appear in finalized manifest",
+        )
+        self.assertAlmostEqual(artifacts["result.json"].get("score"), 1.0)
+        self.assertTrue(artifacts["result.json"].get("pass"))
+
+    def test_logs_api_includes_terminal_flag(self):
+        """GET /api/runs/<id>/logs must include 'terminal' and 'status' fields."""
+        status, data = self._start_ros("#!/bin/bash\necho log_terminal_check\nexit 0\n")
+        self.assertEqual(status, 202)
+        run_id = data["run_id"]
+        self._poll_terminal(run_id, timeout=10.0)
+
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", f"/api/runs/{run_id}/logs")
+        resp = conn.getresponse()
+        logs_data = json.loads(resp.read())
+        conn.close()
+
+        self.assertEqual(resp.status, 200)
+        self.assertIn("terminal", logs_data)
+        self.assertIn("status", logs_data)
+        self.assertTrue(logs_data["terminal"], "terminal must be True for a completed run")
+        self.assertEqual(logs_data["status"], "completed")
+
+
+# ── fast-exit manifest race tests ─────────────────────────────────────────────
+
+class TestFastExitRace(unittest.TestCase):
+    """Verify that a child process exiting before start_ros_experiment returns
+    does not leave the manifest permanently in 'starting' or 'running' state."""
+
+    def test_fast_exit_before_start_ros_returns(self):
+        """Synchronous completion inside start_ros_experiment must not lose the manifest.
+
+        This test uses a fake ProcessManager whose start_ros_experiment fires
+        the completion callback *synchronously* before returning — deterministically
+        simulating a child that exits before the handler writes 'running'.
+        """
+
+        class _SyncCompletePM:
+            """Fires on_complete synchronously to simulate instant child exit."""
+
+            def start_ros_experiment(self, run_id, args, env=None, on_complete=None):
+                if on_complete is not None:
+                    on_complete(run_id, 0, False, ["fast_line"])
+                return 99999  # fake PID
+
+            def active_ros_run_id(self):
+                return None
+
+            def stop_experiment(self, run_id):
+                raise KeyError(run_id)
+
+            def get_logs(self, run_id):
+                return []
+
+            def is_running(self, run_id):
+                return False
+
+            def cleanup(self):
+                pass
+
+        with _TempDir() as d:
+            run_store = RunStore(d / "runs")
+            pm = _SyncCompletePM()
+            srv, port, _ = _start_test_server(
+                config={"socket_path": "/tmp/no_such.sock", "quiet": True},
+                process_manager=pm,
+                run_store=run_store,
+            )
+            try:
+                body = json.dumps({"params": {}}).encode()
+                conn = HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.request(
+                    "POST", "/api/ros/start", body=body,
+                    headers={"Content-Type": "application/json"},
+                )
+                resp = conn.getresponse()
+                data = json.loads(resp.read())
+                conn.close()
+
+                self.assertEqual(resp.status, 202)
+                run_id = data["run_id"]
+
+                # The pre-write guarantee means the manifest must exist.
+                record = run_store.get_run(run_id)
+                self.assertIsNotNone(record, "Manifest must exist even after fast exit")
+
+                # The callback fired synchronously, so status must be terminal.
+                self.assertIn(
+                    record.get("status"),
+                    _TERMINAL_STATUSES,
+                    f"Expected terminal status after fast exit, got: {record.get('status')!r}",
+                )
+                self.assertEqual(record.get("exit_code"), 0)
+                self.assertIn("completed_at", record)
+            finally:
+                srv.shutdown()
 
 
 # ── startup bind / warning tests ──────────────────────────────────────────────

@@ -43,7 +43,7 @@ from .inference_client import (
     run_inference,
 )
 from .process_manager import ProcessManager
-from .run_store import RunStore, _is_safe_run_id
+from .run_store import RunStore, _is_safe_run_id, _TERMINAL_STATUSES
 from .status_collector import collect_status
 
 # ── constants ─────────────────────────────────────────────────────────────────
@@ -245,8 +245,18 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if not _is_safe_run_id(run_id):
             self._send_error(400, "Invalid run_id")
             return
-        logs = self.server_instance.process_manager.get_logs(run_id)
-        self._send_json(200, {"run_id": run_id, "log_lines": logs})
+        # In-memory logs (available while the process is still registered).
+        live_logs = self.server_instance.process_manager.get_logs(run_id)
+        # Persisted manifest — authoritative after finalization or after restart.
+        record = self.server_instance.run_store.get_run(run_id)
+        status = record.get("status") if record else None
+        terminal = status in _TERMINAL_STATUSES
+        # Prefer live logs while running; fall back to persisted logs after restart.
+        log_lines = live_logs if live_logs else (record.get("log_lines", []) if record else [])
+        self._send_json(
+            200,
+            {"run_id": run_id, "log_lines": log_lines, "status": status, "terminal": terminal},
+        )
 
     def _api_infer(self) -> None:
         cfg = self.server_instance.config
@@ -369,9 +379,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(400, error)
             return
 
-        # Only allowlisted env vars are forwarded; no arbitrary env injection.
         run_id = RunStore.new_run_id()
-        env = _build_ros_env(params, cfg)
+        run_store = self.server_instance.run_store
+
+        # Create the per-run artifact directory (same as the run store dir for this run).
+        artifact_dir = run_store.base_dir / run_id
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        # Only allowlisted env vars are forwarded; no arbitrary env injection.
+        env = _build_ros_env(params, cfg, artifact_dir)
 
         script_path = cfg.get(
             "ros_script_path",
@@ -386,7 +402,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         # Construct argument list; never shell=True.
         args = ["bash", script_path]
 
-        run_store = self.server_instance.run_store
+        # ── persist initial manifest BEFORE launching ────────────────────────
+        # Writing the manifest here (with status "starting") guarantees that
+        # the completion callback always finds a record even when the child
+        # exits before start_ros_experiment returns (fast-exit race).
+        initial_record: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "ros",
+            "created_at": _now_iso(),
+            "params": params,
+            "status": "starting",
+            "artifact_dir": str(artifact_dir),
+        }
+        run_store.save_run(run_id, initial_record)
 
         def _on_complete(
             rid: str,
@@ -394,28 +423,44 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             was_stopped: bool,
             log_lines: list,
         ) -> None:
-            record = run_store.get_run(rid)
-            if record is None:
-                return
+            """Atomically finalize the manifest with terminal state + artifacts."""
             if was_stopped:
-                status_str = "stopped"
-                success = False
+                status_str: str = "stopped"
+                success: bool = False
             elif exit_code == 0:
                 status_str = "completed"
                 success = True
             else:
                 status_str = "failed"
                 success = False
-            record.update(
-                {
-                    "status": status_str,
-                    "exit_code": exit_code,
-                    "completed_at": _now_iso(),
-                    "success": success,
-                    "log_lines": log_lines[:200],
-                }
-            )
-            run_store.save_run(rid, record)
+
+            # Collect JSON artifact files written by the ROS script into the
+            # per-run directory (e.g. result.json, metrics.json).
+            run_dir = run_store.run_dir(rid)
+            artifacts: Dict[str, Any] = {}
+            if run_dir is not None:
+                for candidate in ("result.json", "metrics.json"):
+                    p = run_dir / candidate
+                    if p.is_file():
+                        try:
+                            artifacts[candidate] = json.loads(
+                                p.read_text(encoding="utf-8")
+                            )
+                        except (json.JSONDecodeError, OSError):
+                            artifacts[candidate] = None
+
+            updates: Dict[str, Any] = {
+                "status": status_str,
+                "exit_code": exit_code,
+                "completed_at": _now_iso(),
+                "success": success,
+                "log_lines": log_lines[:200],
+            }
+            if artifacts:
+                updates["artifacts"] = artifacts
+
+            # finalize_run is a no-op if the run is already terminal (idempotency guard).
+            run_store.finalize_run(rid, updates)
 
         try:
             pid = self.server_instance.process_manager.start_ros_experiment(
@@ -425,20 +470,34 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 on_complete=_on_complete,
             )
         except RuntimeError as exc:
+            # Another ROS experiment is already running; mark the pre-written
+            # manifest as failed so it is not left in a non-terminal state.
+            run_store.finalize_run(run_id, {
+                "status": "failed",
+                "exit_code": None,
+                "completed_at": _now_iso(),
+                "success": False,
+                "error": str(exc),
+            })
             self._send_error(409, str(exc))
             return
+        except Exception as exc:
+            # Popen or pgid lookup failed; finalize the manifest as failed.
+            run_store.finalize_run(run_id, {
+                "status": "failed",
+                "exit_code": None,
+                "completed_at": _now_iso(),
+                "success": False,
+                "error": str(exc),
+            })
+            self._send_error(500, f"Failed to launch ROS experiment: {exc}")
+            return
 
-        record: Dict[str, Any] = {
-            "schema_version": 1,
-            "run_id": run_id,
-            "kind": "ros",
-            "created_at": _now_iso(),
-            "params": params,
-            "pid": pid,
-            "status": "running",
-        }
-        self.server_instance.run_store.save_run(run_id, record)
-        self._send_json(202, record)
+        # Atomically advance "starting" → "running" only if the completion
+        # callback has not already written a terminal state (fast-exit guard).
+        run_store.update_run_if_status(run_id, "starting", {"status": "running", "pid": pid})
+        resp_record = run_store.get_run(run_id) or initial_record
+        self._send_json(202, resp_record)
 
     def _api_ros_stop(self) -> None:
         body = self._read_json_body()
@@ -507,10 +566,16 @@ _RUN_RE = re.compile(
 
 # ── ROS env builder ───────────────────────────────────────────────────────────
 
-def _build_ros_env(params: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, str]:
+def _build_ros_env(
+    params: Dict[str, Any],
+    cfg: Dict[str, Any],
+    artifact_dir: Optional[pathlib.Path] = None,
+) -> Dict[str, str]:
     """Build a subprocess environment for the ROS experiment script.
 
     Only allowlisted parameters are passed; no arbitrary values are forwarded.
+    When *artifact_dir* is supplied it is set as ARTIFACT_DIR so the script
+    knows where to write result/metrics files.
     """
     env = os.environ.copy()
     _map: Dict[str, str] = {
@@ -527,12 +592,12 @@ def _build_ros_env(params: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, str
     for param_key, env_key in _map.items():
         if param_key in params:
             env[env_key] = str(params[param_key])
-    # Forward artifact dir if configured.
-    artifact_root = cfg.get("artifact_dir", "")
-    if artifact_root:
-        run_id = cfg.get("_current_run_id", "")
-        if run_id:
-            env["ARTIFACT_DIR"] = str(pathlib.Path(artifact_root) / run_id)
+    # Set ARTIFACT_DIR from the explicit per-run path when provided, otherwise
+    # fall back to the legacy cfg key (kept for backward compatibility).
+    if artifact_dir is not None:
+        env["ARTIFACT_DIR"] = str(artifact_dir)
+    elif cfg.get("artifact_dir"):
+        env["ARTIFACT_DIR"] = str(cfg["artifact_dir"])
     return env
 
 
