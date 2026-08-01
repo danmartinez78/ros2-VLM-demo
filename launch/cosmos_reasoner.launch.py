@@ -147,6 +147,14 @@ def generate_launch_description() -> LaunchDescription:
             default_value='false',
             description='Use simulation time (set true when playing a bag with --clock)',
         ),
+        DeclareLaunchArgument(
+            'benchmark_output_file',
+            default_value='',
+            description=(
+                'When non-empty, append per-frame timing JSON lines to this file for '
+                'ROS overhead benchmarking (zero overhead when empty)'
+            ),
+        ),
     ]
 
     # ── Node ──────────────────────────────────────────────────────────────────
@@ -182,6 +190,7 @@ def generate_launch_description() -> LaunchDescription:
                 'max_generate_length': LaunchConfiguration('max_generate_length'),
                 'temperature': LaunchConfiguration('temperature'),
                 'jpeg_quality': LaunchConfiguration('jpeg_quality'),
+                'benchmark_output_file': LaunchConfiguration('benchmark_output_file'),
             },
         ],
     )

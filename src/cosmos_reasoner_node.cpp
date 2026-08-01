@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -213,6 +214,11 @@ CosmosReasonerNode::CosmosReasonerNode(
 : rclcpp::Node("cosmos_reasoner", options),
   backend_(std::move(backend))
 {
+  // Capture node initialisation start time before any heavyweight work.
+  // Used as the "node_init_wall_ns" baseline in benchmark session_start records.
+  node_init_wall_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+
   declare_parameters();
   validate_parameters();
 
@@ -253,11 +259,41 @@ CosmosReasonerNode::CosmosReasonerNode(
     prompt_config_hash_.c_str(),
     prompt_history_max_entries_,
     prompt_history_reset_policy_.c_str());
+
+  if (benchmark_out_) {
+    *benchmark_out_
+      << "{\"record_type\":\"session_start\""
+      << ",\"node_init_wall_ns\":" << node_init_wall_ns_
+      << ",\"worker_ready_wall_ns\":" << worker_ready_wall_ns_
+      << ",\"task_profile\":\"" << task_profile_ << "\""
+      << ",\"prompt_version\":\"" << prompt_version_ << "\""
+      << ",\"prompt_config_hash\":\"" << prompt_config_hash_ << "\""
+      << ",\"max_generate_length\":" << max_generate_length_
+      << ",\"sample_period_seconds\":" << std::fixed << std::setprecision(6)
+      << sample_period_seconds_
+      << ",\"image_max_width\":" << image_max_width_
+      << ",\"jpeg_quality\":" << jpeg_quality_
+      << ",\"drop_old_frames\":" << (drop_old_frames_ ? "true" : "false")
+      << "}\n";
+    benchmark_out_->flush();
+  }
 }
 
 CosmosReasonerNode::~CosmosReasonerNode()
 {
   stop_worker();
+
+  if (benchmark_out_) {
+    *benchmark_out_
+      << "{\"record_type\":\"session_end\""
+      << ",\"received\":" << stats_.received
+      << ",\"sampled\":" << stats_.sampled
+      << ",\"dropped\":" << stats_.dropped
+      << ",\"success\":" << stats_.success
+      << ",\"failure\":" << stats_.failure
+      << "}\n";
+    benchmark_out_->flush();
+  }
 
   RCLCPP_INFO(
     this->get_logger(),
@@ -414,6 +450,12 @@ void CosmosReasonerNode::declare_parameters()
   this->declare_parameter(
     "profile_output_directory", "/tmp/cosmos_ros2_profiles",
     desc("Directory for profiling output files"));
+
+  this->declare_parameter(
+    "benchmark_output_file", "",
+    desc("When non-empty, append per-frame timing JSON lines to this file for "
+    "ROS overhead benchmarking. Each line is a JSON object; the first line is a "
+    "session_start record and the last is session_end."));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -580,6 +622,19 @@ void CosmosReasonerNode::validate_parameters()
 
   drop_old_frames_ = this->get_parameter("drop_old_frames").as_bool();
   publish_results_ = this->get_parameter("publish_results").as_bool();
+
+  benchmark_output_file_ = this->get_parameter("benchmark_output_file").as_string();
+  if (!benchmark_output_file_.empty()) {
+    benchmark_out_ = std::make_unique<std::ofstream>(
+      benchmark_output_file_, std::ios::out | std::ios::app);
+    if (!benchmark_out_->is_open()) {
+      throw std::runtime_error(
+              "benchmark_output_file: cannot open '" + benchmark_output_file_ + "'");
+    }
+    RCLCPP_INFO(
+      this->get_logger(),
+      "Benchmark timing output: %s", benchmark_output_file_.c_str());
+  }
 }
 
 void CosmosReasonerNode::validate_template_variables(
@@ -740,6 +795,11 @@ void CosmosReasonerNode::worker_loop()
     return;
   }
 
+  // Record worker-ready wall time immediately after successful initialisation.
+  // This is used as the "cold start" reference point in benchmark reports.
+  worker_ready_wall_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     backend_init_complete_ = true;
@@ -748,6 +808,7 @@ void CosmosReasonerNode::worker_loop()
 
   while (true) {
     PendingFrame frame;
+    uint64_t dropped_before_this_frame = 0;
 
     // ── wait for a frame ─────────────────────────────────────────────────
     {
@@ -762,9 +823,19 @@ void CosmosReasonerNode::worker_loop()
       if (!pending_frame_.has_value()) {
         break;
       }
+      dropped_before_this_frame = stats_.dropped;
       frame = *pending_frame_;
       pending_frame_.reset();
     }
+
+    // ── record dequeue wall time ──────────────────────────────────────────
+    const int64_t dequeue_wall_ns = benchmark_out_ ?
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+    // Queue delay: time the frame spent waiting in the queue before being picked
+    // up by the worker. Captured in the subscription callback and carried through
+    // PendingFrame so this segment is separate from image conversion time.
+    const int64_t subscribe_wall_ns = frame.subscribe_wall_ns;
 
     // ── convert image ─────────────────────────────────────────────────────
     cv::Mat bgr;
@@ -790,6 +861,11 @@ void CosmosReasonerNode::worker_loop()
       cv::resize(bgr, bgr, cv::Size(image_max_width_, new_h), 0.0, 0.0, cv::INTER_AREA);
     }
 
+    // ── record convert-done wall time ────────────────────────────────────
+    const int64_t convert_done_ns = benchmark_out_ ?
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+
     // ── build and run inference request ──────────────────────────────────
     maybe_reset_prompt_history_before_request();
     const std::string effective_prompt = render_effective_prompt(frame.seq);
@@ -809,6 +885,11 @@ void CosmosReasonerNode::worker_loop()
       resp.error = std::string("backend exception: ") + e.what();
     }
 
+    // ── record infer-done wall time ──────────────────────────────────────
+    const int64_t infer_done_ns = benchmark_out_ ?
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+
     if (resp.success) {
       ++stats_.success;
       RCLCPP_INFO(
@@ -825,6 +906,39 @@ void CosmosReasonerNode::worker_loop()
 
     update_prompt_history_after_response(resp);
     publish_result(frame.msg->header, frame.seq, resp, effective_prompt);
+
+    // ── record publish-done wall time and write benchmark record ─────────
+    if (benchmark_out_) {
+      const int64_t publish_done_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+      const int64_t image_stamp_ns =
+        static_cast<int64_t>(frame.msg->header.stamp.sec) * 1000000000LL +
+        frame.msg->header.stamp.nanosec;
+
+      // Escape error string: replace backslash and double-quote characters
+      std::string escaped_error;
+      escaped_error.reserve(resp.error.size());
+      for (const char c : resp.error) {
+        if (c == '\\' || c == '"') {escaped_error += '\\';}
+        escaped_error += c;
+      }
+
+      *benchmark_out_ << std::fixed << std::setprecision(9)
+        << "{\"record_type\":\"frame\""
+        << ",\"frame_seq\":" << frame.seq
+        << ",\"image_stamp_ns\":" << image_stamp_ns
+        << ",\"subscribe_wall_ns\":" << subscribe_wall_ns
+        << ",\"dequeue_wall_ns\":" << dequeue_wall_ns
+        << ",\"convert_done_ns\":" << convert_done_ns
+        << ",\"infer_done_ns\":" << infer_done_ns
+        << ",\"publish_done_ns\":" << publish_done_ns
+        << ",\"inference_seconds\":" << resp.inference_seconds
+        << ",\"dropped_before\":" << dropped_before_this_frame
+        << ",\"success\":" << (resp.success ? "true" : "false")
+        << ",\"error\":\"" << escaped_error << "\""
+        << "}\n";
+      benchmark_out_->flush();
+    }
   }
 }
 
@@ -850,13 +964,20 @@ void CosmosReasonerNode::image_callback(
   have_last_time_ = true;
   ++stats_.sampled;
 
+  // ── capture subscription wall time before enqueue ─────────────────────
+  // Recorded here so "queue delay" (time the frame waits in the queue) can
+  // be reported separately from image-conversion and inference time.
+  const int64_t subscribe_wall_ns = benchmark_out_ ?
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+
   // ── enqueue (bounded depth 1) ─────────────────────────────────────────
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     if (pending_frame_.has_value() && drop_old_frames_) {
       ++stats_.dropped;
     }
-    pending_frame_ = PendingFrame{msg, stats_.sampled};
+    pending_frame_ = PendingFrame{msg, stats_.sampled, subscribe_wall_ns};
   }
   queue_cv_.notify_one();
 }
