@@ -58,13 +58,20 @@ cleanup() {
   if [[ -n "${launch_pid}" ]]; then
     # Kill the entire process group so ros2 launch and all child workers
     # (inference worker, etc.) shut down cleanly together.
-    local pgid
+    # Safety guard: only send a negative-PGID signal when the target PGID is
+    # confirmed to differ from the test script's own PGID — prevents
+    # accidentally terminating the calling shell and its parents.
+    local pgid own_pgid
     pgid="$(ps -o pgid= -p "${launch_pid}" 2>/dev/null | tr -d ' ')" || true
-    if [[ -n "${pgid}" ]] && [[ "${pgid}" != "0" ]]; then
+    own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || true
+    if [[ -n "${pgid}" ]] && [[ "${pgid}" != "0" ]] && \
+       [[ -n "${own_pgid}" ]] && [[ "${pgid}" != "${own_pgid}" ]]; then
       kill -INT -- "-${pgid}" 2>/dev/null || true
       sleep 3
       kill -TERM -- "-${pgid}" 2>/dev/null || true
-    elif kill -0 "${launch_pid}" 2>/dev/null; then
+    else
+      # PGID matches own group or cannot be determined — signal only the
+      # launch process directly rather than the shared group.
       kill -INT "${launch_pid}" 2>/dev/null || true
     fi
     wait "${launch_pid}" 2>/dev/null || true
@@ -128,9 +135,11 @@ worker_pid() {
 }
 
 reasoner_pid() {
-  # Scope to 'cosmos_reasoner' (the ROS 2 node executable name).
+  # Match the installed executable path ending in '/cosmos_reasoner' followed
+  # by end-of-command or a space — avoids matching cosmos_reasoner_node or
+  # other commands that merely contain the substring "cosmos_reasoner".
   local pids
-  pids="$(pgrep -f "cosmos_reasoner" 2>/dev/null)" || true
+  pids="$(pgrep -f '/cosmos_reasoner($| )' 2>/dev/null)" || true
   # Require exactly one match for this test instance.
   local count=0
   [[ -n "${pids}" ]] && count="$(printf '%s\n' "${pids}" | wc -l | tr -d ' ')"
@@ -206,10 +215,10 @@ echo "  worker_request_timeout_seconds    = ${client_timeout}"
 echo "  worker_socket_path                = ${worker_socket}"
 echo "  COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL = ${test_sentinel}"
 
-# Redirect ros2 launch output directly to the log file so that $! captures
-# the ros2 launch PID, not a tee process.  Use process-group kill in cleanup
-# to terminate ros2 launch and all child workers together.
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+# Start ros2 launch in its own session so setsid gives it a new PGID that
+# differs from the test script's PGID.  This makes the negative-PGID kill in
+# cleanup() safe: it can never reach the test script's own process group.
+setsid ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
   image_topic:="${image_topic}" \
   result_topic:="${result_topic}" \
   llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}" \
@@ -231,7 +240,15 @@ old_worker_pid="$(wait_for_worker)" || {
 echo "Initial worker PID:   ${old_worker_pid}"
 
 # Record cosmos_reasoner PID for verification 5.
+# Require exactly one nonempty PID — an empty result here means the reasoner
+# has not started yet or there are multiple matches.  Do not proceed: a false
+# empty would silently bypass the "reasoner PID unchanged" assertion.
 old_reasoner_pid="$(reasoner_pid)" || true
+if [[ -z "${old_reasoner_pid}" ]]; then
+  echo "FAIL: could not find exactly one cosmos_reasoner process." \
+       "Ensure no other cosmos_reasoner instance is running." >&2
+  exit 1
+fi
 echo "cosmos_reasoner PID:  ${old_reasoner_pid}"
 
 # Wait for the reasoner subscription to come up before publishing frames.
@@ -306,7 +323,11 @@ fi
 
 # ── Verify cosmos_reasoner PID did not change (verification 5) ───────────────
 new_reasoner_pid="$(reasoner_pid)" || true
-if [[ -n "${old_reasoner_pid}" && "${old_reasoner_pid}" != "${new_reasoner_pid}" ]]; then
+if [[ -z "${new_reasoner_pid}" ]]; then
+  echo "FAIL (verification 5): cosmos_reasoner is no longer running after recovery." >&2
+  exit 1
+fi
+if [[ "${old_reasoner_pid}" != "${new_reasoner_pid}" ]]; then
   echo "FAIL (verification 5): cosmos_reasoner PID changed" \
        "(${old_reasoner_pid} → ${new_reasoner_pid})." >&2
   exit 1
