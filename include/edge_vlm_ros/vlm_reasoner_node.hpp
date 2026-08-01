@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "cosmos_ros2_video_reasoner/inference_backend.hpp"
+#include "edge_vlm_ros/inference_backend.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include <cstddef>
 #include <condition_variable>
@@ -31,9 +31,9 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 
-#include "cosmos_ros2_video_reasoner/msg/vision_reasoning_result.hpp"
+#include "edge_vlm_ros/msg/vlm_result.hpp"
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 /// ROS 2 node that samples camera frames, sends them to a VLM backend,
@@ -47,10 +47,10 @@ namespace cosmos_ros2_video_reasoner
 /// The two threads share a single pending frame slot protected by a mutex + condition variable.
 /// When `drop_old_frames` is true and a new frame arrives before the worker finishes the
 /// previous one, the older frame is replaced.
-class CosmosReasonerNode : public rclcpp::Node
+class VlmReasonerNode : public rclcpp::Node
 {
 public:
-  explicit CosmosReasonerNode(
+  explicit VlmReasonerNode(
     std::unique_ptr<InferenceBackend> backend,
     const rclcpp::NodeOptions & options = rclcpp::NodeOptions{});
 
@@ -100,7 +100,7 @@ private:
 
   // ── ROS interfaces ──────────────────────────────────────────────────────
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
-  rclcpp::Publisher<msg::VisionReasoningResult>::SharedPtr result_pub_;
+  rclcpp::Publisher<msg::VlmResult>::SharedPtr result_pub_;
 
   // ── Sampling state ──────────────────────────────────────────────────────
   rclcpp::Time last_sampled_time_{0, 0, RCL_ROS_TIME};
@@ -171,4 +171,4 @@ private:
   int64_t worker_ready_wall_ns_{0}; // wall time when inference worker finished initialising
 };
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

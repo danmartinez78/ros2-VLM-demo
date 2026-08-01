@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-/// Integration-style tests for CosmosReasonerNode using FakeInferenceBackend.
+/// Integration-style tests for VlmReasonerNode using FakeInferenceBackend.
 /// No NVIDIA hardware required.
 
 #include <gtest/gtest.h>
@@ -28,19 +28,19 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
-#include "cosmos_ros2_video_reasoner/cosmos_reasoner_node.hpp"
-#include "cosmos_ros2_video_reasoner/msg/vision_reasoning_result.hpp"
+#include "edge_vlm_ros/vlm_reasoner_node.hpp"
+#include "edge_vlm_ros/msg/vlm_result.hpp"
 #include "fake_inference_backend.hpp"
 
 using namespace std::chrono_literals;
-using cosmos_ros2_video_reasoner::CosmosReasonerNode;
-using cosmos_ros2_video_reasoner::FakeInferenceBackend;
-using cosmos_ros2_video_reasoner::FailingFakeInferenceBackend;
-using cosmos_ros2_video_reasoner::HistoryEntry;
-using cosmos_ros2_video_reasoner::InferenceRequest;
-using cosmos_ros2_video_reasoner::InferenceResponse;
-using cosmos_ros2_video_reasoner::SlowFakeInferenceBackend;
-using ResultMsg = cosmos_ros2_video_reasoner::msg::VisionReasoningResult;
+using edge_vlm_ros::VlmReasonerNode;
+using edge_vlm_ros::FakeInferenceBackend;
+using edge_vlm_ros::FailingFakeInferenceBackend;
+using edge_vlm_ros::HistoryEntry;
+using edge_vlm_ros::InferenceRequest;
+using edge_vlm_ros::InferenceResponse;
+using edge_vlm_ros::SlowFakeInferenceBackend;
+using ResultMsg = edge_vlm_ros::msg::VlmResult;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -96,7 +96,7 @@ protected:
     node_.reset();
   }
 
-  std::shared_ptr<CosmosReasonerNode> node_;
+  std::shared_ptr<VlmReasonerNode> node_;
 };
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -105,7 +105,7 @@ protected:
 TEST_F(NodeTest, BackendInitialized)
 {
   auto * raw_backend = new FakeInferenceBackend();
-  node_ = std::make_shared<CosmosReasonerNode>(
+  node_ = std::make_shared<VlmReasonerNode>(
     std::unique_ptr<FakeInferenceBackend>(raw_backend),
     make_options(false));
   EXPECT_TRUE(raw_backend->is_initialized());
@@ -121,13 +121,13 @@ TEST_F(NodeTest, SuccessfulInferencePublishesResult)
 
   // Subscribe to results
   auto sub = helper->create_subscription<ResultMsg>(
-    "/cosmos/reasoning", rclcpp::SystemDefaultsQoS(),
+    "/vlm/result", rclcpp::SystemDefaultsQoS(),
     [&](ResultMsg::SharedPtr msg) {
       last_msg = *msg;
       received = true;
     });
 
-  node_ = std::make_shared<CosmosReasonerNode>(
+  node_ = std::make_shared<VlmReasonerNode>(
     std::make_unique<FakeInferenceBackend>(),
     make_options(true));
 
@@ -158,13 +158,13 @@ TEST_F(NodeTest, FailingInferencePublishesError)
 
   auto helper = std::make_shared<rclcpp::Node>("_test_helper_fail");
   auto sub = helper->create_subscription<ResultMsg>(
-    "/cosmos/reasoning", rclcpp::SystemDefaultsQoS(),
+    "/vlm/result", rclcpp::SystemDefaultsQoS(),
     [&](ResultMsg::SharedPtr msg) {
       last_msg = *msg;
       received = true;
     });
 
-  node_ = std::make_shared<CosmosReasonerNode>(
+  node_ = std::make_shared<VlmReasonerNode>(
     std::make_unique<FailingFakeInferenceBackend>(),
     make_options(true));
 
@@ -192,7 +192,7 @@ TEST_F(NodeTest, CallbackDoesNotBlockOnSlowBackend)
 {
   constexpr auto kSlowDelay = 300ms;
 
-  node_ = std::make_shared<CosmosReasonerNode>(
+  node_ = std::make_shared<VlmReasonerNode>(
     std::make_unique<SlowFakeInferenceBackend>(kSlowDelay),
     make_options(false));
 
@@ -223,7 +223,7 @@ TEST_F(NodeTest, FullQueueDropsOldFrameWhenConfigured)
   rclcpp::NodeOptions opts = make_options(false);
   opts.append_parameter_override("drop_old_frames", true);
   // Use a slow backend (500 ms) so the worker can't keep up
-  node_ = std::make_shared<CosmosReasonerNode>(
+  node_ = std::make_shared<VlmReasonerNode>(
     std::make_unique<SlowFakeInferenceBackend>(500ms),
     opts);
 
@@ -253,7 +253,7 @@ TEST_F(NodeTest, FullQueueDropsOldFrameWhenConfigured)
 /// The node shuts down cleanly: the worker thread is joined without deadlock.
 TEST_F(NodeTest, CleanShutdown)
 {
-  node_ = std::make_shared<CosmosReasonerNode>(
+  node_ = std::make_shared<VlmReasonerNode>(
     std::make_unique<FakeInferenceBackend>(),
     make_options(false));
 
@@ -268,7 +268,7 @@ TEST_F(NodeTest, InvalidSamplePeriodRejected)
   opts.append_parameter_override("sample_period_seconds", -1.0);
 
   EXPECT_THROW(
-    std::make_shared<CosmosReasonerNode>(
+    std::make_shared<VlmReasonerNode>(
       std::make_unique<FakeInferenceBackend>(), opts),
     std::exception);
 }
@@ -280,7 +280,7 @@ TEST_F(NodeTest, InvalidTemperatureRejected)
   opts.append_parameter_override("temperature", -0.5);
 
   EXPECT_THROW(
-    std::make_shared<CosmosReasonerNode>(
+    std::make_shared<VlmReasonerNode>(
       std::make_unique<FakeInferenceBackend>(), opts),
     std::exception);
 }
@@ -293,7 +293,7 @@ TEST_F(NodeTest, PublishesProfileAndPromptVersionMetadata)
 
   auto helper = std::make_shared<rclcpp::Node>("_test_helper_profile_metadata");
   auto sub = helper->create_subscription<ResultMsg>(
-    "/cosmos/reasoning", rclcpp::SystemDefaultsQoS(),
+    "/vlm/result", rclcpp::SystemDefaultsQoS(),
     [&](ResultMsg::SharedPtr msg) {
       last_msg = *msg;
       received = true;
@@ -303,7 +303,7 @@ TEST_F(NodeTest, PublishesProfileAndPromptVersionMetadata)
   opts.append_parameter_override("task_profile", "hazard_detection");
   opts.append_parameter_override("prompt_version", "hazard-v2");
   opts.append_parameter_override("task_instruction", "Use concise bullet points.");
-  node_ = std::make_shared<CosmosReasonerNode>(
+  node_ = std::make_shared<VlmReasonerNode>(
     std::make_unique<FakeInferenceBackend>(),
     opts);
 
@@ -334,7 +334,7 @@ TEST_F(NodeTest, InvalidTemplateVariableRejected)
     "Describe scene with {not_a_valid_variable}");
 
   EXPECT_THROW(
-    std::make_shared<CosmosReasonerNode>(
+    std::make_shared<VlmReasonerNode>(
       std::make_unique<FakeInferenceBackend>(), opts),
     std::exception);
 }
@@ -345,7 +345,7 @@ TEST_F(NodeTest, UnsupportedSeparateInstructionModeRejected)
   rclcpp::NodeOptions opts = make_options(false);
   opts.append_parameter_override("instruction_delivery_mode", "separate");
   EXPECT_THROW(
-    std::make_shared<CosmosReasonerNode>(
+    std::make_shared<VlmReasonerNode>(
       std::make_unique<FakeInferenceBackend>(), opts),
     std::exception);
 }
@@ -378,7 +378,7 @@ TEST_F(NodeTest, InstructionVariablesAreNotDuplicated)
   opts.append_parameter_override("task_profile", "scene_description");
   opts.append_parameter_override("system_instruction", "Conservative output.");
   opts.append_parameter_override("task_instruction", "Bulleted response.");
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
 
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
@@ -429,7 +429,7 @@ TEST_F(NodeTest, PromptHistoryIsBoundedByEntries)
     "Current frame. Prior context:\n{context}");
   opts.append_parameter_override("task_profile", "scene_description");
 
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
 
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
@@ -486,7 +486,7 @@ TEST_F(NodeTest, PromptHistoryResetsOnError)
     "Current frame. Prior context:\n{context}");
   opts.append_parameter_override("task_profile", "scene_description");
 
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
   qos.best_effort();
@@ -536,7 +536,7 @@ TEST_F(NodeTest, PromptHistoryEveryNRequestsBoundary)
     "Current frame. Prior context:\n{context}");
   opts.append_parameter_override("task_profile", "scene_description");
 
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
   qos.best_effort();
@@ -585,7 +585,7 @@ TEST_F(NodeTest, HistoryEnabledWithoutContextVariableDoesNotInjectHistory)
     "Describe the current frame only.");
   opts.append_parameter_override("task_profile", "scene_description");
 
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
   qos.best_effort();
@@ -639,7 +639,7 @@ TEST_F(NodeTest, PromptHistoryIsBoundedByCharacterSize)
     "Current frame. Prior context:\n{context}");
   opts.append_parameter_override("task_profile", "scene_description");
 
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
   qos.best_effort();
@@ -700,7 +700,7 @@ TEST_F(NodeTest, StructuredPromptHistoryCountsBothSidesOfEachTurn)
   opts.append_parameter_override("task_profiles.scene_description.template", "x");
   opts.append_parameter_override("task_profile", "scene_description");
 
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
   qos.best_effort();
@@ -734,7 +734,7 @@ TEST_F(NodeTest, TemplateBraceValidationAndLiteralBraces)
     "task_profiles.scene_description.template",
     "Malformed template }");
   EXPECT_THROW(
-    std::make_shared<CosmosReasonerNode>(
+    std::make_shared<VlmReasonerNode>(
       std::make_unique<FakeInferenceBackend>(), bad_opts),
     std::exception);
 
@@ -760,7 +760,7 @@ TEST_F(NodeTest, TemplateBraceValidationAndLiteralBraces)
   ok_opts.append_parameter_override(
     "task_profiles.scene_description.template",
     "Literal {{brace}} and topic {source_topic}");
-  node_ = std::make_shared<CosmosReasonerNode>(std::move(backend), ok_opts);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), ok_opts);
   std::this_thread::sleep_for(50ms);
   rclcpp::QoS qos{rclcpp::KeepLast(10)};
   qos.best_effort();

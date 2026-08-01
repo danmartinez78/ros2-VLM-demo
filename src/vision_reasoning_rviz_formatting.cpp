@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cosmos_ros2_video_reasoner/vision_reasoning_rviz_formatting.hpp"
+#include "edge_vlm_ros/vision_reasoning_rviz_formatting.hpp"
 
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
 
-namespace cosmos_ros2_video_reasoner::rviz
+namespace edge_vlm_ros::rviz
 {
 
 std::string format_stamp(const builtin_interfaces::msg::Time & stamp)
@@ -45,7 +45,7 @@ std::string format_stamp(const rclcpp::Time & stamp)
 }
 
 ResultPresentation build_result_presentation(
-  const msg::VisionReasoningResult * result,
+  const msg::VlmResult * result,
   const std::optional<rclcpp::Time> & latest_image_stamp,
   const rclcpp::Time & now,
   double stale_after_seconds)
@@ -54,7 +54,7 @@ ResultPresentation build_result_presentation(
   if (!result) {
     presentation.state = ResultState::kNoResult;
     presentation.status_text = "NO RESULT";
-    presentation.details_text = "Waiting for VisionReasoningResult messages.";
+    presentation.details_text = "Waiting for VlmResult messages.";
     return presentation;
   }
 
@@ -88,4 +88,4 @@ ResultPresentation build_result_presentation(
   return presentation;
 }
 
-}  // namespace cosmos_ros2_video_reasoner::rviz
+}  // namespace edge_vlm_ros::rviz

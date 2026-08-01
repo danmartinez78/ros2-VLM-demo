@@ -2,7 +2,7 @@
 # Thor hardware validation: watchdog-triggered recovery test.
 #
 # Injects a deterministic one-shot hang using the
-# COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL environment variable:
+# EDGE_VLM_TEST_INJECT_HANG_ONCE_SENTINEL environment variable:
 #   - The first inference worker creates a sentinel file and then sleeps for
 #     worker_inference_deadline_seconds + 30 s.  The InferenceWatchdog fires
 #     at the configured deadline and calls std::_Exit(1).
@@ -13,7 +13,7 @@
 # preserved.  The client timeout (worker_request_timeout_seconds=90) exceeds
 # the deadline so the client observes a clean EOF rather than SO_RCVTIMEO.
 #
-# This test is HARDWARE-ONLY; COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL must
+# This test is HARDWARE-ONLY; EDGE_VLM_TEST_INJECT_HANG_ONCE_SENTINEL must
 # never be set in production deployments.
 #
 # Verifications (all 6 required):
@@ -21,17 +21,17 @@
 #   2. Worker PID changes after respawn.
 #   3. One watchdog failure (and at most one reconnect-race failure) is published.
 #   4. A later successful reasoning result is received.
-#   5. cosmos_reasoner PID does not change.
+#   5. edge_vlm_ros_node PID does not change.
 #   6. No orphan worker process or socket file remains after shutdown.
 set -Eeuo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 asset_root="${ROSBAG_DIR:-${repo_root}/test_data/rosbags}/image-proc"
-env_file="${COSMOS_ENV_FILE:-${repo_root}/scripts/cosmos_env.sh}"
+env_file="${EDGE_VLM_ENV_FILE:-${repo_root}/scripts/edge_vlm_env.sh}"
 image_topic="/hawk_0_left_rgb_image"
-result_topic="/cosmos/reasoning"
-worker_socket="${WORKER_SOCKET_PATH:-/tmp/cosmos_edge_llm.sock}"
+result_topic="/vlm/result"
+worker_socket="${WORKER_SOCKET_PATH:-/tmp/edge_vlm.sock}"
 # Normal production deadline; long enough for real Cosmos inference on Thor.
 watchdog_deadline="${WORKER_INFERENCE_DEADLINE_SECONDS:-60}"
 # Client timeout must exceed the watchdog deadline to observe a clean EOF
@@ -41,8 +41,8 @@ client_timeout="${WORKER_REQUEST_TIMEOUT_SECONDS:-90}"
 launch_pid=""
 bag_pid=""
 result_echo_pid=""
-launch_log="$(mktemp /tmp/cosmos-recovery-launch.XXXXXX.log)"
-result_log="$(mktemp /tmp/cosmos-recovery-results.XXXXXX.log)"
+launch_log="$(mktemp /tmp/edge-vlm-recovery-launch.XXXXXX.log)"
+result_log="$(mktemp /tmp/edge-vlm-recovery-results.XXXXXX.log)"
 
 wait_for_process_exit() {
   local pid="$1"
@@ -58,8 +58,8 @@ wait_for_process_exit() {
 # std::_Exit(1).  The respawned worker finds the sentinel present and skips
 # the hang, allowing normal inference to proceed.
 # Never set in production — this variable is only exported by this script.
-test_sentinel="$(mktemp -u /tmp/cosmos-test-sentinel-XXXXXX.flag)"
-export COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL="${test_sentinel}"
+test_sentinel="$(mktemp -u /tmp/edge-vlm-test-sentinel-XXXXXX.flag)"
+export EDGE_VLM_TEST_INJECT_HANG_ONCE_SENTINEL="${test_sentinel}"
 
 cleanup() {
   if [[ -n "${result_echo_pid}" ]] && kill -0 "${result_echo_pid}" 2>/dev/null; then
@@ -127,7 +127,7 @@ elif [[ -f "${repo_root}/../../install/setup.bash" ]]; then
 fi
 set -u
 
-for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGIN_PATH; do
+for variable in EDGE_VLM_LLM_ENGINE_DIR EDGE_VLM_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGIN_PATH; do
   if [[ -z "${!variable:-}" ]]; then
     echo "Missing ${variable}; configure ${env_file} first." >&2
     exit 1
@@ -141,7 +141,7 @@ worker_pid() {
   local escaped_socket
   escaped_socket="$(printf '%s' "${worker_socket}" | sed 's/[.[\*^$()|+?{}]/\\&/g')"
   local pids
-  pids="$(pgrep -f "cosmos_inference_worker.*${escaped_socket}" 2>/dev/null)" || true
+  pids="$(pgrep -f "edge_vlm_server.*${escaped_socket}" 2>/dev/null)" || true
   # Require exactly one match — guards against misreporting 0 (not yet
   # started) or 2+ PIDs (brief overlap during respawn) as a valid single PID.
   local count=0
@@ -150,11 +150,11 @@ worker_pid() {
 }
 
 reasoner_pid() {
-  # Match the installed executable path ending in '/cosmos_reasoner' followed
-  # by end-of-command or a space — avoids matching cosmos_reasoner_node or
-  # other commands that merely contain the substring "cosmos_reasoner".
+  # Match the installed executable path ending in '/edge_vlm_ros_node' followed
+  # by end-of-command or a space — avoids matching other commands that merely
+  # contain the substring "edge_vlm_ros_node".
   local pids
-  pids="$(pgrep -f '/cosmos_reasoner($| )' 2>/dev/null)" || true
+  pids="$(pgrep -f '/edge_vlm_ros_node($| )' 2>/dev/null)" || true
   # Require exactly one match for this test instance.
   local count=0
   [[ -n "${pids}" ]] && count="$(printf '%s\n' "${pids}" | wc -l | tr -d ' ')"
@@ -181,7 +181,7 @@ wait_for_success_result() {
   local attempts=0
   local output=""
   while (( attempts < max_attempts )); do
-    output="$(mktemp /tmp/cosmos-recovery-result.XXXXXX)"
+    output="$(mktemp /tmp/edge-vlm-recovery-result.XXXXXX)"
     if timeout 120 ros2 topic echo "${result_topic}" --once >"${output}" 2>&1; then
       if grep -q '^success: true$' "${output}"; then
         cat "${output}"
@@ -226,17 +226,17 @@ count_failure_results() {
 # Refuse to run around stale deployments. Ambiguous global PID discovery can
 # attach assertions to the wrong reasoner and cleanup must never kill processes
 # that this test did not launch.
-existing_reasoners="$(pgrep -f '/cosmos_reasoner($| )' 2>/dev/null || true)"
-existing_workers="$(pgrep -f '/cosmos_inference_worker($| )' 2>/dev/null || true)"
+existing_reasoners="$(pgrep -f '/edge_vlm_ros_node($| )' 2>/dev/null || true)"
+existing_workers="$(pgrep -f '/edge_vlm_server($| )' 2>/dev/null || true)"
 if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
-  echo "Existing Cosmos deployment processes detected; stop them before testing." >&2
+  echo "Existing edge_vlm_ros deployment processes detected; stop them before testing." >&2
   [[ -n "${existing_reasoners}" ]] && printf '  reasoner PID(s):\n%s\n' "${existing_reasoners}" >&2
   [[ -n "${existing_workers}" ]] && printf '  worker PID(s):\n%s\n' "${existing_workers}" >&2
   exit 1
 fi
 if [[ -e "${worker_socket}" ]]; then
   echo "Stale worker socket exists: ${worker_socket}" >&2
-  echo "Remove it only after confirming no Cosmos worker is running." >&2
+  echo "Remove it only after confirming no edge_vlm_server is running." >&2
   exit 1
 fi
 
@@ -245,16 +245,16 @@ echo "Starting watchdog-triggered recovery test..."
 echo "  worker_inference_deadline_seconds = ${watchdog_deadline}"
 echo "  worker_request_timeout_seconds    = ${client_timeout}"
 echo "  worker_socket_path                = ${worker_socket}"
-echo "  COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL = ${test_sentinel}"
+echo "  EDGE_VLM_TEST_INJECT_HANG_ONCE_SENTINEL = ${test_sentinel}"
 
 # Start ros2 launch in its own session so setsid gives it a new PGID that
 # differs from the test script's PGID.  This makes the negative-PGID kill in
 # cleanup() safe: it can never reach the test script's own process group.
-setsid ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+setsid ros2 launch edge_vlm_ros edge_vlm.launch.py \
   image_topic:="${image_topic}" \
   result_topic:="${result_topic}" \
-  llm_engine_dir:="${COSMOS_LLM_ENGINE_DIR}" \
-  multimodal_engine_dir:="${COSMOS_MULTIMODAL_ENGINE_DIR}" \
+  llm_engine_dir:="${EDGE_VLM_LLM_ENGINE_DIR}" \
+  multimodal_engine_dir:="${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
   edge_llm_plugin_path:="${EDGELLM_PLUGIN_PATH}" \
   worker_socket_path:="${worker_socket}" \
   worker_inference_deadline_seconds:="${watchdog_deadline}" \
@@ -271,17 +271,17 @@ old_worker_pid="$(wait_for_worker)" || {
 }
 echo "Initial worker PID:   ${old_worker_pid}"
 
-# Record cosmos_reasoner PID for verification 5.
+# Record edge_vlm_ros_node PID for verification 5.
 # Require exactly one nonempty PID — an empty result here means the reasoner
 # has not started yet or there are multiple matches.  Do not proceed: a false
 # empty would silently bypass the "reasoner PID unchanged" assertion.
 old_reasoner_pid="$(reasoner_pid)" || true
 if [[ -z "${old_reasoner_pid}" ]]; then
-  echo "FAIL: could not find exactly one cosmos_reasoner process." \
-       "Ensure no other cosmos_reasoner instance is running." >&2
+  echo "FAIL: could not find exactly one edge_vlm_ros_node process." \
+       "Ensure no other edge_vlm_ros_node instance is running." >&2
   exit 1
 fi
-echo "cosmos_reasoner PID:  ${old_reasoner_pid}"
+echo "edge_vlm_ros_node PID:  ${old_reasoner_pid}"
 
 # Wait for the reasoner subscription to come up before publishing frames.
 ready=false
@@ -331,7 +331,7 @@ echo "Waiting for watchdog expiry and worker self-termination..."
 echo "(This will take approximately ${watchdog_deadline} s while the injected hang runs.)"
 
 failure_count=0
-success_output="$(mktemp /tmp/cosmos-recovery-success.XXXXXX)"
+success_output="$(mktemp /tmp/edge-vlm-recovery-success.XXXXXX)"
 # Drain results: count failures before the first success (verif. 3 + 4).
 count_failure_results >"${success_output}" || {
   echo "Did not receive a successful result after the watchdog fired." >&2
@@ -376,18 +376,18 @@ else
   exit 1
 fi
 
-# ── Verify cosmos_reasoner PID did not change (verification 5) ───────────────
+# ── Verify edge_vlm_ros_node PID did not change (verification 5) ───────────────
 new_reasoner_pid="$(reasoner_pid)" || true
 if [[ -z "${new_reasoner_pid}" ]]; then
-  echo "FAIL (verification 5): cosmos_reasoner is no longer running after recovery." >&2
+  echo "FAIL (verification 5): edge_vlm_ros_node is no longer running after recovery." >&2
   exit 1
 fi
 if [[ "${old_reasoner_pid}" != "${new_reasoner_pid}" ]]; then
-  echo "FAIL (verification 5): cosmos_reasoner PID changed" \
+  echo "FAIL (verification 5): edge_vlm_ros_node PID changed" \
        "(${old_reasoner_pid} → ${new_reasoner_pid})." >&2
   exit 1
 fi
-echo "PASS (verification 5): cosmos_reasoner PID unchanged (${new_reasoner_pid})."
+echo "PASS (verification 5): edge_vlm_ros_node PID unchanged (${new_reasoner_pid})."
 
 # ── Shutdown: verify no orphan worker or socket (verification 6) ─────────────
 cleanup
@@ -409,6 +409,6 @@ echo "PASS (verification 6, socket): socket file removed after shutdown."
 
 echo ""
 echo "PASS: all 6 verifications passed — watchdog fires, worker PID changes,"
-echo "      recovery failures stay bounded, reasoning resumes, cosmos_reasoner PID unchanged,"
+echo "      recovery failures stay bounded, reasoning resumes, edge_vlm_ros_node PID unchanged,"
 echo "      and no orphan worker or socket remains after shutdown."
 

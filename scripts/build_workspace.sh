@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
-env_file="${COSMOS_ENV_FILE:-${script_dir}/cosmos_env.sh}"
+env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
 
 if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090
@@ -46,7 +46,7 @@ elif [[ "$(basename -- "$(dirname -- "${repo_root}")")" == "src" ]]; then
   ros_workspace="$(cd -- "${repo_root}/../.." && pwd)"
 else
   echo "Cannot infer the ROS workspace from ${repo_root}." >&2
-  echo "Set ROS_WORKSPACE in scripts/cosmos_env.sh." >&2
+  echo "Set ROS_WORKSPACE in scripts/edge_vlm_env.sh." >&2
   exit 1
 fi
 
@@ -64,7 +64,7 @@ rosdep install \
 cd "${ros_workspace}"
 colcon build \
   --symlink-install \
-  --packages-select cosmos_ros2_video_reasoner \
+  --packages-select edge_vlm_ros \
   --event-handlers console_direct+ \
   --cmake-args \
     -DCMAKE_BUILD_TYPE=Release \

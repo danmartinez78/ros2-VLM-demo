@@ -53,15 +53,15 @@ jobs:
         run: |
           source "/opt/ros/${ROS_DISTRO}/setup.bash"
           colcon build \
-            --packages-select cosmos_ros2_video_reasoner \
+            --packages-select edge_vlm_ros \
             --cmake-args -DBUILD_TESTING=ON
-          test -f build/cosmos_ros2_video_reasoner/libcosmos_reasoning_rviz_panel.so
+          test -f build/edge_vlm_ros/libedge_vlm_rviz_panel.so
 
       - name: Run hardware-independent tests
         run: |
           source "/opt/ros/${ROS_DISTRO}/setup.bash"
           source install/setup.bash
-          colcon test --packages-select cosmos_ros2_video_reasoner \
+          colcon test --packages-select edge_vlm_ros \
             --ctest-args \
               -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|worker_recovery_helpers)" \
               --output-on-failure

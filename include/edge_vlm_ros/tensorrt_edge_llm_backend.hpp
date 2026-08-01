@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 #pragma once
 
-#include "cosmos_ros2_video_reasoner/inference_backend.hpp"
+#include "edge_vlm_ros/inference_backend.hpp"
 
 #include <memory>
 #include <string>
@@ -33,7 +33,7 @@ class LLMInferenceRuntime;
 struct CUstream_st;
 using cudaStream_t = CUstream_st *;
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 /// Configuration for the TensorRT Edge-LLM backend.
@@ -87,4 +87,4 @@ private:
   int jpeg_quality_{90};
 };
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

@@ -1,8 +1,8 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 
 #include <gtest/gtest.h>
 
-#include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
+#include "edge_vlm_ros/ipc_protocol.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -15,7 +15,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace ipc = cosmos_ros2_video_reasoner::ipc;
+namespace ipc = edge_vlm_ros::ipc;
 
 namespace
 {

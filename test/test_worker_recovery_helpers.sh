@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Copyright 2025 cosmos_ros2_video_reasoner contributors
+# Copyright 2025 edge_vlm_ros contributors
 #
 # Shell-level unit tests for the PID-match helpers and PGID isolation safety
 # checks used in scripts/test_data/run_worker_recovery_test.sh.

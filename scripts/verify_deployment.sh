@@ -19,7 +19,7 @@ fi
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
-env_file="${COSMOS_ENV_FILE:-${script_dir}/cosmos_env.sh}"
+env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
 
 if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090
@@ -41,10 +41,10 @@ check() {
 ros_distro="${ROS_DISTRO:-jazzy}"
 edge_root="${TENSORRT_EDGE_LLM_ROOT:-${HOME}/TensorRT-Edge-LLM}"
 edge_build="${TENSORRT_EDGE_LLM_BUILD_DIR:-${edge_root}/build}"
-model_name="${COSMOS_MODEL_NAME:-Cosmos-Reason2-8B}"
-cosmos_workspace="${COSMOS_WORKSPACE_DIR:-${HOME}/tensorrt-edgellm-workspace}"
-llm_engine="${COSMOS_LLM_ENGINE_DIR:-${cosmos_workspace}/${model_name}/engine/llm}"
-multimodal_engine="${COSMOS_MULTIMODAL_ENGINE_DIR:-${cosmos_workspace}/${model_name}/engine}"
+model_name="${EDGE_VLM_MODEL_NAME:-Cosmos-Reason2-8B}"
+edge_vlm_workspace="${EDGE_VLM_WORKSPACE_DIR:-${HOME}/tensorrt-edgellm-workspace}"
+llm_engine="${EDGE_VLM_LLM_ENGINE_DIR:-${edge_vlm_workspace}/${model_name}/engine/llm}"
+multimodal_engine="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-${edge_vlm_workspace}/${model_name}/engine}"
 plugin_path="${EDGELLM_PLUGIN_PATH:-${edge_build}/libNvInfer_edgellm_plugin.so}"
 l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 
@@ -78,8 +78,8 @@ check "OpenCV development package" dpkg-query -W libopencv-dev
 check "Edge-LLM runtime header" test -f "${edge_root}/cpp/runtime/llmInferenceRuntime.h"
 check "Edge-LLM core archive" bash -c 'find "$1" -name libedgellmCore.a -print -quit | grep -q .' _ "${edge_build}"
 check "Edge-LLM plugin" test -f "${plugin_path}"
-check "Cosmos LLM engine directory" test -d "${llm_engine}"
-check "Cosmos visual engine directory" test -d "${multimodal_engine}"
+check "LLM engine directory" test -d "${llm_engine}"
+check "Visual encoder engine directory" test -d "${multimodal_engine}"
 
 if [[ -n "${ROS_WORKSPACE:-}" ]]; then
   ros_workspace="${ROS_WORKSPACE}"
@@ -98,18 +98,18 @@ if [[ -n "${ros_workspace}" && -f "${ros_workspace}/install/setup.bash" ]]; then
   source "${ros_workspace}/install/setup.bash"
   set -u
 
-  check "Installed ROS package" ros2 pkg prefix cosmos_ros2_video_reasoner
+  check "Installed ROS package" ros2 pkg prefix edge_vlm_ros
   check "Installed reasoner executable" bash -c \
-    "ros2 pkg executables cosmos_ros2_video_reasoner | grep -q ' cosmos_reasoner$'"
+    "ros2 pkg executables edge_vlm_ros | grep -q ' edge_vlm_ros_node$'"
   check "Installed inference worker" bash -c \
-    "ros2 pkg executables cosmos_ros2_video_reasoner | grep -q ' cosmos_inference_worker$'"
+    "ros2 pkg executables edge_vlm_ros | grep -q ' edge_vlm_server$'"
 
-  package_prefix="$(ros2 pkg prefix cosmos_ros2_video_reasoner)"
-  reasoner_executable="${package_prefix}/lib/cosmos_ros2_video_reasoner/cosmos_reasoner"
-  worker_executable="${package_prefix}/lib/cosmos_ros2_video_reasoner/cosmos_inference_worker"
+  package_prefix="$(ros2 pkg prefix edge_vlm_ros)"
+  reasoner_executable="${package_prefix}/lib/edge_vlm_ros/edge_vlm_ros_node"
+  worker_executable="${package_prefix}/lib/edge_vlm_ros/edge_vlm_server"
 
   check "ROS process excludes CUDA and TensorRT" bash -c \
-    '! ldd "$1" | grep -Eq "lib(cuda|nvinfer|cosmos_trt_backend)"' \
+    '! ldd "$1" | grep -Eq "lib(cuda|nvinfer|edge_vlm_trt_backend)"' \
     _ "${reasoner_executable}"
   check "Inference worker excludes ROS libraries" bash -c \
     '! ldd "$1" | grep -Eq "lib(rcl|rmw|rosidl|fastrtps)"' \

@@ -1,7 +1,7 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
-#include "cosmos_ros2_video_reasoner/inference_watchdog.hpp"
-#include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
-#include "cosmos_ros2_video_reasoner/tensorrt_edge_llm_backend.hpp"
+// Copyright 2025 edge_vlm_ros contributors
+#include "edge_vlm_ros/inference_watchdog.hpp"
+#include "edge_vlm_ros/ipc_protocol.hpp"
+#include "edge_vlm_ros/tensorrt_edge_llm_backend.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -101,17 +101,17 @@ int main(int argc, char ** argv)
   }
 
   try {
-    cosmos_ros2_video_reasoner::TensorRTEdgeLLMConfig config;
+    edge_vlm_ros::TensorRTEdgeLLMConfig config;
     config.llm_engine_dir = argv[1];
     config.multimodal_engine_dir = argv[2];
     config.edge_llm_plugin_path = argv[3];
     config.jpeg_quality = jpeg_quality;
-    cosmos_ros2_video_reasoner::TensorRTEdgeLLMBackend backend(config);
+    edge_vlm_ros::TensorRTEdgeLLMBackend backend(config);
     backend.initialize();
-    std::cout << "Cosmos inference worker ready on " << socket_path << std::endl;
+    std::cout << "edge_vlm_server ready on " << socket_path << std::endl;
 
     // ── Test-only one-shot injected hang ─────────────────────────────────
-    // COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL names a sentinel file path.
+    // EDGE_VLM_TEST_INJECT_HANG_ONCE_SENTINEL names a sentinel file path.
     // The first inference request will atomically create the sentinel and
     // then sleep past the watchdog deadline so the watchdog fires and calls
     // std::_Exit(1).  Subsequent workers find the sentinel already present
@@ -120,7 +120,7 @@ int main(int argc, char ** argv)
     // DISABLED by default (env var unset).  Set only for hardware recovery
     // validation — never in production.
     const char * const test_sentinel_path =
-      std::getenv("COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL");
+      std::getenv("EDGE_VLM_TEST_INJECT_HANG_ONCE_SENTINEL");
 
     // The service outlives individual clients. This permits a CLI, experiment
     // harness, and ROS adapter to connect sequentially without reloading engines.
@@ -136,92 +136,92 @@ int main(int argc, char ** argv)
       g_client_fd = client_fd;
 
       while (!g_stop) {
-        cosmos_ros2_video_reasoner::ipc::RequestHeader header;
+        edge_vlm_ros::ipc::RequestHeader header;
         try {
-          cosmos_ros2_video_reasoner::ipc::read_all(client_fd, &header, sizeof(header));
+          edge_vlm_ros::ipc::read_all(client_fd, &header, sizeof(header));
         } catch (std::exception const &) {
           break;
         }
-        if (header.magic != cosmos_ros2_video_reasoner::ipc::kMagic ||
-          header.version != cosmos_ros2_video_reasoner::ipc::kVersion ||
-          header.encoding != cosmos_ros2_video_reasoner::ipc::kEncodingBgr8 ||
+        if (header.magic != edge_vlm_ros::ipc::kMagic ||
+          header.version != edge_vlm_ros::ipc::kVersion ||
+          header.encoding != edge_vlm_ros::ipc::kEncodingBgr8 ||
           header.width == 0 || header.height == 0 ||
           header.width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
           header.height > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
           static_cast<uint64_t>(header.step) !=
           static_cast<uint64_t>(header.width) * 3U ||
-          header.prompt_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
-          header.system_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
-          header.history_count > cosmos_ros2_video_reasoner::ipc::kMaxHistoryEntries)
+          header.prompt_bytes > edge_vlm_ros::ipc::kMaxTextBytes ||
+          header.system_bytes > edge_vlm_ros::ipc::kMaxTextBytes ||
+          header.history_count > edge_vlm_ros::ipc::kMaxHistoryEntries)
         {
           throw std::runtime_error("invalid IPC request header");
         }
         const uint64_t expected_image_bytes =
           static_cast<uint64_t>(header.step) * header.height;
         if (expected_image_bytes != header.image_bytes ||
-          header.image_bytes > cosmos_ros2_video_reasoner::ipc::kMaxImageBytes)
+          header.image_bytes > edge_vlm_ros::ipc::kMaxImageBytes)
         {
           throw std::runtime_error("invalid IPC image payload size");
         }
   
         // ── Read image ────────────────────────────────────────────────────────
         std::vector<uint8_t> image_bytes(header.image_bytes);
-        cosmos_ros2_video_reasoner::ipc::read_all(
+        edge_vlm_ros::ipc::read_all(
           client_fd, image_bytes.data(), image_bytes.size());
   
         // ── Read structured or inline payload ─────────────────────────────────
         const bool is_structured =
-          (header.schema_flags & cosmos_ros2_video_reasoner::ipc::kSchemaFlagStructured) != 0;
+          (header.schema_flags & edge_vlm_ros::ipc::kSchemaFlagStructured) != 0;
   
         std::string system_message;
         std::string prompt;
-        std::vector<cosmos_ros2_video_reasoner::HistoryEntry> history;
+        std::vector<edge_vlm_ros::HistoryEntry> history;
   
         if (is_structured) {
           // Read system message (may be empty).
           if (header.system_bytes > 0) {
             system_message.resize(header.system_bytes);
-            cosmos_ros2_video_reasoner::ipc::read_all(
+            edge_vlm_ros::ipc::read_all(
               client_fd, system_message.data(), system_message.size());
           }
           // Read user message.
           prompt.resize(header.prompt_bytes);
-          cosmos_ros2_video_reasoner::ipc::read_all(client_fd, prompt.data(), prompt.size());
+          edge_vlm_ros::ipc::read_all(client_fd, prompt.data(), prompt.size());
           // Read history entries.
           history.resize(header.history_count);
           for (auto & entry : history) {
-            cosmos_ros2_video_reasoner::ipc::HistoryEntryHeader entry_header;
-            cosmos_ros2_video_reasoner::ipc::read_all(
+            edge_vlm_ros::ipc::HistoryEntryHeader entry_header;
+            edge_vlm_ros::ipc::read_all(
               client_fd, &entry_header, sizeof(entry_header));
-            if (entry_header.user_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
-              entry_header.asst_bytes > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)
+            if (entry_header.user_bytes > edge_vlm_ros::ipc::kMaxTextBytes ||
+              entry_header.asst_bytes > edge_vlm_ros::ipc::kMaxTextBytes)
             {
               throw std::runtime_error("IPC history entry exceeds protocol limits");
             }
             entry.user_text.resize(entry_header.user_bytes);
             entry.asst_text.resize(entry_header.asst_bytes);
-            cosmos_ros2_video_reasoner::ipc::read_all(
+            edge_vlm_ros::ipc::read_all(
               client_fd, entry.user_text.data(), entry.user_text.size());
-            cosmos_ros2_video_reasoner::ipc::read_all(
+            edge_vlm_ros::ipc::read_all(
               client_fd, entry.asst_text.data(), entry.asst_text.size());
           }
         } else {
           // Inline mode: single prompt string, no system message, no history.
           prompt.resize(header.prompt_bytes);
-          cosmos_ros2_video_reasoner::ipc::read_all(client_fd, prompt.data(), prompt.size());
+          edge_vlm_ros::ipc::read_all(client_fd, prompt.data(), prompt.size());
         }
   
         cv::Mat view(
           static_cast<int>(header.height), static_cast<int>(header.width),
           CV_8UC3, image_bytes.data(), header.step);
   
-        cosmos_ros2_video_reasoner::InferenceRequest request;
+        edge_vlm_ros::InferenceRequest request;
         request.image = view;
         request.prompt = std::move(prompt);
         request.system_message = std::move(system_message);
         request.history = std::move(history);
         request.use_system_prompt_cache =
-          (header.schema_flags & cosmos_ros2_video_reasoner::ipc::kSchemaFlagSysCache) != 0;
+          (header.schema_flags & edge_vlm_ros::ipc::kSchemaFlagSysCache) != 0;
         request.max_generate_length = header.max_generate_length;
         request.temperature = header.temperature;
         request.top_p = header.top_p;
@@ -247,11 +247,11 @@ int main(int argc, char ** argv)
         // wedges past the deadline, the watchdog emits a diagnostic and calls
         // std::_Exit(1) — see watchdog_exit_on_expire for the rationale for
         // _Exit over quick_exit.
-        cosmos_ros2_video_reasoner::InferenceWatchdog watchdog(
+        edge_vlm_ros::InferenceWatchdog watchdog(
           inference_deadline_seconds, header.request_id,
-          cosmos_ros2_video_reasoner::watchdog_exit_on_expire);
+          edge_vlm_ros::watchdog_exit_on_expire);
   
-        cosmos_ros2_video_reasoner::InferenceResponse result;
+        edge_vlm_ros::InferenceResponse result;
         if (inject_hang) {
           // Intentionally sleep past the watchdog deadline so the watchdog
           // fires and calls std::_Exit(1).  The sleep_for call is unreachable
@@ -272,21 +272,21 @@ int main(int argc, char ** argv)
         // Signal the watchdog that inference completed within the deadline.
         watchdog.cancel();
   
-        if (result.text.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
-          result.error.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)
+        if (result.text.size() > edge_vlm_ros::ipc::kMaxTextBytes ||
+          result.error.size() > edge_vlm_ros::ipc::kMaxTextBytes)
         {
           throw std::runtime_error("inference response exceeds IPC protocol limits");
         }
   
-        cosmos_ros2_video_reasoner::ipc::ResponseHeader response;
+        edge_vlm_ros::ipc::ResponseHeader response;
         response.request_id = header.request_id;
         response.success = result.success ? 1U : 0U;
         response.text_bytes = static_cast<uint32_t>(result.text.size());
         response.error_bytes = static_cast<uint32_t>(result.error.size());
         response.inference_seconds = result.inference_seconds;
-        cosmos_ros2_video_reasoner::ipc::write_all(client_fd, &response, sizeof(response));
-        cosmos_ros2_video_reasoner::ipc::write_all(client_fd, result.text.data(), result.text.size());
-        cosmos_ros2_video_reasoner::ipc::write_all(
+        edge_vlm_ros::ipc::write_all(client_fd, &response, sizeof(response));
+        edge_vlm_ros::ipc::write_all(client_fd, result.text.data(), result.text.size());
+        edge_vlm_ros::ipc::write_all(
           client_fd, result.error.data(), result.error.size());
       }
       ::close(client_fd);

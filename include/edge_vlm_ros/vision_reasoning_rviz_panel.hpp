@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,9 +32,9 @@
 #include <rviz_common/panel.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
-#include "cosmos_ros2_video_reasoner/msg/vision_reasoning_result.hpp"
+#include "edge_vlm_ros/msg/vlm_result.hpp"
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 class VisionReasoningPanel : public rviz_common::Panel
@@ -50,7 +50,7 @@ private Q_SLOTS:
 
 private:
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & msg);
-  void result_callback(const msg::VisionReasoningResult::ConstSharedPtr & msg);
+  void result_callback(const msg::VlmResult::ConstSharedPtr & msg);
 
   static std::optional<QImage> to_qimage(const sensor_msgs::msg::Image & msg);
   std::optional<QImage> find_cached_image_for_stamp(const builtin_interfaces::msg::Time & stamp) const;
@@ -67,13 +67,13 @@ private:
 
   std::shared_ptr<rclcpp::Node> node_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
-  rclcpp::Subscription<msg::VisionReasoningResult>::SharedPtr result_sub_;
+  rclcpp::Subscription<msg::VlmResult>::SharedPtr result_sub_;
   rclcpp::executors::SingleThreadedExecutor executor_;
   std::thread spin_thread_;
   QTimer * refresh_timer_{nullptr};
 
   mutable std::mutex data_mutex_;
-  std::optional<msg::VisionReasoningResult> latest_result_;
+  std::optional<msg::VlmResult> latest_result_;
   std::optional<rclcpp::Time> latest_result_received_at_;
   std::optional<rclcpp::Time> latest_image_stamp_;
   std::deque<std::pair<rclcpp::Time, QImage>> image_cache_;
@@ -83,4 +83,4 @@ private:
   QSize displayed_label_size_;
 };
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

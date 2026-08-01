@@ -179,7 +179,7 @@ def generate_comparison(
             "llm_inference_profile": native_results.get("llm_inference_profile") if native_results else None,
         },
         "ros_overhead": {
-            "source": "cosmos_reasoner benchmark_output_file instrumentation",
+            "source": "edge_vlm_ros_node benchmark_output_file instrumentation",
             "image_convert_ms_mean": convert.get("mean"),
             "image_convert_ms_p50": convert.get("p50"),
             "ipc_overhead_ms_mean": ipc_overhead.get("mean"),

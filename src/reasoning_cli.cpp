@@ -1,5 +1,5 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
-#include "cosmos_ros2_video_reasoner/ipc_inference_backend.hpp"
+// Copyright 2025 edge_vlm_ros contributors
+#include "edge_vlm_ros/ipc_inference_backend.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 
@@ -30,8 +30,8 @@ std::string require_value(int argc, char ** argv, int & index)
 
 int main(int argc, char ** argv)
 {
-  cosmos_ros2_video_reasoner::IpcInferenceConfig config;
-  cosmos_ros2_video_reasoner::InferenceRequest request;
+  edge_vlm_ros::IpcInferenceConfig config;
+  edge_vlm_ros::InferenceRequest request;
   request.prompt = "Describe the scene in this image.";
   request.max_generate_length = 64;
   request.temperature = 0.2F;
@@ -82,7 +82,7 @@ int main(int argc, char ** argv)
       throw std::runtime_error("failed to decode image: " + image_path);
     }
 
-    cosmos_ros2_video_reasoner::IpcInferenceBackend backend(config);
+    edge_vlm_ros::IpcInferenceBackend backend(config);
     backend.initialize();
     const auto response = backend.infer(request);
     if (!response.success) {
@@ -94,7 +94,7 @@ int main(int argc, char ** argv)
     std::cerr << "Inference time: " << response.inference_seconds << " seconds\n";
     return 0;
   } catch (std::exception const & error) {
-    std::cerr << "cosmos_reasoning_cli: " << error.what() << '\n';
+    std::cerr << "edge_vlm_cli: " << error.what() << '\n';
     usage(argv[0]);
     return 2;
   }

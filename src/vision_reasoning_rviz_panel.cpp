@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "cosmos_ros2_video_reasoner/vision_reasoning_rviz_panel.hpp"
+#include "edge_vlm_ros/vision_reasoning_rviz_panel.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -25,9 +25,9 @@
 
 #include <pluginlib/class_list_macros.hpp>
 
-#include "cosmos_ros2_video_reasoner/vision_reasoning_rviz_formatting.hpp"
+#include "edge_vlm_ros/vision_reasoning_rviz_formatting.hpp"
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 VisionReasoningPanel::VisionReasoningPanel(QWidget * parent)
@@ -91,8 +91,8 @@ VisionReasoningPanel::VisionReasoningPanel(QWidget * parent)
     "/camera/image_raw", image_qos,
     std::bind(&VisionReasoningPanel::image_callback, this, std::placeholders::_1));
 
-  result_sub_ = node_->create_subscription<msg::VisionReasoningResult>(
-    "/cosmos/reasoning", rclcpp::SystemDefaultsQoS(),
+  result_sub_ = node_->create_subscription<msg::VlmResult>(
+    "/vlm/result", rclcpp::SystemDefaultsQoS(),
     std::bind(&VisionReasoningPanel::result_callback, this, std::placeholders::_1));
 
   executor_.add_node(node_);
@@ -131,7 +131,7 @@ void VisionReasoningPanel::image_callback(const sensor_msgs::msg::Image::ConstSh
   }
 }
 
-void VisionReasoningPanel::result_callback(const msg::VisionReasoningResult::ConstSharedPtr & msg)
+void VisionReasoningPanel::result_callback(const msg::VlmResult::ConstSharedPtr & msg)
 {
   std::lock_guard<std::mutex> lock(data_mutex_);
   latest_result_ = *msg;
@@ -140,7 +140,7 @@ void VisionReasoningPanel::result_callback(const msg::VisionReasoningResult::Con
 
 void VisionReasoningPanel::refresh_display()
 {
-  std::optional<msg::VisionReasoningResult> latest_result;
+  std::optional<msg::VlmResult> latest_result;
   std::optional<rclcpp::Time> latest_image_stamp;
   std::optional<rclcpp::Time> result_received_at;
   {
@@ -175,7 +175,7 @@ void VisionReasoningPanel::refresh_display()
     prompt_text_->setPlainText("");
     response_text_->setPlainText("");
     error_text_->setPlainText(QString::fromStdString(presentation.details_text));
-    image_label_->setText("Waiting for VisionReasoningResult");
+    image_label_->setText("Waiting for VlmResult");
     return;
   }
 
@@ -278,6 +278,6 @@ std::optional<QImage> VisionReasoningPanel::find_cached_image_for_stamp(
   return it->second;
 }
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros
 
-PLUGINLIB_EXPORT_CLASS(cosmos_ros2_video_reasoner::VisionReasoningPanel, rviz_common::Panel)
+PLUGINLIB_EXPORT_CLASS(edge_vlm_ros::VisionReasoningPanel, rviz_common::Panel)

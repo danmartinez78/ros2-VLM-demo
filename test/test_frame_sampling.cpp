@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,12 +26,12 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
-#include "cosmos_ros2_video_reasoner/cosmos_reasoner_node.hpp"
+#include "edge_vlm_ros/vlm_reasoner_node.hpp"
 #include "fake_inference_backend.hpp"
 
 using namespace std::chrono_literals;
-using cosmos_ros2_video_reasoner::CosmosReasonerNode;
-using cosmos_ros2_video_reasoner::FakeInferenceBackend;
+using edge_vlm_ros::VlmReasonerNode;
+using edge_vlm_ros::FakeInferenceBackend;
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -81,7 +81,7 @@ protected:
   void SetUp() override
   {
     auto backend = std::make_unique<FakeInferenceBackend>();
-    node_ = std::make_shared<CosmosReasonerNode>(
+    node_ = std::make_shared<VlmReasonerNode>(
       std::move(backend), node_options_no_trt());
   }
 
@@ -90,7 +90,7 @@ protected:
     node_.reset();
   }
 
-  std::shared_ptr<CosmosReasonerNode> node_;
+  std::shared_ptr<VlmReasonerNode> node_;
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr make_pub()
   {

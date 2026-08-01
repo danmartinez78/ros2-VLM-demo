@@ -17,7 +17,7 @@
 #
 # Usage
 # -----
-#   source scripts/cosmos_env.sh          # sets COSMOS_* and EDGELLM_* env vars
+#   source scripts/edge_vlm_env.sh          # sets COSMOS_* and EDGELLM_* env vars
 #   bash scripts/benchmark/run_native_benchmarks.sh [OPTIONS]
 #
 # Options
@@ -89,14 +89,14 @@ done
 
 # ── environment validation ────────────────────────────────────────────────────
 
-: "${TENSORRT_EDGE_LLM_ROOT:?Set TENSORRT_EDGE_LLM_ROOT (source scripts/cosmos_env.sh)}"
-: "${COSMOS_LLM_ENGINE_DIR:?Set COSMOS_LLM_ENGINE_DIR (source scripts/cosmos_env.sh)}"
-: "${COSMOS_MULTIMODAL_ENGINE_DIR:?Set COSMOS_MULTIMODAL_ENGINE_DIR (source scripts/cosmos_env.sh)}"
-: "${EDGELLM_PLUGIN_PATH:?Set EDGELLM_PLUGIN_PATH (source scripts/cosmos_env.sh)}"
+: "${TENSORRT_EDGE_LLM_ROOT:?Set TENSORRT_EDGE_LLM_ROOT (source scripts/edge_vlm_env.sh)}"
+: "${EDGE_VLM_LLM_ENGINE_DIR:?Set EDGE_VLM_LLM_ENGINE_DIR (source scripts/edge_vlm_env.sh)}"
+: "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:?Set EDGE_VLM_MULTIMODAL_ENGINE_DIR (source scripts/edge_vlm_env.sh)}"
+: "${EDGELLM_PLUGIN_PATH:?Set EDGELLM_PLUGIN_PATH (source scripts/edge_vlm_env.sh)}"
 
 LLM_BENCH="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_bench"
 LLM_INFERENCE="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_inference"
-VISUAL_ENGINE_DIR="${COSMOS_VISUAL_ENGINE_DIR:-${COSMOS_MULTIMODAL_ENGINE_DIR}/visual}"
+VISUAL_ENGINE_DIR="${EDGE_VLM_VISUAL_ENGINE_DIR:-${EDGE_VLM_MULTIMODAL_ENGINE_DIR}/visual}"
 
 if [[ "${DRY_RUN}" == "false" ]]; then
   if [[ ! -x "${LLM_BENCH}" ]]; then
@@ -110,7 +110,7 @@ if [[ "${DRY_RUN}" == "false" ]]; then
   fi
   if [[ "${SKIP_VISUAL}" == "false" && ! -f "${VISUAL_ENGINE_DIR}/visual.engine" ]]; then
     echo "ERROR: visual.engine not found: ${VISUAL_ENGINE_DIR}/visual.engine" >&2
-    echo "       Set COSMOS_VISUAL_ENGINE_DIR to the visual engine directory." >&2
+    echo "       Set EDGE_VLM_VISUAL_ENGINE_DIR to the visual engine directory." >&2
     exit 1
   fi
 fi
@@ -157,8 +157,8 @@ collect_metadata() {
   EDGE_LLM_COMMIT="${edge_llm_commit}" EDGE_LLM_TAG="${edge_llm_tag}" \
   NVPMODEL="${nvpmodel}" \
   MODEL_NAME="${COSMOS_MODEL_NAME:-}" \
-  LLM_ENGINE_DIR="${COSMOS_LLM_ENGINE_DIR}" \
-  MULTIMODAL_ENGINE_DIR="${COSMOS_MULTIMODAL_ENGINE_DIR}" \
+  LLM_ENGINE_DIR="${EDGE_VLM_LLM_ENGINE_DIR}" \
+  MULTIMODAL_ENGINE_DIR="${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
   BATCH_SIZE_V="${BATCH_SIZE}" \
   INPUT_LEN_V="${INPUT_LEN}" \
   PAST_KV_LEN_V="${PAST_KV_LEN}" \
@@ -215,7 +215,7 @@ else
   PREFILL_CMD=(
     "${LLM_BENCH}"
     --mode prefill
-    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
+    --engineDir "${EDGE_VLM_LLM_ENGINE_DIR}"
     --batchSize "${BATCH_SIZE}"
     --inputLen "${INPUT_LEN}"
     --warmup "${WARMUP}"
@@ -248,7 +248,7 @@ else
   DECODE_CMD=(
     "${LLM_BENCH}"
     --mode decode
-    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
+    --engineDir "${EDGE_VLM_LLM_ENGINE_DIR}"
     --batchSize "${BATCH_SIZE}"
     --pastKVLen "${PAST_KV_LEN}"
     --warmup "${WARMUP}"
@@ -324,8 +324,8 @@ else
 
   PROFILE_CMD=(
     "${LLM_INFERENCE}"
-    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
-    --multimodalEngineDir "${COSMOS_MULTIMODAL_ENGINE_DIR}"
+    --engineDir "${EDGE_VLM_LLM_ENGINE_DIR}"
+    --multimodalEngineDir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
     --inputFile "${INPUT_VLM_JSON}"
     --outputFile "${INFERENCE_OUT}"
     --maxGenerateLength "${MAX_GENERATE_LENGTH}"

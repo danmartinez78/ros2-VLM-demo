@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@
 #include "runtime/llmInferenceRuntime.h"  // LLMInferenceRuntime, LLMGenerationRequest/Response
 #include "runtime/imageUtils.h"           // imageUtils::loadImageFromMemory
 
-#include "cosmos_ros2_video_reasoner/tensorrt_edge_llm_backend.hpp"
+#include "edge_vlm_ros/tensorrt_edge_llm_backend.hpp"
 
 #include <chrono>
 #include <dlfcn.h>
@@ -31,7 +31,7 @@
 #include <cuda_runtime.h>
 #include <opencv2/imgcodecs.hpp>
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 TensorRTEdgeLLMBackend::TensorRTEdgeLLMBackend(TensorRTEdgeLLMConfig config)
@@ -269,4 +269,4 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   return resp;
 }
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

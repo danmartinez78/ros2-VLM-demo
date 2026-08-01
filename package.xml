@@ -1,11 +1,11 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>cosmos_ros2_video_reasoner</name>
+  <name>edge_vlm_ros</name>
   <version>0.1.0</version>
   <description>
     ROS 2 Jazzy pipeline for NVIDIA Jetson AGX Thor that samples camera frames,
-    sends them to an isolated NVIDIA Cosmos Reason2 TensorRT Edge-LLM worker,
+    sends them to an isolated TensorRT Edge-LLM worker,
     and publishes structured inference results.
   </description>
   <maintainer email="dan@shadowhounddrones.com">Dan Martinez</maintainer>

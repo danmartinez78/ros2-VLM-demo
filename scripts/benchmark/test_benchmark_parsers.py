@@ -571,8 +571,8 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
         env = {
             "PATH": "/usr/bin:/bin",
             "TENSORRT_EDGE_LLM_ROOT": "/fake/edgellm",
-            "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
-            "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+            "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+            "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
             "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
         }
         cmd = ["bash", str(self._SCRIPT), "--dry-run"]
@@ -658,8 +658,8 @@ class TestNativeBenchmarkDefaultFlags(unittest.TestCase):
         env = {
             "PATH": "/usr/bin:/bin",
             "TENSORRT_EDGE_LLM_ROOT": "/fake/edgellm",
-            "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
-            "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+            "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+            "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
             "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
         }
         cmd = ["bash", str(self._SCRIPT), "--dry-run"]
@@ -727,8 +727,8 @@ class TestNativeBenchmarkDefaultFlags(unittest.TestCase):
             env = {
                 "PATH": "/usr/bin:/bin",
                 "TENSORRT_EDGE_LLM_ROOT": tmpdir,
-                "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
-                "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+                "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+                "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
                 "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
             }
             result = subprocess.run(
@@ -780,8 +780,8 @@ class TestNativeBenchmarkFailureExitsNonzero(unittest.TestCase):
             env = {
                 "PATH": "/usr/bin:/bin",
                 "TENSORRT_EDGE_LLM_ROOT": tmpdir,
-                "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
-                "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+                "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+                "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
                 "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
             }
             result = subprocess.run(
@@ -801,8 +801,8 @@ class TestNativeBenchmarkFailureExitsNonzero(unittest.TestCase):
         env = {
             "PATH": "/usr/bin:/bin",
             "TENSORRT_EDGE_LLM_ROOT": "/fake/edgellm",
-            "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
-            "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+            "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+            "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
             "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
         }
         result = subprocess.run(
@@ -842,8 +842,8 @@ class TestManifestArrayTypes(unittest.TestCase):
             env = {
                 "PATH": "/usr/bin:/bin",
                 "TENSORRT_EDGE_LLM_ROOT": tmpdir,
-                "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
-                "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+                "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+                "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
                 "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
             }
             subprocess.run(

@@ -1,4 +1,4 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,14 +14,14 @@
 
 #pragma once
 
-#include "cosmos_ros2_video_reasoner/inference_backend.hpp"
+#include "edge_vlm_ros/inference_backend.hpp"
 
 #include <chrono>
 #include <functional>
 #include <string>
 #include <thread>
 
-namespace cosmos_ros2_video_reasoner
+namespace edge_vlm_ros
 {
 
 /// Fake backend used in unit tests.
@@ -102,4 +102,4 @@ public:
   }
 };
 
-}  // namespace cosmos_ros2_video_reasoner
+}  // namespace edge_vlm_ros

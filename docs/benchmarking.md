@@ -1,7 +1,7 @@
 # Performance Benchmarking Guide
 
 This guide explains how to reproduce latency, throughput, and resource
-benchmarks for `cosmos_ros2_video_reasoner` on NVIDIA Jetson AGX Thor.
+benchmarks for `edge_vlm_ros` on NVIDIA Jetson AGX Thor.
 
 Measurements fall into two layers that must not be conflated:
 
@@ -22,7 +22,7 @@ A prepared Jetson AGX Thor with:
 - JetPack 7.2 / R39.2 (CUDA 13.2, TensorRT, Edge-LLM built for `sm_110a`)
 - Cosmos-Reason2-8B NVFP4 engine bundle
 - ROS 2 Jazzy workspace built (see [deployment.md](deployment.md))
-- Environment sourced: `source scripts/cosmos_env.sh`
+- Environment sourced: `source scripts/edge_vlm_env.sh`
 
 Follow [deployment.md](deployment.md) steps 1–6 before running any benchmark.
 
@@ -35,7 +35,7 @@ commits and model configurations.
 
 ```bash
 cd "$HOME/ros2_ws/src/ros2-VLM-demo"
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 
 bash scripts/benchmark/run_native_benchmarks.sh \
   --input-vlm-json "$COSMOS_WORKSPACE_DIR/input_vlm.json"
@@ -52,7 +52,7 @@ This calls, in order:
 ```bash
 # Prefill latency / throughput
 llm_bench --mode prefill \
-  --engineDir "$COSMOS_LLM_ENGINE_DIR" \
+  --engineDir "$EDGE_VLM_LLM_ENGINE_DIR" \
   --batchSize 1 \
   --inputLen 2048 \
   --warmup 3 --iterations 10 \
@@ -60,7 +60,7 @@ llm_bench --mode prefill \
 
 # Generation (decode) throughput
 llm_bench --mode decode \
-  --engineDir "$COSMOS_LLM_ENGINE_DIR" \
+  --engineDir "$EDGE_VLM_LLM_ENGINE_DIR" \
   --batchSize 1 \
   --pastKVLen 2048 \
   --warmup 3 --iterations 10 \
@@ -68,15 +68,15 @@ llm_bench --mode decode \
 
 # Vision-encoder latency / throughput
 llm_bench --mode visual \
-  --engineDir "$COSMOS_MULTIMODAL_ENGINE_DIR/visual" \
+  --engineDir "$EDGE_VLM_MULTIMODAL_ENGINE_DIR/visual" \
   --imageSize 1024x2048 \
   --warmup 3 --iterations 10 \
   --profile
 
 # End-to-end profiling with representative input
 llm_inference \
-  --engineDir "$COSMOS_LLM_ENGINE_DIR" \
-  --multimodalEngineDir "$COSMOS_MULTIMODAL_ENGINE_DIR" \
+  --engineDir "$EDGE_VLM_LLM_ENGINE_DIR" \
+  --multimodalEngineDir "$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
   --inputFile "$COSMOS_WORKSPACE_DIR/input_vlm.json" \
   --outputFile /tmp/cosmos_native_bench_*/llm_inference_output.json \
   --maxGenerateLength 64 \
@@ -107,15 +107,15 @@ All native tool outputs are preserved verbatim in a timestamped directory:
 ### 2a. Run the pipeline with benchmark output enabled
 
 ```bash
-source scripts/cosmos_env.sh
+source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
 
 BENCH_FILE="/tmp/cosmos_ros_bench_$(date +%Y%m%d_%H%M%S).jsonl"
 
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
+ros2 launch edge_vlm_ros edge_vlm.launch.py \
   image_topic:=/hawk_0_left_rgb_image \
-  llm_engine_dir:="$COSMOS_LLM_ENGINE_DIR" \
-  multimodal_engine_dir:="$COSMOS_MULTIMODAL_ENGINE_DIR" \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
   edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH" \
   benchmark_output_file:="${BENCH_FILE}" \
   use_sim_time:=true &
@@ -147,8 +147,8 @@ The `benchmark_output_file` parameter writes one JSON line per sampled frame plu
 # Collect system metadata
 python3 scripts/benchmark/benchmark_metadata.py \
   --model-name "${COSMOS_MODEL_NAME}" \
-  --llm-engine-dir "${COSMOS_LLM_ENGINE_DIR}" \
-  --multimodal-engine-dir "${COSMOS_MULTIMODAL_ENGINE_DIR}" \
+  --llm-engine-dir "${EDGE_VLM_LLM_ENGINE_DIR}" \
+  --multimodal-engine-dir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
   --edge-llm-root "${TENSORRT_EDGE_LLM_ROOT}" \
   --output /tmp/bench_metadata.json
 
@@ -302,7 +302,7 @@ python3 scripts/benchmark/test_benchmark_parsers.py -v
 | `ipc_overhead_ms` is negative | Clock skew between node and worker; `collect_ros_metrics.py` clamps to 0 |
 | `ready_to_first_frame_ms` is None | `session_start` record was not written; check node startup succeeded |
 | `llm_bench` not found | Build TensorRT Edge-LLM with `--cmake-args -DBUILD_BENCHMARKS=ON` |
-| `unrecognized option '--multimodalEngineDir'` | `llm_bench --mode visual` accepts only `--engineDir`; point it directly at `$COSMOS_MULTIMODAL_ENGINE_DIR/visual` |
+| `unrecognized option '--multimodalEngineDir'` | `llm_bench --mode visual` accepts only `--engineDir`; point it directly at `$EDGE_VLM_MULTIMODAL_ENGINE_DIR/visual` |
 | `Image data must be 4D [T, H, W, C]` | The pinned `llm_bench` creates a 3D dummy tensor for visual mode. Apply the source workaround below and rebuild `llm_bench` |
 | Image dimensions are not divisible by `patchSize * mergeSize` | Use dimensions compatible with the visual model. Cosmos/Qwen3-VL requires multiples of 32; quick mode uses 320x320 |
 | Native profile JSON missing | Pass `--profileOutputFile`; verify `--dumpProfile` flag is supported in your Edge-LLM version |

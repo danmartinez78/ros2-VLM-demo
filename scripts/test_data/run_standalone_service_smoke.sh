@@ -14,13 +14,13 @@ if [[ ! -f "$image_path" ]]; then
 fi
 
 : "${ROS_WORKSPACE:=${HOME}/ros2_ws}"
-: "${COSMOS_LLM_ENGINE_DIR:?source scripts/cosmos_env.sh first}"
-: "${COSMOS_MULTIMODAL_ENGINE_DIR:?source scripts/cosmos_env.sh first}"
-: "${EDGELLM_PLUGIN_PATH:?source scripts/cosmos_env.sh first}"
+: "${EDGE_VLM_LLM_ENGINE_DIR:?source scripts/edge_vlm_env.sh first}"
+: "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:?source scripts/edge_vlm_env.sh first}"
+: "${EDGELLM_PLUGIN_PATH:?source scripts/edge_vlm_env.sh first}"
 
-install_root="${ROS_WORKSPACE}/install/cosmos_ros2_video_reasoner"
-service="${install_root}/lib/cosmos_ros2_video_reasoner/cosmos_inference_worker"
-client="${install_root}/lib/cosmos_ros2_video_reasoner/cosmos_reasoning_cli"
+install_root="${ROS_WORKSPACE}/install/edge_vlm_ros"
+service="${install_root}/lib/edge_vlm_ros/edge_vlm_server"
+client="${install_root}/lib/edge_vlm_ros/edge_vlm_cli"
 
 for executable in "$service" "$client"; do
   if [[ ! -x "$executable" ]]; then
@@ -30,7 +30,7 @@ for executable in "$service" "$client"; do
   fi
 done
 
-run_dir=$(mktemp -d /tmp/cosmos-standalone-smoke.XXXXXX)
+run_dir=$(mktemp -d /tmp/edge-vlm-standalone-smoke.XXXXXX)
 socket_path="${run_dir}/reasoning.sock"
 service_log="${run_dir}/service.log"
 service_pid=""
@@ -44,7 +44,7 @@ cleanup()
 }
 trap cleanup EXIT INT TERM
 
-"$service"   "$COSMOS_LLM_ENGINE_DIR"   "$COSMOS_MULTIMODAL_ENGINE_DIR"   "$EDGELLM_PLUGIN_PATH"   "$socket_path"   90   60 >"$service_log" 2>&1 &
+"$service"   "$EDGE_VLM_LLM_ENGINE_DIR"   "$EDGE_VLM_MULTIMODAL_ENGINE_DIR"   "$EDGELLM_PLUGIN_PATH"   "$socket_path"   90   60 >"$service_log" 2>&1 &
 service_pid=$!
 
 echo "Standalone service PID: $service_pid"

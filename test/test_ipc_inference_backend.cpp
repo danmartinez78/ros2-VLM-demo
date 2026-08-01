@@ -1,9 +1,9 @@
-// Copyright 2025 cosmos_ros2_video_reasoner contributors
+// Copyright 2025 edge_vlm_ros contributors
 
 #include <gtest/gtest.h>
 
-#include "cosmos_ros2_video_reasoner/ipc_inference_backend.hpp"
-#include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
+#include "edge_vlm_ros/ipc_inference_backend.hpp"
+#include "edge_vlm_ros/ipc_protocol.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -27,18 +27,18 @@
 
 namespace
 {
-using cosmos_ros2_video_reasoner::HistoryEntry;
-using cosmos_ros2_video_reasoner::InferenceRequest;
-using cosmos_ros2_video_reasoner::IpcInferenceBackend;
-using cosmos_ros2_video_reasoner::IpcInferenceConfig;
-namespace ipc = cosmos_ros2_video_reasoner::ipc;
+using edge_vlm_ros::HistoryEntry;
+using edge_vlm_ros::InferenceRequest;
+using edge_vlm_ros::IpcInferenceBackend;
+using edge_vlm_ros::IpcInferenceConfig;
+namespace ipc = edge_vlm_ros::ipc;
 
 std::atomic<uint64_t> g_path_counter{0};
 
 std::string make_socket_path()
 {
   const uint64_t id = g_path_counter.fetch_add(1, std::memory_order_relaxed);
-  return "/tmp/cosmos-ipc-test-" + std::to_string(static_cast<long long>(::getpid())) + "-" +
+  return "/tmp/edge-vlm-ipc-test-" + std::to_string(static_cast<long long>(::getpid())) + "-" +
          std::to_string(static_cast<long long>(id)) + ".sock";
 }
 
@@ -569,7 +569,7 @@ TEST(IpcInferenceBackend, ReconnectsAfterWorkerRestart)
 //      exits within the 3-second client timeout.  Exactly one error is
 //      reported; the request is NOT replayed.
 //   3. A replacement worker becomes available on the same socket path.
-//   4. The client reconnects and succeeds without restarting cosmos_reasoner.
+//   4. The client reconnects and succeeds without restarting edge_vlm_ros_node.
 //
 // Worker-side deadline (1 s) < client timeout (3 s) matches the production
 // relationship: worker_inference_deadline_seconds < worker_request_timeout_seconds.
@@ -627,7 +627,7 @@ TEST(IpcInferenceBackend, TimesOutThenReconnectsAfterWorkerSelfTermination)
   }, socket_path);
 
   // Client must reconnect automatically and succeed without restarting
-  // cosmos_reasoner — exactly one successful result for the next request.
+  // edge_vlm_ros_node — exactly one successful result for the next request.
   auto recovered = backend->infer(make_request("after recovery"));
   EXPECT_TRUE(recovered.success);
   EXPECT_EQ(recovered.text, "recovered");
