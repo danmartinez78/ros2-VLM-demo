@@ -302,6 +302,15 @@ ROS package renames cannot safely reuse old colcon artifacts.
 Run these commands on an existing Thor checkout **before** rebuilding:
 
 ```bash
+# Validate ROS_WORKSPACE before any recursive deletion.
+# It must be a non-empty absolute path that contains a src/ directory.
+if [[ -z "${ROS_WORKSPACE:-}" || "${ROS_WORKSPACE}" != /* || ! -d "${ROS_WORKSPACE}/src" ]]; then
+  echo "ERROR: ROS_WORKSPACE must be a non-empty absolute path to a ROS workspace" \
+       "(one that contains a src/ directory)." >&2
+  echo "       Got: '${ROS_WORKSPACE:-<unset>}'" >&2
+  exit 1
+fi
+
 # Remove stale colcon artifacts for the old and new package
 rm -rf "${ROS_WORKSPACE}/build/cosmos_ros2_video_reasoner"
 rm -rf "${ROS_WORKSPACE}/install/cosmos_ros2_video_reasoner"
@@ -311,9 +320,10 @@ rm -rf "${ROS_WORKSPACE}/install/edge_vlm_ros"
 # Clear workspace logs (optional but recommended)
 rm -rf "${ROS_WORKSPACE}/log"
 
-# Rebuild
-cd "${ROS_WORKSPACE}"
-colcon build --packages-select edge_vlm_ros
+# Rebuild — use build_workspace.sh so the required TensorRT CMake arguments
+# are preserved and rosdep dependencies are re-checked automatically.
+cd "${ROS_WORKSPACE}/src/ros2-VLM-demo"
+bash scripts/build_workspace.sh
 ```
 
 Also rename your local environment file:

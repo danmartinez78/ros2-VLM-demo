@@ -34,6 +34,7 @@ Thumbs.db
 
 # Local deployment configuration
 scripts/cosmos_env.sh
+scripts/edge_vlm_env.sh
 
 # Downloaded test datasets
 test_data/

@@ -38,7 +38,7 @@ cd "$HOME/ros2_ws/src/ros2-VLM-demo"
 source scripts/edge_vlm_env.sh
 
 bash scripts/benchmark/run_native_benchmarks.sh \
-  --input-vlm-json "$COSMOS_WORKSPACE_DIR/input_vlm.json"
+  --input-vlm-json "$EDGE_VLM_WORKSPACE_DIR/input_vlm.json"
 ```
 
 Default parameters match the NVIDIA published workload:
@@ -77,7 +77,7 @@ llm_bench --mode visual \
 llm_inference \
   --engineDir "$EDGE_VLM_LLM_ENGINE_DIR" \
   --multimodalEngineDir "$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
-  --inputFile "$COSMOS_WORKSPACE_DIR/input_vlm.json" \
+  --inputFile "$EDGE_VLM_WORKSPACE_DIR/input_vlm.json" \
   --outputFile /tmp/cosmos_native_bench_*/llm_inference_output.json \
   --maxGenerateLength 64 \
   --warmup 10 \
@@ -146,7 +146,7 @@ The `benchmark_output_file` parameter writes one JSON line per sampled frame plu
 ```bash
 # Collect system metadata
 python3 scripts/benchmark/benchmark_metadata.py \
-  --model-name "${COSMOS_MODEL_NAME}" \
+  --model-name "${EDGE_VLM_MODEL_NAME}" \
   --llm-engine-dir "${EDGE_VLM_LLM_ENGINE_DIR}" \
   --multimodal-engine-dir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
   --edge-llm-root "${TENSORRT_EDGE_LLM_ROOT}" \

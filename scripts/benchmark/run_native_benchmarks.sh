@@ -17,7 +17,7 @@
 #
 # Usage
 # -----
-#   source scripts/edge_vlm_env.sh          # sets COSMOS_* and EDGELLM_* env vars
+#   source scripts/edge_vlm_env.sh          # sets EDGE_VLM_* and EDGELLM_* env vars
 #   bash scripts/benchmark/run_native_benchmarks.sh [OPTIONS]
 #
 # Options
@@ -156,7 +156,7 @@ collect_metadata() {
   TRT="${trt}" GPU_CC="${gpu_cc}" GPU_NAME="${gpu_name}" \
   EDGE_LLM_COMMIT="${edge_llm_commit}" EDGE_LLM_TAG="${edge_llm_tag}" \
   NVPMODEL="${nvpmodel}" \
-  MODEL_NAME="${COSMOS_MODEL_NAME:-}" \
+  MODEL_NAME="${EDGE_VLM_MODEL_NAME:-}" \
   LLM_ENGINE_DIR="${EDGE_VLM_LLM_ENGINE_DIR}" \
   MULTIMODAL_ENGINE_DIR="${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
   BATCH_SIZE_V="${BATCH_SIZE}" \

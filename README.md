@@ -1,8 +1,9 @@
 # edge_vlm_ros
 
 ROS 2 Jazzy pipeline for NVIDIA Jetson AGX Thor that samples raw camera frames,
-runs NVIDIA Cosmos Reason2 through TensorRT Edge-LLM, and publishes structured
-vision-reasoning results.
+runs a TensorRT Edge-LLM VLM through a model-neutral IPC worker, and publishes
+structured vision-language results. Validated model configurations include
+NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
 The hardware path has been validated on JetPack 7.2 / Jetson Linux R39.2 with a
 Cosmos-Reason2-8B NVFP4 engine and an NVIDIA Isaac ROS image-proc rosbag.

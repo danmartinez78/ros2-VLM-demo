@@ -180,7 +180,7 @@ endif()
 
 # ── Node library (hardware-independent) ──────────────────────────────────────
 add_library(vlm_reasoner_node SHARED
-  src/cosmos_reasoner_node.cpp
+  src/vlm_reasoner_node.cpp
 )
 
 target_include_directories(vlm_reasoner_node PUBLIC
