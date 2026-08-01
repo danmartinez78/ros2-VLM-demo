@@ -60,6 +60,15 @@ source "$HOME/ros2_ws/install/setup.bash"
 Run the command again with another image to verify that the service remains
 loaded across client connections.
 
+For a one-command Thor smoke test that starts the service, invokes two sequential
+clients, verifies that the service PID remains unchanged, and cleans up:
+
+```bash
+source scripts/cosmos_env.sh
+source "$ROS_WORKSPACE/install/setup.bash"
+bash scripts/test_data/run_standalone_service_smoke.sh /absolute/path/to/image.jpg
+```
+
 ## Connect the ROS adapter to the existing service
 
 ```bash
