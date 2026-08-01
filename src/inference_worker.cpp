@@ -12,8 +12,10 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -93,6 +95,18 @@ int main(int argc, char ** argv)
     backend.initialize();
     std::cout << "Cosmos inference worker ready on " << socket_path << std::endl;
 
+    // ── Test-only one-shot injected hang ─────────────────────────────────
+    // COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL names a sentinel file path.
+    // The first inference request will atomically create the sentinel and
+    // then sleep past the watchdog deadline so the watchdog fires and calls
+    // std::_Exit(1).  Subsequent workers find the sentinel already present
+    // and skip the hang, allowing normal inference to proceed.
+    //
+    // DISABLED by default (env var unset).  Set only for hardware recovery
+    // validation — never in production.
+    const char * const test_sentinel_path =
+      std::getenv("COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL");
+
     int client_fd = ::accept4(server_fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (client_fd < 0) {throw std::runtime_error("worker accept failed");}
 
@@ -140,6 +154,21 @@ int main(int argc, char ** argv)
       request.top_p = header.top_p;
       request.top_k = header.top_k;
 
+      // ── Test-only: check whether to inject a one-shot hang ───────────────
+      // O_CREAT|O_EXCL is atomic: only the first worker to process a request
+      // succeeds in creating the sentinel.  All later workers (or later
+      // requests from the same worker) find the file already present and
+      // proceed normally.  The sleep below exceeds the watchdog deadline so
+      // the watchdog fires and calls std::_Exit(1) before the sleep ends.
+      bool inject_hang = false;
+      if (test_sentinel_path != nullptr && *test_sentinel_path != '\0') {
+        int sfd = ::open(test_sentinel_path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (sfd >= 0) {
+          ::close(sfd);
+          inject_hang = true;
+        }
+      }
+
       // ── Worker-side inference deadline watchdog ──────────────────────────
       // Guards the TensorRT call with a configurable deadline. If the call
       // wedges past the deadline, the watchdog emits a diagnostic and calls
@@ -150,11 +179,21 @@ int main(int argc, char ** argv)
         cosmos_ros2_video_reasoner::watchdog_exit_on_expire);
 
       cosmos_ros2_video_reasoner::InferenceResponse result;
-      try {
-        result = backend.infer(request);
-      } catch (std::exception const & error) {
+      if (inject_hang) {
+        // Intentionally sleep past the watchdog deadline so the watchdog
+        // fires and calls std::_Exit(1).  The sleep_for call is unreachable
+        // past _Exit(1) — the lines after are defensive dead code only.
+        std::this_thread::sleep_for(
+          std::chrono::seconds(inference_deadline_seconds + 30));
         result.success = false;
-        result.error = error.what();
+        result.error = "injected hang (unreachable after watchdog)";
+      } else {
+        try {
+          result = backend.infer(request);
+        } catch (std::exception const & error) {
+          result.success = false;
+          result.error = error.what();
+        }
       }
 
       // Signal the watchdog that inference completed within the deadline.

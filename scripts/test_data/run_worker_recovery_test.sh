@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # Thor hardware validation: watchdog-triggered recovery test.
 #
-# Uses a 1-second inference deadline (worker_inference_deadline_seconds=1) to
-# force the worker-side watchdog to fire deterministically — Cosmos inference
-# on the validated Thor configuration reliably exceeds 1 second, so the
-# watchdog fires on the first request without injecting any artificial hang.
+# Injects a deterministic one-shot hang using the
+# COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL environment variable:
+#   - The first inference worker creates a sentinel file and then sleeps for
+#     worker_inference_deadline_seconds + 30 s.  The InferenceWatchdog fires
+#     at the configured deadline and calls std::_Exit(1).
+#   - The respawned worker finds the sentinel present and runs normally
+#     (normal inference, no injected hang), so a successful result arrives.
+#
+# The normal production deadline (worker_inference_deadline_seconds=60) is
+# preserved.  The client timeout (worker_request_timeout_seconds=90) exceeds
+# the deadline so the client observes a clean EOF rather than SO_RCVTIMEO.
+#
+# This test is HARDWARE-ONLY; COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL must
+# never be set in production deployments.
 #
 # Verifications (all 6 required):
 #   1. WATCHDOG diagnostic appears in worker stderr.
@@ -22,27 +32,44 @@ env_file="${COSMOS_ENV_FILE:-${repo_root}/scripts/cosmos_env.sh}"
 image_topic="/hawk_0_left_rgb_image"
 result_topic="/cosmos/reasoning"
 worker_socket="${WORKER_SOCKET_PATH:-/tmp/cosmos_edge_llm.sock}"
-# 1-second deadline is below any real Cosmos inference time on Thor hardware;
-# the watchdog fires deterministically without needing an injected hang.
-watchdog_deadline=1
-# Client timeout must exceed the watchdog deadline so the client sees a clean
-# EOF instead of a SO_RCVTIMEO error.
-client_timeout=20
+# Normal production deadline; long enough for real Cosmos inference on Thor.
+watchdog_deadline="${WORKER_INFERENCE_DEADLINE_SECONDS:-60}"
+# Client timeout must exceed the watchdog deadline to observe a clean EOF
+# (client sees the worker exit) rather than a SO_RCVTIMEO socket error.
+client_timeout="${WORKER_REQUEST_TIMEOUT_SECONDS:-90}"
 
 launch_pid=""
 bag_pid=""
 launch_log="$(mktemp /tmp/cosmos-recovery-launch.XXXXXX.log)"
+
+# One-shot injected hang: the first inference request creates this file and
+# then sleeps past the watchdog deadline; the watchdog fires and calls
+# std::_Exit(1).  The respawned worker finds the sentinel present and skips
+# the hang, allowing normal inference to proceed.
+# Never set in production — this variable is only exported by this script.
+test_sentinel="$(mktemp -u /tmp/cosmos-test-sentinel-XXXXXX.flag)"
+export COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL="${test_sentinel}"
 
 cleanup() {
   if [[ -n "${bag_pid}" ]] && kill -0 "${bag_pid}" 2>/dev/null; then
     kill -INT "${bag_pid}" 2>/dev/null || true
     wait "${bag_pid}" 2>/dev/null || true
   fi
-  if [[ -n "${launch_pid}" ]] && kill -0 "${launch_pid}" 2>/dev/null; then
-    kill -INT "${launch_pid}" 2>/dev/null || true
+  if [[ -n "${launch_pid}" ]]; then
+    # Kill the entire process group so ros2 launch and all child workers
+    # (inference worker, etc.) shut down cleanly together.
+    local pgid
+    pgid="$(ps -o pgid= -p "${launch_pid}" 2>/dev/null | tr -d ' ')" || true
+    if [[ -n "${pgid}" ]] && [[ "${pgid}" != "0" ]]; then
+      kill -INT -- "-${pgid}" 2>/dev/null || true
+      sleep 3
+      kill -TERM -- "-${pgid}" 2>/dev/null || true
+    elif kill -0 "${launch_pid}" 2>/dev/null; then
+      kill -INT "${launch_pid}" 2>/dev/null || true
+    fi
     wait "${launch_pid}" 2>/dev/null || true
   fi
-  rm -f "${launch_log}"
+  rm -f "${launch_log}" "${test_sentinel}"
 }
 trap cleanup EXIT INT TERM
 
@@ -86,16 +113,28 @@ for variable in COSMOS_LLM_ENGINE_DIR COSMOS_MULTIMODAL_ENGINE_DIR EDGELLM_PLUGI
 done
 
 # ── PID helpers ──────────────────────────────────────────────────────────────
-# Scope the worker lookup to the specific socket path to avoid matching
-# unrelated processes that happen to share a similar command name.
 worker_pid() {
-  # Full-command match ("-f") scoped to the exact socket path to avoid
-  # collisions with other test runs or unrelated processes.
-  pgrep -f "cosmos_inference_worker.*${worker_socket}" || true
+  # Escape ERE metacharacters in the socket path (primarily '.' in filenames)
+  # so that pgrep -f treats it as a literal component, not a regex wildcard.
+  local escaped_socket
+  escaped_socket="$(printf '%s' "${worker_socket}" | sed 's/[.[\*^$()|+?{}]/\\&/g')"
+  local pids
+  pids="$(pgrep -f "cosmos_inference_worker.*${escaped_socket}" 2>/dev/null)" || true
+  # Require exactly one match — guards against misreporting 0 (not yet
+  # started) or 2+ PIDs (brief overlap during respawn) as a valid single PID.
+  local count=0
+  [[ -n "${pids}" ]] && count="$(printf '%s\n' "${pids}" | wc -l | tr -d ' ')"
+  [[ "${count}" -eq 1 ]] && printf '%s\n' "${pids}" || true
 }
 
 reasoner_pid() {
-  pgrep -f "cosmos_reasoner" || true
+  # Scope to 'cosmos_reasoner' (the ROS 2 node executable name).
+  local pids
+  pids="$(pgrep -f "cosmos_reasoner" 2>/dev/null)" || true
+  # Require exactly one match for this test instance.
+  local count=0
+  [[ -n "${pids}" ]] && count="$(printf '%s\n' "${pids}" | wc -l | tr -d ' ')"
+  [[ "${count}" -eq 1 ]] && printf '%s\n' "${pids}" || true
 }
 
 wait_for_worker() {
@@ -138,8 +177,10 @@ count_failure_results() {
   # Count consecutive failed results before the first success.  Returns the
   # count in the caller's "failure_count" variable.
   failure_count=0
+  # Overall bound: fail fast if no success arrives within 5 minutes.
+  local deadline=$((SECONDS + 300))
   local output=""
-  while true; do
+  while (( SECONDS < deadline )); do
     output="$(mktemp /tmp/cosmos-recovery-count.XXXXXX)"
     if timeout 30 ros2 topic echo "${result_topic}" --once >"${output}" 2>&1; then
       if grep -q '^success: true$' "${output}"; then
@@ -154,6 +195,8 @@ count_failure_results() {
       return 1   # more than expected — something is wrong
     fi
   done
+  echo "count_failure_results: overall 5-minute deadline exceeded." >&2
+  return 1
 }
 
 # ── Launch ───────────────────────────────────────────────────────────────────
@@ -161,7 +204,11 @@ echo "Starting watchdog-triggered recovery test..."
 echo "  worker_inference_deadline_seconds = ${watchdog_deadline}"
 echo "  worker_request_timeout_seconds    = ${client_timeout}"
 echo "  worker_socket_path                = ${worker_socket}"
+echo "  COSMOS_TEST_INJECT_HANG_ONCE_SENTINEL = ${test_sentinel}"
 
+# Redirect ros2 launch output directly to the log file so that $! captures
+# the ros2 launch PID, not a tee process.  Use process-group kill in cleanup
+# to terminate ros2 launch and all child workers together.
 ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
   image_topic:="${image_topic}" \
   result_topic:="${result_topic}" \
@@ -173,7 +220,7 @@ ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
   worker_request_timeout_seconds:="${client_timeout}" \
   sample_period_seconds:=1.0 \
   max_generate_length:=64 \
-  use_sim_time:=true 2>&1 | tee "${launch_log}" &
+  use_sim_time:=true > "${launch_log}" 2>&1 &
 launch_pid=$!
 
 # ── Wait for initial worker and reasoner ─────────────────────────────────────
@@ -207,10 +254,12 @@ ros2 bag play "${bag_path}" --clock --loop &
 bag_pid=$!
 
 # ── Watchdog fires on first inference request ─────────────────────────────────
-# The 1-second deadline is shorter than any real Cosmos inference call on Thor;
-# the watchdog fires deterministically and the worker self-terminates.
-# We wait for exactly one failure (verification 3) followed by a success.
+# The sentinel mechanism causes only the first worker to hang past its deadline.
+# The watchdog fires at ${watchdog_deadline} s, calls std::_Exit(1), and the OS
+# closes all file descriptors.  The client observes a clean EOF (well within
+# the ${client_timeout} s client timeout) and reports exactly one failure.
 echo "Waiting for watchdog expiry and worker self-termination..."
+echo "(This will take approximately ${watchdog_deadline} s while the injected hang runs.)"
 
 failure_count=0
 success_output="$(mktemp /tmp/cosmos-recovery-success.XXXXXX)"
