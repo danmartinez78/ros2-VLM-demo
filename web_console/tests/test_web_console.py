@@ -165,6 +165,108 @@ class TestProcessManager(unittest.TestCase):
         mgr.cleanup()
         mgr.cleanup()  # second call should not raise
 
+    # ── completion callback tests ─────────────────────────────────────────────
+
+    def test_completion_callback_natural_success(self):
+        """Callback fires with exit_code=0 and was_stopped=False on clean exit."""
+        mgr = ProcessManager()
+        run_id = RunStore.new_run_id()
+        fired = threading.Event()
+        result = {}
+
+        def _cb(rid, exit_code, was_stopped, log_lines):
+            result.update(
+                rid=rid, exit_code=exit_code, was_stopped=was_stopped, log_lines=log_lines
+            )
+            fired.set()
+
+        mgr.start_ros_experiment(run_id, ["bash", "-c", "echo hello_cb"], on_complete=_cb)
+        self.assertTrue(fired.wait(timeout=8.0), "Callback not fired within timeout")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertFalse(result["was_stopped"])
+        self.assertIn("hello_cb", result["log_lines"])
+
+    def test_completion_callback_nonzero_exit(self):
+        """Callback fires with exit_code=1 and was_stopped=False on error exit."""
+        mgr = ProcessManager()
+        run_id = RunStore.new_run_id()
+        fired = threading.Event()
+        result = {}
+
+        def _cb(rid, exit_code, was_stopped, log_lines):
+            result.update(exit_code=exit_code, was_stopped=was_stopped)
+            fired.set()
+
+        mgr.start_ros_experiment(run_id, ["bash", "-c", "exit 1"], on_complete=_cb)
+        self.assertTrue(fired.wait(timeout=8.0))
+        self.assertEqual(result["exit_code"], 1)
+        self.assertFalse(result["was_stopped"])
+
+    def test_completion_callback_explicit_stop(self):
+        """Callback fires with was_stopped=True when stop_experiment is called."""
+        mgr = ProcessManager()
+        run_id = RunStore.new_run_id()
+        fired = threading.Event()
+        result = {}
+
+        def _cb(rid, exit_code, was_stopped, log_lines):
+            result.update(was_stopped=was_stopped)
+            fired.set()
+
+        mgr.start_ros_experiment(run_id, ["sleep", "60"], on_complete=_cb)
+        mgr.stop_experiment(run_id)
+        self.assertTrue(fired.wait(timeout=8.0))
+        self.assertTrue(result["was_stopped"])
+
+    def test_callback_fires_at_most_once(self):
+        """Calling stop after natural exit must not fire the callback twice."""
+        mgr = ProcessManager()
+        run_id = RunStore.new_run_id()
+        call_count = {"n": 0}
+        fired = threading.Event()
+
+        def _cb(rid, exit_code, was_stopped, log_lines):
+            call_count["n"] += 1
+            fired.set()
+
+        mgr.start_ros_experiment(run_id, ["bash", "-c", "exit 0"], on_complete=_cb)
+        # Wait for natural completion.
+        fired.wait(timeout=8.0)
+        # Now call stop (process already gone).
+        mgr.stop_experiment(run_id)
+        time.sleep(0.3)
+        self.assertEqual(call_count["n"], 1, "Callback must fire exactly once")
+        mgr.cleanup()
+
+    def test_concurrent_start_is_atomic(self):
+        """Atomicity: two simultaneous start calls must allow exactly one to succeed."""
+        mgr = ProcessManager()
+        successes: list = []
+        failures: list = []
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+
+        def _try_start(run_id):
+            barrier.wait()
+            try:
+                mgr.start_ros_experiment(run_id, ["sleep", "30"])
+                with lock:
+                    successes.append(run_id)
+            except RuntimeError:
+                with lock:
+                    failures.append(run_id)
+
+        ids = [RunStore.new_run_id(), RunStore.new_run_id()]
+        threads = [threading.Thread(target=_try_start, args=(rid,)) for rid in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+        mgr.cleanup()
+
+        self.assertEqual(len(successes), 1, "Exactly one start must succeed")
+        self.assertEqual(len(failures), 1, "Exactly one start must be rejected")
+
 
 # ── RunStore tests ────────────────────────────────────────────────────────────
 
@@ -754,6 +856,57 @@ class TestConsoleServerAPI(unittest.TestCase):
         )
         self.assertEqual(status, 400)
 
+    # ── Content-Length guard tests ─────────────────────────────────────────────
+
+    def test_negative_content_length_json_returns_400(self):
+        """A negative Content-Length on a JSON endpoint must be rejected (not block)."""
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request(
+            "POST",
+            "/api/ros/start",
+            body=b"{}",
+            headers={"Content-Type": "application/json", "Content-Length": "-1"},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertIn(resp.status, (400, 411))
+
+    def test_missing_content_length_json_returns_411(self):
+        """A JSON request with no Content-Length header must be rejected."""
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        # Manually send HTTP/1.0 request without Content-Length.
+        conn.request(
+            "POST",
+            "/api/ros/start",
+            body=b"{}",
+            headers={"Content-Type": "application/json", "Content-Length": ""},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertIn(resp.status, (400, 411))
+
+    def test_negative_content_length_multipart_returns_400(self):
+        """A negative Content-Length on the multipart endpoint must be rejected."""
+        boundary = "testboundary"
+        ct = f"multipart/form-data; boundary={boundary}"
+        stub = f"--{boundary}--\r\n".encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request(
+            "POST",
+            "/api/infer",
+            body=stub,
+            headers={"Content-Type": ct, "Content-Length": "-1"},
+        )
+        try:
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertIn(resp.status, (400, 411))
+        except (BrokenPipeError, ConnectionResetError):
+            conn.close()  # server correctly rejected and closed
+
     # ── static assets ─────────────────────────────────────────────────────────
 
     def test_static_css_served(self):
@@ -927,6 +1080,137 @@ class TestBuildRosEnv(unittest.TestCase):
         self.assertIn("PATH", env)
 
 
+
+
+# ── ROS run finalization tests ────────────────────────────────────────────────
+
+class TestRosRunFinalization(unittest.TestCase):
+    """Integration tests: verify that ROS run manifests are finalized on disk
+    when the experiment process exits naturally, exits with error, or is stopped."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = pathlib.Path(tempfile.mkdtemp())
+        cls._run_store = RunStore(cls._tmpdir / "runs")
+        cls._process_manager = ProcessManager()
+        cls._srv, cls._port, cls._thread = _start_test_server(
+            config={"socket_path": "/tmp/no_such.sock", "quiet": True},
+            process_manager=cls._process_manager,
+            run_store=cls._run_store,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        cls._process_manager.cleanup()
+        shutil.rmtree(str(cls._tmpdir), ignore_errors=True)
+
+    def _start_ros(self, script_content: str) -> tuple:
+        """Write a temp script and POST /api/ros/start; return (http_status, response_data)."""
+        script = self._tmpdir / f"script_{RunStore.new_run_id()}.sh"
+        script.write_text(script_content)
+        script.chmod(0o755)
+        old = self._srv.config.get("ros_script_path")
+        self._srv.config["ros_script_path"] = str(script)
+        try:
+            body = json.dumps({"params": {}}).encode()
+            conn = HTTPConnection("127.0.0.1", self._port, timeout=10)
+            conn.request(
+                "POST",
+                "/api/ros/start",
+                body=body,
+                headers={"Content-Type": "application/json"},
+            )
+            resp = conn.getresponse()
+            data = json.loads(resp.read())
+            return resp.status, data
+        finally:
+            conn.close()
+            if old is None:
+                self._srv.config.pop("ros_script_path", None)
+            else:
+                self._srv.config["ros_script_path"] = old
+
+    def _poll_terminal(self, run_id: str, timeout: float = 10.0) -> dict:
+        """Poll GET /api/runs/<id> until status is not 'running', or timeout."""
+        deadline = time.monotonic() + timeout
+        data = {}
+        while time.monotonic() < deadline:
+            conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+            conn.request("GET", f"/api/runs/{run_id}")
+            resp = conn.getresponse()
+            data = json.loads(resp.read())
+            conn.close()
+            if data.get("status") != "running":
+                return data
+            time.sleep(0.1)
+        return data
+
+    def test_manifest_finalized_on_natural_success(self):
+        """Natural exit 0: manifest updated with completed/success/log_lines."""
+        status, data = self._start_ros("#!/bin/bash\necho hello_finalize\nexit 0\n")
+        self.assertEqual(status, 202)
+        run_id = data["run_id"]
+
+        record = self._poll_terminal(run_id, timeout=10.0)
+        self.assertEqual(record.get("status"), "completed")
+        self.assertTrue(record.get("success"))
+        self.assertEqual(record.get("exit_code"), 0)
+        self.assertIn("completed_at", record)
+        log_text = " ".join(record.get("log_lines", []))
+        self.assertIn("hello_finalize", log_text)
+
+    def test_manifest_finalized_on_nonzero_exit(self):
+        """Natural exit 1: manifest updated with failed/success=False."""
+        status, data = self._start_ros("#!/bin/bash\nexit 1\n")
+        self.assertEqual(status, 202)
+        run_id = data["run_id"]
+
+        record = self._poll_terminal(run_id, timeout=10.0)
+        self.assertEqual(record.get("status"), "failed")
+        self.assertFalse(record.get("success"))
+        self.assertEqual(record.get("exit_code"), 1)
+        self.assertIn("completed_at", record)
+
+    def test_manifest_finalized_on_explicit_stop(self):
+        """Explicit stop: manifest updated with stopped status."""
+        status, data = self._start_ros("#!/bin/bash\nsleep 60\n")
+        self.assertEqual(status, 202)
+        run_id = data["run_id"]
+
+        # Stop via API.
+        body = json.dumps({"run_id": run_id}).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=15)
+        conn.request(
+            "POST",
+            "/api/ros/stop",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+
+        # After the stop response, the manifest must already be finalized.
+        record = self._poll_terminal(run_id, timeout=5.0)
+        self.assertNotEqual(record.get("status"), "running")
+        self.assertIn("completed_at", record)
+        self.assertIn("exit_code", record)
+
+    def test_finalized_manifest_readable_after_restart(self):
+        """Finalized manifests are persisted and readable from a fresh RunStore."""
+        status, data = self._start_ros("#!/bin/bash\necho persist_check\nexit 0\n")
+        self.assertEqual(status, 202)
+        run_id = data["run_id"]
+        self._poll_terminal(run_id, timeout=10.0)
+
+        # Simulate a restart by reading directly from disk (new RunStore instance).
+        fresh_store = RunStore(self._tmpdir / "runs")
+        record = fresh_store.get_run(run_id)
+        self.assertIsNotNone(record)
+        self.assertNotEqual(record.get("status"), "running",
+                            "Persisted manifest must reflect terminal state")
+        self.assertIn("completed_at", record)
 
 
 # ── startup bind / warning tests ──────────────────────────────────────────────

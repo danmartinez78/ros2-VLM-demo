@@ -33,7 +33,7 @@ import tempfile
 import threading
 import time
 import traceback
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
@@ -259,7 +259,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         try:
             length = int(length_str)
         except (ValueError, TypeError):
-            self._send_error(400, "Missing or invalid Content-Length")
+            self._send_error(411, "Content-Length required")
+            return
+        if length < 0:
+            self._send_error(400, "Invalid Content-Length")
             return
         if length > MAX_IMAGE_BYTES + 65536:  # image + form fields overhead
             self._send_error(413, "Upload too large")
@@ -383,11 +386,43 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         # Construct argument list; never shell=True.
         args = ["bash", script_path]
 
+        run_store = self.server_instance.run_store
+
+        def _on_complete(
+            rid: str,
+            exit_code: Optional[int],
+            was_stopped: bool,
+            log_lines: list,
+        ) -> None:
+            record = run_store.get_run(rid)
+            if record is None:
+                return
+            if was_stopped:
+                status_str = "stopped"
+                success = False
+            elif exit_code == 0:
+                status_str = "completed"
+                success = True
+            else:
+                status_str = "failed"
+                success = False
+            record.update(
+                {
+                    "status": status_str,
+                    "exit_code": exit_code,
+                    "completed_at": _now_iso(),
+                    "success": success,
+                    "log_lines": log_lines[:200],
+                }
+            )
+            run_store.save_run(rid, record)
+
         try:
             pid = self.server_instance.process_manager.start_ros_experiment(
                 run_id=run_id,
                 args=args,
                 env=env,
+                on_complete=_on_complete,
             )
         except RuntimeError as exc:
             self._send_error(409, str(exc))
@@ -423,11 +458,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     # ── response helpers ──────────────────────────────────────────────────────
 
     def _read_json_body(self) -> Optional[Dict[str, Any]]:
-        length_str = self.headers.get("Content-Length", "0")
+        length_str = self.headers.get("Content-Length", "")
         try:
             length = int(length_str)
         except (ValueError, TypeError):
-            length = 0
+            self._send_error(411, "Content-Length required")
+            return None
+        if length < 0:
+            self._send_error(400, "Invalid Content-Length")
+            return None
         if length > 65536:
             self._send_error(413, "Request body too large")
             return None
@@ -499,8 +538,13 @@ def _build_ros_env(params: Dict[str, Any], cfg: Dict[str, Any]) -> Dict[str, str
 
 # ── server class ──────────────────────────────────────────────────────────────
 
-class ConsoleServer(HTTPServer):
-    """HTTP server for the web console with shared state."""
+class ConsoleServer(ThreadingHTTPServer):
+    """Threading HTTP server for the web console with shared state.
+
+    Uses ThreadingHTTPServer so that long-running inference requests do not
+    block concurrent status polls or stop commands from the browser.  All
+    shared state (ProcessManager, RunStore) is independently thread-safe.
+    """
 
     def __init__(
         self,
