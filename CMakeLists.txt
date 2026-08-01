@@ -499,6 +499,14 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   target_link_libraries(test_ipc_inference_backend ${OpenCV_LIBRARIES})
+
+  # InferenceWatchdog component tests (no GPU, no TensorRT)
+  ament_add_gtest(test_inference_watchdog
+    test/test_inference_watchdog.cpp
+  )
+  target_include_directories(test_inference_watchdog PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
 endif()
 
 ament_export_targets(cosmos_reasoner_nodeTargets HAS_LIBRARY_TARGET)

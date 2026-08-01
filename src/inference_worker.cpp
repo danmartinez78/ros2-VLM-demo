@@ -1,4 +1,5 @@
 // Copyright 2025 cosmos_ros2_video_reasoner contributors
+#include "cosmos_ros2_video_reasoner/inference_watchdog.hpp"
 #include "cosmos_ros2_video_reasoner/ipc_protocol.hpp"
 #include "cosmos_ros2_video_reasoner/tensorrt_edge_llm_backend.hpp"
 
@@ -8,11 +9,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <future>
 #include <iostream>
 #include <limits>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <sys/socket.h>
@@ -142,33 +141,13 @@ int main(int argc, char ** argv)
       request.top_k = header.top_k;
 
       // ── Worker-side inference deadline watchdog ──────────────────────────
-      // If the TensorRT call wedges past the deadline, emit a diagnostic and
-      // self-terminate so ROS launch respawn creates a clean process and CUDA
-      // context.  The client IPC timeout must be longer than this deadline so
-      // the worker has time to exit and the client sees a clean EOF rather
-      // than a socket-level timeout.
-      std::promise<void> infer_done;
-      std::future<void> infer_done_future = infer_done.get_future();
-      const int watchdog_deadline = inference_deadline_seconds;
-      const uint64_t watchdog_request_id = header.request_id;
-
-      std::thread watchdog_thread(
-        [&infer_done_future, watchdog_deadline, watchdog_request_id]() {
-          if (infer_done_future.wait_for(std::chrono::seconds(watchdog_deadline)) ==
-          std::future_status::timeout)
-          {
-            std::cerr
-              << "[cosmos_inference_worker] WATCHDOG: inference deadline ("
-              << watchdog_deadline << "s) expired"
-              << " request_id=" << watchdog_request_id
-              << "; self-terminating for clean respawn\n";
-            std::cerr.flush();
-            // quick_exit bypasses C++ destructors to avoid hanging on wedged
-            // CUDA state.  The OS reclaims all file descriptors; the socket
-            // file is unlinked by the replacement worker at startup.
-            std::quick_exit(1);
-          }
-        });
+      // Guards the TensorRT call with a configurable deadline. If the call
+      // wedges past the deadline, the watchdog emits a diagnostic and calls
+      // std::_Exit(1) — see watchdog_exit_on_expire for the rationale for
+      // _Exit over quick_exit.
+      cosmos_ros2_video_reasoner::InferenceWatchdog watchdog(
+        inference_deadline_seconds, header.request_id,
+        cosmos_ros2_video_reasoner::watchdog_exit_on_expire);
 
       cosmos_ros2_video_reasoner::InferenceResponse result;
       try {
@@ -179,10 +158,7 @@ int main(int argc, char ** argv)
       }
 
       // Signal the watchdog that inference completed within the deadline.
-      infer_done.set_value();
-      if (watchdog_thread.joinable()) {
-        watchdog_thread.join();
-      }
+      watchdog.cancel();
 
       if (result.text.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes ||
         result.error.size() > cosmos_ros2_video_reasoner::ipc::kMaxTextBytes)

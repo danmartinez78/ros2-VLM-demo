@@ -215,58 +215,36 @@ bash scripts/test_data/run_worker_recovery_test.sh
 The final line should be:
 
 ```text
-PASS: worker respawned and reasoning resumed without restarting the ROS node.
+PASS: all 6 verifications passed — watchdog fires, worker PID changes, exactly
+      one failure published, reasoning resumes, cosmos_reasoner PID unchanged,
+      and no orphan worker or socket remains after shutdown.
 ```
 
 ### Thor hardware validation: watchdog-triggered recovery (requires hardware)
 
-> **Draft — requires Thor validation before merging to main.**
+> **Requires Thor hardware to run. Validated Cosmos configuration reliably
+> exceeds the 1-second test deadline, making the watchdog fire deterministically
+> without injecting an artificial hang.**
 
-This test forces a request past its inference deadline and verifies the worker
-PID changes and reasoning resumes without restarting `cosmos_reasoner`.
+The script `scripts/test_data/run_worker_recovery_test.sh` runs the full
+end-to-end test automatically and verifies all six required properties.
+
+Manual recipe (same as the script):
 
 ```bash
-# Start the pipeline with a short deadline to force the watchdog to fire.
-ros2 launch cosmos_ros2_video_reasoner cosmos_reasoner.launch.py \
-  llm_engine_dir:="$COSMOS_LLM_ENGINE_DIR" \
-  multimodal_engine_dir:="$COSMOS_MULTIMODAL_ENGINE_DIR" \
-  edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH" \
-  worker_inference_deadline_seconds:=5 \
-  worker_request_timeout_seconds:=20 \
-  use_sim_time:=true &
-
-LAUNCH_PID=$!
-sleep 5  # wait for worker to be ready
-
-# Record the initial worker PID.
-WORKER_PID_BEFORE=$(pgrep -n cosmos_inference_worker)
-echo "Worker PID before: $WORKER_PID_BEFORE"
-
-# Start bag playback; the first frame will trigger inference.
-ros2 bag play "$HOME/tensorrt-edgellm-workspace/image-proc-rosbag" --clock &
-BAG_PID=$!
-
-# Wait for the watchdog to fire and the worker to restart.
-sleep 30
-
-# Verify the worker PID has changed (launch respawned it).
-WORKER_PID_AFTER=$(pgrep -n cosmos_inference_worker)
-echo "Worker PID after:  $WORKER_PID_AFTER"
-
-if [ "$WORKER_PID_BEFORE" != "$WORKER_PID_AFTER" ] && [ -n "$WORKER_PID_AFTER" ]; then
-  echo "PASS: worker respawned (PID changed) and reasoning can resume."
-else
-  echo "FAIL: worker PID did not change or worker is not running."
-fi
-
-kill $BAG_PID $LAUNCH_PID 2>/dev/null
+# The 1-second deadline is shorter than any real Cosmos inference call on Thor.
+# worker_request_timeout_seconds (20 s) must exceed the deadline (1 s) — the
+# launch file validates this relationship and fails fast if it is violated.
+bash scripts/test_data/run_worker_recovery_test.sh
 ```
 
-Expected evidence:
-- Worker stderr prints the WATCHDOG diagnostic line.
-- `cosmos_reasoner` stderr prints one IPC error for the timed-out frame.
-- Launch respawns the worker (new PID).
-- Reasoning resumes on the next sampled frame without restarting `cosmos_reasoner`.
+The script verifies:
+1. The `WATCHDOG: inference deadline` diagnostic appears in the launch log.
+2. The worker PID changes after launch respawns it.
+3. Exactly one failure result is published for the expired request.
+4. A successful reasoning result is received after the replacement worker starts.
+5. The `cosmos_reasoner` PID does not change (supervisor survives).
+6. No orphan worker process or socket file remains after shutdown.
 
 ## 8. Run a custom bag or camera
 
