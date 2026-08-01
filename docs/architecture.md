@@ -21,6 +21,8 @@ flowchart TD
       NODE --> QUEUE --> IPC
     end
     IPC <-->|versioned Unix socket| SERVER
+    CLI[ROS-free CLI] <-->|same IPC contract| SERVER
+    EXPERIMENT[Evaluation harness] -.->|same IPC contract| SERVER
     subgraph GP[ROS-free GPU process]
       SERVER[cosmos_inference_worker]
       BACKEND[TensorRTEdgeLLMBackend]
@@ -54,7 +56,9 @@ The worker process:
 - owns the CUDA context, non-blocking CUDA stream, and TensorRT runtime;
 - converts received BGR8 frames to in-memory JPEG;
 - calls `LLMInferenceRuntime::handleRequest()` serially;
-- returns text, error state, and measured inference duration.
+- returns text, error state, and measured inference duration;
+- remains alive across sequential client connections so ROS and non-ROS tools
+  can share the already-loaded engines.
 
 The final worker executable directly links the Edge-LLM core, CuTe DSL AOT
 archive, TensorRT, and CUDA. This ensures the Thor `sm_110a` device-link step
@@ -193,19 +197,33 @@ The protocol uses native POD layout and is intended only for the two binaries
 built from the same package on one host. It is not a network API or a
 cross-version serialization format.
 
-## Startup
+## Startup and service ownership
 
-Launch starts the worker and ROS process together:
+Two startup modes use the same process boundary and IPC contract.
 
-1. worker creates the Unix socket;
-2. worker loads the plugin and initializes Edge-LLM;
-3. worker begins listening;
-4. ROS inference thread connects, with a 120-second default deadline;
-5. only after backend initialization succeeds does the node create its camera
-   subscription;
-6. rosbag test scripts wait for that subscription before playback.
+### Launch-managed mode
 
-This prevents frames from being consumed before the engines are ready.
+This remains the default (`start_worker:=true`):
+
+1. launch starts the worker and ROS process;
+2. worker creates the Unix socket and initializes Edge-LLM;
+3. ROS connects with a 120-second default deadline;
+4. the node creates its camera subscription only after connection succeeds;
+5. launch respawns a worker that exits unexpectedly.
+
+### Standalone-service mode
+
+With `start_worker:=false`, an operator or service manager starts the worker
+first. The ROS launch file starts only the adapter and connects to the existing
+socket. The same service can accept a CLI client before or after the ROS
+adapter without reloading its engines.
+
+Only one connected client is served at a time. This is sufficient for the
+initial decoupling milestone and keeps TensorRT execution serialized. Scheduling
+multiple concurrent clients is deferred until an experiment demonstrates that
+it is needed.
+
+Both modes prevent frames from being consumed before the engines are ready.
 
 The missing optional action engine message is informational for image-only
 Cosmos Reason2 deployments and does not fail initialization.
