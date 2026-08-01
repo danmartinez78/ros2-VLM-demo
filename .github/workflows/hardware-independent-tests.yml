@@ -98,6 +98,21 @@ jobs:
           bash -n scripts/benchmark/run_observation_history_experiment.sh
           bash -n scripts/test_data/run_image_proc_test.sh
 
+  web-console-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run web console tests (CPU-only, no hardware required)
+        run: python3 web_console/tests/test_web_console.py -v
+
   obsolete-identifier-check:
     runs-on: ubuntu-24.04
     timeout-minutes: 5

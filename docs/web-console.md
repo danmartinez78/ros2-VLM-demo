@@ -1,0 +1,193 @@
+# Web Experiment Console
+
+A lightweight local HTTP control plane for running and inspecting standalone
+Edge-VLM inference and bounded ROS/rosbag experiments without a remote desktop
+or repeated terminal orchestration.
+
+**This console is an experiment control plane.** It does not embed TensorRT
+inference, replace the standalone `edge_vlm_server`, or participate in the
+frame-to-inference data path.
+
+## Installation and launch
+
+The console uses only Python 3 standard library — no pip install is needed.
+
+```bash
+# From the repository root:
+python3 -m web_console
+```
+
+Default options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` | `127.0.0.1` | Bind address |
+| `--port` | `8765` | TCP port |
+| `--socket` | `/tmp/edge_vlm.sock` | Path to `edge_vlm_server` IPC socket |
+| `--cli` | `edge_vlm_cli` | Path to `edge_vlm_cli` binary |
+| `--runs-dir` | `~/.web_console/runs` | Directory for run records |
+| `--ros-script` | `scripts/test_data/run_image_proc_test.sh` | ROS experiment script |
+| `--quiet` | off | Suppress request logging |
+
+Once started, open **http://127.0.0.1:8765/** in your browser.
+
+### Example with explicit paths
+
+```bash
+source scripts/edge_vlm_env.sh
+source "$ROS_WORKSPACE/install/setup.bash"
+
+python3 -m web_console \
+  --socket "$WORKER_SOCKET_PATH" \
+  --cli "$ROS_WORKSPACE/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_cli" \
+  --runs-dir "$HOME/.web_console/runs"
+```
+
+## Remote access
+
+### SSH port forwarding
+
+```bash
+# On your laptop — forward local port 8765 to the Jetson:
+ssh -L 8765:127.0.0.1:8765 user@jetson-host
+
+# Then open http://localhost:8765/ locally.
+```
+
+### Tailscale
+
+If the Jetson is enrolled in your Tailscale network, start the console with:
+
+```bash
+python3 -m web_console --host 100.x.y.z --port 8765
+```
+
+Replace `100.x.y.z` with the Jetson's Tailscale IP. Access from any device on
+the same tailnet at `http://100.x.y.z:8765/`.
+
+> **Trust boundary:** The console is designed for single-user, localhost-only
+> use. There is no authentication. Do not expose it on a public or shared
+> network interface.
+
+## Architecture and trust boundary
+
+```
+Browser ──HTTP──► ConsoleServer (127.0.0.1:8765)
+                      │
+                      ├─► status_collector   (read-only: socket connect probe, ss, nvidia-smi)
+                      ├─► inference_client   (subprocess: edge_vlm_cli — arg list, no shell)
+                      ├─► ProcessManager     (subprocess: bash <ros_script> — arg list, no shell)
+                      └─► RunStore           (local JSON manifests under ~/.web_console/runs/)
+
+ConsoleServer ─IPC─► edge_vlm_server        (pre-existing worker; not started/stopped by console)
+```
+
+The console:
+- Never starts or stops `edge_vlm_server` automatically.
+- Never accepts arbitrary shell commands or executable paths from HTTP requests.
+- Constructs all subprocess argument arrays directly (no `shell=True`).
+- Tracks and stops only process groups that it started.
+- Validates run IDs against a UUID pattern to prevent path traversal.
+- Rejects concurrent conflicting ROS experiments with HTTP 409.
+- Applies upload size limits (64 MiB) and allowed image extension lists.
+- Degrades cleanly on CPU-only/CI systems (no CUDA, TensorRT, or nvidia-smi required).
+
+## Supported MVP workflows
+
+### Status
+
+The **Status** section shows:
+- Whether `edge_vlm_server` is reachable on the configured socket.
+- GPU utilisation and memory (when `nvidia-smi` is available).
+- Relevant environment variables.
+- Active ROS experiment run ID (if any).
+
+### Standalone inference
+
+1. Select a supported image file (JPEG, PNG, BMP, WebP, TIFF — max 64 MiB).
+2. Enter a prompt.
+3. Adjust optional parameters (max tokens, temperature, top-p, top-k).
+4. Click **Run Inference**.
+
+The console calls `edge_vlm_cli` through the IPC socket. The full response,
+inference duration, and a downloadable JSON manifest are preserved in the run
+history.
+
+### Bounded ROS experiment
+
+1. Fill in the allowlisted parameters (image topic, prompt, delivery mode,
+   observation history, playback duration, timeouts, required results).
+2. Click **Start ROS Experiment**.
+
+The console launches `scripts/test_data/run_image_proc_test.sh` as an isolated
+subprocess. Live log lines are polled and displayed. Click **Stop** to send
+SIGTERM (with SIGKILL fallback) to the experiment process group.
+
+**Only the experiment started by the console is stopped.** Pre-existing
+`edge_vlm_ros_node` and `edge_vlm_server` processes are never touched.
+
+### Run history
+
+All run manifests are stored under `--runs-dir`. Click a run in the history
+table to inspect its full configuration, result text, latency, and error
+information.
+
+## Artifact locations and retention
+
+| Path | Contents |
+|---|---|
+| `~/.web_console/runs/<run_id>/manifest.json` | Full run record (config + results) |
+
+The 100 most recent runs are retained; older directories are removed
+automatically when a new run is saved.
+
+## Clean shutdown and recovery
+
+Press **Ctrl+C** or send `SIGTERM` to the console process. It will:
+1. Send SIGTERM to all owned process groups.
+2. Wait up to 5 s for each group to exit.
+3. Send SIGKILL to any remaining processes.
+4. Stop the HTTP server.
+
+If the console exits unexpectedly, any ROS experiment it launched will continue
+running in its own process group. Identify and stop it with:
+
+```bash
+# Find running edge_vlm_ros processes:
+pgrep -a -f edge_vlm_ros_node
+pgrep -a -f edge_vlm_server
+
+# Stop by process group (replace PGID with the value from ps):
+kill -TERM -- -<PGID>
+sleep 3
+kill -KILL -- -<PGID> 2>/dev/null || true
+```
+
+Stale IPC sockets can be removed with `rm -f /tmp/edge_vlm.sock`.
+
+## Thor validation checklist
+
+After cloud CI passes, manually verify on a prepared Thor:
+
+1. Start the standalone `edge_vlm_server`:
+   ```bash
+   source scripts/edge_vlm_env.sh
+   edge_vlm_server "$EDGE_VLM_LLM_ENGINE_DIR" "$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
+     "$EDGELLM_PLUGIN_PATH" /tmp/edge_vlm.sock 90 60 &
+   ```
+2. Start the web console: `python3 -m web_console`
+3. Open `http://127.0.0.1:8765/` and verify the status badge shows **server reachable**.
+4. Submit at least two image inference requests from the UI and confirm:
+   - Both return successful responses.
+   - The server PID shown in the status JSON does not change between requests.
+5. Start a ROS experiment (image-proc rosbag workflow) from the UI and wait for
+   a successful `/vlm/result` output in the live log.
+6. Click **Stop** for the ROS experiment. Confirm:
+   - The standalone server status badge remains green.
+   - `edge_vlm_cli` runs successfully from a separate terminal.
+7. Run `edge_vlm_cli` successfully after stopping the ROS experiment.
+8. Confirm no orphan UI-owned processes or temporary sockets remain:
+   ```bash
+   pgrep -a -f edge_vlm_ros_node || echo "none"
+   ls /tmp/web_console_* 2>/dev/null || echo "none"
+   ```
