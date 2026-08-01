@@ -144,7 +144,7 @@ if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
       sort -nu
   )"
   detected_pid_csv="$(printf '%s\n' "${detected_pids}" | paste -sd, -)"
-  own_pgid="$(ps -o pgid= -p "$" 2>/dev/null | tr -d ' ')" || true
+  own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || true
   detected_pgids="$(
     ps -o pgid= -p "${detected_pid_csv}" 2>/dev/null |
       tr -d ' ' |
