@@ -189,7 +189,10 @@ bash scripts/benchmark/run_native_benchmarks.sh \
 
 Defaults match the NVIDIA published workload: `--batch-size 1 --input-len 2048
 --past-kv-len 2048 --image-size 1024x2048 --warmup 3 --iterations 10
---inference-warmup 10`. Pass `--quick` for faster smoke-test runs.
+--inference-warmup 10`. Pass `--quick` for a 320x320 visual smoke test and
+reduced token lengths/iteration counts. The pinned TensorRT Edge-LLM revision
+requires a one-line upstream fix for Cosmos/Qwen3-VL visual benchmarking; see
+the [benchmark troubleshooting guide](docs/benchmarking.md#cosmosqwen3-vl-visual-benchmark-workaround).
 
 Artifacts are written to `/tmp/cosmos_native_bench_YYYYMMDD_HHMMSS/`.
 
