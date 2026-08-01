@@ -90,10 +90,10 @@ private:
     uint64_t frame_seq,
     bool suppress_system_and_context = false) const;
   void validate_template_variables(const std::string & name, const std::string & templ) const;
-  void maybe_reset_prompt_history_before_request();
-  void update_prompt_history_after_response(
+  void maybe_reset_observation_history_before_request();
+  void update_observation_history_after_response(
     const InferenceResponse & resp, const std::string & user_text);
-  size_t prompt_history_size_chars() const;
+  size_t observation_history_size_chars() const;
 
   // ── Backend ─────────────────────────────────────────────────────────────
   std::unique_ptr<InferenceBackend> backend_;
@@ -117,10 +117,10 @@ private:
   std::string task_instruction_;
   std::string instruction_delivery_mode_{"inline"};
   std::string active_prompt_template_;
-  int prompt_history_max_entries_{0};
-  int prompt_history_max_chars_{0};
-  std::string prompt_history_reset_policy_{"never"};
-  int prompt_history_reset_interval_requests_{0};
+  int observation_history_max_entries_{0};
+  int observation_history_max_chars_{0};
+  std::string observation_history_reset_policy_{"never"};
+  int observation_history_reset_interval_requests_{0};
   std::unordered_map<std::string, std::string> task_profiles_;
   int max_generate_length_{256};
   float temperature_{0.2f};
@@ -149,8 +149,8 @@ private:
   mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::optional<PendingFrame> pending_frame_;  // bounded queue of depth 1
-  std::deque<HistoryEntry> prompt_history_;
-  uint64_t requests_since_prompt_history_reset_{0};
+  std::deque<HistoryEntry> observation_history_;
+  uint64_t requests_since_observation_history_reset_{0};
 
   // ── Counters ─────────────────────────────────────────────────────────────
   struct Stats
