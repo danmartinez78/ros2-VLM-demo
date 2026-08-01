@@ -264,7 +264,7 @@ if [[ "${ready}" != true ]]; then
   exit 1
 fi
 
-ros2 topic echo "${result_topic}" >"${result_log}" 2>&1 &
+ros2 topic echo --full-length "${result_topic}" >"${result_log}" 2>&1 &
 result_echo_pid=$!
 
 subscriber_ready=false
