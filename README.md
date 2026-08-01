@@ -339,10 +339,10 @@ rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
 | `task_instruction` | string | empty | Optional task instruction text |
 | `instruction_delivery_mode` | string | `inline` | Prompt delivery mode: `inline` (legacy, all text in one user message) or `structured` (system message, user message, and history as native Edge-LLM Message roles) |
 | `enable_system_prompt_cache` | bool | `false` | Request system-prompt caching for stable system messages (only valid with `instruction_delivery_mode: structured`; silently ignored when the runtime does not support caching — see Thor validation note in architecture docs) |
-| `prompt_history_max_entries` | int | `0` | Bound on prior successful responses retained for prompt-history injection |
-| `prompt_history_max_chars` | int | `0` | Maximum total retained prompt-history characters (`0` disables size limit) |
-| `prompt_history_reset_policy` | string | `never` | Prompt-history reset policy: `never`, `on_error`, `every_n_requests` |
-| `prompt_history_reset_interval_requests` | int | `0` | Reset interval when policy is `every_n_requests` |
+| `observation_history_max_entries` | int | `0` | Bound on prior successful responses retained for observation-history injection |
+| `observation_history_max_chars` | int | `0` | Maximum total retained observation-history characters (`0` disables size limit) |
+| `observation_history_reset_policy` | string | `never` | Observation-history reset policy: `never`, `on_error`, `every_n_requests` |
+| `observation_history_reset_interval_requests` | int | `0` | Reset interval when policy is `every_n_requests` |
 | `sample_period_seconds` | double | `2.0` | Minimum ROS timestamp interval between samples |
 | `max_generate_length` | int | `256` | Maximum generated tokens |
 | `temperature` | double | `0.2` | Sampling temperature |
