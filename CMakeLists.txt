@@ -516,6 +516,7 @@ if(BUILD_TESTING)
     COMMAND "${BASH_EXECUTABLE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/test/test_worker_recovery_helpers.sh"
     TIMEOUT 30
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
   )
 endif()
 
