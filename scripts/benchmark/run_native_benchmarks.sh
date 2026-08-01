@@ -7,7 +7,7 @@
 #   - llm_bench --mode prefill   (prefill latency / throughput)
 #   - llm_bench --mode decode    (generation throughput)
 #   - llm_bench --mode visual    (vision-encoder latency / throughput)
-#   - llm_inference --dumpProfile --profileOutputFile ...
+#   - llm_inference --warmup ... --dumpProfile --profileOutputFile ...
 #
 # This script does NOT reimplement TTFT, token throughput, ViT timing, or any
 # layer profiling — those are authoritative in the NVIDIA tool outputs.
@@ -22,8 +22,13 @@
 #
 # Options
 #   --output-dir DIR        Directory to write artifacts (default: /tmp/cosmos_native_bench_TIMESTAMP)
-#   --warmup N              Number of warm-up iterations (default: 3)
-#   --iterations N          Number of measured iterations (default: 10)
+#   --batch-size N          Batch size for prefill and decode (default: 1)
+#   --input-len N           Input token length for prefill benchmark (default: 128)
+#   --past-kv-len N         Past KV-cache length for decode benchmark (default: 128)
+#   --image-size WxH        Image dimensions for visual encoder benchmark (default: 336x336)
+#   --warmup N              Warmup iterations for llm_bench modes (default: 3)
+#   --iterations N          Measured iterations for llm_bench modes (default: 10)
+#   --inference-warmup N    Warmup runs for llm_inference (default: 3)
 #   --max-generate-length N Token budget for decode/end-to-end (default: 64)
 #   --input-image PATH      Path to a representative input image (default: env IMAGE_PATH or skip)
 #   --input-vlm-json PATH   Path to llm_inference input JSON (default: env INPUT_VLM_JSON or skip)
@@ -39,8 +44,13 @@ set -euo pipefail
 
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 OUTPUT_DIR="/tmp/cosmos_native_bench_${TIMESTAMP}"
+BATCH_SIZE=1
+INPUT_LEN=128
+PAST_KV_LEN=128
+IMAGE_SIZE="336x336"
 WARMUP=3
 ITERATIONS=10
+INFERENCE_WARMUP=3
 MAX_GENERATE_LENGTH=64
 INPUT_IMAGE="${IMAGE_PATH:-}"
 INPUT_VLM_JSON="${INPUT_VLM_JSON:-}"
@@ -54,17 +64,22 @@ DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --output-dir)       OUTPUT_DIR="$2";           shift 2 ;;
-    --warmup)           WARMUP="$2";               shift 2 ;;
-    --iterations)       ITERATIONS="$2";           shift 2 ;;
-    --max-generate-length) MAX_GENERATE_LENGTH="$2"; shift 2 ;;
-    --input-image)      INPUT_IMAGE="$2";          shift 2 ;;
-    --input-vlm-json)   INPUT_VLM_JSON="$2";       shift 2 ;;
-    --skip-prefill)     SKIP_PREFILL=true;         shift   ;;
-    --skip-decode)      SKIP_DECODE=true;          shift   ;;
-    --skip-visual)      SKIP_VISUAL=true;          shift   ;;
-    --skip-profile)     SKIP_PROFILE=true;         shift   ;;
-    --dry-run)          DRY_RUN=true;              shift   ;;
+    --output-dir)          OUTPUT_DIR="$2";            shift 2 ;;
+    --batch-size)          BATCH_SIZE="$2";             shift 2 ;;
+    --input-len)           INPUT_LEN="$2";              shift 2 ;;
+    --past-kv-len)         PAST_KV_LEN="$2";           shift 2 ;;
+    --image-size)          IMAGE_SIZE="$2";             shift 2 ;;
+    --warmup)              WARMUP="$2";                 shift 2 ;;
+    --iterations)          ITERATIONS="$2";             shift 2 ;;
+    --inference-warmup)    INFERENCE_WARMUP="$2";       shift 2 ;;
+    --max-generate-length) MAX_GENERATE_LENGTH="$2";    shift 2 ;;
+    --input-image)         INPUT_IMAGE="$2";            shift 2 ;;
+    --input-vlm-json)      INPUT_VLM_JSON="$2";         shift 2 ;;
+    --skip-prefill)        SKIP_PREFILL=true;           shift   ;;
+    --skip-decode)         SKIP_DECODE=true;            shift   ;;
+    --skip-visual)         SKIP_VISUAL=true;            shift   ;;
+    --skip-profile)        SKIP_PROFILE=true;           shift   ;;
+    --dry-run)             DRY_RUN=true;                shift   ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -79,14 +94,16 @@ done
 LLM_BENCH="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_bench"
 LLM_INFERENCE="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_inference"
 
-if [[ ! -x "${LLM_BENCH}" ]]; then
-  echo "ERROR: llm_bench not found or not executable: ${LLM_BENCH}" >&2
-  echo "       Build TensorRT Edge-LLM first." >&2
-  exit 1
-fi
-if [[ ! -x "${LLM_INFERENCE}" ]]; then
-  echo "ERROR: llm_inference not found or not executable: ${LLM_INFERENCE}" >&2
-  exit 1
+if [[ "${DRY_RUN}" == "false" ]]; then
+  if [[ ! -x "${LLM_BENCH}" ]]; then
+    echo "ERROR: llm_bench not found or not executable: ${LLM_BENCH}" >&2
+    echo "       Build TensorRT Edge-LLM first." >&2
+    exit 1
+  fi
+  if [[ ! -x "${LLM_INFERENCE}" ]]; then
+    echo "ERROR: llm_inference not found or not executable: ${LLM_INFERENCE}" >&2
+    exit 1
+  fi
 fi
 
 # ── output directory ──────────────────────────────────────────────────────────
@@ -98,26 +115,16 @@ else
   echo "[DRY RUN] Would write to: ${OUTPUT_DIR}"
 fi
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── state tracking ────────────────────────────────────────────────────────────
 
 ERRORS=()
 SKIPPED_MODES=()
 
-run_cmd() {
-  local label="$1"; shift
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    echo "[DRY RUN] ${label}: $*"
-    return 0
-  fi
-  echo "==> ${label}"
-  echo "    $*"
-  if ! "$@"; then
-    echo "WARNING: ${label} exited with non-zero status" >&2
-    ERRORS+=("${label} failed")
-    return 1
-  fi
-  return 0
-}
+PREFILL_OUT=""
+DECODE_OUT=""
+VISUAL_OUT=""
+PROFILE_OUT=""
+INFERENCE_OUT=""
 
 # ── metadata collection ───────────────────────────────────────────────────────
 
@@ -134,82 +141,95 @@ collect_metadata() {
   edge_llm_tag=$(git -C "${TENSORRT_EDGE_LLM_ROOT}" describe --tags --abbrev=0 2>/dev/null || echo "")
   nvpmodel=$(nvpmodel -q 2>/dev/null | head -1 || echo "")
 
-  python3 -c "
-import json, sys
+  # Pass all values via environment variables to avoid shell interpolation inside
+  # Python source code.  The single-quoted heredoc prevents any expansion.
+  ARCH="${arch}" KERNEL="${kernel}" JETPACK="${jetpack}" CUDA="${cuda}" \
+  TRT="${trt}" GPU_CC="${gpu_cc}" GPU_NAME="${gpu_name}" \
+  EDGE_LLM_COMMIT="${edge_llm_commit}" EDGE_LLM_TAG="${edge_llm_tag}" \
+  NVPMODEL="${nvpmodel}" \
+  MODEL_NAME="${COSMOS_MODEL_NAME:-}" \
+  LLM_ENGINE_DIR="${COSMOS_LLM_ENGINE_DIR}" \
+  MULTIMODAL_ENGINE_DIR="${COSMOS_MULTIMODAL_ENGINE_DIR}" \
+  BATCH_SIZE_V="${BATCH_SIZE}" \
+  INPUT_LEN_V="${INPUT_LEN}" \
+  PAST_KV_LEN_V="${PAST_KV_LEN}" \
+  IMAGE_SIZE_V="${IMAGE_SIZE}" \
+  WARMUP_V="${WARMUP}" \
+  ITERATIONS_V="${ITERATIONS}" \
+  INFERENCE_WARMUP_V="${INFERENCE_WARMUP}" \
+  MAX_GENERATE_LENGTH_V="${MAX_GENERATE_LENGTH}" \
+  INPUT_IMAGE_V="${INPUT_IMAGE}" \
+  INPUT_VLM_JSON_V="${INPUT_VLM_JSON}" \
+  python3 <<'PYEOF'
+import json, os
+
+def _n(v):
+    return v if v else None
+
+def _i(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
 print(json.dumps({
-  'arch': '${arch}',
-  'kernel': '${kernel}',
-  'jetpack_version': '${jetpack}' or None,
-  'cuda_version': '${cuda}' or None,
-  'tensorrt_version': '${trt}' or None,
-  'gpu_compute_capability': '${gpu_cc}' or None,
-  'gpu_name': '${gpu_name}' or None,
-  'edge_llm_commit': '${edge_llm_commit}' or None,
-  'edge_llm_version_tag': '${edge_llm_tag}' or None,
-  'nvpmodel_mode': '${nvpmodel}' or None,
-  'model_name': '${COSMOS_MODEL_NAME:-}' or None,
-  'llm_engine_dir': '${COSMOS_LLM_ENGINE_DIR}',
-  'multimodal_engine_dir': '${COSMOS_MULTIMODAL_ENGINE_DIR}',
-  'max_generate_length': ${MAX_GENERATE_LENGTH},
-  'warmup_iterations': ${WARMUP},
-  'measured_iterations': ${ITERATIONS},
-  'input_image_path': '${INPUT_IMAGE}' or None,
-  'input_vlm_json': '${INPUT_VLM_JSON}' or None,
+    "arch": os.environ.get("ARCH", "unknown"),
+    "kernel": os.environ.get("KERNEL", "unknown"),
+    "jetpack_version": _n(os.environ.get("JETPACK")),
+    "cuda_version": _n(os.environ.get("CUDA")),
+    "tensorrt_version": _n(os.environ.get("TRT")),
+    "gpu_compute_capability": _n(os.environ.get("GPU_CC")),
+    "gpu_name": _n(os.environ.get("GPU_NAME")),
+    "edge_llm_commit": _n(os.environ.get("EDGE_LLM_COMMIT")),
+    "edge_llm_version_tag": _n(os.environ.get("EDGE_LLM_TAG")),
+    "nvpmodel_mode": _n(os.environ.get("NVPMODEL")),
+    "model_name": _n(os.environ.get("MODEL_NAME")),
+    "llm_engine_dir": os.environ.get("LLM_ENGINE_DIR", ""),
+    "multimodal_engine_dir": os.environ.get("MULTIMODAL_ENGINE_DIR", ""),
+    "batch_size": _i(os.environ.get("BATCH_SIZE_V")),
+    "input_len": _i(os.environ.get("INPUT_LEN_V")),
+    "past_kv_len": _i(os.environ.get("PAST_KV_LEN_V")),
+    "image_size": os.environ.get("IMAGE_SIZE_V", ""),
+    "max_generate_length": _i(os.environ.get("MAX_GENERATE_LENGTH_V")),
+    "warmup_iterations": _i(os.environ.get("WARMUP_V")),
+    "measured_iterations": _i(os.environ.get("ITERATIONS_V")),
+    "inference_warmup_runs": _i(os.environ.get("INFERENCE_WARMUP_V")),
+    "input_image_path": _n(os.environ.get("INPUT_IMAGE_V")),
+    "input_vlm_json": _n(os.environ.get("INPUT_VLM_JSON_V")),
 }, indent=2, sort_keys=True))
-"
+PYEOF
 }
-
-# ── run llm_bench for each mode ───────────────────────────────────────────────
-
-run_llm_bench_mode() {
-  local mode="$1"
-  local out_file="${OUTPUT_DIR}/llm_bench_${mode}.txt"
-
-  local cmd=(
-    "${LLM_BENCH}"
-    --mode "${mode}"
-    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
-    --warmUp "${WARMUP}"
-    --numRuns "${ITERATIONS}"
-  )
-  if [[ "${mode}" == "visual" ]]; then
-    cmd+=(--multimodalEngineDir "${COSMOS_MULTIMODAL_ENGINE_DIR}")
-    if [[ -n "${INPUT_IMAGE}" ]]; then
-      cmd+=(--inputImage "${INPUT_IMAGE}")
-    fi
-  fi
-
-  if run_cmd "llm_bench --mode ${mode}" "${cmd[@]}" 2>&1 | tee "${out_file}"; then
-    echo "${mode}_bench_file=${out_file}"
-    return 0
-  fi
-  return 1
-}
-
-PREFILL_OUT=""
-DECODE_OUT=""
-VISUAL_OUT=""
-PROFILE_OUT=""
-INFERENCE_OUT=""
 
 # ── prefill ───────────────────────────────────────────────────────────────────
 
 if [[ "${SKIP_PREFILL}" == "true" ]]; then
   SKIPPED_MODES+=("prefill")
 else
-  if [[ "${DRY_RUN}" == "false" ]]; then
-    echo "--- prefill benchmark ---"
-    PREFILL_OUT="${OUTPUT_DIR}/llm_bench_prefill.txt"
-    run_cmd "llm_bench --mode prefill" \
-      "${LLM_BENCH}" \
-      --mode prefill \
-      --engineDir "${COSMOS_LLM_ENGINE_DIR}" \
-      --warmUp "${WARMUP}" \
-      --numRuns "${ITERATIONS}" \
-      2>&1 | tee "${PREFILL_OUT}" || true
-  else
-    echo "[DRY RUN] llm_bench --mode prefill --engineDir ${COSMOS_LLM_ENGINE_DIR} --warmUp ${WARMUP} --numRuns ${ITERATIONS}"
+  PREFILL_CMD=(
+    "${LLM_BENCH}"
+    --mode prefill
+    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
+    --batchSize "${BATCH_SIZE}"
+    --inputLen "${INPUT_LEN}"
+    --warmup "${WARMUP}"
+    --iterations "${ITERATIONS}"
+    --profile
+  )
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "[DRY RUN] ${PREFILL_CMD[*]}"
     PREFILL_OUT="llm_bench_prefill.txt"
+  else
+    PREFILL_OUT="${OUTPUT_DIR}/llm_bench_prefill.txt"
+    echo "==> llm_bench --mode prefill"
+    echo "    ${PREFILL_CMD[*]}"
+    if "${PREFILL_CMD[@]}" > "${PREFILL_OUT}" 2>&1; then
+      echo "OK: prefill benchmark written to ${PREFILL_OUT}"
+    else
+      echo "ERROR: prefill benchmark failed" >&2
+      ERRORS+=("prefill failed")
+      PREFILL_OUT=""
+    fi
   fi
 fi
 
@@ -218,20 +238,31 @@ fi
 if [[ "${SKIP_DECODE}" == "true" ]]; then
   SKIPPED_MODES+=("decode")
 else
-  if [[ "${DRY_RUN}" == "false" ]]; then
-    echo "--- decode benchmark ---"
-    DECODE_OUT="${OUTPUT_DIR}/llm_bench_decode.txt"
-    run_cmd "llm_bench --mode decode" \
-      "${LLM_BENCH}" \
-      --mode decode \
-      --engineDir "${COSMOS_LLM_ENGINE_DIR}" \
-      --warmUp "${WARMUP}" \
-      --numRuns "${ITERATIONS}" \
-      --maxGenerateLength "${MAX_GENERATE_LENGTH}" \
-      2>&1 | tee "${DECODE_OUT}" || true
-  else
-    echo "[DRY RUN] llm_bench --mode decode --engineDir ${COSMOS_LLM_ENGINE_DIR} --warmUp ${WARMUP} --numRuns ${ITERATIONS} --maxGenerateLength ${MAX_GENERATE_LENGTH}"
+  DECODE_CMD=(
+    "${LLM_BENCH}"
+    --mode decode
+    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
+    --batchSize "${BATCH_SIZE}"
+    --pastKVLen "${PAST_KV_LEN}"
+    --warmup "${WARMUP}"
+    --iterations "${ITERATIONS}"
+    --profile
+  )
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "[DRY RUN] ${DECODE_CMD[*]}"
     DECODE_OUT="llm_bench_decode.txt"
+  else
+    DECODE_OUT="${OUTPUT_DIR}/llm_bench_decode.txt"
+    echo "==> llm_bench --mode decode"
+    echo "    ${DECODE_CMD[*]}"
+    if "${DECODE_CMD[@]}" > "${DECODE_OUT}" 2>&1; then
+      echo "OK: decode benchmark written to ${DECODE_OUT}"
+    else
+      echo "ERROR: decode benchmark failed" >&2
+      ERRORS+=("decode failed")
+      DECODE_OUT=""
+    fi
   fi
 fi
 
@@ -240,24 +271,34 @@ fi
 if [[ "${SKIP_VISUAL}" == "true" ]]; then
   SKIPPED_MODES+=("visual")
 else
-  if [[ "${DRY_RUN}" == "false" ]]; then
-    echo "--- visual encoder benchmark ---"
-    VISUAL_OUT="${OUTPUT_DIR}/llm_bench_visual.txt"
-    VISUAL_CMD=(
-      "${LLM_BENCH}"
-      --mode visual
-      --engineDir "${COSMOS_LLM_ENGINE_DIR}"
-      --multimodalEngineDir "${COSMOS_MULTIMODAL_ENGINE_DIR}"
-      --warmUp "${WARMUP}"
-      --numRuns "${ITERATIONS}"
-    )
-    if [[ -n "${INPUT_IMAGE}" ]]; then
-      VISUAL_CMD+=(--inputImage "${INPUT_IMAGE}")
-    fi
-    run_cmd "llm_bench --mode visual" "${VISUAL_CMD[@]}" 2>&1 | tee "${VISUAL_OUT}" || true
-  else
-    echo "[DRY RUN] llm_bench --mode visual --engineDir ${COSMOS_LLM_ENGINE_DIR} --multimodalEngineDir ${COSMOS_MULTIMODAL_ENGINE_DIR} ..."
+  VISUAL_CMD=(
+    "${LLM_BENCH}"
+    --mode visual
+    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
+    --multimodalEngineDir "${COSMOS_MULTIMODAL_ENGINE_DIR}"
+    --imageSize "${IMAGE_SIZE}"
+    --warmup "${WARMUP}"
+    --iterations "${ITERATIONS}"
+    --profile
+  )
+  if [[ -n "${INPUT_IMAGE}" ]]; then
+    VISUAL_CMD+=(--inputImage "${INPUT_IMAGE}")
+  fi
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "[DRY RUN] ${VISUAL_CMD[*]}"
     VISUAL_OUT="llm_bench_visual.txt"
+  else
+    VISUAL_OUT="${OUTPUT_DIR}/llm_bench_visual.txt"
+    echo "==> llm_bench --mode visual"
+    echo "    ${VISUAL_CMD[*]}"
+    if "${VISUAL_CMD[@]}" > "${VISUAL_OUT}" 2>&1; then
+      echo "OK: visual benchmark written to ${VISUAL_OUT}"
+    else
+      echo "ERROR: visual benchmark failed" >&2
+      ERRORS+=("visual failed")
+      VISUAL_OUT=""
+    fi
   fi
 fi
 
@@ -265,26 +306,37 @@ fi
 
 if [[ "${SKIP_PROFILE}" == "true" ]]; then
   SKIPPED_MODES+=("profile")
+elif [[ -z "${INPUT_VLM_JSON}" ]]; then
+  echo "WARNING: --input-vlm-json not set; skipping llm_inference --dumpProfile" >&2
+  SKIPPED_MODES+=("profile")
 else
-  if [[ -z "${INPUT_VLM_JSON}" ]]; then
-    echo "WARNING: --input-vlm-json not set; skipping llm_inference --dumpProfile" >&2
-    SKIPPED_MODES+=("profile")
+  PROFILE_OUT="${OUTPUT_DIR}/llm_inference_profile.json"
+  INFERENCE_OUT="${OUTPUT_DIR}/llm_inference_output.json"
+
+  PROFILE_CMD=(
+    "${LLM_INFERENCE}"
+    --engineDir "${COSMOS_LLM_ENGINE_DIR}"
+    --multimodalEngineDir "${COSMOS_MULTIMODAL_ENGINE_DIR}"
+    --inputFile "${INPUT_VLM_JSON}"
+    --outputFile "${INFERENCE_OUT}"
+    --maxGenerateLength "${MAX_GENERATE_LENGTH}"
+    --warmup "${INFERENCE_WARMUP}"
+    --dumpProfile
+    --profileOutputFile "${PROFILE_OUT}"
+  )
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    echo "[DRY RUN] ${PROFILE_CMD[*]}"
   else
-    PROFILE_OUT="${OUTPUT_DIR}/llm_inference_profile.json"
-    INFERENCE_OUT="${OUTPUT_DIR}/llm_inference_output.json"
-    if [[ "${DRY_RUN}" == "false" ]]; then
-      echo "--- end-to-end profiling ---"
-      run_cmd "llm_inference --dumpProfile" \
-        "${LLM_INFERENCE}" \
-        --engineDir "${COSMOS_LLM_ENGINE_DIR}" \
-        --multimodalEngineDir "${COSMOS_MULTIMODAL_ENGINE_DIR}" \
-        --inputFile "${INPUT_VLM_JSON}" \
-        --outputFile "${INFERENCE_OUT}" \
-        --maxGenerateLength "${MAX_GENERATE_LENGTH}" \
-        --dumpProfile \
-        --profileOutputFile "${PROFILE_OUT}" || true
+    echo "==> llm_inference --dumpProfile"
+    echo "    ${PROFILE_CMD[*]}"
+    if "${PROFILE_CMD[@]}"; then
+      echo "OK: profile written to ${PROFILE_OUT}"
     else
-      echo "[DRY RUN] llm_inference --engineDir ... --dumpProfile --profileOutputFile ${PROFILE_OUT}"
+      echo "ERROR: llm_inference profiling failed" >&2
+      ERRORS+=("profile failed")
+      PROFILE_OUT=""
+      INFERENCE_OUT=""
     fi
   fi
 fi
@@ -299,21 +351,51 @@ manifest_file="${OUTPUT_DIR}/manifest.json"
 if [[ "${DRY_RUN}" == "false" ]]; then
   METADATA_JSON=$(collect_metadata 2>/dev/null || echo '{}')
 
-  python3 - "${manifest_file}" <<PYEOF
-import json, sys
+  # Encode arrays as SOH-delimited strings; the single-quoted heredoc prevents
+  # any shell expansion inside the Python source, avoiding injection risks.
+  _SKIPPED="$(IFS=$'\x01'; echo "${SKIPPED_MODES[*]+"${SKIPPED_MODES[*]}"}")" \
+  _ERRORS="$(IFS=$'\x01'; echo "${ERRORS[*]+"${ERRORS[*]}"}")" \
+  _PREFILL_OUT="${PREFILL_OUT}" \
+  _DECODE_OUT="${DECODE_OUT}" \
+  _VISUAL_OUT="${VISUAL_OUT}" \
+  _PROFILE_OUT="${PROFILE_OUT}" \
+  _INFERENCE_OUT="${INFERENCE_OUT}" \
+  _RUN_ID="${RUN_ID}" \
+  _RECORDED_AT="${RECORDED_AT}" \
+  _METADATA_JSON="${METADATA_JSON}" \
+  python3 - "${manifest_file}" <<'PYEOF'
+import json, os, sys
+
+_SEP = "\x01"
+
+def _nullable_basename(v):
+    return os.path.basename(v) if v else None
+
+def _split_env(key):
+    raw = os.environ.get(key, "")
+    return [item for item in raw.split(_SEP) if item]
+
+skipped_modes = _split_env("_SKIPPED")
+errors = _split_env("_ERRORS")
+
+metadata = {}
+try:
+    metadata = json.loads(os.environ.get("_METADATA_JSON", "{}"))
+except json.JSONDecodeError:
+    pass
 
 manifest = {
-  "schema_version": "1",
-  "run_id": "${RUN_ID}",
-  "recorded_at": "${RECORDED_AT}",
-  "metadata": ${METADATA_JSON},
-  "llm_bench_prefill": "$(basename "${PREFILL_OUT}")" if "${PREFILL_OUT}" else None,
-  "llm_bench_decode": "$(basename "${DECODE_OUT}")" if "${DECODE_OUT}" else None,
-  "llm_bench_visual": "$(basename "${VISUAL_OUT}")" if "${VISUAL_OUT}" else None,
-  "llm_inference_profile": "$(basename "${PROFILE_OUT}")" if "${PROFILE_OUT}" else None,
-  "llm_inference_output": "$(basename "${INFERENCE_OUT}")" if "${INFERENCE_OUT}" else None,
-  "skipped_modes": ${SKIPPED_MODES@Q},
-  "errors": [],
+    "schema_version": "1",
+    "run_id": os.environ["_RUN_ID"],
+    "recorded_at": os.environ["_RECORDED_AT"],
+    "metadata": metadata,
+    "llm_bench_prefill": _nullable_basename(os.environ.get("_PREFILL_OUT")),
+    "llm_bench_decode": _nullable_basename(os.environ.get("_DECODE_OUT")),
+    "llm_bench_visual": _nullable_basename(os.environ.get("_VISUAL_OUT")),
+    "llm_inference_profile": _nullable_basename(os.environ.get("_PROFILE_OUT")),
+    "llm_inference_output": _nullable_basename(os.environ.get("_INFERENCE_OUT")),
+    "skipped_modes": skipped_modes,
+    "errors": errors,
 }
 
 with open(sys.argv[1], "w") as fh:
@@ -335,4 +417,11 @@ PYEOF
   fi
 else
   echo "[DRY RUN] Would write manifest: ${manifest_file}"
+fi
+
+# ── exit nonzero if any requested benchmark failed ────────────────────────────
+
+if [[ "${#ERRORS[@]}" -gt 0 ]]; then
+  echo "ERROR: ${#ERRORS[@]} benchmark(s) failed: ${ERRORS[*]}" >&2
+  exit 1
 fi

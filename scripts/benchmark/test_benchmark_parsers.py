@@ -52,6 +52,7 @@ def _make_frame_record(
     *,
     frame_seq: int = 1,
     inference_seconds: float = 1.5,
+    queue_delay_ms: float = 2.0,
     convert_ms: float = 5.0,
     ipc_overhead_ms: float = 3.0,
     publication_ms: float = 1.0,
@@ -60,14 +61,16 @@ def _make_frame_record(
     dropped_before: int = 0,
 ) -> dict[str, Any]:
     """Build a synthetic JSONL frame record with consistent nanosecond timestamps."""
-    dequeue = 1_000_000_000
+    subscribe = 1_000_000_000
+    dequeue = subscribe + int(queue_delay_ms * _NS)
     convert_done = dequeue + int(convert_ms * _NS)
     infer_done = convert_done + int(inference_seconds * 1_000 * _NS) + int(ipc_overhead_ms * _NS)
     publish_done = infer_done + int(publication_ms * _NS)
     return {
         "record_type": "frame",
         "frame_seq": frame_seq,
-        "image_stamp_ns": dequeue - 50 * _NS,
+        "image_stamp_ns": subscribe - 50 * _NS,
+        "subscribe_wall_ns": subscribe,
         "dequeue_wall_ns": dequeue,
         "convert_done_ns": convert_done,
         "infer_done_ns": infer_done,
@@ -79,10 +82,14 @@ def _make_frame_record(
     }
 
 
-def _make_session_start(node_start_ns: int = 500_000_000) -> dict[str, Any]:
+def _make_session_start(
+    node_init_ns: int = 400_000_000,
+    worker_ready_ns: int = 500_000_000,
+) -> dict[str, Any]:
     return {
         "record_type": "session_start",
-        "node_start_wall_ns": node_start_ns,
+        "node_init_wall_ns": node_init_ns,
+        "worker_ready_wall_ns": worker_ready_ns,
         "task_profile": "scene_description",
         "prompt_version": "v1",
         "prompt_config_hash": "deadbeef0000",
@@ -175,6 +182,7 @@ class TestComputeFrameMetrics(unittest.TestCase):
     def test_basic_timing_breakdown(self):
         record = _make_frame_record(
             inference_seconds=1.5,
+            queue_delay_ms=2.0,
             convert_ms=5.0,
             ipc_overhead_ms=3.0,
             publication_ms=1.0,
@@ -182,6 +190,7 @@ class TestComputeFrameMetrics(unittest.TestCase):
         metrics = compute_frame_metrics(record)
 
         self.assertAlmostEqual(metrics["inference_ms"], 1500.0, places=1)
+        self.assertAlmostEqual(metrics["queue_delay_ms"], 2.0, delta=0.5)
         self.assertAlmostEqual(metrics["image_convert_ms"], 5.0, places=1)
         self.assertAlmostEqual(metrics["ipc_overhead_ms"], 3.0, delta=0.5)
         self.assertAlmostEqual(metrics["publication_ms"], 1.0, delta=0.5)
@@ -193,13 +202,17 @@ class TestComputeFrameMetrics(unittest.TestCase):
     def test_ros_overhead_excludes_inference(self):
         record = _make_frame_record(
             inference_seconds=2.0,
+            queue_delay_ms=2.0,
             convert_ms=4.0,
             ipc_overhead_ms=2.0,
             publication_ms=1.0,
         )
         metrics = compute_frame_metrics(record)
-        # ros_overhead = convert + ipc_overhead + publication
-        expected_ros = metrics["image_convert_ms"] + metrics["ipc_overhead_ms"] + metrics["publication_ms"]
+        # ros_overhead = queue_delay + convert + ipc_overhead + publication
+        expected_ros = (
+            metrics["queue_delay_ms"] + metrics["image_convert_ms"]
+            + metrics["ipc_overhead_ms"] + metrics["publication_ms"]
+        )
         self.assertAlmostEqual(metrics["ros_overhead_ms"], expected_ros, places=3)
         # inference_ms should NOT be included in ros_overhead
         self.assertAlmostEqual(metrics["inference_ms"], 2000.0, places=1)
@@ -248,13 +261,22 @@ class TestComputeAggregate(unittest.TestCase):
         self.assertIsNotNone(agg["inference_ms"]["mean"])
         self.assertIsNotNone(agg["ros_overhead_ms"]["mean"])
 
-    def test_cold_start_computed_from_session_start(self):
-        session_start = _make_session_start(node_start_ns=500_000_000)
-        # first frame dequeues at 1_000_000_000 (from _make_frame_record default)
+    def test_cold_start_computed_from_worker_ready(self):
+        # worker_ready_ns=500_000_000; first frame subscribe at 1_000_000_000
+        # (dequeue is 2 ms after subscribe = 1_002_000_000)
+        # cold_start = (dequeue - worker_ready) / 1e6 = (1_002_000_000 - 500_000_000) / 1e6 = 502 ms
+        session_start = _make_session_start(node_init_ns=400_000_000, worker_ready_ns=500_000_000)
+        metrics = [compute_frame_metrics(_make_frame_record(queue_delay_ms=2.0))]
+        agg = compute_aggregate(metrics, session_start, None)
+        # dequeue = subscribe + 2ms = 1_002_000_000
+        self.assertAlmostEqual(agg["cold_start_ms"], 502.0, places=0)
+
+    def test_backend_init_ms_computed(self):
+        session_start = _make_session_start(node_init_ns=400_000_000, worker_ready_ns=500_000_000)
         metrics = [compute_frame_metrics(_make_frame_record())]
         agg = compute_aggregate(metrics, session_start, None)
-        # cold_start = (1_000_000_000 - 500_000_000) / 1e6 = 500 ms
-        self.assertAlmostEqual(agg["cold_start_ms"], 500.0, places=0)
+        # backend_init = (500_000_000 - 400_000_000) / 1e6 = 100 ms
+        self.assertAlmostEqual(agg["backend_init_ms"], 100.0, places=0)
 
     def test_cold_start_none_without_session_start(self):
         metrics = [compute_frame_metrics(_make_frame_record())]
@@ -530,6 +552,243 @@ class TestEndToEndRoundTrip(unittest.TestCase):
             self.assertIn("ROS Pipeline Overhead", text)
         finally:
             path.unlink(missing_ok=True)
+
+
+# ── native benchmark script tests ─────────────────────────────────────────────
+
+
+class TestNativeBenchmarkDryRun(unittest.TestCase):
+    """
+    Verify that dry-run output contains NVIDIA's documented CLI flags without
+    executing any binaries.  The environment variables required by the script
+    are satisfied by stubs; all modes default to included.
+    """
+
+    _SCRIPT = Path(__file__).resolve().parent / "run_native_benchmarks.sh"
+
+    def _run_dry(self, extra_args: list[str] | None = None) -> str:
+        import subprocess
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "TENSORRT_EDGE_LLM_ROOT": "/fake/edgellm",
+            "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
+            "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+            "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
+        }
+        cmd = ["bash", str(self._SCRIPT), "--dry-run"]
+        if extra_args:
+            cmd.extend(extra_args)
+        result = subprocess.run(
+            cmd, env=env, capture_output=True, text=True
+        )
+        return result.stdout + result.stderr
+
+    def test_prefill_contains_batchsize_and_inputlen(self):
+        out = self._run_dry(["--batch-size", "4", "--input-len", "256"])
+        self.assertIn("--batchSize", out)
+        self.assertIn("--inputLen", out)
+        self.assertIn("--mode prefill", out)
+
+    def test_decode_contains_batchsize_and_pastkv(self):
+        out = self._run_dry(["--batch-size", "4", "--past-kv-len", "512"])
+        self.assertIn("--pastKVLen", out)
+        self.assertIn("--mode decode", out)
+
+    def test_visual_contains_imagesize(self):
+        out = self._run_dry(["--image-size", "448x448"])
+        self.assertIn("--imageSize", out)
+        self.assertIn("448x448", out)
+        self.assertIn("--mode visual", out)
+
+    def test_llm_bench_uses_warmup_and_iterations_flags(self):
+        out = self._run_dry(["--warmup", "5", "--iterations", "20"])
+        # All three llm_bench modes must use --warmup and --iterations
+        self.assertEqual(out.count("--warmup 5"), 3)
+        self.assertEqual(out.count("--iterations 20"), 3)
+
+    def test_all_modes_include_profile_flag(self):
+        out = self._run_dry()
+        # Each of the three llm_bench dry-run lines must include --profile
+        lines_with_mode = [l for l in out.splitlines() if "--mode" in l and "llm_bench" in l.lower()]
+        for line in lines_with_mode:
+            self.assertIn("--profile", line, f"--profile missing from: {line}")
+
+    def test_inference_uses_warmup_and_dumpprofile(self):
+        out = self._run_dry(
+            ["--input-vlm-json", "/fake/input.json", "--inference-warmup", "7"]
+        )
+        self.assertIn("--dumpProfile", out)
+        self.assertIn("--profileOutputFile", out)
+        self.assertIn("--warmup 7", out)
+
+    def test_skip_flags_omit_modes(self):
+        out = self._run_dry(["--skip-prefill", "--skip-visual"])
+        self.assertNotIn("--mode prefill", out)
+        self.assertNotIn("--mode visual", out)
+        self.assertIn("--mode decode", out)
+
+
+class TestNativeBenchmarkFailureExitsNonzero(unittest.TestCase):
+    """
+    Verify that a failing benchmark mode causes the script to exit nonzero
+    rather than swallowing the error with `|| true`.
+    """
+
+    _SCRIPT = Path(__file__).resolve().parent / "run_native_benchmarks.sh"
+
+    def test_failing_prefill_exits_nonzero(self):
+        import subprocess
+        import tempfile
+
+        # Create a fake llm_bench that exits 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_build = Path(tmpdir) / "build" / "examples" / "llm"
+            fake_build.mkdir(parents=True)
+            llm_bench = fake_build / "llm_bench"
+            llm_bench.write_text("#!/bin/sh\nexit 1\n")
+            llm_bench.chmod(0o755)
+            llm_inference = fake_build / "llm_inference"
+            llm_inference.write_text("#!/bin/sh\nexit 1\n")
+            llm_inference.chmod(0o755)
+
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "TENSORRT_EDGE_LLM_ROOT": tmpdir,
+                "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
+                "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+                "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
+            }
+            result = subprocess.run(
+                [
+                    "bash", str(self._SCRIPT),
+                    "--skip-decode", "--skip-visual", "--skip-profile",
+                    "--output-dir", str(Path(tmpdir) / "out"),
+                ],
+                env=env, capture_output=True, text=True,
+            )
+        self.assertNotEqual(result.returncode, 0,
+                            "Script must exit nonzero when a benchmark fails")
+
+    def test_all_skipped_exits_zero(self):
+        import subprocess
+
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "TENSORRT_EDGE_LLM_ROOT": "/fake/edgellm",
+            "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
+            "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+            "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
+        }
+        result = subprocess.run(
+            [
+                "bash", str(self._SCRIPT),
+                "--dry-run",
+                "--skip-prefill", "--skip-decode", "--skip-visual", "--skip-profile",
+            ],
+            env=env, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"Script should exit 0 when all modes skipped (stderr: {result.stderr})")
+
+
+class TestManifestArrayTypes(unittest.TestCase):
+    """
+    Verify that the manifest JSON written by run_native_benchmarks.sh uses
+    proper JSON arrays for skipped_modes and errors, not bash-quoted strings.
+    """
+
+    _SCRIPT = Path(__file__).resolve().parent / "run_native_benchmarks.sh"
+
+    def test_skipped_modes_is_json_array(self):
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_build = Path(tmpdir) / "build" / "examples" / "llm"
+            fake_build.mkdir(parents=True)
+            # Fake binaries that succeed
+            for name in ("llm_bench", "llm_inference"):
+                b = fake_build / name
+                b.write_text("#!/bin/sh\necho 'ok'\n")
+                b.chmod(0o755)
+
+            out_dir = Path(tmpdir) / "bench_out"
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "TENSORRT_EDGE_LLM_ROOT": tmpdir,
+                "COSMOS_LLM_ENGINE_DIR": "/fake/llm_engine",
+                "COSMOS_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+                "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
+            }
+            subprocess.run(
+                [
+                    "bash", str(self._SCRIPT),
+                    "--skip-decode", "--skip-visual", "--skip-profile",
+                    "--output-dir", str(out_dir),
+                ],
+                env=env, capture_output=True, text=True,
+            )
+
+            manifest_path = out_dir / "manifest.json"
+            if not manifest_path.exists():
+                self.skipTest("manifest not written (likely missing Python or shell)")
+            with manifest_path.open() as fh:
+                manifest = json.load(fh)
+
+        self.assertIsInstance(manifest["skipped_modes"], list,
+                              "skipped_modes must be a JSON array")
+        self.assertIsInstance(manifest["errors"], list,
+                              "errors must be a JSON array")
+        # decode + visual + profile were skipped
+        self.assertIn("decode", manifest["skipped_modes"])
+        self.assertIn("visual", manifest["skipped_modes"])
+        self.assertIn("profile", manifest["skipped_modes"])
+
+
+class TestQueueDelayMetric(unittest.TestCase):
+    """Verify that queue_delay_ms is computed from subscribe_wall_ns."""
+
+    def test_queue_delay_positive(self):
+        record = _make_frame_record(queue_delay_ms=5.0)
+        metrics = compute_frame_metrics(record)
+        self.assertAlmostEqual(metrics["queue_delay_ms"], 5.0, delta=0.5)
+
+    def test_queue_delay_zero_when_no_subscribe_wall(self):
+        record = _make_frame_record()
+        del record["subscribe_wall_ns"]
+        metrics = compute_frame_metrics(record)
+        self.assertEqual(metrics["queue_delay_ms"], 0.0)
+
+    def test_queue_delay_included_in_ros_overhead(self):
+        record = _make_frame_record(queue_delay_ms=10.0, convert_ms=2.0, ipc_overhead_ms=1.0, publication_ms=0.5)
+        metrics = compute_frame_metrics(record)
+        self.assertGreaterEqual(metrics["ros_overhead_ms"], metrics["queue_delay_ms"])
+        self.assertAlmostEqual(
+            metrics["ros_overhead_ms"],
+            metrics["queue_delay_ms"] + metrics["image_convert_ms"]
+            + metrics["ipc_overhead_ms"] + metrics["publication_ms"],
+            places=3,
+        )
+
+
+class TestColdStartVsBackendInit(unittest.TestCase):
+    """Verify cold_start and backend_init_ms use correct reference points."""
+
+    def test_cold_start_uses_worker_ready_not_node_init(self):
+        # node_init=400ms, worker_ready=600ms, first_dequeue=1002ms (subscribe=1000ms + 2ms queue)
+        session_start = _make_session_start(node_init_ns=400_000_000, worker_ready_ns=600_000_000)
+        metrics = [compute_frame_metrics(_make_frame_record(queue_delay_ms=2.0))]
+        agg = compute_aggregate(metrics, session_start, None)
+        # cold_start = (1_002_000_000 - 600_000_000) / 1e6 = 402 ms
+        self.assertAlmostEqual(agg["cold_start_ms"], 402.0, places=0)
+        # Should NOT be 602 ms (which would use node_init_ns)
+        self.assertFalse(abs(agg["cold_start_ms"] - 602.0) < 2.0)
+
+    def test_backend_init_ms_is_worker_ready_minus_node_init(self):
+        session_start = _make_session_start(node_init_ns=400_000_000, worker_ready_ns=600_000_000)
+        metrics = [compute_frame_metrics(_make_frame_record())]
+        agg = compute_aggregate(metrics, session_start, None)
+        self.assertAlmostEqual(agg["backend_init_ms"], 200.0, places=0)
 
 
 if __name__ == "__main__":

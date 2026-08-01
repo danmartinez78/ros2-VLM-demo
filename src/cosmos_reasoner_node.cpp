@@ -214,6 +214,11 @@ CosmosReasonerNode::CosmosReasonerNode(
 : rclcpp::Node("cosmos_reasoner", options),
   backend_(std::move(backend))
 {
+  // Capture node initialisation start time before any heavyweight work.
+  // Used as the "node_init_wall_ns" baseline in benchmark session_start records.
+  node_init_wall_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+
   declare_parameters();
   validate_parameters();
 
@@ -256,11 +261,10 @@ CosmosReasonerNode::CosmosReasonerNode(
     prompt_history_reset_policy_.c_str());
 
   if (benchmark_out_) {
-    const int64_t node_start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now().time_since_epoch()).count();
     *benchmark_out_
       << "{\"record_type\":\"session_start\""
-      << ",\"node_start_wall_ns\":" << node_start_ns
+      << ",\"node_init_wall_ns\":" << node_init_wall_ns_
+      << ",\"worker_ready_wall_ns\":" << worker_ready_wall_ns_
       << ",\"task_profile\":\"" << task_profile_ << "\""
       << ",\"prompt_version\":\"" << prompt_version_ << "\""
       << ",\"prompt_config_hash\":\"" << prompt_config_hash_ << "\""
@@ -791,6 +795,11 @@ void CosmosReasonerNode::worker_loop()
     return;
   }
 
+  // Record worker-ready wall time immediately after successful initialisation.
+  // This is used as the "cold start" reference point in benchmark reports.
+  worker_ready_wall_ns_ = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     backend_init_complete_ = true;
@@ -823,6 +832,10 @@ void CosmosReasonerNode::worker_loop()
     const int64_t dequeue_wall_ns = benchmark_out_ ?
       std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+    // Queue delay: time the frame spent waiting in the queue before being picked
+    // up by the worker. Captured in the subscription callback and carried through
+    // PendingFrame so this segment is separate from image conversion time.
+    const int64_t subscribe_wall_ns = frame.subscribe_wall_ns;
 
     // ── convert image ─────────────────────────────────────────────────────
     cv::Mat bgr;
@@ -914,6 +927,7 @@ void CosmosReasonerNode::worker_loop()
         << "{\"record_type\":\"frame\""
         << ",\"frame_seq\":" << frame.seq
         << ",\"image_stamp_ns\":" << image_stamp_ns
+        << ",\"subscribe_wall_ns\":" << subscribe_wall_ns
         << ",\"dequeue_wall_ns\":" << dequeue_wall_ns
         << ",\"convert_done_ns\":" << convert_done_ns
         << ",\"infer_done_ns\":" << infer_done_ns
@@ -950,13 +964,20 @@ void CosmosReasonerNode::image_callback(
   have_last_time_ = true;
   ++stats_.sampled;
 
+  // ── capture subscription wall time before enqueue ─────────────────────
+  // Recorded here so "queue delay" (time the frame waits in the queue) can
+  // be reported separately from image-conversion and inference time.
+  const int64_t subscribe_wall_ns = benchmark_out_ ?
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+
   // ── enqueue (bounded depth 1) ─────────────────────────────────────────
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     if (pending_frame_.has_value() && drop_old_frames_) {
       ++stats_.dropped;
     }
-    pending_frame_ = PendingFrame{msg, stats_.sampled};
+    pending_frame_ = PendingFrame{msg, stats_.sampled, subscribe_wall_ns};
   }
   queue_cv_.notify_one();
 }

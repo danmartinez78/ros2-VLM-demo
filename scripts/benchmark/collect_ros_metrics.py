@@ -5,10 +5,26 @@ Compute ROS pipeline overhead metrics from per-frame timing records.
 Reads the JSON-Lines file written by cosmos_reasoner when the
 `benchmark_output_file` parameter is set, then computes and reports:
 
-  - Per-frame: image-convert time, IPC/encoding overhead, native inference
-    time (from the worker's own timer), publication latency, total ROS overhead.
+  - Per-frame: queue delay, image-convert time, IPC/encoding overhead, native
+    inference time (from the worker's own timer), publication latency, total
+    ROS overhead.
   - Aggregate: mean/p50/p95/max for all timing components, dropped-frame count,
-    cold-start duration (first frame latency from session start), failure count.
+    cold-start duration (worker-ready to first dequeue), backend init time, and
+    failure count.
+
+Timing breakdown per frame
+──────────────────────────
+  subscribe_wall_ns  →  dequeue_wall_ns  : queue delay (frame waiting in queue)
+  dequeue_wall_ns    →  convert_done_ns  : image format conversion + optional resize
+  convert_done_ns    →  infer_done_ns    : IPC round-trip (includes native inference)
+  infer_done_ns      →  publish_done_ns  : ROS message publish
+
+Cold-start reference
+────────────────────
+  node_init_wall_ns    : captured at start of CosmosReasonerNode constructor
+  worker_ready_wall_ns : captured after backend.initialize() completes
+  cold_start_ms        : worker_ready → first dequeue (pipeline latency after readiness)
+  backend_init_ms      : node_init → worker_ready (backend initialisation cost)
 
 Native engine timing (inference_seconds) is passed through unmodified from the
 TensorRT worker — it is NOT recomputed here.
@@ -117,18 +133,21 @@ def compute_frame_metrics(record: dict[str, Any]) -> dict[str, Any]:
 
     Timing breakdown
     ────────────────
-      dequeue_wall_ns  →  convert_done_ns  : image format conversion + optional resize
-      convert_done_ns  →  infer_done_ns    : IPC round-trip (includes native inference)
-      infer_done_ns    →  publish_done_ns  : ROS message publish
+      subscribe_wall_ns  →  dequeue_wall_ns  : time frame waited in the queue
+      dequeue_wall_ns    →  convert_done_ns  : image format conversion + optional resize
+      convert_done_ns    →  infer_done_ns    : IPC round-trip (includes native inference)
+      infer_done_ns      →  publish_done_ns  : ROS message publish
 
     ROS overhead = everything except the native inference_seconds timer.
     """
+    subscribe = record.get("subscribe_wall_ns", 0)
     dequeue = record["dequeue_wall_ns"]
     convert_done = record["convert_done_ns"]
     infer_done = record["infer_done_ns"]
     publish_done = record["publish_done_ns"]
     inference_s = float(record.get("inference_seconds", 0.0))
 
+    queue_delay_ms = (dequeue - subscribe) / _NS_PER_MS if subscribe else 0.0
     image_convert_ms = (convert_done - dequeue) / _NS_PER_MS
     total_ipc_ms = (infer_done - convert_done) / _NS_PER_MS
     inference_ms = inference_s * 1000.0
@@ -137,16 +156,18 @@ def compute_frame_metrics(record: dict[str, Any]) -> dict[str, Any]:
     ipc_overhead_ms = max(0.0, total_ipc_ms - inference_ms)
     publication_ms = (publish_done - infer_done) / _NS_PER_MS
     total_worker_ms = (publish_done - dequeue) / _NS_PER_MS
-    ros_overhead_ms = image_convert_ms + ipc_overhead_ms + publication_ms
+    ros_overhead_ms = queue_delay_ms + image_convert_ms + ipc_overhead_ms + publication_ms
 
     return {
         "frame_seq": record["frame_seq"],
         "image_stamp_ns": record.get("image_stamp_ns", 0),
+        "subscribe_wall_ns": subscribe,
         "dequeue_wall_ns": dequeue,
         "convert_done_ns": convert_done,
         "infer_done_ns": infer_done,
         "publish_done_ns": publish_done,
         "inference_ms": inference_ms,
+        "queue_delay_ms": queue_delay_ms,
         "image_convert_ms": image_convert_ms,
         "ipc_overhead_ms": ipc_overhead_ms,
         "publication_ms": publication_ms,
@@ -179,6 +200,7 @@ def compute_aggregate(
     ros_overhead_vals = [f["ros_overhead_ms"] for f in successful]
     ipc_overhead_vals = [f["ipc_overhead_ms"] for f in successful]
     convert_vals = [f["image_convert_ms"] for f in successful]
+    queue_delay_vals = [f["queue_delay_ms"] for f in successful]
     publication_vals = [f["publication_ms"] for f in successful]
     total_vals = [f["total_worker_ms"] for f in successful]
 
@@ -187,13 +209,26 @@ def compute_aggregate(
         (frame_metrics[-1]["dropped_before"] if frame_metrics else 0)
     )
 
-    # Cold start: time from session_start to first frame dequeued
+    # Cold start: time from worker-ready to first frame dequeued.
+    # worker_ready_wall_ns marks when the inference backend finished initialising
+    # (the point at which the pipeline can actually accept frames).
+    # node_init_wall_ns is also recorded for reference but is NOT used as the
+    # cold-start baseline; time between node_init and worker_ready is backend
+    # initialisation time, not cold-start.
     cold_start_ms: float | None = None
     if session_start and frame_metrics:
-        node_start = session_start.get("node_start_wall_ns", 0)
+        worker_ready = session_start.get("worker_ready_wall_ns", 0)
         first_dequeue = frame_metrics[0].get("dequeue_wall_ns", 0)
-        if node_start and first_dequeue:
-            cold_start_ms = (first_dequeue - node_start) / _NS_PER_MS
+        if worker_ready and first_dequeue:
+            cold_start_ms = (first_dequeue - worker_ready) / _NS_PER_MS
+
+    # Backend initialisation time: node_init → worker_ready
+    backend_init_ms: float | None = None
+    if session_start:
+        node_init = session_start.get("node_init_wall_ns", 0)
+        worker_ready = session_start.get("worker_ready_wall_ns", 0)
+        if node_init and worker_ready:
+            backend_init_ms = (worker_ready - node_init) / _NS_PER_MS
 
     return {
         "total_frames": len(frame_metrics),
@@ -203,8 +238,10 @@ def compute_aggregate(
         "failed_frames": len(measured) - len(successful),
         "total_dropped": total_dropped,
         "cold_start_ms": cold_start_ms,
+        "backend_init_ms": backend_init_ms,
         "inference_ms": _stats(inference_ms_vals),
         "ros_overhead_ms": _stats(ros_overhead_vals),
+        "queue_delay_ms": _stats(queue_delay_vals),
         "ipc_overhead_ms": _stats(ipc_overhead_vals),
         "image_convert_ms": _stats(convert_vals),
         "publication_ms": _stats(publication_vals),
@@ -252,6 +289,7 @@ def build_report(
 _CSV_FIELDS = [
     "frame_seq",
     "image_stamp_ns",
+    "queue_delay_ms",
     "inference_ms",
     "image_convert_ms",
     "ipc_overhead_ms",
