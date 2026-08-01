@@ -26,6 +26,12 @@ caused a reproducible fused-attention prefill stall on Thor. Process isolation
 removes that interaction and allows a failed worker to be restarted without
 restarting the ROS node.
 
+The worker is also a standalone reasoning service. It can remain loaded while
+ROS adapters, command-line experiments, and future evaluation tools connect
+sequentially through the same versioned IPC contract. See
+[the standalone service guide](docs/standalone-reasoning-service.md) for
+ROS-free image inference and externally managed worker recipes.
+
 See [docs/architecture.md](docs/architecture.md) for the detailed design and
 [docs/thor-edge-llm-prefill-stall-rca.md](docs/thor-edge-llm-prefill-stall-rca.md)
 for the investigation and evidence.
@@ -345,6 +351,7 @@ rviz2 -d /absolute/path/to/ros2-VLM-demo/rviz/vision_reasoning_results.rviz
 | `image_topic` | string | `/camera/image_raw` | Raw image input topic |
 | `result_topic` | string | `/cosmos/reasoning` | Result topic |
 | `worker_socket_path` | string | `/tmp/cosmos_edge_llm.sock` | Worker Unix-socket path |
+| `start_worker` | launch argument | `true` | Start and supervise the worker from ROS launch; set `false` to use a standalone service |
 | `worker_connect_timeout_seconds` | int | `120` | Initial/reconnect deadline |
 | `worker_inference_deadline_seconds` | int | `60` | Worker-side inference deadline; worker self-terminates via watchdog on expiry (must be < `worker_request_timeout_seconds`) |
 | `worker_request_timeout_seconds` | int | `90` | Per-request IPC send/receive deadline (must be > `worker_inference_deadline_seconds`) |
