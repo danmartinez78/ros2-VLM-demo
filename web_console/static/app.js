@@ -60,6 +60,9 @@ function navigate(viewId) {
   else if (viewId === "datasets") { _loadDatasets(); }
   else if (viewId === "runs") { _loadRuns(); }
   else if (viewId === "diagnostics") { _loadDiagnostics(); }
+  else if (viewId === "frame-explorer") { _loadFrameExplorer(); }
+  else if (viewId === "profiles") { _loadProfiles(); }
+  else if (viewId === "compare") { _loadCompare(); }
 }
 
 document.addEventListener("DOMContentLoaded", function() {
@@ -1097,3 +1100,290 @@ async function loadDiagDatasets() {
     el.textContent = "Error: " + e.message;
   }
 }
+
+/* ── Frame Extraction ────────────────────────────────────────────────────── */
+
+async function _startExtraction(bagKey, imageTopic, options) {
+  var body = Object.assign({ bag_key: bagKey, image_topic: imageTopic }, options || {});
+  return _apiPost("/api/extract", body);
+}
+
+async function _cancelExtraction(runId) {
+  return _apiPost("/api/extract/" + runId + "/cancel", {});
+}
+
+/* ── Frame Explorer view ─────────────────────────────────────────────────── */
+
+var _frameExplorerDatasetId = null;
+var _frameExplorerFrames = [];
+var _frameExplorerSelected = 0;
+
+async function _loadFrameExplorer() {
+  var listEl = document.getElementById("frame-dataset-list");
+  if (!listEl) return;
+  _empty(listEl);
+  listEl.appendChild(_el("p", "muted", "Loading datasets…"));
+  try {
+    var data = await _apiGet("/api/frame-datasets");
+    _empty(listEl);
+    if (!data.datasets || data.datasets.length === 0) {
+      listEl.appendChild(_el("p", "muted", "No frame datasets found. Extract frames from a rosbag to get started."));
+      return;
+    }
+    data.datasets.forEach(function(ds) {
+      var btn = _el("button", "dataset-btn");
+      btn.appendChild(_el("span", "ds-id", ds.dataset_id.slice(0, 8) + "…"));
+      btn.appendChild(_el("span", "ds-meta", " bag: " + (ds.bag_key || "?") + " · " + (ds.frame_count || "?") + " frames"));
+      btn.addEventListener("click", function() { _openFrameDataset(ds.dataset_id); });
+      listEl.appendChild(btn);
+    });
+  } catch (e) {
+    _empty(listEl);
+    listEl.appendChild(_el("p", "error-msg", "Failed to load datasets: " + e.message));
+  }
+}
+
+async function _openFrameDataset(datasetId) {
+  _frameExplorerDatasetId = datasetId;
+  var previewEl = document.getElementById("frame-preview-area");
+  var stripEl = document.getElementById("frame-thumbnail-strip");
+  var metaEl = document.getElementById("frame-metadata");
+  if (!previewEl || !stripEl) return;
+  _empty(stripEl);
+  _empty(previewEl);
+  if (metaEl) metaEl.textContent = "Loading…";
+  try {
+    var manifest = await _apiGet("/api/frame-datasets/" + datasetId);
+    _frameExplorerFrames = manifest.frames || [];
+    _frameExplorerSelected = 0;
+    _renderFrameStrip(datasetId, manifest.frames);
+    if (manifest.frames && manifest.frames.length > 0) {
+      _showFrame(datasetId, 0, manifest.frames[0]);
+    }
+  } catch (e) {
+    previewEl.appendChild(_el("p", "error-msg", "Failed to load dataset: " + e.message));
+  }
+}
+
+function _renderFrameStrip(datasetId, frames) {
+  var stripEl = document.getElementById("frame-thumbnail-strip");
+  if (!stripEl) return;
+  _empty(stripEl);
+  (frames || []).forEach(function(frame, idx) {
+    var thumb = document.createElement("img");
+    thumb.className = "frame-thumb" + (idx === 0 ? " selected" : "");
+    thumb.src = "/api/frame-datasets/" + datasetId + "/frames/" + idx;
+    thumb.alt = "Frame " + idx;
+    thumb.title = "Frame " + idx + " @ " + (frame.timestamp_sec || "?") + "s";
+    thumb.addEventListener("click", function() { _showFrame(datasetId, idx, frame); });
+    stripEl.appendChild(thumb);
+  });
+}
+
+function _showFrame(datasetId, idx, frame) {
+  _frameExplorerSelected = idx;
+  var previewEl = document.getElementById("frame-preview-area");
+  var metaEl = document.getElementById("frame-metadata");
+  if (!previewEl) return;
+  _empty(previewEl);
+  var img = document.createElement("img");
+  img.className = "frame-preview-img";
+  img.src = "/api/frame-datasets/" + datasetId + "/frames/" + idx;
+  img.alt = "Frame " + idx;
+  previewEl.appendChild(img);
+  if (metaEl) {
+    _empty(metaEl);
+    metaEl.appendChild(_el("span", "meta-item", "Frame: " + idx));
+    metaEl.appendChild(_el("span", "meta-item", " · Timestamp: " + (frame.timestamp_sec || "?") + "s"));
+    if (frame.source_seq) metaEl.appendChild(_el("span", "meta-item", " · Seq: " + frame.source_seq));
+  }
+  // Update thumbnail selection.
+  document.querySelectorAll(".frame-thumb").forEach(function(t, i) {
+    _setClass(t, "selected", i === idx);
+  });
+}
+
+function _framePrev() {
+  if (!_frameExplorerDatasetId || _frameExplorerFrames.length === 0) return;
+  var next = Math.max(0, _frameExplorerSelected - 1);
+  _showFrame(_frameExplorerDatasetId, next, _frameExplorerFrames[next]);
+}
+
+function _frameNext() {
+  if (!_frameExplorerDatasetId || _frameExplorerFrames.length === 0) return;
+  var next = Math.min(_frameExplorerFrames.length - 1, _frameExplorerSelected + 1);
+  _showFrame(_frameExplorerDatasetId, next, _frameExplorerFrames[next]);
+}
+
+/* ── Profiles view ───────────────────────────────────────────────────────── */
+
+async function _loadProfiles() {
+  var el = document.getElementById("profiles-list");
+  if (!el) return;
+  _empty(el);
+  el.appendChild(_el("p", "muted", "Loading profiles…"));
+  try {
+    var data = await _apiGet("/api/profiles");
+    _empty(el);
+    if (!data.profiles || data.profiles.length === 0) {
+      el.appendChild(_el("p", "muted", "No task profiles found."));
+      return;
+    }
+    data.profiles.forEach(function(p) {
+      var card = _el("div", "profile-card");
+      card.appendChild(_el("h3", null, p.name + " v" + p.version));
+      card.appendChild(_el("p", "profile-hash", "Hash: " + p.prompt_hash.slice(0, 16) + "…"));
+      var pre = _el("pre", "profile-prompt");
+      pre.textContent = p.task_prompt;
+      card.appendChild(pre);
+      el.appendChild(card);
+    });
+  } catch (e) {
+    _empty(el);
+    el.appendChild(_el("p", "error-msg", "Failed to load profiles: " + e.message));
+  }
+}
+
+/* ── Compare view ────────────────────────────────────────────────────────── */
+
+async function _loadCompare() {
+  var formEl = document.getElementById("compare-form");
+  var resultsEl = document.getElementById("compare-results");
+  if (!formEl || !resultsEl) return;
+  _empty(resultsEl);
+  resultsEl.appendChild(_el("p", "muted", "Enter two or more run IDs above and click Compare."));
+}
+
+async function _runCompare() {
+  var input1 = document.getElementById("compare-run-id-1");
+  var input2 = document.getElementById("compare-run-id-2");
+  var resultsEl = document.getElementById("compare-results");
+  if (!input1 || !input2 || !resultsEl) return;
+  var ids = [input1.value.trim(), input2.value.trim()].filter(Boolean);
+  if (ids.length < 2) {
+    _empty(resultsEl);
+    resultsEl.appendChild(_el("p", "error-msg", "Please enter at least two run IDs."));
+    return;
+  }
+  _empty(resultsEl);
+  resultsEl.appendChild(_el("p", "muted", "Comparing…"));
+  try {
+    var data = await _apiGet("/api/compare?run_ids=" + ids.join(","));
+    _empty(resultsEl);
+    _renderCompareResults(data, resultsEl, ids);
+  } catch (e) {
+    _empty(resultsEl);
+    resultsEl.appendChild(_el("p", "error-msg", "Compare failed: " + e.message));
+  }
+}
+
+function _renderCompareResults(data, container, runIds) {
+  // Summary headers.
+  var summaryDiv = _el("div", "compare-summary");
+  runIds.forEach(function(rid) {
+    var s = data.summaries && data.summaries[rid];
+    if (!s) return;
+    var card = _el("div", "compare-summary-card");
+    card.appendChild(_el("h4", null, rid.slice(0, 8) + "…"));
+    card.appendChild(_el("p", null, "Model: " + (s.model || "?")));
+    card.appendChild(_el("p", null, "Strategy: " + (s.strategy || s.kind || "?")));
+    card.appendChild(_el("p", null, "Status: " + (s.status || "?")));
+    summaryDiv.appendChild(card);
+  });
+  container.appendChild(summaryDiv);
+
+  // Aligned frames table.
+  var frames = data.aligned_frames || [];
+  if (frames.length === 0) {
+    container.appendChild(_el("p", "muted", "No aligned frames found."));
+    return;
+  }
+  var table = document.createElement("table");
+  table.className = "compare-table";
+  var thead = document.createElement("thead");
+  var hRow = document.createElement("tr");
+  hRow.appendChild(_el("th", null, "Frame"));
+  runIds.forEach(function(rid) {
+    hRow.appendChild(_el("th", null, rid.slice(0, 8) + "…"));
+  });
+  thead.appendChild(hRow);
+  table.appendChild(thead);
+  var tbody = document.createElement("tbody");
+  frames.forEach(function(row) {
+    var tr = document.createElement("tr");
+    tr.appendChild(_el("td", null, String(row.frame_key)));
+    runIds.forEach(function(rid) {
+      var cell = _el("td", null);
+      var fr = row[rid];
+      if (fr) {
+        var txt = _el("pre", "compare-cell-text");
+        txt.textContent = fr.text || "(no text)";
+        var lat = _el("span", "compare-latency", fr.latency_ms ? fr.latency_ms + "ms" : "");
+        _append(cell, txt, lat);
+      } else {
+        cell.appendChild(_el("span", "muted", "—"));
+      }
+      tr.appendChild(cell);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  container.appendChild(table);
+}
+
+/* ── Review annotations ──────────────────────────────────────────────────── */
+
+async function _submitReview(runId, frameIndex, label, note) {
+  return _apiPost("/api/runs/" + runId + "/reviews", {
+    frame_index: frameIndex,
+    label: label,
+    note: note || "",
+  });
+}
+
+async function _loadReviewsForRun(runId, containerEl) {
+  if (!containerEl) return;
+  try {
+    var data = await _apiGet("/api/runs/" + runId + "/reviews");
+    _empty(containerEl);
+    if (!data.reviews || data.reviews.length === 0) {
+      containerEl.appendChild(_el("p", "muted", "No reviews yet."));
+      return;
+    }
+    data.reviews.forEach(function(r) {
+      var row = _el("div", "review-row");
+      row.appendChild(_el("span", "review-frame", "Frame " + r.frame_index));
+      row.appendChild(_badge(r.label, "review-label-" + r.label.replace(/_/g, "-")));
+      if (r.note) row.appendChild(_el("span", "review-note", r.note));
+      containerEl.appendChild(row);
+    });
+  } catch (e) {
+    containerEl.appendChild(_el("p", "error-msg", "Failed to load reviews: " + e.message));
+  }
+}
+
+function _renderReviewUI(runId, frameIndex, containerEl) {
+  if (!containerEl) return;
+  _empty(containerEl);
+  var labels = ["acceptable", "unsupported_hallucinated", "missed_important_detail", "ambiguous"];
+  var noteInput = document.createElement("input");
+  noteInput.type = "text";
+  noteInput.className = "review-note-input";
+  noteInput.placeholder = "Optional note…";
+  containerEl.appendChild(_el("span", "review-label-prompt", "Annotate frame " + frameIndex + ": "));
+  labels.forEach(function(lbl) {
+    var btn = _el("button", "review-btn review-btn-" + lbl.replace(/_/g, "-"), lbl.replace(/_/g, " "));
+    btn.addEventListener("click", async function() {
+      try {
+        await _submitReview(runId, frameIndex, lbl, noteInput.value);
+        btn.classList.add("review-saved");
+        btn.textContent = "✓ " + lbl.replace(/_/g, " ");
+      } catch (e) {
+        containerEl.appendChild(_el("span", "error-msg", "Save failed: " + e.message));
+      }
+    });
+    containerEl.appendChild(btn);
+  });
+  containerEl.appendChild(noteInput);
+}
+

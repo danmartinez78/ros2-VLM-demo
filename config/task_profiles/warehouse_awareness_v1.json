@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "name": "warehouse_awareness",
+  "version": "1.0",
+  "description": "Warehouse operational-awareness task profile. Reports people, vehicles, objects, and hazards visible in a single camera frame. Targets structured JSON output compatible with downstream annotation and comparison workflows.",
+  "system_instruction": "You are a warehouse safety and operational observer. Analyse only the current image. Base every claim on what is directly visible. When evidence is ambiguous or absent, record the uncertainty rather than guessing.",
+  "task_prompt": "Analyse this warehouse camera frame and return ONLY a JSON object with these keys:\n- \"summary\": one-sentence description of the scene\n- \"people\": list of objects {\"activity\": \"...\", \"visibility\": \"clear|partial|uncertain\"}\n- \"vehicles\": list of objects {\"type\": \"AGV|forklift|other\", \"motion\": \"moving|stationary|uncertain\"}\n- \"objects_or_obstructions\": list of strings describing pallets, crates, boxes, or aisle blockages\n- \"scene_changes\": list of strings describing visible differences from a prior observation (empty list if none or no prior context)\n- \"hazards\": list of strings describing worker-vehicle proximity or immediate dangers\n- \"uncertainties\": list of strings for claims the image does not support\n\nReturn only the JSON object, no prose before or after.",
+  "output_schema": {
+    "type": "object",
+    "required": ["summary", "people", "vehicles", "objects_or_obstructions", "scene_changes", "hazards", "uncertainties"],
+    "properties": {
+      "summary": {"type": "string"},
+      "people": {"type": "array"},
+      "vehicles": {"type": "array"},
+      "objects_or_obstructions": {"type": "array"},
+      "scene_changes": {"type": "array"},
+      "hazards": {"type": "array"},
+      "uncertainties": {"type": "array"}
+    }
+  }
+}

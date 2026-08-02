@@ -8,15 +8,24 @@ that interface; a conspicuous warning is printed at startup in that case.
 
 Routes
 ------
-GET  /                        → HTML console page
-GET  /api/status              → JSON server + GPU status
-POST /api/infer               → multipart/form-data image + prompt → JSON result
-POST /api/ros/start           → JSON body → start ROS experiment
-POST /api/ros/stop            → JSON body {run_id} → stop ROS experiment
-GET  /api/runs                → JSON list of recent runs
-GET  /api/runs/<run_id>       → JSON single run manifest
-GET  /api/runs/<run_id>/logs  → JSON log lines for a ROS run
-GET  /static/<path>           → static asset (css/js)
+GET  /                                          → HTML console page
+GET  /api/status                                → JSON server + GPU status
+POST /api/infer                                 → multipart/form-data image + prompt → JSON result
+POST /api/ros/start                             → JSON body → start ROS experiment
+POST /api/ros/stop                              → JSON body {run_id} → stop ROS experiment
+GET  /api/runs                                  → JSON list of recent runs
+GET  /api/runs/<run_id>                         → JSON single run manifest
+GET  /api/runs/<run_id>/logs                    → JSON log lines for a ROS run
+GET  /static/<path>                             → static asset (css/js)
+GET  /api/profiles                              → JSON list of task profiles
+GET  /api/frame-datasets                        → JSON list of frame datasets
+GET  /api/frame-datasets/<dataset_id>           → JSON frame dataset manifest
+GET  /api/frame-datasets/<dataset_id>/frames/<n> → JPEG frame image (bounded, allowlisted)
+POST /api/extract                               → JSON body → start frame extraction from catalog bag
+POST /api/extract/<run_id>/cancel               → cancel frame extraction run
+GET  /api/runs/<run_id>/reviews                 → JSON list of review annotations for a run
+POST /api/runs/<run_id>/reviews                 → JSON body → upsert review annotation
+GET  /api/compare                               → JSON comparison of two runs aligned by frame
 """
 from __future__ import annotations
 
@@ -44,6 +53,14 @@ from .experiment_engine import (
     run_experiment,
     validate_definition,
 )
+from .frame_extractor import (
+    ExtractionParams,
+    FrameDatasetStore,
+    _is_safe_dataset_id,
+    allowlist_bag_path,
+    build_extraction_args,
+    validate_extraction_params,
+)
 from .inference_client import (
     ALLOWED_IMAGE_EXTENSIONS,
     MAX_IMAGE_BYTES,
@@ -51,8 +68,20 @@ from .inference_client import (
 )
 from .model_catalog import discover_models
 from .process_manager import ProcessManager
+from .review_store import (
+    ALLOWED_REVIEW_LABELS,
+    ReviewAnnotation,
+    ReviewStore,
+    validate_review,
+)
 from .run_store import RunStore, _is_safe_run_id, _TERMINAL_STATUSES
 from .status_collector import collect_status, check_server_reachable
+from .task_profiles import (
+    ParsedOutput,
+    TaskProfile,
+    discover_profiles,
+    parse_structured_output,
+)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -78,6 +107,9 @@ _ALLOWED_ROS_PARAMS = frozenset(
 # Allowlisted artifact filenames produced by run_image_proc_test.sh.
 # The script writes these into $ARTIFACT_DIR; no other filenames are captured.
 _ROS_ARTIFACT_ALLOWLIST = ("manifest.json", "benchmark.jsonl", "launch.log", "results.log")
+
+# Maximum frame index that can be requested via the image-serving route.
+_MAX_FRAME_INDEX = 9999
 
 _STATIC_DIR = pathlib.Path(__file__).parent / "static"
 _CONTENT_TYPES: Dict[str, str] = {
@@ -436,12 +468,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_list_models()
             elif path == "/api/datasets":
                 self._api_list_datasets()
+            elif path == "/api/profiles":
+                self._api_list_profiles()
+            elif path == "/api/frame-datasets":
+                self._api_list_frame_datasets()
+            elif path == "/api/compare":
+                self._api_compare_runs(parsed)
             elif _RUN_RE.match(path) and path.endswith("/logs"):
                 run_id = _RUN_RE.match(path).group(1)
                 self._api_get_run_logs(run_id)
+            elif _RUN_REVIEWS_RE.match(path):
+                run_id = _RUN_REVIEWS_RE.match(path).group(1)
+                self._api_get_reviews(run_id)
             elif _RUN_RE.match(path):
                 run_id = _RUN_RE.match(path).group(1)
                 self._api_get_run(run_id)
+            elif _FRAME_IMAGE_RE.match(path):
+                m = _FRAME_IMAGE_RE.match(path)
+                self._api_serve_frame_image(m.group(1), int(m.group(2)))
+            elif _FRAME_DATASET_RE.match(path):
+                dataset_id = _FRAME_DATASET_RE.match(path).group(1)
+                self._api_get_frame_dataset(dataset_id)
             elif path.startswith("/static/"):
                 self._serve_static(path[len("/static/"):])
             else:
@@ -464,6 +511,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_experiment_run()
             elif path == "/api/datasets/download":
                 self._api_dataset_download()
+            elif path == "/api/extract":
+                self._api_extract_start()
+            elif _EXTRACT_CANCEL_RE.match(path):
+                run_id = _EXTRACT_CANCEL_RE.match(path).group(1)
+                self._api_extract_cancel(run_id)
+            elif _RUN_REVIEWS_RE.match(path):
+                run_id = _RUN_REVIEWS_RE.match(path).group(1)
+                self._api_upsert_review(run_id)
             else:
                 self._send_error(404, "Not found")
         except Exception:
@@ -1180,6 +1235,342 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         threading.Thread(target=_run_in_background, daemon=True).start()
         self._send_json(202, initial_record)
 
+    # ── task profile API ─────────────────────────────────────────────────────
+
+    def _api_list_profiles(self) -> None:
+        cfg = self.server_instance.config
+        profiles_dir = cfg.get("task_profiles_dir") or str(
+            pathlib.Path(__file__).parent.parent / "config" / "task_profiles"
+        )
+        try:
+            profiles = discover_profiles(profiles_dir)
+        except Exception as exc:
+            self._send_error(500, f"Failed to load profiles: {exc}")
+            return
+        self._send_json(200, {
+            "profiles": [
+                {
+                    "profile_id": p.profile_id(),
+                    "name": p.name,
+                    "version": p.version,
+                    "prompt_hash": p.prompt_hash,
+                    "system_instruction": p.system_instruction,
+                    "task_prompt": p.task_prompt,
+                    "schema_example": p.schema_example,
+                }
+                for p in profiles
+            ]
+        })
+
+    # ── frame dataset API ────────────────────────────────────────────────────
+
+    def _api_list_frame_datasets(self) -> None:
+        store = self.server_instance.frame_dataset_store
+        try:
+            datasets = store.list_datasets()
+        except Exception as exc:
+            self._send_error(500, f"Failed to list frame datasets: {exc}")
+            return
+        self._send_json(200, {"datasets": datasets})
+
+    def _api_get_frame_dataset(self, dataset_id: str) -> None:
+        if not _is_safe_dataset_id(dataset_id):
+            self._send_error(400, "Invalid dataset_id")
+            return
+        store = self.server_instance.frame_dataset_store
+        manifest = store.get_manifest(dataset_id)
+        if manifest is None:
+            self._send_error(404, "Dataset not found")
+            return
+        self._send_json(200, manifest)
+
+    def _api_serve_frame_image(self, dataset_id: str, frame_index: int) -> None:
+        if not _is_safe_dataset_id(dataset_id):
+            self._send_error(400, "Invalid dataset_id")
+            return
+        if frame_index < 0 or frame_index > _MAX_FRAME_INDEX:
+            self._send_error(400, "Frame index out of range")
+            return
+        store = self.server_instance.frame_dataset_store
+        img_path = store.get_frame_path(dataset_id, frame_index)
+        if img_path is None:
+            self._send_error(404, "Frame not found")
+            return
+        try:
+            data = img_path.read_bytes()
+        except OSError:
+            self._send_error(404, "Frame not found")
+            return
+        self._send_response(200, data, "image/jpeg")
+
+    # ── frame extraction API ─────────────────────────────────────────────────
+
+    def _api_extract_start(self) -> None:
+        """Start a rosbag frame-extraction run.
+
+        The bag must be an installed catalog entry; no arbitrary paths.
+        """
+        cfg = self.server_instance.config
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        # Validate extraction parameters.
+        error = validate_extraction_params(body)
+        if error:
+            self._send_error(400, error)
+            return
+
+        # Allowlist bag path against catalog.
+        bag_key = body.get("bag_key", "")
+        catalog = discover_datasets(
+            rosbag_root=cfg.get("rosbag_dir"),
+            image_root=cfg.get("image_dataset_dir"),
+            video_root=cfg.get("video_dataset_dir"),
+        )
+        try:
+            bag_path = allowlist_bag_path(bag_key, catalog)
+        except ValueError as exc:
+            self._send_error(400, str(exc))
+            return
+
+        run_id = RunStore.new_run_id()
+        run_store = self.server_instance.run_store
+        frame_store = self.server_instance.frame_dataset_store
+        dataset_id = RunStore.new_run_id()  # unique ID for this dataset
+
+        output_dir = frame_store.base_dir / dataset_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        params = ExtractionParams(
+            bag_key=bag_key,
+            bag_path=bag_path,
+            image_topic=body.get("image_topic", ""),
+            start_offset=body.get("start_offset", 0.0),
+            end_offset=body.get("end_offset"),
+            duration=body.get("duration"),
+            sample_interval=body.get("sample_interval"),
+            target_sample_count=body.get("target_sample_count"),
+            max_frames=body.get("max_frames", 100),
+            dataset_id=dataset_id,
+            output_dir=str(output_dir),
+        )
+
+        script_path = str(
+            pathlib.Path(__file__).parent.parent / "scripts" / "extract_bag_frames.py"
+        )
+        args = build_extraction_args(script_path, params)
+
+        initial_record: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "extraction",
+            "created_at": _now_iso(),
+            "bag_key": bag_key,
+            "bag_path": bag_path,
+            "dataset_id": dataset_id,
+            "image_topic": params.image_topic,
+            "max_frames": params.max_frames,
+            "output_dir": str(output_dir),
+            "status": "starting",
+        }
+        run_store.save_run(run_id, initial_record)
+
+        def _on_complete(
+            rid: str,
+            exit_code: Optional[int],
+            was_stopped: bool,
+            log_lines: list,
+        ) -> None:
+            status_str = "stopped" if was_stopped else (
+                "completed" if exit_code == 0 else
+                "ros_unavailable" if exit_code == 2 else
+                "failed"
+            )
+            run_store.finalize_run(rid, {
+                "status": status_str,
+                "exit_code": exit_code,
+                "completed_at": _now_iso(),
+                "success": exit_code == 0 and not was_stopped,
+                "log_lines": log_lines[:200],
+            })
+
+        srv = self.server_instance
+        try:
+            pid = srv.process_manager.start_ros_experiment(
+                run_id=run_id,
+                args=args,
+                env=os.environ.copy(),
+                on_complete=_on_complete,
+            )
+        except Exception as exc:
+            run_store.finalize_run(run_id, {
+                "status": "failed",
+                "exit_code": None,
+                "completed_at": _now_iso(),
+                "success": False,
+                "error": str(exc),
+            })
+            self._send_error(500, f"Failed to start extraction: {exc}")
+            return
+
+        run_store.update_run_if_status(run_id, "starting", {"status": "running", "pid": pid})
+        self._send_json(202, run_store.get_run(run_id) or initial_record)
+
+    def _api_extract_cancel(self, run_id: str) -> None:
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        run_store = self.server_instance.run_store
+        manifest = run_store.get_run(run_id)
+        if manifest is None:
+            self._send_error(404, "Run not found")
+            return
+        if manifest.get("kind") != "extraction":
+            self._send_error(400, "Not an extraction run")
+            return
+        stopped = self.server_instance.process_manager.stop_ros_experiment(run_id)
+        self._send_json(200, {"run_id": run_id, "stopped": stopped})
+
+    # ── review annotation API ─────────────────────────────────────────────────
+
+    def _api_get_reviews(self, run_id: str) -> None:
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        review_store = self.server_instance.review_store
+        reviews = review_store.get_reviews(run_id)
+        self._send_json(200, {
+            "run_id": run_id,
+            "reviews": [
+                {
+                    "frame_index": r.frame_index,
+                    "label": r.label,
+                    "note": r.note,
+                    "created_at": r.created_at,
+                    "updated_at": r.updated_at,
+                }
+                for r in reviews
+            ]
+        })
+
+    def _api_upsert_review(self, run_id: str) -> None:
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        error = validate_review(body)
+        if error:
+            self._send_error(400, error)
+            return
+        annotation = ReviewAnnotation(
+            run_id=run_id,
+            frame_index=int(body["frame_index"]),
+            label=body["label"],
+            note=body.get("note", ""),
+            created_at=_now_iso(),
+            updated_at=_now_iso(),
+        )
+        review_store = self.server_instance.review_store
+        try:
+            review_store.upsert_review(annotation)
+        except Exception as exc:
+            self._send_error(500, f"Failed to save review: {exc}")
+            return
+        self._send_json(200, {
+            "run_id": run_id,
+            "frame_index": annotation.frame_index,
+            "label": annotation.label,
+            "note": annotation.note,
+            "updated_at": annotation.updated_at,
+        })
+
+    # ── comparison API ────────────────────────────────────────────────────────
+
+    def _api_compare_runs(self, parsed: Any) -> None:
+        """Align two or more runs by source frame/timestamp.
+
+        Query string: ?run_ids=<id1>,<id2>[,<id3>...]
+        """
+        from urllib.parse import parse_qs
+        qs = parse_qs(parsed.query)
+        run_ids_param = qs.get("run_ids", [""])[0]
+        run_ids = [r.strip() for r in run_ids_param.split(",") if r.strip()]
+        if len(run_ids) < 2:
+            self._send_error(400, "run_ids must contain at least two run IDs")
+            return
+        if len(run_ids) > 8:
+            self._send_error(400, "run_ids must contain at most eight run IDs")
+            return
+        for rid in run_ids:
+            if not _is_safe_run_id(rid):
+                self._send_error(400, f"Invalid run_id: {rid!r}")
+                return
+
+        run_store = self.server_instance.run_store
+        manifests = {}
+        for rid in run_ids:
+            m = run_store.get_run(rid)
+            if m is None:
+                self._send_error(404, f"Run not found: {rid}")
+                return
+            manifests[rid] = m
+
+        # Extract per-frame results from each run; key by (source_path or frame_index).
+        per_run: Dict[str, Dict[Any, Any]] = {}
+        for rid, manifest in manifests.items():
+            frames: Dict[Any, Any] = {}
+            for r in manifest.get("result_frames", []):
+                key = r.get("source_path") or r.get("frame_index")
+                frames[key] = r
+            per_run[rid] = frames
+
+        # Collect all known frame keys across all runs.
+        all_keys: list = []
+        seen: set = set()
+        for rid in run_ids:
+            for k in per_run[rid]:
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
+        # Sort numerically where possible.
+        try:
+            all_keys.sort(key=lambda k: int(k) if isinstance(k, int) else 0)
+        except Exception:
+            all_keys.sort(key=str)
+
+        aligned = []
+        for key in all_keys:
+            row: Dict[str, Any] = {"frame_key": key}
+            for rid in run_ids:
+                row[rid] = per_run[rid].get(key)
+            aligned.append(row)
+
+        # Build per-run summary stats.
+        summaries = {}
+        for rid, manifest in manifests.items():
+            summaries[rid] = {
+                "run_id": rid,
+                "kind": manifest.get("kind"),
+                "status": manifest.get("status"),
+                "model": manifest.get("model"),
+                "profile": manifest.get("profile"),
+                "strategy": manifest.get("strategy"),
+                "created_at": manifest.get("created_at"),
+                "mean_latency_ms": manifest.get("mean_latency_ms"),
+                "successful_frames": manifest.get("successful_frames"),
+                "failed_frames": manifest.get("failed_frames"),
+                "repetition_flags": manifest.get("repetition_flags"),
+            }
+
+        self._send_json(200, {
+            "run_ids": run_ids,
+            "aligned_frames": aligned,
+            "summaries": summaries,
+        })
+
     # ── response helpers ──────────────────────────────────────────────────────
 
     def _read_json_body(self) -> Optional[Dict[str, Any]]:
@@ -1225,8 +1616,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
 # ── routing regex ─────────────────────────────────────────────────────────────
 
+_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _RUN_RE = re.compile(
     r"^/api/runs/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:/logs)?$"
+)
+_RUN_REVIEWS_RE = re.compile(
+    r"^/api/runs/(" + _UUID_PATTERN + r")/reviews$"
+)
+_FRAME_DATASET_RE = re.compile(
+    r"^/api/frame-datasets/(" + _UUID_PATTERN + r")$"
+)
+_FRAME_IMAGE_RE = re.compile(
+    r"^/api/frame-datasets/(" + _UUID_PATTERN + r")/frames/(\d{1,5})$"
+)
+_EXTRACT_CANCEL_RE = re.compile(
+    r"^/api/extract/(" + _UUID_PATTERN + r")/cancel$"
 )
 
 
@@ -1298,6 +1702,8 @@ class ConsoleServer(ThreadingHTTPServer):
         config: Optional[Dict[str, Any]] = None,
         process_manager: Optional[ProcessManager] = None,
         run_store: Optional[RunStore] = None,
+        frame_dataset_store: Optional[FrameDatasetStore] = None,
+        review_store: Optional[ReviewStore] = None,
     ) -> None:
         self.config = config or {}
         self.process_manager = process_manager or ProcessManager()
@@ -1305,6 +1711,14 @@ class ConsoleServer(ThreadingHTTPServer):
             self.config.get("runs_dir", pathlib.Path.home() / ".web_console" / "runs")
         )
         self.run_store = run_store or RunStore(runs_dir)
+        frame_datasets_dir = pathlib.Path(
+            self.config.get(
+                "frame_datasets_dir",
+                runs_dir / "frame_datasets",
+            )
+        )
+        self.frame_dataset_store = frame_dataset_store or FrameDatasetStore(frame_datasets_dir)
+        self.review_store = review_store or ReviewStore(runs_dir)
         self._quiet = self.config.get("quiet", False)
         # Bounded experiment coordinator: at most one active experiment at a time.
         self._active_experiment_lock = threading.Lock()
@@ -1360,8 +1774,11 @@ _INDEX_TEMPLATE = """\
   <button data-view="dashboard" aria-label="Dashboard">Dashboard</button>
   <button data-view="models" aria-label="Models">Models</button>
   <button data-view="datasets" aria-label="Datasets">Datasets</button>
+  <button data-view="frame-explorer" aria-label="Frame Explorer">Frame Explorer</button>
+  <button data-view="profiles" aria-label="Task Profiles">Task Profiles</button>
   <button data-view="experiment" aria-label="Experiment">Experiment</button>
   <button data-view="runs" aria-label="Runs">Runs</button>
+  <button data-view="compare" aria-label="Compare">Compare</button>
   <button data-view="diagnostics" aria-label="Diagnostics">Diagnostics</button>
 </nav>
 <main>
@@ -1602,6 +2019,10 @@ _INDEX_TEMPLATE = """\
   </div>
   <div id="run-detail" style="display:none" class="panel">
     <div class="panel-title">Run Detail</div>
+    <div id="run-detail-reviews" class="review-panel">
+      <div class="panel-title">Review Annotations</div>
+      <div id="review-list"><span class="muted">Select a run to view reviews.</span></div>
+    </div>
   </div>
 </div>
 
@@ -1630,6 +2051,52 @@ _INDEX_TEMPLATE = """\
       <button class="secondary small" onclick="loadDiagDatasets()" style="margin-left:auto">Refresh</button>
     </div>
     <pre id="diag-datasets-pre">Click Refresh to load.</pre>
+  </div>
+</div>
+
+<!-- ── Frame Explorer view ──────────────────────────────────────────────────── -->
+<div id="view-frame-explorer" class="view">
+  <div class="panel">
+    <div class="panel-title">Frame Datasets
+      <button class="secondary small" onclick="_loadFrameExplorer()" style="margin-left:auto">Refresh</button>
+    </div>
+    <div id="frame-dataset-list"><span class="muted">Loading…</span></div>
+  </div>
+  <div class="panel" id="frame-explorer-viewer" style="display:none">
+    <div class="panel-title">Frame Viewer
+      <button class="secondary small" onclick="_framePrev()">&#8592; Prev</button>
+      <button class="secondary small" onclick="_frameNext()">Next &#8594;</button>
+    </div>
+    <div id="frame-preview-area"></div>
+    <div id="frame-metadata" class="frame-meta"></div>
+    <div id="frame-thumbnail-strip" class="thumb-strip"></div>
+    <div id="frame-review-ui" class="review-panel"></div>
+  </div>
+</div>
+
+<!-- ── Task Profiles view ──────────────────────────────────────────────────── -->
+<div id="view-profiles" class="view">
+  <div class="panel">
+    <div class="panel-title">Task Profiles (warehouse awareness &amp; custom)
+      <button class="secondary small" onclick="_loadProfiles()" style="margin-left:auto">Refresh</button>
+    </div>
+    <div id="profiles-list"><span class="muted">Loading…</span></div>
+  </div>
+</div>
+
+<!-- ── Compare view ────────────────────────────────────────────────────────── -->
+<div id="view-compare" class="view">
+  <div class="panel">
+    <div class="panel-title">Compare Runs</div>
+    <div id="compare-form" class="compare-form-row">
+      <label>Run ID 1: <input id="compare-run-id-1" type="text" placeholder="UUID" size="40"></label>
+      <label>Run ID 2: <input id="compare-run-id-2" type="text" placeholder="UUID" size="40"></label>
+      <button onclick="_runCompare()">Compare</button>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Results</div>
+    <div id="compare-results"><span class="muted">Enter run IDs above to compare.</span></div>
   </div>
 </div>
 
