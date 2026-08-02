@@ -642,17 +642,55 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                             bench_records = _parse_benchmark_jsonl(
                                 bench_path.read_text(encoding="utf-8", errors="replace")
                             )
-                            frame_recs = [r for r in bench_records if r.get("record_type") == "frame"]
+                            frame_recs = [
+                                r for r in bench_records
+                                if r.get("record_type") == "frame"
+                            ]
+                            session_end = next(
+                                (
+                                    r for r in reversed(bench_records)
+                                    if r.get("record_type") == "session_end"
+                                ),
+                                {},
+                            )
                             if frame_recs:
-                                success_recs = [f for f in frame_recs if f.get("success", True)]
-                                infer_ms_vals = [
-                                    f.get("inference_ms", 0) for f in success_recs
+                                success_recs = [
+                                    f for f in frame_recs if f.get("success", True)
                                 ]
+                                infer_ms_vals = []
+                                for frame in success_recs:
+                                    if "inference_seconds" in frame:
+                                        infer_ms_vals.append(
+                                            float(frame["inference_seconds"]) * 1000.0
+                                        )
+                                    elif "inference_ms" in frame:
+                                        infer_ms_vals.append(
+                                            float(frame["inference_ms"])
+                                        )
                                 benchmark_summary = {
                                     "frame_count": len(frame_recs),
                                     "successful_frames": len(success_recs),
+                                    "failed_frames": len(frame_recs) - len(success_recs),
+                                    "dropped_frames": session_end.get(
+                                        "dropped",
+                                        sum(
+                                            int(f.get("dropped_before", 0))
+                                            for f in frame_recs
+                                        ),
+                                    ),
                                     "mean_inference_ms": (
-                                        round(sum(infer_ms_vals) / len(infer_ms_vals), 2)
+                                        round(
+                                            sum(infer_ms_vals) / len(infer_ms_vals),
+                                            2,
+                                        )
+                                        if infer_ms_vals else None
+                                    ),
+                                    "min_inference_ms": (
+                                        round(min(infer_ms_vals), 2)
+                                        if infer_ms_vals else None
+                                    ),
+                                    "max_inference_ms": (
+                                        round(max(infer_ms_vals), 2)
                                         if infer_ms_vals else None
                                     ),
                                 }
