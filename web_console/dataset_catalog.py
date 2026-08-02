@@ -212,39 +212,49 @@ def _parse_bag_metadata(metadata_path: Path) -> Dict[str, Any]:
 
 
 def _find_rosbag_dirs(root: Path) -> List[Path]:
-    """Recursively find directories that contain a rosbag2 metadata.yaml."""
-    found: List[Path] = []
+    """Recursively find directories that contain a rosbag2 metadata.yaml.
+
+    Isaac ROS archives commonly nest the actual bag several levels below the
+    catalog key, such as h264/isaac_ros_h264_decoder/quickstart.
+    """
     if not root.is_dir():
-        return found
+        return []
     try:
-        for entry in root.iterdir():
-            if entry.is_dir():
-                if (entry / _ROSBAG_METADATA_FILENAME).is_file():
-                    found.append(entry)
-                else:
-                    # One level deeper
-                    for sub in entry.iterdir():
-                        if sub.is_dir() and (sub / _ROSBAG_METADATA_FILENAME).is_file():
-                            found.append(sub)
+        return sorted(
+            metadata.parent
+            for metadata in root.rglob(_ROSBAG_METADATA_FILENAME)
+            if metadata.is_file()
+        )
     except OSError:
-        pass
-    return found
+        return []
 
 
 def _scan_rosbags(rosbag_root: Path) -> Dict[str, RosbagEntry]:
-    """Build a map of installed rosbag entries keyed by their directory name."""
+    """Build installed entries keyed by the dataset top-level catalog key.
+
+    The playable bag path remains the directory containing metadata.yaml. The
+    first path component relative to rosbag_root is used as the key so nested
+    NVIDIA assets merge with their matching downloadable definitions.
+    """
     installed: Dict[str, RosbagEntry] = {}
     for bag_dir in _find_rosbag_dirs(rosbag_root):
+        try:
+            relative_parts = bag_dir.relative_to(rosbag_root).parts
+        except ValueError:
+            continue
+        if not relative_parts:
+            continue
+        key = relative_parts[0]
         meta = _parse_bag_metadata(bag_dir / _ROSBAG_METADATA_FILENAME)
-        size = _dir_size_bytes(bag_dir)
+        dataset_root = rosbag_root / key
         entry = RosbagEntry(
-            key=bag_dir.name,
-            name=bag_dir.name,
+            key=key,
+            name=key,
             source="local",
             description="Locally installed rosbag",
             installed=True,
             local_path=str(bag_dir),
-            size_bytes=size,
+            size_bytes=_dir_size_bytes(dataset_root),
             duration_seconds=meta.get("duration_seconds"),
             topics=meta.get("topics", []),
             topic_types=meta.get("topic_types", {}),
@@ -252,7 +262,9 @@ def _scan_rosbags(rosbag_root: Path) -> Dict[str, RosbagEntry]:
             image_topics=meta.get("image_topics", []),
             downloadable=False,
         )
-        installed[bag_dir.name] = entry
+        # A catalog key currently represents one playable bag. Keep the first
+        # deterministic match if an archive contains multiple metadata files.
+        installed.setdefault(key, entry)
     return installed
 
 
