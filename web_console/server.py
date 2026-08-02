@@ -1182,16 +1182,25 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._send_error(404, f"Task profile not found: {profile_name!r}")
                 return
 
-        # Determine system_instruction and task_prompt (body overrides profile).
+        # Determine system_instruction and task_prompt.
+        # When a profile is selected its prompts are authoritative; body overrides
+        # are rejected to ensure that the persisted profile identity matches the
+        # prompt that was actually executed.
         if resolved_profile is not None:
-            default_system = resolved_profile.system_instruction
-            default_task = resolved_profile.task_prompt
+            if "task_prompt" in body or "system_instruction" in body:
+                self._send_error(
+                    400,
+                    "task_prompt and system_instruction may not override a named profile; "
+                    "omit them or remove profile_name",
+                )
+                return
+            task_prompt = resolved_profile.task_prompt
+            system_instruction = resolved_profile.system_instruction
         else:
-            default_system = "You are a vision observer. Base claims on the current image."
-            default_task = ""
-
-        task_prompt = str(body.get("task_prompt", default_task)).strip()
-        system_instruction = str(body.get("system_instruction", default_system)).strip()
+            system_instruction = str(
+                body.get("system_instruction", "You are a vision observer. Base claims on the current image.")
+            ).strip()
+            task_prompt = str(body.get("task_prompt", "")).strip()
 
         # ── build ExperimentDefinition ───────────────────────────────────────
         try:
@@ -1235,9 +1244,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         defn.run_id = run_id
         run_store = srv.run_store
 
-        # Register run_id in coordinator slot (concurrency gate was already
-        # checked at entry; claim the slot now).
+        # Atomically check-and-claim the coordinator slot.  A second request that
+        # slipped past the early gate (above) while validation was in progress will
+        # be rejected here under the same lock, closing the check/claim race.
         with srv._active_experiment_lock:
+            if srv._active_experiment_id is not None:
+                self._send_error(
+                    409,
+                    f"Experiment already in progress: {srv._active_experiment_id}. "
+                    "Wait for it to complete or poll /api/runs/<id> for status.",
+                )
+                return
             srv._active_experiment_id = run_id
 
         artifact_dir = run_store.base_dir / run_id / "artifacts"

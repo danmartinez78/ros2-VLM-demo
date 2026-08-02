@@ -84,6 +84,22 @@ def _try_encode_image(msg_data: bytes, encoding: str, width: int, height: int) -
     return b""
 
 
+def _compute_effective_end_offset(args) -> "Optional[float]":
+    """Return the effective end-time offset in seconds.
+
+    ``--end-offset`` takes precedence; when absent and ``--duration`` is given,
+    the effective end is derived as ``start_offset + duration``; otherwise
+    returns ``None`` meaning play to the end of the bag.
+
+    This helper is a pure function so it can be unit-tested without rosbag2_py.
+    """
+    if args.end_offset is not None:
+        return args.end_offset
+    if args.duration is not None:
+        return args.start_offset + args.duration
+    return None
+
+
 def main(argv=None) -> int:
     args = _parse_args(argv)
 
@@ -152,14 +168,15 @@ def main(argv=None) -> int:
         return 1
 
     start_ns = int(args.start_offset * 1e9)
-    end_ns = int(args.end_offset * 1e9) if args.end_offset is not None else None
+    effective_end_offset = _compute_effective_end_offset(args)
+    end_ns = int(effective_end_offset * 1e9) if effective_end_offset is not None else None
     sample_interval_ns = int(args.sample_interval * 1e9)
 
     # Auto-compute interval from target count if requested
     if args.target_count is not None and args.target_count > 0:
         available_sec = (
-            (args.end_offset - args.start_offset)
-            if args.end_offset is not None
+            (effective_end_offset - args.start_offset)
+            if effective_end_offset is not None
             else bag_duration_sec - args.start_offset
         )
         computed_interval = max(0.05, available_sec / args.target_count)
@@ -223,6 +240,8 @@ def main(argv=None) -> int:
         "topic": args.topic,
         "start_offset_sec": args.start_offset,
         "end_offset_sec": args.end_offset,
+        "duration_sec": args.duration,
+        "effective_end_offset_sec": effective_end_offset,
         "sample_interval_sec": args.sample_interval,
         "max_frames": args.max_frames,
         "frames": frames,

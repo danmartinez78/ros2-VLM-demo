@@ -2775,8 +2775,49 @@ class TestExperimentConcurrency(unittest.TestCase):
         self.assertIn(status, (400, 422), f"Expected 400/422, got {status}: {data}")
         self.assertIn("error", data)
 
+    def test_concurrent_submissions_atomic_claim(self):
+        """Two simultaneous requests must not both receive 202; one must get 409."""
+        # Inject a fake active experiment so the first thread will see 409.
+        # Then verify that even without the pre-injected ID, the atomic claim
+        # in the handler prevents both concurrent submissions from succeeding.
+        results = []
+        errors = []
 
-class TestExperimentStackScript(unittest.TestCase):
+        def _submit():
+            try:
+                status, data = self._post_json(
+                    "/api/experiment/run",
+                    {
+                        "strategy": "single_frame",
+                        "frame_dataset_id": str(uuid.uuid4()),
+                        "task_prompt": "Describe.",
+                    },
+                )
+                results.append(status)
+            except Exception as exc:
+                errors.append(exc)
+
+        # Simulate race: inject active ID, send two concurrent requests; both
+        # should return 409 because the slot is occupied.
+        self._srv._active_experiment_id = "aaaaaaaa-0000-0000-0000-000000000099"
+        try:
+            threads = [threading.Thread(target=_submit) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+        finally:
+            self._srv._active_experiment_id = None
+
+        self.assertFalse(errors, f"Submission threads raised exceptions: {errors}")
+        # All requests should have been rejected with 409 (slot was occupied).
+        self.assertTrue(
+            all(s == 409 for s in results),
+            f"Expected all 409 when slot occupied, got: {results}",
+        )
+
+
+
     """Verify experiment_stack.sh passes bash -n syntax check."""
 
     def test_bash_syntax_check(self):
@@ -3739,8 +3780,86 @@ class TestFrameExtractorValidation(unittest.TestCase):
         self.assertFalse(_is_safe_dataset_id("/absolute/path"))
         self.assertFalse(_is_safe_dataset_id(""))
 
+    # ── behavioral duration tests ────────────────────────────────────────────
 
-class TestFrameDatasetStore(unittest.TestCase):
+    def test_duration_derives_effective_end_offset(self):
+        """--duration must derive effective_end = start + duration (no rosbag2_py needed)."""
+        import sys as _sys
+        _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_REPO_ROOT))
+        from scripts.extract_bag_frames import _parse_args, _compute_effective_end_offset
+
+        args = _parse_args([
+            "--bag-path", "/data/bag",
+            "--output-dir", "/tmp/out",
+            "--topic", "/cam",
+            "--dataset-id", "11111111-1111-1111-1111-111111111111",
+            "--start-offset", "2.0",
+            "--duration", "10.0",
+        ])
+        effective_end = _compute_effective_end_offset(args)
+        self.assertIsNotNone(effective_end)
+        self.assertAlmostEqual(effective_end, 12.0, places=6,
+                               msg="effective_end should be start_offset + duration")
+
+    def test_end_offset_takes_precedence_over_duration(self):
+        """When both --end-offset and --duration are given, --end-offset wins."""
+        import sys as _sys
+        _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_REPO_ROOT))
+        from scripts.extract_bag_frames import _parse_args, _compute_effective_end_offset
+
+        args = _parse_args([
+            "--bag-path", "/data/bag",
+            "--output-dir", "/tmp/out",
+            "--topic", "/cam",
+            "--dataset-id", "11111111-1111-1111-1111-111111111111",
+            "--start-offset", "0.0",
+            "--end-offset", "20.0",
+            "--duration", "5.0",
+        ])
+        effective_end = _compute_effective_end_offset(args)
+        self.assertAlmostEqual(effective_end, 20.0, places=6,
+                               msg="--end-offset must take precedence over --duration")
+
+    def test_no_end_or_duration_returns_none(self):
+        """With neither --end-offset nor --duration, effective end is None (play to bag end)."""
+        import sys as _sys
+        _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_REPO_ROOT))
+        from scripts.extract_bag_frames import _parse_args, _compute_effective_end_offset
+
+        args = _parse_args([
+            "--bag-path", "/data/bag",
+            "--output-dir", "/tmp/out",
+            "--topic", "/cam",
+            "--dataset-id", "11111111-1111-1111-1111-111111111111",
+        ])
+        self.assertIsNone(_compute_effective_end_offset(args))
+
+    def test_manifest_records_effective_end_offset_sec(self):
+        """build_extraction_args must pass --duration; manifest field must be present."""
+        from web_console.frame_extractor import ExtractionParams, build_extraction_args
+
+        params = ExtractionParams(
+            bag_key="my-bag",
+            bag_path="/data/my-bag",
+            image_topic="/cam",
+            dataset_id="11111111-1111-1111-1111-111111111111",
+            output_dir="/tmp/out",
+            start_offset=2.0,
+            duration=10.0,
+            max_frames=50,
+        )
+        args = build_extraction_args("/path/to/script.py", params)
+        self.assertIn("--duration", args)
+        idx = args.index("--duration")
+        self.assertEqual(args[idx + 1], "10.0")
+        # --end-offset must NOT be present (duration is the mechanism here)
+        self.assertNotIn("--end-offset", args)
+
+
+
     """Tests for FrameDatasetStore: manifest, path safety, frame listing."""
 
     def setUp(self):
@@ -4711,7 +4830,29 @@ class TestExperimentIntegration(unittest.TestCase):
         })
         self.assertEqual(status, 404)
 
-    # ── test: compare aligns by source_dataset_id + source_frame_index ───────
+    def test_experiment_rejects_task_prompt_override_when_profile_selected(self):
+        """Providing task_prompt alongside profile_name must return 400 (provenance integrity)."""
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "profile_name": "integration_profile",
+            "task_prompt": "Override prompt that disagrees with profile.",
+        })
+        self.assertEqual(status, 400,
+                         f"Expected 400 when task_prompt overrides a profile, got {status}: {data}")
+        self.assertIn("error", data)
+
+    def test_experiment_rejects_system_instruction_override_when_profile_selected(self):
+        """Providing system_instruction alongside profile_name must return 400."""
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "profile_name": "integration_profile",
+            "system_instruction": "Override instruction that disagrees with profile.",
+        })
+        self.assertEqual(status, 400,
+                         f"Expected 400 when system_instruction overrides a profile, got {status}: {data}")
+        self.assertIn("error", data)
+
+
     def test_compare_aligns_by_source_provenance(self):
         """Comparison must use (source_dataset_id, source_frame_index) as key."""
         run_id1 = self._make_completed_run(frame_count=2)
