@@ -103,76 +103,106 @@ def _now_iso() -> str:
 
 
 def _parse_results_log(text: str) -> list:
-    """Parse ros2 topic echo YAML output for a VlmResult topic into frame dicts.
+    """Parse real ros2 topic echo output for VlmResult messages.
 
-    Each message block is delimited by ``---`` markers.  Only top-level scalar
-    fields are extracted; nested YAML objects (e.g. ``header:``, ``stamp:``)
-    are skipped.  Block-scalar indicators (``>`` ``>-`` ``|`` ``|-``) are
-    handled by collecting subsequent indented lines as a single string.
-
-    Returns an empty list on empty or entirely malformed input.
+    ros2 topic echo writes the message first and a trailing separator.
+    Returned dictionaries preserve the ROS message field names used by the
+    browser. Nested header timestamps become source_timestamp_ns.
     """
     frames: list = []
-    current: Dict[str, Any] = {}
-    in_block = False
-    pending_key: Optional[str] = None
-    pending_lines: list = []
+    scalar_fields = {
+        "source_topic", "task_profile", "prompt_version", "prompt_config_hash",
+        "prompt", "response", "inference_seconds", "frame_sequence",
+        "success", "error",
+    }
 
-    def _flush() -> None:
-        nonlocal current, in_block, pending_key, pending_lines
-        if pending_key is not None:
-            current[pending_key] = " ".join(l.strip() for l in pending_lines)
-            pending_key = None
-            pending_lines = []
-        if in_block and current:
-            frames.append(current)
-        current = {}
-        in_block = False
+    def _scalar(raw: str) -> Any:
+        value = raw.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if value.lower() == "true":
+            return True
+        if value.lower() == "false":
+            return False
+        if value == "":
+            return ""
+        try:
+            return float(value) if ("." in value or "e" in value.lower()) else int(value)
+        except ValueError:
+            return value
 
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped == "---":
-            _flush()
-            in_block = True
+    # A trailing separator is canonical; leading separators are also tolerated.
+    blocks = re.split(r"(?m)^---\\s*$", text)
+    for block in blocks:
+        if not block.strip():
             continue
-        if not in_block:
-            continue
-        # Continuation of a YAML block scalar
-        if pending_key is not None:
-            if line.startswith((" ", "\t")):
-                pending_lines.append(stripped)
-                continue
-            else:
-                current[pending_key] = " ".join(l.strip() for l in pending_lines)
+        frame: Dict[str, Any] = {}
+        stamp_sec: Optional[int] = None
+        stamp_nanosec: Optional[int] = None
+        in_header = False
+        in_stamp = False
+        pending_key: Optional[str] = None
+        pending_indent = 0
+        pending_lines: list = []
+
+        def flush_pending() -> None:
+            nonlocal pending_key, pending_lines
+            if pending_key is not None:
+                frame[pending_key] = "\\n".join(pending_lines).rstrip()
                 pending_key = None
                 pending_lines = []
-        # Top-level key: value pair (not indented)
-        if ": " in line and not line.startswith((" ", "\t")):
-            key, _, raw = line.partition(": ")
-            key = key.strip()
-            raw = raw.strip()
-            if raw in (">", ">-", "|", "|-"):
-                pending_key = key
-                pending_lines = []
-            else:
-                val_str = raw.strip("'\"")
-                if val_str.lower() == "true":
-                    current[key] = True
-                elif val_str.lower() == "false":
-                    current[key] = False
-                elif val_str == "":
-                    current[key] = ""
-                else:
-                    try:
-                        current[key] = (
-                            float(val_str) if ("." in val_str or "e" in val_str.lower()) else int(val_str)
-                        )
-                    except ValueError:
-                        current[key] = val_str
-        # Top-level nested key without value (stamp:, header:) — skip
-    _flush()
-    return frames
 
+        for line in block.splitlines():
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip(" "))
+
+            if pending_key is not None:
+                if stripped and indent > pending_indent:
+                    pending_lines.append(
+                        line[pending_indent + 2:]
+                        if len(line) > pending_indent + 2 else stripped
+                    )
+                    continue
+                flush_pending()
+
+            if indent == 0:
+                in_header = stripped == "header:"
+                in_stamp = False
+                if ": " not in line:
+                    continue
+                key, _, raw = line.partition(": ")
+                key = key.strip()
+                if key not in scalar_fields:
+                    continue
+                raw = raw.strip()
+                if raw in (">", ">-", "|", "|-"):
+                    pending_key = key
+                    pending_indent = indent
+                else:
+                    frame[key] = _scalar(raw)
+                continue
+
+            if in_header and indent == 2 and stripped == "stamp:":
+                in_stamp = True
+                continue
+            if in_header and in_stamp and indent >= 4 and ": " in stripped:
+                key, _, raw = stripped.partition(": ")
+                try:
+                    if key == "sec":
+                        stamp_sec = int(raw)
+                    elif key == "nanosec":
+                        stamp_nanosec = int(raw)
+                except ValueError:
+                    pass
+
+        flush_pending()
+        if stamp_sec is not None:
+            frame["source_timestamp_ns"] = (
+                stamp_sec * 1_000_000_000 + (stamp_nanosec or 0)
+            )
+        if any(key in frame for key in ("success", "response", "frame_sequence")):
+            frames.append(frame)
+    return frames
 
 def _parse_benchmark_jsonl(text: str) -> list:
     """Parse a benchmark.jsonl file; returns all valid JSON object records.
