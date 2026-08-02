@@ -132,7 +132,7 @@ def _parse_results_log(text: str) -> list:
             return value
 
     # A trailing separator is canonical; leading separators are also tolerated.
-    blocks = re.split(r"(?m)^---\\s*$", text)
+    blocks = re.split(r"(?m)^---\s*$", text)
     for block in blocks:
         if not block.strip():
             continue
@@ -148,7 +148,7 @@ def _parse_results_log(text: str) -> list:
         def flush_pending() -> None:
             nonlocal pending_key, pending_lines
             if pending_key is not None:
-                frame[pending_key] = "\\n".join(pending_lines).rstrip()
+                frame[pending_key] = "\n".join(pending_lines).rstrip()
                 pending_key = None
                 pending_lines = []
 
