@@ -41,6 +41,10 @@ DEFAULT_SOCKET_PATH="/tmp/edge_vlm.sock"
 DEFAULT_WEB_HOST="127.0.0.1"
 DEFAULT_WEB_PORT=8765
 DEFAULT_RUNS_DIR="${HOME}/.web_console/runs"
+# Positional args 5 and 6 for edge_vlm_server: request_timeout inference_deadline (seconds).
+# The inference deadline MUST be strictly less than the request timeout.
+DEFAULT_SERVER_REQUEST_TIMEOUT="${EDGE_VLM_REQUEST_TIMEOUT:-90}"
+DEFAULT_SERVER_INFERENCE_DEADLINE="${EDGE_VLM_INFERENCE_DEADLINE:-60}"
 
 # Health-check timeouts (seconds)
 SERVER_AWAIT_SECONDS="${EDGE_VLM_SERVER_AWAIT:-60}"
@@ -70,6 +74,13 @@ Commands:
   restart   Stop then start (passes options to start)
 
 Start/restart options:
+  --model MODEL       Model name or ID from the catalog to activate.
+                      Looks up profile paths from model_catalog and exports them.
+                      An unknown or incomplete model (missing engine/plugin dirs)
+                      causes immediate startup failure.
+                      When omitted, EDGE_VLM_LLM_ENGINE_DIR /
+                      EDGE_VLM_MULTIMODAL_ENGINE_DIR / EDGELLM_PLUGIN_PATH must
+                      already be set in the environment.
   --socket PATH       IPC socket path (default: /tmp/edge_vlm.sock)
   --host HOST         Web console bind address (default: 127.0.0.1)
   --port PORT         Web console TCP port (default: 8765)
@@ -309,6 +320,76 @@ _warn_if_non_loopback() {
   echo ""
 }
 
+# ── model resolution ──────────────────────────────────────────────────────────
+
+# Resolve a model name/ID from the catalog and export the engine/plugin paths.
+# When a model name or ID is supplied, uses the Python model_catalog to look up
+# the profile; then validates that all required paths exist on disk.
+# Fails with a clear error message when the model is unknown or incomplete.
+_resolve_model() {
+  local selected_model="$1"
+  if [[ -z "${selected_model}" ]]; then
+    return 0
+  fi
+
+  _info "Resolving model '${selected_model}' from catalog…"
+  local py_out
+  if ! py_out=$(PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" python3 -c "
+import sys, os
+try:
+    from web_console.model_catalog import discover_models
+except ImportError as e:
+    print(f'ImportError: {e}', file=sys.stderr)
+    sys.exit(1)
+target = sys.argv[1]
+profiles = discover_models()
+selected = next(
+    (p for p in profiles if p.model_name == target or p.model_id == target),
+    None,
+)
+if selected is None:
+    known = [p.model_name for p in profiles]
+    print(
+        f'Model not found: {target!r}. '
+        f'Known models: {known if known else \"(none discovered)\"}',
+        file=sys.stderr,
+    )
+    sys.exit(1)
+missing = []
+if not selected.llm_engine_exists:
+    missing.append(f'LLM engine directory: {selected.llm_engine_dir!r}')
+if not selected.multimodal_engine_exists:
+    missing.append(f'Multimodal engine directory: {selected.multimodal_engine_dir!r}')
+if not selected.plugin_exists:
+    missing.append(f'Plugin file: {selected.plugin_path!r}')
+if missing:
+    for m in missing:
+        print(f'Missing: {m}', file=sys.stderr)
+    sys.exit(1)
+print(f'EDGE_VLM_LLM_ENGINE_DIR={selected.llm_engine_dir}')
+print(f'EDGE_VLM_MULTIMODAL_ENGINE_DIR={selected.multimodal_engine_dir}')
+print(f'EDGELLM_PLUGIN_PATH={selected.plugin_path}')
+print(f'EDGE_VLM_MODEL_NAME={selected.model_name}')
+print(f'EDGE_VLM_MODEL_ID={selected.model_id}')
+" "${selected_model}" 2>&1); then
+    _error "Model resolution failed: ${py_out}"
+    return 1
+  fi
+
+  # Export each KEY=VALUE line; split on the first '=' to preserve path values.
+  local key value
+  while IFS= read -r line; do
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ -n "${key}" ]] && export "${key}=${value}"
+  done <<< "${py_out}"
+
+  _info "Model resolved: ${EDGE_VLM_MODEL_NAME:-${selected_model}}"
+  _debug "  LLM engine    : ${EDGE_VLM_LLM_ENGINE_DIR:-}"
+  _debug "  Multimodal    : ${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}"
+  _debug "  Plugin        : ${EDGELLM_PLUGIN_PATH:-}"
+}
+
 # ── validation ────────────────────────────────────────────────────────────────
 
 _validate() {
@@ -342,16 +423,35 @@ _validate() {
     _warn "Standalone inference via web console will fail until the CLI is available"
   fi
 
-  # Validate engine bundle (only warn — binary may embed model path)
+  # Validate required engine bundle when starting the server.
+  # Missing or nonexistent engine/plugin configuration is a hard startup failure;
+  # the server cannot initialise without these positional arguments.
   if [[ "${NO_SERVER:-0}" != "1" ]]; then
-    if [[ -n "${EDGE_VLM_LLM_ENGINE_DIR:-}" ]] && [[ ! -d "${EDGE_VLM_LLM_ENGINE_DIR}" ]]; then
-      _warn "EDGE_VLM_LLM_ENGINE_DIR does not exist: ${EDGE_VLM_LLM_ENGINE_DIR}"
+    local missing_cfg=0
+    if [[ -z "${EDGE_VLM_LLM_ENGINE_DIR:-}" ]]; then
+      _error "EDGE_VLM_LLM_ENGINE_DIR is not set. Set it via env/env-file, or use --model <name>."
+      missing_cfg=1
+    elif [[ ! -d "${EDGE_VLM_LLM_ENGINE_DIR}" ]]; then
+      _error "EDGE_VLM_LLM_ENGINE_DIR does not exist: ${EDGE_VLM_LLM_ENGINE_DIR}"
+      missing_cfg=1
     fi
-    if [[ -n "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}" ]] && [[ ! -d "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" ]]; then
-      _warn "EDGE_VLM_MULTIMODAL_ENGINE_DIR does not exist: ${EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
+    if [[ -z "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}" ]]; then
+      _error "EDGE_VLM_MULTIMODAL_ENGINE_DIR is not set. Set it via env/env-file, or use --model <name>."
+      missing_cfg=1
+    elif [[ ! -d "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" ]]; then
+      _error "EDGE_VLM_MULTIMODAL_ENGINE_DIR does not exist: ${EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
+      missing_cfg=1
     fi
-    if [[ -n "${EDGELLM_PLUGIN_PATH:-}" ]] && [[ ! -f "${EDGELLM_PLUGIN_PATH}" ]]; then
-      _warn "EDGELLM_PLUGIN_PATH does not exist: ${EDGELLM_PLUGIN_PATH}"
+    if [[ -z "${EDGELLM_PLUGIN_PATH:-}" ]]; then
+      _error "EDGELLM_PLUGIN_PATH is not set. Set it via env/env-file, or use --model <name>."
+      missing_cfg=1
+    elif [[ ! -f "${EDGELLM_PLUGIN_PATH}" ]]; then
+      _error "EDGELLM_PLUGIN_PATH does not exist: ${EDGELLM_PLUGIN_PATH}"
+      missing_cfg=1
+    fi
+    if [[ "${missing_cfg}" == "1" ]]; then
+      _error "Engine/plugin configuration is incomplete. Use --no-server to skip the inference service."
+      ok=1
     fi
   fi
 
@@ -413,6 +513,10 @@ cmd_start() {
     fi
   fi
 
+  # ── resolve model (if --model was given) ─────────────────────────────────
+
+  _resolve_model "${SELECTED_MODEL:-}" || return 1
+
   # ── validate ──────────────────────────────────────────────────────────────
 
   _warn_if_non_loopback "${WEB_HOST}"
@@ -428,6 +532,8 @@ RUNS_DIR=${RUNS_DIR}
 SERVER_BIN=${SERVER_BIN}
 CLI_BIN=${CLI_BIN}
 NO_SERVER=${NO_SERVER:-0}
+ACTIVE_MODEL=${EDGE_VLM_MODEL_NAME:-}
+ACTIVE_MODEL_LLM_DIR=${EDGE_VLM_LLM_ENGINE_DIR:-}
 STARTED_AT=$(_now_iso)
 CONF
 
@@ -439,15 +545,32 @@ CONF
 
   local server_started=0
   if [[ "${NO_SERVER:-0}" != "1" ]]; then
-    local server_cmd="${SERVER_BIN}"
+    # Build the full argv array for edge_vlm_server.  The binary takes six
+    # positional arguments (no flags); order matches run_standalone_service_smoke.sh:
+    #   1. LLM engine directory
+    #   2. Multimodal engine directory
+    #   3. EdgeLLM TensorRT plugin path
+    #   4. IPC socket path
+    #   5. Worker request timeout (seconds)
+    #   6. Worker inference deadline (seconds, must be < timeout)
+    local server_argv=(
+      "${SERVER_BIN}"
+      "${EDGE_VLM_LLM_ENGINE_DIR}"
+      "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
+      "${EDGELLM_PLUGIN_PATH}"
+      "${SOCKET_PATH}"
+      "${SERVER_REQUEST_TIMEOUT}"
+      "${SERVER_INFERENCE_DEADLINE}"
+    )
     _info "Starting edge_vlm_server → log: ${SERVER_LOG}"
+    _debug "  argv: ${server_argv[*]}"
     if [[ "${FOREGROUND:-0}" == "1" ]]; then
-      "${server_cmd}" >> "${SERVER_LOG}" 2>&1 &
+      "${server_argv[@]}" >> "${SERVER_LOG}" 2>&1 &
     else
-      "${server_cmd}" > "${SERVER_LOG}" 2>&1 &
+      "${server_argv[@]}" > "${SERVER_LOG}" 2>&1 &
     fi
     local srv_pid=$!
-    _write_pid_file "${SERVER_PID_FILE}" "${srv_pid}" "${server_cmd}" "$(_now_iso)"
+    _write_pid_file "${SERVER_PID_FILE}" "${srv_pid}" "${SERVER_BIN}" "$(_now_iso)"
     # Mark socket ownership
     echo "${SOCKET_PATH}" > "${SOCKET_OWNER_FILE}"
     server_started=1
@@ -637,6 +760,16 @@ cmd_status() {
   else
     echo "  status: degraded (see above)"
   fi
+  # ── active model ──────────────────────────────────────────────────────────
+  if [[ -f "${STACK_CONFIG}" ]]; then
+    local cfg_model cfg_llm_dir
+    cfg_model=$(grep '^ACTIVE_MODEL=' "${STACK_CONFIG}" | cut -d= -f2 2>/dev/null || true)
+    cfg_llm_dir=$(grep '^ACTIVE_MODEL_LLM_DIR=' "${STACK_CONFIG}" | cut -d= -f2 2>/dev/null || true)
+    if [[ -n "${cfg_model}" ]]; then
+      echo "  active model    : ${cfg_model}"
+      [[ -n "${cfg_llm_dir}" ]] && echo "  llm engine dir  : ${cfg_llm_dir}"
+    fi
+  fi
   echo "  runtime dir: ${STACK_RUN_DIR}"
 }
 
@@ -693,9 +826,12 @@ WEB_PORT="${DEFAULT_WEB_PORT}"
 RUNS_DIR="${DEFAULT_RUNS_DIR}"
 SERVER_BIN="${EDGE_VLM_SERVER_BIN:-edge_vlm_server}"
 CLI_BIN="${EDGE_VLM_CLI_BIN:-edge_vlm_cli}"
+SERVER_REQUEST_TIMEOUT="${DEFAULT_SERVER_REQUEST_TIMEOUT}"
+SERVER_INFERENCE_DEADLINE="${DEFAULT_SERVER_INFERENCE_DEADLINE}"
 ENV_FILE=""
 NO_SERVER=0
 FOREGROUND=0
+SELECTED_MODEL=""
 
 # Temporary array for logs sub-command options
 LOGS_OPTS=()
@@ -719,6 +855,8 @@ esac
 
 while (($#)); do
   case "$1" in
+    --model)       SELECTED_MODEL="$2"; shift 2 ;;
+    --model=*)     SELECTED_MODEL="${1#--model=}"; shift ;;
     --socket)      SOCKET_PATH="$2"; shift 2 ;;
     --socket=*)    SOCKET_PATH="${1#--socket=}"; shift ;;
     --host)        WEB_HOST="$2"; shift 2 ;;

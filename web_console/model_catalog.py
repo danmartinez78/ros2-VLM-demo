@@ -13,6 +13,7 @@ experiment_stack.sh lifecycle script.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from dataclasses import dataclass, field
@@ -88,11 +89,17 @@ class ModelProfile:
 
 
 def _make_model_id(model_name: str, llm_engine_dir: str) -> str:
-    """Derive a stable opaque ID from model_name and llm_engine_dir."""
+    """Derive a stable opaque ID from model_name and llm_engine_dir.
+
+    Uses a truncated SHA-256 digest so the ID is deterministic across Python
+    interpreter restarts (unlike the randomised ``hash()`` built-in).
+    """
     safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name or "unknown")
     if llm_engine_dir:
-        # Hash the path so the ID is short but path-specific.
-        path_suffix = abs(hash(llm_engine_dir)) % (10**8)
+        # SHA-256 over "safe_name:raw_path" — consistent across processes and
+        # PYTHONHASHSEED values.
+        digest_input = f"{safe_name}:{llm_engine_dir}".encode("utf-8")
+        path_suffix = hashlib.sha256(digest_input).hexdigest()[:8]
         return f"{safe_name}_{path_suffix}"
     return safe_name
 

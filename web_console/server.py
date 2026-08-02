@@ -948,8 +948,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(400, error)
             return
 
-        # Validate that image files exist (prevents trivially broken runs).
-        for img_path in defn.image_paths[:100]:  # check first 100 for speed
+        # Validate that ALL image files exist before marking the run active.
+        # A partial check (e.g. first-100-only) allows large runs to start with
+        # unchecked paths that will fail mid-experiment.
+        for img_path in defn.image_paths:
             if not os.path.isabs(img_path):
                 self._send_error(400, f"image_paths must be absolute: {img_path!r}")
                 return
@@ -959,7 +961,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
         run_id = defn.experiment_id
         defn.run_id = run_id
-        run_store = self.server_instance.run_store
+        srv = self.server_instance
+        run_store = srv.run_store
+
+        # Bounded experiment coordinator: reject concurrent submissions.
+        with srv._active_experiment_lock:
+            if srv._active_experiment_id is not None:
+                self._send_error(
+                    409,
+                    f"Experiment already in progress: {srv._active_experiment_id}. "
+                    "Wait for it to complete or poll /api/runs/<id> for status.",
+                )
+                return
+            srv._active_experiment_id = run_id
 
         artifact_dir = run_store.base_dir / run_id / "artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -1028,9 +1042,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     "success": False,
                     "error": str(exc),
                 })
+            finally:
+                # Release the coordinator slot so the next experiment can start.
+                with srv._active_experiment_lock:
+                    if srv._active_experiment_id == run_id:
+                        srv._active_experiment_id = None
 
-        import threading as _threading
-        _threading.Thread(target=_run_in_background, daemon=True).start()
+        threading.Thread(target=_run_in_background, daemon=True).start()
         self._send_json(202, initial_record)
 
     # ── response helpers ──────────────────────────────────────────────────────
@@ -1158,6 +1176,9 @@ class ConsoleServer(ThreadingHTTPServer):
         )
         self.run_store = run_store or RunStore(runs_dir)
         self._quiet = self.config.get("quiet", False)
+        # Bounded experiment coordinator: at most one active experiment at a time.
+        self._active_experiment_lock = threading.Lock()
+        self._active_experiment_id: Optional[str] = None
 
         def handler(*args: Any, **kwargs: Any) -> None:
             h = ConsoleHandler(*args, **kwargs)

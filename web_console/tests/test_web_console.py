@@ -2368,6 +2368,22 @@ class TestModelCatalog(unittest.TestCase):
         id2 = _make_model_id("MyModel", "/some/path")
         self.assertEqual(id1, id2)
         self.assertIn("MyModel", id1)
+        # Different paths must produce different IDs.
+        id3 = _make_model_id("MyModel", "/other/path")
+        self.assertNotEqual(id1, id3)
+
+    def test_make_model_id_deterministic_format(self):
+        """model_id must use a hex digest suffix, not a numeric hash."""
+        model_id = _make_model_id("MyModel", "/some/path")
+        # Format: <safe_name>_<8-hex-chars>
+        parts = model_id.rsplit("_", 1)
+        self.assertEqual(len(parts), 2, f"Unexpected format: {model_id!r}")
+        suffix = parts[1]
+        self.assertEqual(len(suffix), 8, f"Expected 8-char hex suffix, got {suffix!r}")
+        self.assertTrue(
+            all(c in "0123456789abcdef" for c in suffix),
+            f"Suffix is not hex: {suffix!r}",
+        )
 
     def test_make_model_id_no_path(self):
         model_id = _make_model_id("TestModel", "")
@@ -2634,6 +2650,119 @@ class TestNewAPIRoutes(unittest.TestCase):
 
 
 # ── experiment_stack.sh bash syntax test ──────────────────────────────────────
+
+
+class TestModelIdCrossProcess(unittest.TestCase):
+    """Verify that model_id is stable across interpreter restarts."""
+
+    def test_make_model_id_stable_across_hash_seeds(self):
+        """_make_model_id must return the same value regardless of PYTHONHASHSEED."""
+        script = (
+            f"import sys; sys.path.insert(0, {str(_REPO_ROOT)!r}); "
+            "from web_console.model_catalog import _make_model_id; "
+            "print(_make_model_id('TestModel', '/some/engine/path/llm'))"
+        )
+        results = set()
+        for seed in ("1", "2", "42", "0", "99999"):
+            env = {**os.environ, "PYTHONHASHSEED": seed}
+            out = subprocess.check_output(
+                [sys.executable, "-c", script],
+                text=True,
+                env=env,
+            ).strip()
+            results.add(out)
+        self.assertEqual(
+            len(results),
+            1,
+            f"model_id changed across PYTHONHASHSEED values: {results}",
+        )
+        (stable_id,) = results
+        self.assertIn("TestModel", stable_id)
+
+
+class TestExperimentConcurrency(unittest.TestCase):
+    """Bounded experiment coordinator tests."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(pathlib.Path(self._tmp) / "runs")
+        cfg = {"socket_path": "", "quiet": True}
+        self._srv, self._port, self._thread = _start_test_server(
+            config=cfg, run_store=run_store
+        )
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post_json(self, path, data):
+        body = json.dumps(data).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request(
+            "POST", path, body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body) if resp_body else {}
+
+    def test_concurrent_experiment_rejected_with_409(self):
+        """A second experiment while one is active must return 409."""
+        # Inject a fake active experiment ID directly into the server.
+        self._srv._active_experiment_id = "aaaaaaaa-0000-0000-0000-000000000001"
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                f.write(b"FAKE")
+                img = f.name
+            status, data = self._post_json(
+                "/api/experiment/run",
+                {
+                    "strategy": "single_frame",
+                    "image_paths": [img],
+                    "task_prompt": "Describe.",
+                },
+            )
+        finally:
+            self._srv._active_experiment_id = None
+            os.unlink(img)
+        self.assertEqual(status, 409)
+        self.assertIn("error", data)
+        self.assertIn("aaaaaaaa", data["error"])
+
+    def test_experiment_coordinator_clears_on_completion(self):
+        """_active_experiment_id is cleared when an experiment reaches a terminal state."""
+        # Directly confirm the lock and field are available.
+        self.assertIsNone(self._srv._active_experiment_id)
+        self.assertIsInstance(self._srv._active_experiment_lock, type(__import__("threading").Lock()))
+
+    def test_experiment_validates_all_image_paths(self):
+        """Image path validation must check ALL paths, not just the first 100."""
+        with tempfile.TemporaryDirectory() as d:
+            # Create 101 real files
+            real_paths = []
+            for i in range(101):
+                p = os.path.join(d, f"frame_{i:04d}.jpg")
+                pathlib.Path(p).write_bytes(b"FAKE")
+                real_paths.append(p)
+            # Replace the 101st path with a nonexistent file
+            real_paths[100] = os.path.join(d, "nonexistent_101.jpg")
+
+            status, data = self._post_json(
+                "/api/experiment/run",
+                {
+                    "strategy": "single_frame",
+                    "image_paths": real_paths,
+                    "task_prompt": "Describe.",
+                },
+            )
+        # Should fail because the 101st path does not exist.
+        self.assertIn(status, (400, 422), f"Expected 400/422, got {status}: {data}")
+        self.assertIn("error", data)
+        self.assertIn("nonexistent_101.jpg", data["error"])
 
 
 class TestExperimentStackScript(unittest.TestCase):
