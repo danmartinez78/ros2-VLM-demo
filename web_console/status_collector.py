@@ -39,29 +39,25 @@ def check_server_reachable(socket_path: str) -> Dict[str, Any]:
 
 
 def get_server_pid(socket_path: str) -> Optional[int]:
-    """Return the PID of the process listening on socket_path using ss(8).
-
-    Returns None when the socket is absent, ss is unavailable, or the PID
-    cannot be determined.
-    """
+    """Return the PID listening on *socket_path* using bounded ss output."""
     if not socket_path or not os.path.exists(socket_path):
         return None
     try:
         result = subprocess.run(
-            ["ss", "-xlp", f"src={socket_path}"],
+            ["ss", "-lxnp"],
             capture_output=True,
             text=True,
             timeout=3,
         )
         for line in result.stdout.splitlines():
-            if "pid=" in line:
-                match = re.search(r"pid=(\d+)", line)
-                if match:
-                    return int(match.group(1))
+            if socket_path not in line:
+                continue
+            match = re.search(r"pid=(\\d+)", line)
+            if match:
+                return int(match.group(1))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
     return None
-
 
 def get_gpu_status() -> Dict[str, Any]:
     """Run nvidia-smi and return bounded GPU information.
