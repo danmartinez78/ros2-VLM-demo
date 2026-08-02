@@ -28,7 +28,6 @@ import argparse
 import datetime
 import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -112,12 +111,12 @@ def _detect_storage_id(bag_path: str) -> str:
     metadata_path = path / "metadata.yaml" if path.is_dir() else path.parent / "metadata.yaml"
     try:
         text = metadata_path.read_text(encoding="utf-8", errors="replace")
-        match = re.search(
-            r"(?m)^\\s*storage_identifier:\\s*['\\\"]?([^'\\\"\\s#]+)",
-            text,
-        )
-        if match:
-            return match.group(1)
+        for line in text.splitlines():
+            key, separator, value = line.strip().partition(":")
+            if separator and key == "storage_identifier":
+                storage_id = value.split("#", 1)[0].strip().strip("'\\\"")
+                if storage_id:
+                    return storage_id
     except OSError:
         pass
 
