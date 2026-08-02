@@ -37,11 +37,19 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
+from .dataset_catalog import build_download_command, discover_datasets
+from .experiment_engine import (
+    ExperimentDefinition,
+    _VALID_STRATEGIES,
+    run_experiment,
+    validate_definition,
+)
 from .inference_client import (
     ALLOWED_IMAGE_EXTENSIONS,
     MAX_IMAGE_BYTES,
     run_inference,
 )
+from .model_catalog import discover_models
 from .process_manager import ProcessManager
 from .run_store import RunStore, _is_safe_run_id, _TERMINAL_STATUSES
 from .status_collector import collect_status, check_server_reachable
@@ -63,6 +71,7 @@ _ALLOWED_ROS_PARAMS = frozenset(
         "playback_duration",
         "result_timeout",
         "instruction_delivery_mode",
+        "rosbag_path",
     }
 )
 
@@ -102,6 +111,48 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _single_quote_close_idx(s: str) -> int:
+    """Return the index of the first unescaped closing single-quote in *s*, or -1.
+
+    Within a YAML single-quoted scalar ``''`` is an escaped literal quote and
+    does **not** close the scalar; a lone ``'`` does.
+    """
+    i = 0
+    while i < len(s):
+        if s[i] == "'":
+            if i + 1 < len(s) and s[i + 1] == "'":
+                i += 2  # escaped '' — skip both chars
+            else:
+                return i  # unescaped ' — closing quote
+        else:
+            i += 1
+    return -1
+
+
+def _fold_single_quoted_scalar(parts: list) -> str:
+    """Apply YAML single-quoted scalar line-folding to a list of string parts.
+
+    Rules (matching YAML 1.2 §7.4 single-quoted scalars):
+      - Adjacent non-empty parts are joined with a single space.
+      - Empty parts (blank physical lines) introduce a ``\\n`` in the result.
+      - ``''`` sequences are decoded to a literal ``'``.
+    """
+    segments: list = []
+    pending_nl = 0
+    for part in parts:
+        if not part:
+            pending_nl += 1
+        else:
+            if segments:
+                if pending_nl:
+                    segments.append("\n" * pending_nl)
+                else:
+                    segments.append(" ")
+            segments.append(part)
+            pending_nl = 0
+    return "".join(segments).replace("''", "'")
+
+
 def _parse_results_log(text: str) -> list:
     """Parse real ros2 topic echo output for VlmResult messages.
 
@@ -117,6 +168,11 @@ def _parse_results_log(text: str) -> list:
     Block-scalar indicators (``>`` ``>-`` ``|`` ``|-``) are handled by
     collecting subsequent indented lines as a single space-joined string.
 
+    Single-quoted scalars that span multiple physical lines (as emitted by
+    ``ros2 topic echo`` for long ``response`` fields) are reassembled using
+    YAML single-quoted line-folding: blank lines become ``\\n``, and adjacent
+    non-empty continuation lines are joined with a space.
+
     Field names are normalised to the canonical UI schema on output:
       * ``frame_sequence`` → ``frame_seq``
       * ``response``       → ``text``
@@ -128,6 +184,9 @@ def _parse_results_log(text: str) -> list:
     current: Dict[str, Any] = {}
     pending_key: Optional[str] = None
     pending_lines: list = []
+    # Single-quoted multi-line scalar state
+    pending_sq_key: Optional[str] = None
+    pending_sq_lines: list = []
     _stamp_sec: Optional[int] = None
     _stamp_nanosec: Optional[int] = None
     _in_header: bool = False
@@ -135,12 +194,18 @@ def _parse_results_log(text: str) -> list:
 
     def _flush_frame() -> None:
         nonlocal current, pending_key, pending_lines
+        nonlocal pending_sq_key, pending_sq_lines
         nonlocal _stamp_sec, _stamp_nanosec, _in_header, _in_stamp
         # Finalise any pending block-scalar value.
         if pending_key is not None:
             current[pending_key] = " ".join(l.strip() for l in pending_lines)
             pending_key = None
             pending_lines = []
+        # Finalise any pending single-quoted multi-line scalar.
+        if pending_sq_key is not None:
+            current[pending_sq_key] = _fold_single_quoted_scalar(pending_sq_lines)
+            pending_sq_key = None
+            pending_sq_lines = []
         if not current:
             # Reset timestamp state even for empty blocks.
             _stamp_sec = None
@@ -180,7 +245,19 @@ def _parse_results_log(text: str) -> list:
         if stripped == "---":
             _flush_frame()
             continue
-        # Continuation of a YAML block scalar (indented under the pending key).
+        # ── single-quoted multi-line scalar continuation ──────────────────────
+        if pending_sq_key is not None:
+            close_idx = _single_quote_close_idx(stripped)
+            if close_idx >= 0:
+                # Found the closing quote on this line.
+                pending_sq_lines.append(stripped[:close_idx])
+                current[pending_sq_key] = _fold_single_quoted_scalar(pending_sq_lines)
+                pending_sq_key = None
+                pending_sq_lines = []
+            else:
+                pending_sq_lines.append(stripped)
+            continue
+        # ── block-scalar continuation (indented under the pending key) ────────
         if pending_key is not None:
             if line.startswith((" ", "\t")):
                 pending_lines.append(stripped)
@@ -219,8 +296,34 @@ def _parse_results_log(text: str) -> list:
             if raw in (">", ">-", "|", "|-"):
                 pending_key = key
                 pending_lines = []
+            elif raw.startswith("'"):
+                # Single-quoted scalar: check if it closes on the same line.
+                inner = raw[1:]  # strip the opening '
+                close_idx = _single_quote_close_idx(inner)
+                if close_idx >= 0:
+                    # Entire scalar is on this line.
+                    val_str = inner[:close_idx].replace("''", "'")
+                    if val_str.lower() == "true":
+                        current[key] = True
+                    elif val_str.lower() == "false":
+                        current[key] = False
+                    elif val_str == "":
+                        current[key] = ""
+                    else:
+                        try:
+                            current[key] = (
+                                float(val_str)
+                                if ("." in val_str or "e" in val_str.lower())
+                                else int(val_str)
+                            )
+                        except ValueError:
+                            current[key] = val_str
+                else:
+                    # Multi-line single-quoted scalar: opening content on this line.
+                    pending_sq_key = key
+                    pending_sq_lines = [inner]
             else:
-                val_str = raw.strip("'\"")
+                val_str = raw.strip("\"")
                 if val_str.lower() == "true":
                     current[key] = True
                 elif val_str.lower() == "false":
@@ -329,6 +432,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_get_status()
             elif path == "/api/runs":
                 self._api_list_runs()
+            elif path == "/api/models":
+                self._api_list_models()
+            elif path == "/api/datasets":
+                self._api_list_datasets()
             elif _RUN_RE.match(path) and path.endswith("/logs"):
                 run_id = _RUN_RE.match(path).group(1)
                 self._api_get_run_logs(run_id)
@@ -353,6 +460,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_ros_start()
             elif path == "/api/ros/stop":
                 self._api_ros_stop()
+            elif path == "/api/experiment/run":
+                self._api_experiment_run()
+            elif path == "/api/datasets/download":
+                self._api_dataset_download()
             else:
                 self._send_error(404, "Not found")
         except Exception:
@@ -538,6 +649,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(400, error)
             return
 
+        # Validate rosbag_path against the installed catalog (allowlist).
+        # Arbitrary filesystem paths are never accepted.
+        rosbag_path = params.get("rosbag_path", "")
+        if rosbag_path:
+            catalog = discover_datasets(
+                rosbag_root=cfg.get("rosbag_dir"),
+                image_root=cfg.get("image_dataset_dir"),
+                video_root=cfg.get("video_dataset_dir"),
+            )
+            allowed_paths = {
+                b["local_path"]
+                for b in catalog["rosbags"]
+                if b.get("installed") and b.get("local_path")
+            }
+            if rosbag_path not in allowed_paths:
+                self._send_error(
+                    400, "rosbag_path is not an installed catalog path"
+                )
+                return
+
         run_id = RunStore.new_run_id()
         run_store = self.server_instance.run_store
 
@@ -693,7 +824,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                         round(max(infer_ms_vals), 2)
                                         if infer_ms_vals else None
                                     ),
+                                   # Source label for UI clarity.
+                                   "source": "benchmark.jsonl (all processed inference samples)",
                                 }
+                                # When benchmark and ROS-topic counts diverge, add
+                                # an explanatory note so the UI can surface it.
+                                if len(result_frames) != len(frame_recs):
+                                   benchmark_summary["count_note"] = (
+                                       f"benchmark.jsonl recorded {len(frame_recs)} "
+                                       f"processed inference sample(s); "
+                                       f"results.log captured {len(result_frames)} "
+                                       f"frame result(s) from the ROS topic subscriber. "
+                                       f"The difference typically reflects frames whose "
+                                       f"inference completed during graceful shutdown after "
+                                       f"the subscriber had already closed."
+                                   )
                         except OSError:
                             pass
 
@@ -767,6 +912,273 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(404, f"No active experiment with run_id={run_id!r}")
             return
         self._send_json(200, {"run_id": run_id, "status": "stopped"})
+
+    # ── model and dataset catalog API ─────────────────────────────────────────
+
+    def _api_list_models(self) -> None:
+        cfg = self.server_instance.config
+        workspace_dir = cfg.get("workspace_dir", None)
+        profiles = discover_models(workspace_dir=workspace_dir)
+        self._send_json(200, {"models": [p.to_dict() for p in profiles]})
+
+    def _api_list_datasets(self) -> None:
+        cfg = self.server_instance.config
+        catalog = discover_datasets(
+            rosbag_root=cfg.get("rosbag_dir"),
+            image_root=cfg.get("image_dataset_dir"),
+            video_root=cfg.get("video_dataset_dir"),
+        )
+        self._send_json(200, catalog)
+
+    def _api_dataset_download(self) -> None:
+        """Initiate a rosbag download via the existing download_rosbags.sh script.
+
+        Accepts ``{"bag_key": "<key>"}`` in the JSON body.  Only keys registered
+        in the dataset catalog are accepted.  The command is constructed as an
+        argument array — never shell=True.
+        """
+        cfg = self.server_instance.config
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        bag_key = body.get("bag_key", "")
+        if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", bag_key):
+            self._send_error(400, "Invalid bag_key")
+            return
+
+        import pathlib as _pathlib
+        script_path = str(
+            _pathlib.Path(__file__).parent.parent
+            / "scripts"
+            / "test_data"
+            / "download_rosbags.sh"
+        )
+        args = build_download_command(script_path, bag_key)
+        if args is None:
+            self._send_error(400, f"Unknown or non-downloadable bag_key: {bag_key!r}")
+            return
+
+        run_id = RunStore.new_run_id()
+        run_store = self.server_instance.run_store
+
+        artifact_dir = run_store.base_dir / run_id / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        if cfg.get("rosbag_dir"):
+            env["ROSBAG_DIR"] = cfg["rosbag_dir"]
+
+        initial_record: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "download",
+            "created_at": _now_iso(),
+            "bag_key": bag_key,
+            "status": "starting",
+        }
+        run_store.save_run(run_id, initial_record)
+
+        def _on_complete(
+            rid: str,
+            exit_code: Optional[int],
+            was_stopped: bool,
+            log_lines: list,
+        ) -> None:
+            status_str = "stopped" if was_stopped else ("completed" if exit_code == 0 else "failed")
+            run_store.finalize_run(rid, {
+                "status": status_str,
+                "exit_code": exit_code,
+                "completed_at": _now_iso(),
+                "success": exit_code == 0 and not was_stopped,
+                "log_lines": log_lines[:200],
+            })
+
+        try:
+            pid = self.server_instance.process_manager.start_ros_experiment(
+                run_id=run_id,
+                args=args,
+                env=env,
+                on_complete=_on_complete,
+            )
+        except Exception as exc:
+            run_store.finalize_run(run_id, {
+                "status": "failed",
+                "exit_code": None,
+                "completed_at": _now_iso(),
+                "success": False,
+                "error": str(exc),
+            })
+            self._send_error(500, f"Failed to start download: {exc}")
+            return
+
+        run_store.update_run_if_status(run_id, "starting", {"status": "running", "pid": pid})
+        self._send_json(202, run_store.get_run(run_id) or initial_record)
+
+    # ── ROS-independent experiment API ────────────────────────────────────────
+
+    def _api_experiment_run(self) -> None:
+        """Submit a ROS-independent experiment run.
+
+        Accepts a JSON body with keys:
+          strategy               — "single_frame" or "single_frame_observation_history"
+          image_paths            — list of absolute image paths (max 10 000)
+          task_prompt            — task prompt string
+          system_instruction     — optional system instruction
+          observation_history_max_entries  — int (default 0)
+          observation_history_max_chars    — int (default 4000)
+          max_generate_length    — int (default 96)
+          temperature            — float (default 0.2)
+          top_p                  — float (default 0.9)
+          top_k                  — int (default 20)
+          timeout_seconds        — int (default 120)
+          notes                  — optional reproducibility notes
+
+        Image paths must be absolute and the files must exist at request time.
+        The experiment runs in a background thread to avoid blocking the HTTP
+        server.
+        """
+        cfg = self.server_instance.config
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        # ── build ExperimentDefinition ───────────────────────────────────────
+        try:
+            defn = ExperimentDefinition(
+                strategy=str(body.get("strategy", "single_frame")),
+                image_paths=[str(p) for p in body.get("image_paths", [])],
+                task_prompt=str(body.get("task_prompt", "")).strip(),
+                system_instruction=str(
+                    body.get(
+                        "system_instruction",
+                        "You are a vision observer. Base claims on the current image.",
+                    )
+                ),
+                observation_history_max_entries=int(
+                    body.get("observation_history_max_entries", 0)
+                ),
+                observation_history_max_chars=int(
+                    body.get("observation_history_max_chars", 4000)
+                ),
+                max_generate_length=int(body.get("max_generate_length", 96)),
+                temperature=float(body.get("temperature", 0.2)),
+                top_p=float(body.get("top_p", 0.9)),
+                top_k=int(body.get("top_k", 20)),
+                timeout_seconds=int(body.get("timeout_seconds", 120)),
+                notes=str(body.get("notes", "")),
+            )
+        except (TypeError, ValueError) as exc:
+            self._send_error(400, f"Invalid parameter: {exc}")
+            return
+
+        error = validate_definition(defn)
+        if error:
+            self._send_error(400, error)
+            return
+
+        # Validate that ALL image files exist before marking the run active.
+        # A partial check (e.g. first-100-only) allows large runs to start with
+        # unchecked paths that will fail mid-experiment.
+        for img_path in defn.image_paths:
+            if not os.path.isabs(img_path):
+                self._send_error(400, f"image_paths must be absolute: {img_path!r}")
+                return
+            if not os.path.isfile(img_path):
+                self._send_error(400, f"Image file not found: {img_path!r}")
+                return
+
+        run_id = defn.experiment_id
+        defn.run_id = run_id
+        srv = self.server_instance
+        run_store = srv.run_store
+
+        # Bounded experiment coordinator: reject concurrent submissions.
+        with srv._active_experiment_lock:
+            if srv._active_experiment_id is not None:
+                self._send_error(
+                    409,
+                    f"Experiment already in progress: {srv._active_experiment_id}. "
+                    "Wait for it to complete or poll /api/runs/<id> for status.",
+                )
+                return
+            srv._active_experiment_id = run_id
+
+        artifact_dir = run_store.base_dir / run_id / "artifacts"
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        initial_record: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "experiment",
+            "strategy": defn.strategy,
+            "created_at": defn.created_at,
+            "image_count": len(defn.image_paths),
+            "task_prompt": defn.task_prompt,
+            "observation_history_max_entries": defn.observation_history_max_entries,
+            "max_generate_length": defn.max_generate_length,
+            "temperature": defn.temperature,
+            "top_p": defn.top_p,
+            "top_k": defn.top_k,
+            "timeout_seconds": defn.timeout_seconds,
+            "notes": defn.notes,
+            "status": "running",
+        }
+        run_store.save_run(run_id, initial_record)
+
+        cli_path = cfg.get("cli_path", "edge_vlm_cli")
+        socket_path = cfg.get("socket_path", "/tmp/edge_vlm.sock")
+
+        def _run_in_background() -> None:
+            try:
+                results = run_experiment(
+                    defn,
+                    cli_path=cli_path,
+                    socket_path=socket_path,
+                    artifact_dir=artifact_dir,
+                )
+                successful = [r for r in results if r.success]
+                failed = [r for r in results if not r.success]
+                latencies = [r.latency_ms for r in successful]
+                run_store.finalize_run(run_id, {
+                    "status": "completed",
+                    "completed_at": _now_iso(),
+                    "success": True,
+                    "successful_frames": len(successful),
+                    "failed_frames": len(failed),
+                    "repetition_flags": sum(1 for r in results if r.repetition_flag),
+                    "mean_latency_ms": (
+                        round(sum(latencies) / len(latencies), 2)
+                        if latencies else None
+                    ),
+                    "result_frames": [
+                        {
+                            "frame_index": r.frame_index,
+                            "success": r.success,
+                            "text": r.text,
+                            "error": r.error,
+                            "latency_ms": r.latency_ms,
+                            "history_entries_used": r.history_entries_used,
+                            "repetition_flag": r.repetition_flag,
+                        }
+                        for r in results[:50]  # cap at 50 for manifest size
+                    ],
+                })
+            except Exception as exc:
+                run_store.finalize_run(run_id, {
+                    "status": "failed",
+                    "completed_at": _now_iso(),
+                    "success": False,
+                    "error": str(exc),
+                })
+            finally:
+                # Release the coordinator slot so the next experiment can start.
+                with srv._active_experiment_lock:
+                    if srv._active_experiment_id == run_id:
+                        srv._active_experiment_id = None
+
+        threading.Thread(target=_run_in_background, daemon=True).start()
+        self._send_json(202, initial_record)
 
     # ── response helpers ──────────────────────────────────────────────────────
 
@@ -849,6 +1261,7 @@ def _build_ros_env(
         "playback_duration": "PLAYBACK_DURATION_SECONDS",
         "result_timeout": "RESULT_TIMEOUT_SECONDS",
         "instruction_delivery_mode": "INSTRUCTION_DELIVERY_MODE",
+        "rosbag_path": "ROSBAG_PATH",
     }
     for param_key, env_key in _map.items():
         if param_key in params:
@@ -893,6 +1306,9 @@ class ConsoleServer(ThreadingHTTPServer):
         )
         self.run_store = run_store or RunStore(runs_dir)
         self._quiet = self.config.get("quiet", False)
+        # Bounded experiment coordinator: at most one active experiment at a time.
+        self._active_experiment_lock = threading.Lock()
+        self._active_experiment_id: Optional[str] = None
 
         def handler(*args: Any, **kwargs: Any) -> None:
             h = ConsoleHandler(*args, **kwargs)
@@ -920,61 +1336,9 @@ class ConsoleServer(ThreadingHTTPServer):
 # ── HTML rendering ────────────────────────────────────────────────────────────
 
 def _render_index(srv: ConsoleServer) -> bytes:
-    cfg = srv.config
-    socket_path = html.escape(cfg.get("socket_path", "/tmp/edge_vlm.sock"))
-    runs = srv.run_store.list_runs()
-    runs_html = _render_runs_table(runs)
     active_run = srv.process_manager.active_ros_run_id() or ""
-    page = _INDEX_TEMPLATE.replace("{{SOCKET_PATH}}", socket_path)
-    page = page.replace("{{RUNS_TABLE}}", runs_html)
-    page = page.replace("{{ACTIVE_ROS_RUN}}", html.escape(active_run))
+    page = _INDEX_TEMPLATE.replace("{{ACTIVE_ROS_RUN}}", html.escape(active_run))
     return page.encode("utf-8")
-
-
-def _render_runs_table(runs: list) -> str:
-    if not runs:
-        return "<p class='muted'>No runs yet.</p>"
-    rows = []
-    for r in runs:
-        run_id = html.escape(r.get("run_id", ""))
-        kind = html.escape(r.get("kind", ""))
-        created = html.escape(r.get("created_at", ""))
-        status = html.escape(r.get("status", ""))
-        success = r.get("success", None)
-        badge = ""
-        if success is True:
-            badge = "<span class='badge ok'>OK</span>"
-        elif success is False:
-            badge = "<span class='badge fail'>FAIL</span>"
-        elif status in ("running", "starting"):
-            badge = "<span class='badge running'>Running</span>"
-        # Latency: inference_seconds for standalone; mean_inference_ms for ROS
-        latency_str = ""
-        if kind == "standalone":
-            secs = r.get("inference_seconds")
-            if secs is not None:
-                latency_str = f"{secs:.3f} s"
-        elif kind == "ros":
-            bsumm = r.get("benchmark_summary") or {}
-            mean_ms = bsumm.get("mean_inference_ms")
-            if mean_ms is not None:
-                latency_str = f"{mean_ms:.0f} ms"
-        rows.append(
-            f"<tr>"
-            f"<td><a href='#' onclick=\"loadRun('{run_id}'); return false;\">{run_id[:8]}…</a></td>"
-            f"<td>{kind}</td>"
-            f"<td>{badge}</td>"
-            f"<td>{created[:19].replace('T', ' ')}</td>"
-            f"<td>{latency_str}</td>"
-            f"</tr>"
-        )
-    return (
-        "<table class='runs'><thead><tr>"
-        "<th>Run</th><th>Kind</th><th>Status</th><th>Created</th><th>Latency</th>"
-        "</tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table>"
-    )
 
 
 # ── HTML template ─────────────────────────────────────────────────────────────
@@ -985,112 +1349,301 @@ _INDEX_TEMPLATE = """\
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>edge_vlm_ros — Web Console</title>
+<title>edge_vlm_ros — VLM Experiment Workbench</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 <header>
-  <h1>edge_vlm_ros Web Console</h1>
-  <span id="server-badge" class="badge">checking…</span>
+  <h1>edge_vlm_ros — VLM Experiment Workbench</h1>
 </header>
+<nav aria-label="Primary navigation">
+  <button data-view="dashboard" aria-label="Dashboard">Dashboard</button>
+  <button data-view="models" aria-label="Models">Models</button>
+  <button data-view="datasets" aria-label="Datasets">Datasets</button>
+  <button data-view="experiment" aria-label="Experiment">Experiment</button>
+  <button data-view="runs" aria-label="Runs">Runs</button>
+  <button data-view="diagnostics" aria-label="Diagnostics">Diagnostics</button>
+</nav>
 <main>
 
-<section id="status-section">
-  <h2>Status <button onclick="refreshStatus()" style="margin-left:0.5rem">Refresh</button></h2>
-  <div id="status-cards" class="card-grid">
-    <div class="status-card" id="service-card">
-      <div class="card-title">Inference Service</div>
-      <div id="service-details"><span class="muted">Loading…</span></div>
+<!-- ── Dashboard view ──────────────────────────────────────────────────────── -->
+<div id="view-dashboard" class="view">
+  <div class="panel">
+    <div class="panel-title">Service &amp; GPU Health</div>
+    <div class="card-grid">
+      <div class="status-card">
+        <div class="card-title">Inference Service</div>
+        <div id="dash-service"><span class="muted">Loading…</span></div>
+      </div>
+      <div class="status-card">
+        <div class="card-title">GPU</div>
+        <div id="dash-gpu"><span class="muted">Loading…</span></div>
+      </div>
+      <div class="status-card">
+        <div class="card-title">Active ROS Run</div>
+        <div id="dash-active"><span class="muted">None</span></div>
+      </div>
     </div>
-    <div class="status-card" id="gpu-card">
-      <div class="card-title">GPU</div>
-      <div id="gpu-details"><span class="muted">Loading…</span></div>
-    </div>
-    <div class="status-card" id="active-run-card">
-      <div class="card-title">Active ROS Run</div>
-      <div id="active-run-status"><span class="muted">None</span></div>
-    </div>
   </div>
-  <details class="raw-details">
-    <summary>Raw status JSON</summary>
-    <pre id="status-out"></pre>
-  </details>
-</section>
+  <div class="panel">
+    <div class="panel-title">Recent Runs</div>
+    <div id="dash-recent"><span class="muted">Loading…</span></div>
+  </div>
+</div>
 
-<section id="infer-section">
-  <h2>Standalone Inference</h2>
-  <form id="infer-form" enctype="multipart/form-data">
-    <label>Image (max 64 MiB): <input type="file" name="image" accept="image/*" required></label><br>
-    <label>Prompt: <input type="text" name="prompt" value="Describe the scene." size="60" required></label><br>
-    <label>Max tokens: <input type="number" name="max_generate_length" value="64" min="1" max="4096"></label>
-    <label>Temperature: <input type="number" name="temperature" value="0.2" step="0.01" min="0" max="2"></label>
-    <label>top-p: <input type="number" name="top_p" value="0.9" step="0.01" min="0.01" max="1"></label>
-    <label>top-k: <input type="number" name="top_k" value="20" min="1" max="200"></label><br>
-    <button type="button" onclick="submitInfer()">Run Inference</button>
-  </form>
-  <div id="infer-result-card" style="display:none" class="result-card"></div>
-  <details id="infer-raw-details" class="raw-details" style="display:none">
-    <summary>Full record (JSON)</summary>
-    <pre id="infer-out"></pre>
-  </details>
-</section>
+<!-- ── Models view ─────────────────────────────────────────────────────────── -->
+<div id="view-models" class="view">
+  <div class="panel">
+    <div class="panel-title">Configured Model Profiles</div>
+    <div id="models-list"><span class="muted">Loading…</span></div>
+  </div>
+</div>
 
-<section id="ros-section">
-  <h2>ROS Experiment</h2>
-  <div id="ros-active" class="active-run-banner" style="display:none">
-    Active run: <span id="ros-active-id">{{ACTIVE_ROS_RUN}}</span>
-    <button onclick="stopRos()">Stop</button>
-  </div>
-  <div id="ros-form-area">
-    <label>Image topic: <input id="ros-topic" type="text" value="/hawk_0_left_rgb_image" size="40"></label><br>
-    <label>Prompt: <input id="ros-prompt" type="text" value="" placeholder="(optional override)" size="60"></label><br>
-    <label>Max tokens: <input id="ros-max-gen" type="number" value="64" min="1" max="4096"></label>
-    <label>Delivery mode:
-      <select id="ros-delivery">
-        <option value="inline">inline</option>
-        <option value="structured">structured</option>
-      </select>
-    </label>
-    <label>Obs. history entries: <input id="ros-hist-entries" type="number" value="0" min="0" max="256"></label>
-    <label>Obs. history chars: <input id="ros-hist-chars" type="number" value="0" min="0" max="1000000"></label>
-    <label>Playback duration (s): <input id="ros-playback" type="number" value="20" min="1" max="3600"></label>
-    <label>Result timeout (s): <input id="ros-timeout" type="number" value="120" min="1" max="3600"></label>
-    <label>Required results: <input id="ros-required" type="number" value="1" min="1" max="100"></label><br>
-    <button type="button" onclick="startRos()">Start ROS Experiment</button>
-  </div>
-  <div id="ros-start-out" style="display:none" class="muted"></div>
-  <div id="ros-logs-area" style="display:none">
-    <h3>Live Logs</h3>
-    <pre id="ros-logs"></pre>
-    <button onclick="pollLogs()">Refresh Logs</button>
-  </div>
-  <details id="ros-raw-details" class="raw-details" style="display:none">
-    <summary>Raw start response (JSON)</summary>
-    <pre id="ros-out"></pre>
-  </details>
-</section>
+<!-- ── Datasets view ───────────────────────────────────────────────────────── -->
+<div id="view-datasets" class="view">
+  <div id="datasets-content"><span class="muted">Loading…</span></div>
+</div>
 
-<section id="history-section">
-  <h2>Run History</h2>
-  <button onclick="refreshHistory()">Refresh</button>
-  <div id="runs-table">{{RUNS_TABLE}}</div>
-  <div id="run-detail" style="display:none">
-    <h3>Run Detail</h3>
-    <div id="run-detail-cards"></div>
-    <details class="raw-details">
-      <summary>Raw JSON</summary>
-      <pre id="run-detail-out"></pre>
+<!-- ── Experiment view ─────────────────────────────────────────────────────── -->
+<div id="view-experiment" class="view">
+
+  <!-- Standalone inference -->
+  <div class="panel">
+    <div class="panel-title">Standalone Inference (single image)</div>
+    <form id="infer-form" enctype="multipart/form-data">
+      <fieldset>
+        <legend>Image &amp; Prompt</legend>
+        <label>
+          <span class="label-text">Image (max 64 MiB)</span>
+          <input type="file" name="image" accept="image/*" required>
+        </label>
+        <label>
+          <span class="label-text">Prompt</span>
+          <input type="text" name="prompt" value="Describe the scene." size="60" required>
+        </label>
+      </fieldset>
+      <fieldset>
+        <legend>Generation Settings</legend>
+        <label>
+          <span class="label-text">Max tokens</span>
+          <input type="number" name="max_generate_length" value="64" min="1" max="4096">
+        </label>
+        <label>
+          <span class="label-text">Temperature</span>
+          <input type="number" name="temperature" value="0.2" step="0.01" min="0" max="2">
+        </label>
+        <label>
+          <span class="label-text">top-p</span>
+          <input type="number" name="top_p" value="0.9" step="0.01" min="0.01" max="1">
+        </label>
+        <label>
+          <span class="label-text">top-k</span>
+          <input type="number" name="top_k" value="20" min="1" max="200">
+        </label>
+      </fieldset>
+      <button type="button" id="infer-submit-btn" onclick="submitInfer()">Run Inference</button>
+    </form>
+    <div id="infer-result-card" style="display:none" class="result-card"></div>
+    <details id="infer-raw-details" class="raw-details" style="display:none">
+      <summary>Full record (JSON)</summary>
+      <pre id="infer-out"></pre>
     </details>
   </div>
-</section>
+
+  <!-- Frame-sequence experiment -->
+  <div class="panel">
+    <div class="panel-title">Frame-Sequence Experiment (ROS-independent)</div>
+    <fieldset>
+      <legend>Source</legend>
+      <label>
+        <span class="label-text">Image paths (one per line, absolute)</span>
+        <textarea id="exp-image-paths" rows="4" cols="70" placeholder="/data/frame_001.jpg&#10;/data/frame_002.jpg"></textarea>
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Strategy &amp; Context</legend>
+      <label>
+        <span class="label-text">Strategy</span>
+        <select id="exp-strategy">
+          <option value="single_frame">single_frame — no accumulated context</option>
+          <option value="single_frame_observation_history">single_frame_observation_history — rolling history</option>
+        </select>
+      </label>
+      <label>
+        <span class="label-text">History entries (0 = none)</span>
+        <input type="number" id="exp-history-entries" value="0" min="0" max="256">
+      </label>
+      <label>
+        <span class="label-text">History char budget</span>
+        <input type="number" id="exp-history-chars" value="4000" min="0" max="1000000">
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Prompt</legend>
+      <label>
+        <span class="label-text">System instruction</span>
+        <input type="text" id="exp-system" value="You are a vision observer. Base claims on the current image." size="70">
+      </label>
+      <label>
+        <span class="label-text">Task prompt</span>
+        <input type="text" id="exp-prompt" value="Describe the scene." size="70" required>
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Generation Settings</legend>
+      <label>
+        <span class="label-text">Max tokens</span>
+        <input type="number" id="exp-max-gen" value="96" min="1" max="4096">
+      </label>
+      <label>
+        <span class="label-text">Temperature</span>
+        <input type="number" id="exp-temperature" value="0.2" step="0.01" min="0" max="2">
+      </label>
+      <label>
+        <span class="label-text">top-p</span>
+        <input type="number" id="exp-top-p" value="0.9" step="0.01" min="0.01" max="1">
+      </label>
+      <label>
+        <span class="label-text">top-k</span>
+        <input type="number" id="exp-top-k" value="20" min="1" max="200">
+      </label>
+      <label>
+        <span class="label-text">Timeout (s)</span>
+        <input type="number" id="exp-timeout" value="120" min="1" max="3600">
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Reproducibility</legend>
+      <label>
+        <span class="label-text">Notes</span>
+        <input type="text" id="exp-notes" size="70" placeholder="Optional free-form notes">
+      </label>
+    </fieldset>
+    <button type="button" id="exp-submit-btn" onclick="submitExperiment()">Submit Experiment</button>
+    <div id="exp-result"></div>
+  </div>
+
+  <!-- ROS experiment -->
+  <div class="panel">
+    <div class="panel-title">ROS Image-Proc Experiment (rosbag playback)</div>
+    <div id="ros-active" class="active-run-banner" style="display:none">
+      Active run: <span id="ros-active-id"></span>
+      <button class="danger small" onclick="stopRosRun(document.getElementById('ros-active-id').textContent)">Stop</button>
+    </div>
+    <div id="ros-selected-bag" class="selected-bag-status" style="display:none"></div>
+    <fieldset>
+      <legend>ROS Source &amp; Prompt</legend>
+      <label>
+        <span class="label-text">Image topic</span>
+        <input id="ros-topic" type="text" value="/hawk_0_left_rgb_image" size="40">
+      </label>
+      <label>
+        <span class="label-text">Prompt override (optional)</span>
+        <input id="ros-prompt" type="text" value="" placeholder="(optional override)" size="60">
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Generation &amp; History</legend>
+      <label>
+        <span class="label-text">Max tokens</span>
+        <input id="ros-max-gen" type="number" value="64" min="1" max="4096">
+      </label>
+      <label>
+        <span class="label-text">Delivery mode</span>
+        <select id="ros-delivery">
+          <option value="inline">inline</option>
+          <option value="structured">structured</option>
+        </select>
+      </label>
+      <label>
+        <span class="label-text">Obs. history entries</span>
+        <input id="ros-hist-entries" type="number" value="0" min="0" max="256">
+      </label>
+      <label>
+        <span class="label-text">Obs. history chars</span>
+        <input id="ros-hist-chars" type="number" value="0" min="0" max="1000000">
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Timing</legend>
+      <label>
+        <span class="label-text">Playback duration (s)</span>
+        <input id="ros-playback" type="number" value="20" min="1" max="3600">
+      </label>
+      <label>
+        <span class="label-text">Result timeout (s)</span>
+        <input id="ros-timeout" type="number" value="120" min="1" max="3600">
+      </label>
+      <label>
+        <span class="label-text">Required results</span>
+        <input id="ros-required" type="number" value="1" min="1" max="100">
+      </label>
+    </fieldset>
+    <button type="button" onclick="startRos()">Start ROS Experiment</button>
+    <div id="ros-start-out" style="display:none" class="muted"></div>
+    <div id="ros-logs-area" style="display:none">
+      <div class="panel-title" style="margin-top:0.75rem">Live Logs</div>
+      <pre id="ros-logs" style="max-height:300px"></pre>
+    </div>
+    <details id="ros-raw-details" class="raw-details" style="display:none">
+      <summary>Raw start response (JSON)</summary>
+      <pre id="ros-out"></pre>
+    </details>
+  </div>
+</div>
+
+<!-- ── Runs view ────────────────────────────────────────────────────────────── -->
+<div id="view-runs" class="view">
+  <div class="panel">
+    <div class="panel-title">Run Catalog
+      <button class="secondary small" onclick="_loadRuns()" style="margin-left:auto">Refresh</button>
+    </div>
+    <div id="runs-list"><span class="muted">Loading…</span></div>
+  </div>
+  <div id="run-detail" style="display:none" class="panel">
+    <div class="panel-title">Run Detail</div>
+  </div>
+</div>
+
+<!-- ── Diagnostics view ────────────────────────────────────────────────────── -->
+<div id="view-diagnostics" class="view">
+  <div class="panel">
+    <div class="panel-title">Live Status
+      <button class="secondary small" onclick="loadDiagStatus()" style="margin-left:auto">Refresh</button>
+    </div>
+    <pre id="diag-status-pre">Loading…</pre>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Run Manifests
+      <button class="secondary small" onclick="loadDiagRuns()" style="margin-left:auto">Refresh</button>
+    </div>
+    <pre id="diag-runs-pre">Click Refresh to load.</pre>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Models (raw JSON)
+      <button class="secondary small" onclick="loadDiagModels()" style="margin-left:auto">Refresh</button>
+    </div>
+    <pre id="diag-models-pre">Click Refresh to load.</pre>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Datasets (raw JSON)
+      <button class="secondary small" onclick="loadDiagDatasets()" style="margin-left:auto">Refresh</button>
+    </div>
+    <pre id="diag-datasets-pre">Click Refresh to load.</pre>
+  </div>
+</div>
 
 </main>
 <script src="/static/app.js"></script>
 <script>
-  refreshStatus();
-  var activeRos = "{{ACTIVE_ROS_RUN}}";
-  if (activeRos) { showActiveRun(activeRos); }
+  (function() {
+    var activeRos = "{{ACTIVE_ROS_RUN}}";
+    if (activeRos) { showActiveRun(activeRos); }
+  })();
 </script>
 </body>
 </html>
 """
+
+
+

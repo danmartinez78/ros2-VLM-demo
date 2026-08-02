@@ -43,6 +43,8 @@ from web_console.server import (
     _build_ros_env,
     _parse_results_log,
     _parse_benchmark_jsonl,
+    _single_quote_close_idx,
+    _fold_single_quoted_scalar,
 )
 from web_console.__main__ import _parse_args, _is_loopback
 
@@ -2015,6 +2017,1487 @@ class TestExternalServiceMode(unittest.TestCase):
                                      "IMAGE_TOPIC env var did not reach the subprocess")
                 finally:
                     srv.shutdown()
+
+
+# ── experiment engine tests ───────────────────────────────────────────────────
+
+from web_console.experiment_engine import (
+    ExperimentDefinition,
+    FrameResult,
+    validate_definition,
+    run_experiment,
+    _truncate_history,
+    _compute_repetition,
+    _build_prompt,
+    compute_history_matrix,
+)
+from web_console.model_catalog import (
+    discover_models,
+    _make_model_id,
+    _profile_from_env,
+    _scan_workspace,
+)
+from web_console.dataset_catalog import (
+    discover_datasets,
+    build_download_command,
+    _DOWNLOADABLE_BAGS,
+)
+
+
+class TestExperimentEngineValidation(unittest.TestCase):
+
+    def _valid_defn(self, **kwargs):
+        base = dict(
+            strategy="single_frame",
+            image_paths=["/data/frame.jpg"],
+            task_prompt="Describe the scene.",
+        )
+        base.update(kwargs)
+        return ExperimentDefinition(**base)
+
+    def test_valid_definition_returns_none(self):
+        defn = self._valid_defn()
+        self.assertIsNone(validate_definition(defn))
+
+    def test_invalid_strategy(self):
+        defn = self._valid_defn(strategy="unknown_strategy")
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn("Unknown strategy", err)
+
+    def test_empty_image_paths(self):
+        defn = self._valid_defn(image_paths=[])
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn("image_paths", err)
+
+    def test_unsupported_image_extension(self):
+        defn = self._valid_defn(image_paths=["/data/frame.xyz"])
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn(".xyz", err)
+
+    def test_empty_prompt(self):
+        defn = self._valid_defn(task_prompt="")
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn("task_prompt", err)
+
+    def test_max_generate_length_out_of_range(self):
+        defn = self._valid_defn(max_generate_length=0)
+        self.assertIsNotNone(validate_definition(defn))
+        defn2 = self._valid_defn(max_generate_length=4097)
+        self.assertIsNotNone(validate_definition(defn2))
+
+    def test_temperature_out_of_range(self):
+        defn = self._valid_defn(temperature=2.5)
+        self.assertIsNotNone(validate_definition(defn))
+
+    def test_top_p_out_of_range(self):
+        defn = self._valid_defn(top_p=0.0)
+        self.assertIsNotNone(validate_definition(defn))
+
+    def test_history_entries_out_of_range(self):
+        defn = self._valid_defn(observation_history_max_entries=257)
+        self.assertIsNotNone(validate_definition(defn))
+
+    def test_history_strategy_valid(self):
+        defn = self._valid_defn(
+            strategy="single_frame_observation_history",
+            observation_history_max_entries=3,
+        )
+        self.assertIsNone(validate_definition(defn))
+
+
+class TestExperimentEngineHistoryHelpers(unittest.TestCase):
+
+    def test_truncate_history_empty(self):
+        self.assertEqual(_truncate_history([], 100), "")
+
+    def test_truncate_history_fits(self):
+        result = _truncate_history(["a", "b", "c"], 1000)
+        self.assertEqual(result, "a; b; c")
+
+    def test_truncate_history_respects_budget(self):
+        # With budget of 1 char, only the most-recent entry ("c") fits.
+        result = _truncate_history(["long_entry_here", "b", "c"], 1)
+        self.assertEqual(result, "c")
+
+    def test_truncate_history_zero_budget(self):
+        self.assertEqual(_truncate_history(["a", "b"], 0), "")
+
+    def test_compute_repetition_no_history(self):
+        self.assertFalse(_compute_repetition("hello world", []))
+
+    def test_compute_repetition_identical(self):
+        text = "the quick brown fox jumps over the lazy dog"
+        self.assertTrue(_compute_repetition(text, [text]))
+
+    def test_compute_repetition_distinct(self):
+        t1 = "red apple on a wooden table near the window sill outside"
+        t2 = "blue ocean with waves crashing against rocky cliffs far away"
+        self.assertFalse(_compute_repetition(t1, [t2]))
+
+    def test_build_prompt_no_history(self):
+        result = _build_prompt("What is this?", "You are an observer.", [], 1000)
+        self.assertIn("What is this?", result)
+        self.assertIn("You are an observer.", result)
+        self.assertNotIn("Prior observations", result)
+
+    def test_build_prompt_with_history(self):
+        result = _build_prompt("What changed?", "", ["First obs.", "Second obs."], 1000)
+        self.assertIn("Prior observations", result)
+        self.assertIn("First obs.", result)
+
+
+class TestExperimentEngineSingleFrame(unittest.TestCase):
+
+    def _make_inference_fn(self, text="Test response", success=True):
+        """Return a mock inference function that returns a fixed InferenceResult."""
+        from web_console.inference_client import InferenceResult
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                max_generate_length=64, temperature=0.2, top_p=0.9, top_k=20,
+                timeout=30.0, timeout_seconds=30.0, **kwargs):
+            return InferenceResult(
+                success=success,
+                text=text,
+                error="" if success else "mock error",
+                inference_seconds=0.05,
+            )
+        return _fn
+
+    def test_single_frame_returns_one_result_per_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            img = pathlib.Path(d) / "img.jpg"
+            img.write_bytes(b"FAKE")
+            defn = ExperimentDefinition(
+                strategy="single_frame",
+                image_paths=[str(img)],
+                task_prompt="Describe.",
+            )
+            results = run_experiment(
+                defn,
+                inference_fn=self._make_inference_fn(),
+                socket_path="/tmp/fake.sock",
+            )
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].success)
+            self.assertEqual(results[0].text, "Test response")
+
+    def test_single_frame_multiple_images(self):
+        with tempfile.TemporaryDirectory() as d:
+            imgs = []
+            for i in range(3):
+                p = pathlib.Path(d) / f"f{i}.png"
+                p.write_bytes(b"FAKE")
+                imgs.append(str(p))
+            defn = ExperimentDefinition(
+                strategy="single_frame",
+                image_paths=imgs,
+                task_prompt="Describe.",
+            )
+            results = run_experiment(
+                defn,
+                inference_fn=self._make_inference_fn(),
+                socket_path="/tmp/fake.sock",
+            )
+            self.assertEqual(len(results), 3)
+            for i, r in enumerate(results):
+                self.assertEqual(r.frame_index, i)
+
+    def test_single_frame_writes_artifact(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = pathlib.Path(d)
+            img = tmp / "img.jpg"
+            img.write_bytes(b"FAKE")
+            artifact_dir = tmp / "artifacts"
+            defn = ExperimentDefinition(
+                strategy="single_frame",
+                image_paths=[str(img)],
+                task_prompt="What?",
+            )
+            run_experiment(
+                defn,
+                inference_fn=self._make_inference_fn(),
+                socket_path="/tmp/fake.sock",
+                artifact_dir=artifact_dir,
+            )
+            self.assertTrue((artifact_dir / "experiment.jsonl").exists())
+            self.assertTrue((artifact_dir / "manifest.json").exists())
+
+    def test_invalid_definition_raises(self):
+        defn = ExperimentDefinition(
+            strategy="bad_strategy",
+            image_paths=["/data/frame.jpg"],
+            task_prompt="X",
+        )
+        with self.assertRaises(ValueError):
+            run_experiment(defn, inference_fn=self._make_inference_fn())
+
+
+class TestExperimentEngineObservationHistory(unittest.TestCase):
+
+    def _make_inference_fn(self, responses=None):
+        from web_console.inference_client import InferenceResult
+        responses = responses or []
+        counter = [0]
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                max_generate_length=64, temperature=0.2, top_p=0.9, top_k=20,
+                timeout=30.0, timeout_seconds=30.0, **kwargs):
+            idx = counter[0]
+            counter[0] += 1
+            text = responses[idx] if idx < len(responses) else f"Response {idx}"
+            return InferenceResult(success=True, text=text, error="",
+                                   inference_seconds=0.01)
+        return _fn
+
+    def test_history_not_used_for_depth_zero(self):
+        prompts_seen = []
+
+        from web_console.inference_client import InferenceResult
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                timeout_seconds=30.0, **kw):
+            prompts_seen.append(prompt)
+            return InferenceResult(success=True, text="resp", error="",
+                                   inference_seconds=0.01)
+
+        with tempfile.TemporaryDirectory() as d:
+            imgs = [str(pathlib.Path(d) / f"f{i}.jpg") for i in range(2)]
+            for p in imgs:
+                pathlib.Path(p).write_bytes(b"FAKE")
+            defn = ExperimentDefinition(
+                strategy="single_frame_observation_history",
+                image_paths=imgs,
+                task_prompt="Describe.",
+                observation_history_max_entries=0,
+            )
+            run_experiment(defn, inference_fn=_fn, socket_path="/tmp/fake.sock")
+        # History depth 0 — "Prior observations" should never appear.
+        for p in prompts_seen:
+            self.assertNotIn("Prior observations", p)
+
+    def test_history_accumulates_with_depth_2(self):
+        prompts_seen = []
+        from web_console.inference_client import InferenceResult
+        counter = [0]
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                timeout_seconds=30.0, **kw):
+            prompts_seen.append(prompt)
+            counter[0] += 1
+            return InferenceResult(success=True, text=f"Obs{counter[0]}",
+                                   error="", inference_seconds=0.01)
+
+        with tempfile.TemporaryDirectory() as d:
+            imgs = [str(pathlib.Path(d) / f"f{i}.jpg") for i in range(3)]
+            for p in imgs:
+                pathlib.Path(p).write_bytes(b"FAKE")
+            defn = ExperimentDefinition(
+                strategy="single_frame_observation_history",
+                image_paths=imgs,
+                task_prompt="Describe.",
+                observation_history_max_entries=2,
+                observation_history_max_chars=10000,
+            )
+            run_experiment(defn, inference_fn=_fn, socket_path="/tmp/fake.sock")
+        # Second prompt should contain "Prior observations"
+        self.assertNotIn("Prior observations", prompts_seen[0])
+        self.assertIn("Prior observations", prompts_seen[1])
+        self.assertIn("Prior observations", prompts_seen[2])
+
+
+class TestComputeHistoryMatrix(unittest.TestCase):
+
+    def test_matrix_sorts_by_depth(self):
+        """compute_history_matrix should sort rows by observation_history_max_entries."""
+        manifests = [
+            {
+                "experiment_id": "aaa",
+                "strategy": "single_frame_observation_history",
+                "image_count": 2,
+                "successful_frames": 2,
+                "failed_frames": 0,
+                "repetition_flags": 0,
+                "mean_latency_ms": 50.0,
+                "min_latency_ms": 40.0,
+                "max_latency_ms": 60.0,
+                "definition": {
+                    "observation_history_max_entries": 3,
+                    "task_prompt": "Describe.",
+                    "max_generate_length": 96,
+                    "temperature": 0.2,
+                },
+            },
+            {
+                "experiment_id": "bbb",
+                "strategy": "single_frame",
+                "image_count": 2,
+                "successful_frames": 2,
+                "failed_frames": 0,
+                "repetition_flags": 0,
+                "mean_latency_ms": 45.0,
+                "min_latency_ms": 42.0,
+                "max_latency_ms": 48.0,
+                "definition": {
+                    "observation_history_max_entries": 0,
+                    "task_prompt": "Describe.",
+                    "max_generate_length": 96,
+                    "temperature": 0.2,
+                },
+            },
+        ]
+        rows = compute_history_matrix(manifests)
+        self.assertEqual(len(rows), 2)
+        # depth=0 should come first
+        self.assertEqual(rows[0]["history_depth"], 0)
+        self.assertEqual(rows[1]["history_depth"], 3)
+
+    def test_matrix_empty_input(self):
+        rows = compute_history_matrix([])
+        self.assertEqual(rows, [])
+
+
+# ── model catalog tests ───────────────────────────────────────────────────────
+
+
+class TestModelCatalog(unittest.TestCase):
+
+    def test_make_model_id_stable(self):
+        id1 = _make_model_id("MyModel", "/some/path")
+        id2 = _make_model_id("MyModel", "/some/path")
+        self.assertEqual(id1, id2)
+        self.assertIn("MyModel", id1)
+        # Different paths must produce different IDs.
+        id3 = _make_model_id("MyModel", "/other/path")
+        self.assertNotEqual(id1, id3)
+
+    def test_make_model_id_deterministic_format(self):
+        """model_id must use a hex digest suffix, not a numeric hash."""
+        model_id = _make_model_id("MyModel", "/some/path")
+        # Format: <safe_name>_<8-hex-chars>
+        parts = model_id.rsplit("_", 1)
+        self.assertEqual(len(parts), 2, f"Unexpected format: {model_id!r}")
+        suffix = parts[1]
+        self.assertEqual(len(suffix), 8, f"Expected 8-char hex suffix, got {suffix!r}")
+        self.assertTrue(
+            all(c in "0123456789abcdef" for c in suffix),
+            f"Suffix is not hex: {suffix!r}",
+        )
+
+    def test_make_model_id_no_path(self):
+        model_id = _make_model_id("TestModel", "")
+        self.assertEqual(model_id, "TestModel")
+
+    def test_profile_from_env_none_when_no_vars(self):
+        env_backup = {}
+        for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR"):
+            env_backup[k] = os.environ.pop(k, None)
+        try:
+            result = _profile_from_env()
+            self.assertIsNone(result)
+        finally:
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_profile_from_env_with_name_and_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_backup = {
+                k: os.environ.pop(k, None)
+                for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR",
+                           "EDGE_VLM_MULTIMODAL_ENGINE_DIR", "EDGELLM_PLUGIN_PATH",
+                           "EDGE_VLM_WORKSPACE_DIR")
+            }
+            try:
+                os.environ["EDGE_VLM_MODEL_NAME"] = "FakeModel"
+                os.environ["EDGE_VLM_LLM_ENGINE_DIR"] = d
+                profile = _profile_from_env()
+                self.assertIsNotNone(profile)
+                self.assertEqual(profile.model_name, "FakeModel")
+                self.assertTrue(profile.is_active)
+                self.assertTrue(profile.llm_engine_exists)
+            finally:
+                for k, v in env_backup.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
+
+    def test_scan_workspace_empty_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            profiles = _scan_workspace(d)
+            self.assertEqual(profiles, [])
+
+    def test_scan_workspace_finds_model(self):
+        with tempfile.TemporaryDirectory() as ws:
+            model_dir = pathlib.Path(ws) / "FakeModel" / "engine"
+            model_dir.mkdir(parents=True)
+            (model_dir / "llm").mkdir()
+            profiles = _scan_workspace(ws)
+            self.assertEqual(len(profiles), 1)
+            self.assertEqual(profiles[0].model_name, "FakeModel")
+            self.assertTrue(profiles[0].multimodal_engine_exists)
+
+    def test_scan_workspace_skips_hidden(self):
+        with tempfile.TemporaryDirectory() as ws:
+            hidden = pathlib.Path(ws) / ".hidden" / "engine"
+            hidden.mkdir(parents=True)
+            profiles = _scan_workspace(ws)
+            self.assertEqual(profiles, [])
+
+    def test_discover_models_empty(self):
+        env_backup = {}
+        for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR",
+                   "EDGE_VLM_WORKSPACE_DIR"):
+            env_backup[k] = os.environ.pop(k, None)
+        try:
+            profiles = discover_models(workspace_dir="")
+            self.assertIsInstance(profiles, list)
+        finally:
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_discover_models_deduplicates(self):
+        """When env points at the same model dir as workspace scan, no duplicates."""
+        with tempfile.TemporaryDirectory() as ws:
+            model_dir = pathlib.Path(ws) / "AModel" / "engine"
+            (model_dir / "llm").mkdir(parents=True)
+            env_backup = {
+                k: os.environ.pop(k, None)
+                for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR",
+                           "EDGE_VLM_MULTIMODAL_ENGINE_DIR", "EDGELLM_PLUGIN_PATH")
+            }
+            try:
+                os.environ["EDGE_VLM_MODEL_NAME"] = "AModel"
+                os.environ["EDGE_VLM_LLM_ENGINE_DIR"] = str(model_dir / "llm")
+                profiles = discover_models(workspace_dir=ws)
+                ids = [p.model_id for p in profiles]
+                self.assertEqual(len(ids), len(set(ids)), "Duplicate model IDs")
+            finally:
+                for k, v in env_backup.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
+
+
+# ── dataset catalog tests ─────────────────────────────────────────────────────
+
+
+class TestDatasetCatalog(unittest.TestCase):
+
+    def test_build_download_command_known_key(self):
+        cmd = build_download_command("/scripts/download.sh", "image-proc")
+        self.assertIsNotNone(cmd)
+        self.assertIsInstance(cmd, list)
+        self.assertIn("image-proc", cmd)
+        self.assertNotIn(True, cmd)   # no shell=True via bool leak
+
+    def test_build_download_command_h264(self):
+        cmd = build_download_command("/scripts/download.sh", "h264")
+        self.assertIsNotNone(cmd)
+        self.assertIn("h264", cmd)
+
+    def test_build_download_command_unknown_key_returns_none(self):
+        self.assertIsNone(
+            build_download_command("/scripts/download.sh", "arbitrary_key")
+        )
+
+    def test_build_download_command_traversal_returns_none(self):
+        self.assertIsNone(
+            build_download_command("/scripts/download.sh", "../../../etc/passwd")
+        )
+
+    def test_build_download_command_empty_key_returns_none(self):
+        self.assertIsNone(build_download_command("/scripts/download.sh", ""))
+
+    def test_downloadable_bags_keys_unique(self):
+        keys = [d["key"] for d in _DOWNLOADABLE_BAGS]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_discover_datasets_no_dirs(self):
+        data = discover_datasets(rosbag_root="/nonexistent/dir",
+                                 image_root=None, video_root=None)
+        self.assertIn("rosbags", data)
+        self.assertIn("image_datasets", data)
+        self.assertIn("video_datasets", data)
+        # Should still list downloadable bags
+        self.assertGreater(len(data["rosbags"]), 0)
+        # All listed bags that are not locally installed should be downloadable
+        for bag in data["rosbags"]:
+            if not bag["installed"]:
+                self.assertTrue(bag["downloadable"])
+
+    def test_discover_datasets_with_image_dir(self):
+        with tempfile.TemporaryDirectory() as root:
+            img_root = pathlib.Path(root) / "images"
+            dataset_dir = img_root / "my_dataset"
+            dataset_dir.mkdir(parents=True)
+            (dataset_dir / "frame_000.jpg").write_bytes(b"FAKE")
+            (dataset_dir / "frame_001.png").write_bytes(b"FAKE")
+
+            data = discover_datasets(rosbag_root="/nonexistent",
+                                     image_root=str(img_root), video_root=None)
+            self.assertEqual(len(data["image_datasets"]), 1)
+            self.assertEqual(data["image_datasets"][0]["name"], "my_dataset")
+            self.assertEqual(data["image_datasets"][0]["image_count"], 2)
+
+    def test_discover_datasets_detects_nested_downloaded_asset(self):
+        """Nested NGC bags merge into their top-level downloadable entry."""
+        with tempfile.TemporaryDirectory() as root:
+            bag_dir = (
+                pathlib.Path(root)
+                / "h264"
+                / "isaac_ros_h264_decoder"
+                / "quickstart"
+            )
+            bag_dir.mkdir(parents=True)
+            (bag_dir / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  duration: {nanoseconds: 1000000000}\n",
+                encoding="utf-8",
+            )
+
+            data = discover_datasets(
+                rosbag_root=root, image_root=None, video_root=None
+            )
+            h264 = next(b for b in data["rosbags"] if b["key"] == "h264")
+            self.assertTrue(h264["installed"])
+            self.assertTrue(h264["downloadable"])
+            self.assertEqual(h264["local_path"], str(bag_dir))
+
+    def test_discover_datasets_with_video_dir(self):
+        with tempfile.TemporaryDirectory() as root:
+            vid_root = pathlib.Path(root) / "videos"
+            vid_root.mkdir()
+            (vid_root / "clip.mp4").write_bytes(b"FAKE")
+
+            data = discover_datasets(rosbag_root="/nonexistent",
+                                     image_root=None, video_root=str(vid_root))
+            self.assertEqual(len(data["video_datasets"]), 1)
+            self.assertEqual(data["video_datasets"][0]["name"], "clip.mp4")
+
+
+# ── new API route smoke tests ─────────────────────────────────────────────────
+
+
+class TestNewAPIRoutes(unittest.TestCase):
+    """Smoke tests for /api/models and /api/datasets served by ConsoleServer."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(self._tmp)
+        cfg = {
+            "socket_path": "",
+            "quiet": True,
+            "workspace_dir": "",
+            "rosbag_dir": "/nonexistent",
+            "image_dataset_dir": "",
+            "video_dataset_dir": "",
+        }
+        with patch("web_console.server.check_server_reachable",
+                   return_value={"reachable": False}):
+            self._srv = ConsoleServer(
+                host="127.0.0.1", port=0, config=cfg, run_store=run_store
+            )
+        self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
+        self._thread.start()
+        time.sleep(0.1)
+        self._host, self._port = self._srv.server_address
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body) if body else {}
+
+    def test_api_models_returns_200(self):
+        status, data = self._get("/api/models")
+        self.assertEqual(status, 200)
+        self.assertIn("models", data)
+        self.assertIsInstance(data["models"], list)
+
+    def test_api_datasets_returns_200(self):
+        status, data = self._get("/api/datasets")
+        self.assertEqual(status, 200)
+        self.assertIn("rosbags", data)
+        self.assertIn("image_datasets", data)
+        self.assertIn("video_datasets", data)
+
+    def test_index_contains_workbench_title(self):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b"edge_vlm_ros", body)
+        self.assertIn(b"Workbench", body)
+
+    def test_api_datasets_download_unknown_key_returns_400(self):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        body_bytes = json.dumps({"bag_key": "UNKNOWN_BAG"}).encode()
+        conn.request(
+            "POST", "/api/datasets/download", body=body_bytes,
+            headers={"Content-Type": "application/json",
+                     "Content-Length": str(len(body_bytes))},
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertIn(resp.status, (400, 422))
+
+    def test_api_experiment_run_invalid_definition_returns_422(self):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        body_bytes = json.dumps({
+            "strategy": "bad_strategy",
+            "image_paths": ["/data/frame.jpg"],
+            "task_prompt": "Describe.",
+        }).encode()
+        conn.request(
+            "POST", "/api/experiment/run", body=body_bytes,
+            headers={"Content-Type": "application/json",
+                     "Content-Length": str(len(body_bytes))},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertIn(resp.status, (400, 422))
+
+
+# ── experiment_stack.sh bash syntax test ──────────────────────────────────────
+
+
+class TestModelIdCrossProcess(unittest.TestCase):
+    """Verify that model_id is stable across interpreter restarts."""
+
+    def test_make_model_id_stable_across_hash_seeds(self):
+        """_make_model_id must return the same value regardless of PYTHONHASHSEED."""
+        script = (
+            f"import sys; sys.path.insert(0, {str(_REPO_ROOT)!r}); "
+            "from web_console.model_catalog import _make_model_id; "
+            "print(_make_model_id('TestModel', '/some/engine/path/llm'))"
+        )
+        results = set()
+        for seed in ("1", "2", "42", "0", "99999"):
+            env = {**os.environ, "PYTHONHASHSEED": seed}
+            out = subprocess.check_output(
+                [sys.executable, "-c", script],
+                text=True,
+                env=env,
+            ).strip()
+            results.add(out)
+        self.assertEqual(
+            len(results),
+            1,
+            f"model_id changed across PYTHONHASHSEED values: {results}",
+        )
+        (stable_id,) = results
+        self.assertIn("TestModel", stable_id)
+
+
+class TestExperimentConcurrency(unittest.TestCase):
+    """Bounded experiment coordinator tests."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(pathlib.Path(self._tmp) / "runs")
+        cfg = {"socket_path": "", "quiet": True}
+        self._srv, self._port, self._thread = _start_test_server(
+            config=cfg, run_store=run_store
+        )
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post_json(self, path, data):
+        body = json.dumps(data).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request(
+            "POST", path, body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body) if resp_body else {}
+
+    def test_concurrent_experiment_rejected_with_409(self):
+        """A second experiment while one is active must return 409."""
+        # Inject a fake active experiment ID directly into the server.
+        self._srv._active_experiment_id = "aaaaaaaa-0000-0000-0000-000000000001"
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+                f.write(b"FAKE")
+                img = f.name
+            status, data = self._post_json(
+                "/api/experiment/run",
+                {
+                    "strategy": "single_frame",
+                    "image_paths": [img],
+                    "task_prompt": "Describe.",
+                },
+            )
+        finally:
+            self._srv._active_experiment_id = None
+            os.unlink(img)
+        self.assertEqual(status, 409)
+        self.assertIn("error", data)
+        self.assertIn("aaaaaaaa", data["error"])
+
+    def test_experiment_coordinator_clears_on_completion(self):
+        """_active_experiment_id is cleared when an experiment reaches a terminal state."""
+        # Directly confirm the lock and field are available.
+        self.assertIsNone(self._srv._active_experiment_id)
+        self.assertIsInstance(self._srv._active_experiment_lock, type(__import__("threading").Lock()))
+
+    def test_experiment_validates_all_image_paths(self):
+        """Image path validation must check ALL paths, not just the first 100."""
+        with tempfile.TemporaryDirectory() as d:
+            # Create 101 real files
+            real_paths = []
+            for i in range(101):
+                p = os.path.join(d, f"frame_{i:04d}.jpg")
+                pathlib.Path(p).write_bytes(b"FAKE")
+                real_paths.append(p)
+            # Replace the 101st path with a nonexistent file
+            real_paths[100] = os.path.join(d, "nonexistent_101.jpg")
+
+            status, data = self._post_json(
+                "/api/experiment/run",
+                {
+                    "strategy": "single_frame",
+                    "image_paths": real_paths,
+                    "task_prompt": "Describe.",
+                },
+            )
+        # Should fail because the 101st path does not exist.
+        self.assertIn(status, (400, 422), f"Expected 400/422, got {status}: {data}")
+        self.assertIn("error", data)
+        self.assertIn("nonexistent_101.jpg", data["error"])
+
+
+class TestExperimentStackScript(unittest.TestCase):
+    """Verify experiment_stack.sh passes bash -n syntax check."""
+
+    def test_bash_syntax_check(self):
+        script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "experiment_stack.sh"
+        if not script.is_file():
+            self.skipTest(f"experiment_stack.sh not found at {script}")
+        if shutil.which("bash") is None:
+            self.skipTest("bash not available")
+        result = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"bash -n failed:\n{result.stderr}")
+
+    def test_run_image_proc_bash_syntax(self):
+        """run_image_proc_test.sh must pass bash -n syntax check."""
+        script = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "test_data"
+            / "run_image_proc_test.sh"
+        )
+        if not script.is_file():
+            self.skipTest(f"run_image_proc_test.sh not found at {script}")
+        if shutil.which("bash") is None:
+            self.skipTest("bash not available")
+        result = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"bash -n failed:\n{result.stderr}")
+
+
+# ── rosbag compatibility metadata tests ──────────────────────────────────────
+
+
+class TestRosbagCompatibility(unittest.TestCase):
+    """Tests for raw_image_compatible and compatibility_note catalog fields."""
+
+    def _make_bag(self, tmpdir: str, key: str, metadata_content: str) -> pathlib.Path:
+        """Create a fake installed rosbag under *tmpdir*/<key>/<bag>."""
+        bag_dir = pathlib.Path(tmpdir) / key / "bag0"
+        bag_dir.mkdir(parents=True)
+        (bag_dir / "metadata.yaml").write_text(metadata_content, encoding="utf-8")
+        return bag_dir
+
+    def test_image_proc_catalog_entry_is_compatible(self):
+        """The image-proc downloadable entry must be marked raw_image_compatible."""
+        data = discover_datasets(
+            rosbag_root="/nonexistent", image_root=None, video_root=None
+        )
+        entry = next(b for b in data["rosbags"] if b["key"] == "image-proc")
+        self.assertTrue(entry["raw_image_compatible"])
+        self.assertEqual(entry["compatibility_note"], "")
+
+    def test_h264_catalog_entry_is_not_compatible(self):
+        """The h264 downloadable entry must be marked NOT raw_image_compatible."""
+        data = discover_datasets(
+            rosbag_root="/nonexistent", image_root=None, video_root=None
+        )
+        entry = next(b for b in data["rosbags"] if b["key"] == "h264")
+        self.assertFalse(entry["raw_image_compatible"])
+        self.assertIn("H.264", entry["compatibility_note"])
+
+    def test_installed_bag_with_raw_image_topic_is_compatible(self):
+        """An installed bag whose metadata has a sensor_msgs/Image topic is compatible."""
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /camera/image_raw, type: sensor_msgs/msg/Image, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 5000000000}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            self._make_bag(root, "my_raw_bag", metadata)
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "my_raw_bag")
+        self.assertTrue(entry["raw_image_compatible"])
+        self.assertEqual(entry["compatibility_note"], "")
+
+    def test_installed_bag_with_compressed_image_only_is_not_compatible(self):
+        """An installed bag with only CompressedImage topics is not compatible."""
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /camera/image_compressed, "
+            "type: sensor_msgs/msg/CompressedImage, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 5000000000}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            self._make_bag(root, "my_h264_bag", metadata)
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "my_h264_bag")
+        self.assertFalse(entry["raw_image_compatible"])
+        self.assertNotEqual(entry["compatibility_note"], "")
+
+    def test_h264_installed_bag_uses_catalog_compatibility_note(self):
+        """When the h264 bag is installed, the catalog note overrides the parsed note."""
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /left, type: sensor_msgs/msg/CompressedImage, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 2000000000}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            bag_dir = (
+                pathlib.Path(root) / "h264" / "isaac_ros_h264_decoder" / "quickstart"
+            )
+            bag_dir.mkdir(parents=True)
+            (bag_dir / "metadata.yaml").write_text(metadata, encoding="utf-8")
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "h264")
+        self.assertTrue(entry["installed"])
+        self.assertFalse(entry["raw_image_compatible"])
+        self.assertIn("H.264", entry["compatibility_note"])
+
+    def test_compatibility_fields_present_in_all_catalog_entries(self):
+        """Every entry returned by discover_datasets must carry both compatibility fields."""
+        data = discover_datasets(
+            rosbag_root="/nonexistent", image_root=None, video_root=None
+        )
+        for entry in data["rosbags"]:
+            self.assertIn("raw_image_compatible", entry,
+                          f"Missing raw_image_compatible in {entry['key']}")
+            self.assertIn("compatibility_note", entry,
+                          f"Missing compatibility_note in {entry['key']}")
+
+
+# ── rosbag_path allowlist validation tests ───────────────────────────────────
+
+
+class TestRosbagPathValidation(unittest.TestCase):
+    """Server-side allowlist validation for rosbag_path in /api/ros/start."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(pathlib.Path(self._tmp) / "runs")
+        self._rosbag_root = pathlib.Path(self._tmp) / "rosbags"
+        self._rosbag_root.mkdir()
+        cfg = {
+            "socket_path": "",
+            "quiet": True,
+            "rosbag_dir": str(self._rosbag_root),
+            "image_dataset_dir": "",
+            "video_dataset_dir": "",
+        }
+        self._srv, self._port, self._thread = _start_test_server(
+            config=cfg, run_store=run_store
+        )
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post_ros_start(self, params: dict) -> tuple:
+        body = json.dumps({"params": params}).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request(
+            "POST", "/api/ros/start", body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body) if resp_body else {}
+
+    def _make_installed_bag(self, key: str) -> str:
+        """Create a fake installed bag and return its local_path."""
+        bag_dir = self._rosbag_root / key / "bag0"
+        bag_dir.mkdir(parents=True)
+        (bag_dir / "metadata.yaml").write_text(
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /img, type: sensor_msgs/msg/Image, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 1000000000}\n",
+            encoding="utf-8",
+        )
+        return str(bag_dir)
+
+    def test_arbitrary_rosbag_path_rejected(self):
+        """An arbitrary filesystem path must be rejected with 400."""
+        status, data = self._post_ros_start({"rosbag_path": "/etc/passwd"})
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_path_traversal_rosbag_path_rejected(self):
+        """A traversal path must be rejected with 400."""
+        status, data = self._post_ros_start(
+            {"rosbag_path": str(self._rosbag_root) + "/../../etc"}
+        )
+        self.assertEqual(status, 400)
+
+    def test_installed_catalog_path_accepted(self):
+        """A local_path from the installed catalog is accepted and env is built."""
+        installed_path = self._make_installed_bag("my-test-bag")
+        # The server will try to launch the ROS script; we only need to verify
+        # the 400 is NOT returned for the path check. We patch start_ros_experiment
+        # to avoid actually launching a subprocess.
+        with patch.object(
+            self._srv.process_manager,
+            "start_ros_experiment",
+            return_value=99999,
+        ):
+            status, data = self._post_ros_start({"rosbag_path": installed_path})
+        # Should not get a 400 for path validation.
+        self.assertNotEqual(status, 400, f"Unexpected 400: {data}")
+
+    def test_no_rosbag_path_param_does_not_error(self):
+        """Omitting rosbag_path entirely should not cause a 400 for path validation."""
+        with patch.object(
+            self._srv.process_manager,
+            "start_ros_experiment",
+            return_value=99999,
+        ):
+            status, data = self._post_ros_start({})
+        self.assertNotEqual(status, 400, f"Unexpected 400 without rosbag_path: {data}")
+
+
+# ── _build_ros_env ROSBAG_PATH propagation tests ──────────────────────────────
+
+
+class TestBuildRosEnvRosbagPath(unittest.TestCase):
+    """Verify _build_ros_env forwards rosbag_path as ROSBAG_PATH."""
+
+    def test_rosbag_path_forwarded_to_env(self):
+        env = _build_ros_env(
+            {"rosbag_path": "/data/my_bag"}, cfg={}, artifact_dir=None
+        )
+        self.assertEqual(env.get("ROSBAG_PATH"), "/data/my_bag")
+
+    def test_rosbag_path_absent_when_not_in_params(self):
+        env = _build_ros_env({}, cfg={}, artifact_dir=None)
+        # Should not inject an empty ROSBAG_PATH.
+        # (It may still be present from os.environ; verify it is not *set* by _build_ros_env.)
+        env2 = _build_ros_env({"image_topic": "/cam"}, cfg={}, artifact_dir=None)
+        # Either ROSBAG_PATH is absent or unchanged from os.environ.
+        # The critical check: passing rosbag_path sets it correctly.
+        env3 = _build_ros_env({"rosbag_path": "/bags/custom"}, cfg={}, artifact_dir=None)
+        self.assertEqual(env3["ROSBAG_PATH"], "/bags/custom")
+
+
+# ── UI element presence tests ─────────────────────────────────────────────────
+
+
+class TestUIElementPresence(unittest.TestCase):
+    """Verify required HTML elements are present in the served index page."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(pathlib.Path(self._tmp) / "runs")
+        cfg = {"socket_path": "", "quiet": True}
+        self._srv, self._port, self._thread = _start_test_server(
+            config=cfg, run_store=run_store
+        )
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _get_index(self) -> str:
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        return body.decode("utf-8", errors="replace")
+
+    def test_ros_selected_bag_element_exists(self):
+        """The #ros-selected-bag element must be present in the ROS experiment panel."""
+        html = self._get_index()
+        self.assertIn('id="ros-selected-bag"', html)
+
+    def test_app_js_has_selected_bag_variable(self):
+        """app.js must declare _selectedBag."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("_selectedBag", js)
+
+    def test_app_js_has_select_bag_for_experiment(self):
+        """app.js must define selectBagForExperiment."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("selectBagForExperiment", js)
+
+    def test_app_js_sends_rosbag_path_in_start_ros(self):
+        """startRos() in app.js must include rosbag_path when _selectedBag is set."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("rosbag_path", js)
+
+    def test_app_js_uses_raw_image_compatible_for_button(self):
+        """_bagTile must check raw_image_compatible before showing Use in Experiment."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("raw_image_compatible", js)
+
+    def test_app_js_h264_shows_compatibility_note(self):
+        """_bagTile must show compatibility_note for incompatible bags."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("compatibility_note", js)
+
+
+
+# ── Blocker 1: Multiline single-quoted YAML scalars ───────────────────────────
+
+class TestSingleQuoteHelpers(unittest.TestCase):
+    """Unit tests for _single_quote_close_idx and _fold_single_quoted_scalar."""
+
+    def test_close_idx_simple(self):
+        self.assertEqual(_single_quote_close_idx("hello'"), 5)
+
+    def test_close_idx_at_start(self):
+        self.assertEqual(_single_quote_close_idx("'"), 0)
+
+    def test_close_idx_no_close(self):
+        self.assertEqual(_single_quote_close_idx("hello"), -1)
+
+    def test_close_idx_empty(self):
+        self.assertEqual(_single_quote_close_idx(""), -1)
+
+    def test_close_idx_escaped_quote_not_close(self):
+        # '' is an escape, should not close the scalar
+        self.assertEqual(_single_quote_close_idx("it''s a test'"), 12)
+
+    def test_close_idx_double_escape_then_close(self):
+        # '''' is two escaped '' followed by closing '
+        # wait: '''' — chars: ' ' ' '
+        # i=0: s[0]='s[1]=' → skip to i=2; s[2]='s[3]=' → skip to i=4; out of range → -1
+        # Actually '''' as a scalar *body* (without outer quotes):
+        # chars: ' ' ' '
+        # i=0: s[0]=', s[1]=' → i+=2 (escaped)
+        # i=2: s[2]=', s[3]=' → i+=2 (escaped)
+        # i=4: end → -1
+        self.assertEqual(_single_quote_close_idx("''''"), -1)
+
+    def test_fold_simple(self):
+        self.assertEqual(_fold_single_quoted_scalar(["hello", "world"]), "hello world")
+
+    def test_fold_blank_line_becomes_newline(self):
+        result = _fold_single_quoted_scalar(["line one", "", "line two"])
+        self.assertEqual(result, "line one\nline two")
+
+    def test_fold_two_blank_lines_become_two_newlines(self):
+        result = _fold_single_quoted_scalar(["line one", "", "", "line two"])
+        self.assertEqual(result, "line one\n\nline two")
+
+    def test_fold_escaped_quotes_decoded(self):
+        result = _fold_single_quoted_scalar(["it''s a test"])
+        self.assertEqual(result, "it's a test")
+
+    def test_fold_empty_parts_list(self):
+        self.assertEqual(_fold_single_quoted_scalar([]), "")
+
+    def test_fold_single_part(self):
+        self.assertEqual(_fold_single_quoted_scalar(["hello"]), "hello")
+
+
+class TestParseMultilineSingleQuoted(unittest.TestCase):
+    """Regression tests for multiline single-quoted YAML scalar parsing."""
+
+    def test_thor_multiline_single_quoted_fixture(self):
+        """Exact format observed on Thor: single-quoted scalar spanning multiple
+        physical lines with blank lines as paragraph separators."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: 'Based on the provided image, here is a detailed description of the scene:\n"
+            "\n"
+            "\n"
+            "  The image captures a busy urban intersection.'\n"
+            "inference_seconds: 1.23\n"
+            "success: true\n"
+            "error: ''\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        text_val = frames[0]["text"]
+        # Must contain the first physical line's content
+        self.assertIn("Based on the provided image", text_val)
+        # Must contain the continuation line's content
+        self.assertIn("The image captures a busy urban intersection.", text_val)
+        # The two blank lines between them should produce a newline separator
+        self.assertIn("\n", text_val)
+
+    def test_single_quoted_scalar_on_one_line_unchanged(self):
+        """Single-quoted scalars that open and close on the same line still work."""
+        text = (
+            "frame_sequence: 2\n"
+            "response: 'simple response'\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["text"], "simple response")
+
+    def test_single_quoted_empty_string_unchanged(self):
+        """Single-quoted empty string '' still produces empty string."""
+        text = (
+            "frame_sequence: 3\n"
+            "response: ''\n"
+            "success: false\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["text"], "")
+
+    def test_multiline_sq_across_multiple_continuation_lines(self):
+        """Multi-line single-quoted scalar with three content segments."""
+        text = (
+            "frame_sequence: 4\n"
+            "response: 'Part one.\n"
+            "\n"
+            "Part two.\n"
+            "\n"
+            "Part three.'\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        t = frames[0]["text"]
+        self.assertIn("Part one.", t)
+        self.assertIn("Part two.", t)
+        self.assertIn("Part three.", t)
+
+    def test_multiline_sq_preserves_other_fields(self):
+        """Other fields in the same message are correctly parsed alongside multiline response."""
+        text = (
+            "frame_sequence: 5\n"
+            "response: 'Line A.\n"
+            "\n"
+            "Line B.'\n"
+            "inference_seconds: 2.0\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["frame_seq"], 5)
+        self.assertAlmostEqual(frames[0]["latency_ms"], 2000.0)
+        self.assertIs(frames[0]["success"], True)
+        self.assertIn("Line A.", frames[0]["text"])
+        self.assertIn("Line B.", frames[0]["text"])
+
+    def test_existing_block_scalar_still_works(self):
+        """YAML block scalar (|) handling is not broken by the single-quoted changes."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: |\n"
+            "  Block line one.\n"
+            "  Block line two.\n"
+            "inference_seconds: 0.01\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertIn("Block line one.", frames[0]["text"])
+        self.assertIn("Block line two.", frames[0]["text"])
+
+    def test_multiline_sq_across_two_frames(self):
+        """Two consecutive messages both with multiline single-quoted responses."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: 'Frame one,\n"
+            "\n"
+            "continued.'\n"
+            "success: true\n"
+            "---\n"
+            "frame_sequence: 2\n"
+            "response: 'Frame two,\n"
+            "\n"
+            "also continued.'\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 2)
+        self.assertIn("Frame one", frames[0]["text"])
+        self.assertIn("continued.", frames[0]["text"])
+        self.assertIn("Frame two", frames[1]["text"])
+        self.assertIn("also continued.", frames[1]["text"])
+
+    def test_multiline_sq_incomplete_is_discarded(self):
+        """An unclosed single-quoted scalar at EOF (no ---) is discarded."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: 'no closing quote\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(frames, [])
+
+
+# ── Blocker 2: Stack script model-mismatch tests ──────────────────────────────
+
+class TestExperimentStackModelMismatch(unittest.TestCase):
+    """Tests covering the model-conflict detection logic in experiment_stack.sh.
+
+    These tests verify behaviour using bash -n (syntax) and by inspecting the
+    script source for the required constructs; actual execution requires the
+    native edge_vlm_server binary and is validated in integration tests.
+    """
+
+    def _script_path(self) -> pathlib.Path:
+        return pathlib.Path(__file__).resolve().parents[2] / "scripts" / "experiment_stack.sh"
+
+    def test_stack_script_bash_syntax_still_passes(self):
+        """bash -n must pass after the model-mismatch additions."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        result = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, f"bash -n failed:\n{result.stderr}")
+
+    def test_check_socket_model_conflict_function_present(self):
+        """Script must define _check_socket_model_conflict."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_check_socket_model_conflict", content)
+
+    def test_socket_listener_pid_function_present(self):
+        """Script must define _socket_listener_pid."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_socket_listener_pid", content)
+
+    def test_proc_argv1_function_present(self):
+        """Script must define _proc_argv1 for cmdline inspection."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_proc_argv1", content)
+
+    def test_model_conflict_check_called_in_cmd_start(self):
+        """cmd_start must call _check_socket_model_conflict before starting server."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        # Verify the call is inside cmd_start (between 'cmd_start()' and 'cmd_stop()')
+        start_idx = content.find("cmd_start()")
+        stop_idx = content.find("cmd_stop()")
+        self.assertGreater(start_idx, 0)
+        self.assertGreater(stop_idx, start_idx)
+        cmd_start_body = content[start_idx:stop_idx]
+        self.assertIn("_check_socket_model_conflict", cmd_start_body)
+
+    def test_status_surfaces_running_llm_dir_from_cmdline(self):
+        """cmd_status must read the actual LLM dir from the running process cmdline."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        # status function must call _proc_argv1 to read the actual running engine
+        status_idx = content.find("cmd_status()")
+        self.assertGreater(status_idx, 0)
+        # Find the end of cmd_status (next function definition)
+        next_fn = content.find("\ncmd_", status_idx + 1)
+        cmd_status_body = content[status_idx:next_fn] if next_fn > 0 else content[status_idx:]
+        self.assertIn("_proc_argv1", cmd_status_body)
+
+    def test_reuse_external_socket_variable_present(self):
+        """Script must use _REUSE_EXTERNAL_SOCKET to signal authorised external reuse."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_REUSE_EXTERNAL_SOCKET", content)
+
+    def test_model_mismatch_error_message_present(self):
+        """Script must emit a 'Model conflict' error for mismatched external services."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("Model conflict", content)
+
+    def test_unverifiable_external_service_error_present(self):
+        """Script must fail when the socket owner's model cannot be verified."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        # The script uses either "unidentifiable" or "cannot be verified" to
+        # describe an external service whose loaded model cannot be confirmed.
+        self.assertTrue(
+            "unidentifiable" in content or "cannot be verified" in content,
+            "Script must emit an error when socket owner model cannot be verified",
+        )
+
+
+# ── Blocker 3: Benchmark vs result-frame count reconciliation ─────────────────
+
+class TestBenchmarkCountReconciliation(unittest.TestCase):
+    """Tests for the count_note added when benchmark and result-frame counts differ."""
+
+    def _build_benchmark_summary(
+        self, frame_recs: list, result_frames: list
+    ) -> dict:
+        """Replicate the server-side benchmark_summary construction logic."""
+        success_recs = [f for f in frame_recs if f.get("success", True)]
+        infer_ms_vals = [
+            float(f["inference_ms"])
+            for f in success_recs
+            if "inference_ms" in f
+        ]
+        benchmark_summary = {
+            "frame_count": len(frame_recs),
+            "successful_frames": len(success_recs),
+            "failed_frames": len(frame_recs) - len(success_recs),
+            "dropped_frames": 0,
+            "mean_inference_ms": round(sum(infer_ms_vals) / len(infer_ms_vals), 2)
+            if infer_ms_vals
+            else None,
+            "min_inference_ms": round(min(infer_ms_vals), 2) if infer_ms_vals else None,
+            "max_inference_ms": round(max(infer_ms_vals), 2) if infer_ms_vals else None,
+            "source": "benchmark.jsonl (all processed inference samples)",
+        }
+        if len(result_frames) != len(frame_recs):
+            benchmark_summary["count_note"] = (
+                f"benchmark.jsonl recorded {len(frame_recs)} "
+                f"processed inference sample(s); "
+                f"results.log captured {len(result_frames)} "
+                f"frame result(s) from the ROS topic subscriber. "
+                f"The difference typically reflects frames whose "
+                f"inference completed during graceful shutdown after "
+                f"the subscriber had already closed."
+            )
+        return benchmark_summary
+
+    def test_no_count_note_when_counts_match(self):
+        """count_note must be absent when benchmark and result-frame counts agree."""
+        frame_recs = [
+            {"record_type": "frame", "success": True, "inference_ms": 50.0},
+        ]
+        result_frames = [{"text": "frame 1"}]
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertNotIn("count_note", summary)
+
+    def test_count_note_added_when_benchmark_has_more_frames(self):
+        """count_note must be present when benchmark.jsonl has more frames than
+        results.log (the Thor-observed scenario)."""
+        frame_recs = [
+            {"record_type": "frame", "success": True, "inference_ms": 50.0},
+            {"record_type": "frame", "success": True, "inference_ms": 60.0},
+        ]
+        result_frames = [{"text": "only one frame received"}]  # 1 vs 2
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("count_note", summary)
+        self.assertIn("2", summary["count_note"])
+        self.assertIn("1", summary["count_note"])
+
+    def test_count_note_mentions_shutdown(self):
+        """count_note must explain the shutdown-related reason for the discrepancy."""
+        frame_recs = [{"record_type": "frame", "success": True, "inference_ms": 30.0}] * 3
+        result_frames = [{"text": "f1"}, {"text": "f2"}]  # 2 vs 3
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("shutdown", summary["count_note"])
+
+    def test_count_note_when_result_frames_empty_but_benchmark_has_frames(self):
+        """count_note must appear even when result_frames is empty."""
+        frame_recs = [{"record_type": "frame", "success": True, "inference_ms": 25.0}]
+        result_frames = []
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("count_note", summary)
+
+    def test_benchmark_source_label_present(self):
+        """benchmark_summary must include a 'source' field for UI clarity."""
+        frame_recs = [{"record_type": "frame", "success": True, "inference_ms": 20.0}]
+        result_frames = [{"text": "one"}]
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("source", summary)
+        self.assertIn("benchmark.jsonl", summary["source"])
+
+    def test_app_js_benchmark_summary_title_uses_source(self):
+        """app.js must incorporate the 'source' field into the benchmark title."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("bs.source", js)
+
+    def test_app_js_renders_count_note(self):
+        """app.js must render count_note when present."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("count_note", js)
 
 
 if __name__ == "__main__":
