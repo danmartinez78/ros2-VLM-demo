@@ -1145,6 +1145,7 @@ class TestBuildRosEnv(unittest.TestCase):
         env = _build_ros_env(params, {})
         self.assertEqual(env.get("MAX_GENERATE_LENGTH"), "128")
         self.assertEqual(env.get("INSTRUCTION_DELIVERY_MODE"), "structured")
+        self.assertEqual(env.get("IMAGE_TOPIC"), "/cam")
 
     def test_unknown_param_not_in_env(self):
         params = {"shell_cmd": "evil"}
@@ -1529,88 +1530,85 @@ class TestStartupBind(unittest.TestCase):
 class TestResultsParsing(unittest.TestCase):
     """CPU-only tests for server-side artifact parsers."""
 
-    # ── _parse_results_log ────────────────────────────────────────────────
-
     def test_parse_empty_results_log(self):
-        """Empty string must return an empty list."""
         self.assertEqual(_parse_results_log(""), [])
 
-    def test_parse_whitespace_only(self):
-        self.assertEqual(_parse_results_log("   \n   "), [])
-
-    def test_parse_no_separator_is_empty(self):
-        """A file without any --- separators produces no frames."""
-        text = "text: hello\nsuccess: true\n"
-        self.assertEqual(_parse_results_log(text), [])
-
-    def test_parse_single_successful_frame(self):
+    def test_parse_real_thor_single_result_with_trailing_separator(self):
         text = (
-            "---\n"
+            "header:\n"
+            "  stamp:\n"
+            "    sec: 1677620100\n"
+            "    nanosec: 960493824\n"
+            "  frame_id: HAWK_0:left_rgb\n"
+            "source_topic: /hawk_0_left_rgb_image\n"
+            "task_profile: legacy_prompt\n"
+            "prompt_version: v1\n"
+            "prompt_config_hash: 1d2d0c79c603ef8e\n"
+            "prompt: Describe the scene.\n"
+            "response: A worker is walking through a warehouse.\n"
+            "inference_seconds: 1.691136654\n"
+            "frame_sequence: 1\n"
             "success: true\n"
-            "text: A dog is running.\n"
-            "latency_ms: 42.5\n"
+            "error: ''\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
-        self.assertIs(frames[0]["success"], True)
-        self.assertEqual(frames[0]["text"], "A dog is running.")
-        self.assertAlmostEqual(frames[0]["latency_ms"], 42.5)
+        frame = frames[0]
+        self.assertEqual(frame["frame_sequence"], 1)
+        self.assertEqual(frame["response"], "A worker is walking through a warehouse.")
+        self.assertAlmostEqual(frame["inference_seconds"], 1.691136654)
+        self.assertEqual(frame["source_timestamp_ns"], 1677620100960493824)
+        self.assertIs(frame["success"], True)
+        self.assertEqual(frame["error"], "")
 
-    def test_parse_single_failed_frame(self):
+    def test_parse_failed_result(self):
         text = (
-            "---\n"
+            "header:\n"
+            "  stamp:\n"
+            "    sec: 1\n"
+            "    nanosec: 2\n"
+            "response: ''\n"
+            "inference_seconds: 0.0\n"
+            "frame_sequence: 74\n"
             "success: false\n"
-            "error: timeout\n"
+            "error: 'backend exception: IPC write failed: Broken pipe'\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
         self.assertIs(frames[0]["success"], False)
-        self.assertEqual(frames[0]["error"], "timeout")
+        self.assertEqual(
+            frames[0]["error"],
+            "backend exception: IPC write failed: Broken pipe",
+        )
 
-    def test_parse_multiline_text_block_scalar(self):
-        """YAML block scalar (|) value joined from indented lines."""
+    def test_parse_multiline_response_block_scalar(self):
         text = (
-            "---\n"
-            "success: true\n"
-            "text: |\n"
+            "response: |\n"
             "  Line one.\n"
             "  Line two.\n"
-            "latency_ms: 10\n"
+            "inference_seconds: 0.5\n"
+            "frame_sequence: 2\n"
+            "success: true\n"
+            "error: ''\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
-        self.assertIn("Line one.", frames[0]["text"])
-        self.assertIn("Line two.", frames[0]["text"])
+        self.assertEqual(frames[0]["response"], "Line one.\nLine two.")
 
-    def test_parse_multi_frame_results(self):
+    def test_parse_multiple_trailing_delimited_results(self):
         text = (
-            "---\n"
-            "success: true\n"
-            "text: frame1\n"
-            "---\n"
-            "success: false\n"
-            "text: frame2\n"
-            "---\n"
-            "success: true\n"
-            "text: frame3\n"
+            "response: frame1\nframe_sequence: 1\nsuccess: true\n---\n"
+            "response: frame2\nframe_sequence: 2\nsuccess: false\n---\n"
+            "response: frame3\nframe_sequence: 3\nsuccess: true\n---\n"
         )
         frames = _parse_results_log(text)
-        self.assertEqual(len(frames), 3)
-        self.assertEqual(frames[0]["text"], "frame1")
-        self.assertEqual(frames[1]["text"], "frame2")
-        self.assertEqual(frames[2]["text"], "frame3")
+        self.assertEqual([f["response"] for f in frames], ["frame1", "frame2", "frame3"])
 
-    def test_parse_malformed_lines_skipped(self):
-        """Non key:value lines in a block are silently ignored."""
-        text = (
-            "---\n"
-            ":::not_a_key\n"
-            "success: true\n"
-            "text: ok\n"
-        )
-        frames = _parse_results_log(text)
-        self.assertEqual(len(frames), 1)
-        self.assertEqual(frames[0]["text"], "ok")
+    def test_parse_malformed_noise_is_ignored(self):
+        self.assertEqual(_parse_results_log("diagnostic output\nfoo: bar\n---\n"), [])
 
     # ── _parse_benchmark_jsonl ────────────────────────────────────────────
 
