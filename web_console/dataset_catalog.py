@@ -70,11 +70,20 @@ class RosbagEntry:
     """Description of a rosbag (installed or downloadable)."""
 
     key: str
-    """Stable download key used as the argument to download_rosbags.sh."""
+    """Stable bag key used by browser APIs (and download key for placeholders)."""
 
     name: str
     source: str
     description: str
+
+    asset_key: str = ""
+    """Top-level downloadable asset key (first path component under rosbag root)."""
+
+    bag_key: str = ""
+    """Stable per-playable-bag identity."""
+
+    display_name: str = ""
+    """User-facing bag name including nested bag identity when needed."""
 
     # Installed state
     installed: bool = False
@@ -87,6 +96,8 @@ class RosbagEntry:
     topic_types: Dict[str, str] = field(default_factory=dict)
     message_counts: Dict[str, int] = field(default_factory=dict)
     image_topics: List[str] = field(default_factory=list)
+    topic_details: List[Dict[str, Any]] = field(default_factory=list)
+    storage_identifier: str = ""
     content_types: str = ""
 
     # Compatibility metadata
@@ -102,11 +113,17 @@ class RosbagEntry:
     download_source: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        bag_key = self.bag_key or self.key
+        asset_key = self.asset_key or self.key
+        display_name = self.display_name or self.name
         return {
             "schema_version": _SCHEMA_VERSION,
             "kind": "rosbag",
-            "key": self.key,
-            "name": self.name,
+            "key": bag_key,
+            "asset_key": asset_key,
+            "bag_key": bag_key,
+            "name": display_name,
+            "display_name": display_name,
             "source": self.source,
             "description": self.description,
             "installed": self.installed,
@@ -117,6 +134,8 @@ class RosbagEntry:
             "topic_types": self.topic_types,
             "message_counts": self.message_counts,
             "image_topics": self.image_topics,
+            "topic_details": self.topic_details,
+            "storage_identifier": self.storage_identifier,
             "content_types": self.content_types,
             "raw_image_compatible": self.raw_image_compatible,
             "compatibility_note": self.compatibility_note,
@@ -193,34 +212,107 @@ def _parse_bag_metadata(metadata_path: Path) -> Dict[str, Any]:
     except OSError:
         return result
 
-    # Extract duration (nanoseconds)
-    dur_match = re.search(r"duration:\s*\{nanoseconds:\s*(\d+)", text)
+    # Extract duration (nanoseconds): flow style or block style.
+    dur_match = re.search(r"duration:\s*\{[^}]*nanoseconds:\s*(\d+)", text)
+    if not dur_match:
+        dur_match = re.search(r"duration:\s*\n\s*nanoseconds:\s*(\d+)", text)
     if dur_match:
         result["duration_seconds"] = int(dur_match.group(1)) / 1e9
 
-    # Extract topic names and types
+    storage_match = re.search(r"storage_identifier:\s*([^\s#]+)", text)
+    if storage_match:
+        result["storage_identifier"] = storage_match.group(1).strip().strip("'\"")
+
     topics: List[str] = []
     topic_types: Dict[str, str] = {}
     message_counts: Dict[str, int] = {}
-    # Pattern: - topic_metadata: {name: /topic, type: sensor_msgs/msg/Image, ...}
-    for m in re.finditer(
-        r"topic_metadata:\s*\{name:\s*([^,}]+),\s*type:\s*([^,}]+)", text
-    ):
-        topic = m.group(1).strip()
-        ttype = m.group(2).strip()
+    topic_details: List[Dict[str, Any]] = []
+
+    topic_entries: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+    current_indent = -1
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+
+        inline = re.search(r"topic_metadata:\s*\{([^}]*)\}", stripped)
+        if inline:
+            mapping = inline.group(1)
+            name_match = re.search(r"name:\s*([^,}]+)", mapping)
+            type_match = re.search(r"type:\s*([^,}]+)", mapping)
+            current = {
+                "name": name_match.group(1).strip().strip("'\"") if name_match else "",
+                "type": type_match.group(1).strip().strip("'\"") if type_match else "",
+                "message_count": None,
+            }
+            current_indent = indent
+            topic_entries.append(current)
+            continue
+
+        if stripped in ("topic_metadata:", "- topic_metadata:") or stripped.startswith("- topic_metadata:"):
+            current = {"name": "", "type": "", "message_count": None}
+            current_indent = indent
+            topic_entries.append(current)
+            continue
+
+        if current is not None and indent > current_indent:
+            if stripped.startswith("name:"):
+                current["name"] = stripped.split(":", 1)[1].strip().strip("'\"")
+                continue
+            if stripped.startswith("type:"):
+                current["type"] = stripped.split(":", 1)[1].strip().strip("'\"")
+                continue
+
+        if stripped.startswith("message_count:") and current is not None:
+            val = stripped.split(":", 1)[1].strip()
+            if val.isdigit():
+                current["message_count"] = int(val)
+
+    for entry in topic_entries:
+        topic = str(entry.get("name", "")).strip()
+        ttype = str(entry.get("type", "")).strip()
+        if not topic or not ttype:
+            continue
         if topic not in topics:
             topics.append(topic)
             topic_types[topic] = ttype
+        msg_count = entry.get("message_count")
+        if isinstance(msg_count, int):
+            message_counts[topic] = msg_count
 
-    # message_count per topic
-    for m in re.finditer(r"topic:\s*([^\s]+).*?message_count:\s*(\d+)", text, re.DOTALL):
-        pass  # complex — skip; not critical for MVP
+    for topic in topics:
+        ttype = topic_types.get(topic, "")
+        lowered = topic.lower()
+        modality = "non_image"
+        selectable = False
+        if ttype == "sensor_msgs/msg/Image":
+            selectable = True
+            if "depth" in lowered:
+                modality = "depth"
+            elif "/ir" in lowered or "infra" in lowered:
+                modality = "infrared"
+            else:
+                modality = "color"
+        elif ttype == "sensor_msgs/msg/CompressedImage":
+            modality = "compressed"
+            selectable = False
+        topic_details.append({
+            "name": topic,
+            "type": ttype,
+            "message_count": message_counts.get(topic),
+            "selectable": selectable,
+            "modality": modality,
+        })
 
     result["topics"] = topics
     result["topic_types"] = topic_types
     result["message_counts"] = message_counts
+    result["topic_details"] = topic_details
     result["image_topics"] = [
-        t for t, typ in topic_types.items() if "Image" in typ
+        t["name"] for t in topic_details if t.get("selectable")
     ]
     return result
 
@@ -243,14 +335,25 @@ def _find_rosbag_dirs(root: Path) -> List[Path]:
         return []
 
 
-def _scan_rosbags(rosbag_root: Path) -> Dict[str, RosbagEntry]:
-    """Build installed entries keyed by the dataset top-level catalog key.
+def _slug_token(token: str) -> str:
+    """Return a URL/JSON-safe token segment."""
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", token).strip("-").lower() or "bag"
 
-    The playable bag path remains the directory containing metadata.yaml. The
-    first path component relative to rosbag_root is used as the key so nested
-    NVIDIA assets merge with their matching downloadable definitions.
-    """
-    installed: Dict[str, RosbagEntry] = {}
+
+def _build_bag_key(asset_key: str, relative_parts: tuple, asset_bag_count: int) -> str:
+    """Build a stable bag key from the root-relative path."""
+    if asset_bag_count == 1:
+        return asset_key
+    nested = [_slug_token(p) for p in relative_parts[1:]]
+    return ":".join([_slug_token(asset_key)] + nested)
+
+
+def _scan_rosbags(rosbag_root: Path) -> List[RosbagEntry]:
+    """Build installed entries with one playable entry per discovered metadata.yaml."""
+    installed: List[RosbagEntry] = []
+    discovered: List[Dict[str, Any]] = []
+    asset_counts: Dict[str, int] = {}
+
     for bag_dir in _find_rosbag_dirs(rosbag_root):
         try:
             relative_parts = bag_dir.relative_to(rosbag_root).parts
@@ -258,20 +361,45 @@ def _scan_rosbags(rosbag_root: Path) -> Dict[str, RosbagEntry]:
             continue
         if not relative_parts:
             continue
-        key = relative_parts[0]
+        asset_key = relative_parts[0]
         meta = _parse_bag_metadata(bag_dir / _ROSBAG_METADATA_FILENAME)
-        dataset_root = rosbag_root / key
+        discovered.append({
+            "asset_key": asset_key,
+            "relative_parts": relative_parts,
+            "bag_dir": bag_dir,
+            "meta": meta,
+        })
+        asset_counts[asset_key] = asset_counts.get(asset_key, 0) + 1
+
+    downloadable_name_map = {d["key"]: d["name"] for d in _DOWNLOADABLE_BAGS}
+    for rec in discovered:
+        asset_key = rec["asset_key"]
+        relative_parts = rec["relative_parts"]
+        bag_dir = rec["bag_dir"]
+        meta = rec["meta"]
+        bag_key = _build_bag_key(asset_key, relative_parts, asset_counts.get(asset_key, 1))
         topic_types: Dict[str, str] = meta.get("topic_types", {})
-        # A bag is raw-image compatible when it contains at least one
-        # sensor_msgs/msg/Image (non-compressed) topic.
-        raw_compatible = any(
-            "Image" in typ and "Compressed" not in typ
-            for typ in topic_types.values()
+        topic_details: List[Dict[str, Any]] = meta.get("topic_details", [])
+        raw_compatible = any(t.get("selectable") for t in topic_details)
+        has_compressed = any(
+            t.get("type") == "sensor_msgs/msg/CompressedImage" for t in topic_details
         )
-        note = "" if raw_compatible else "No raw sensor_msgs/Image topic found"
+        if raw_compatible:
+            note = ""
+        elif has_compressed:
+            note = "CompressedImage requires decoding/materialization"
+        else:
+            note = "No raw sensor_msgs/msg/Image topic found"
+        dataset_root = rosbag_root / asset_key
+        display_asset = downloadable_name_map.get(asset_key, asset_key)
+        display_suffix = relative_parts[-1]
+        display_name = display_asset if asset_counts.get(asset_key, 1) == 1 else f"{display_asset} — {display_suffix}"
         entry = RosbagEntry(
-            key=key,
-            name=key,
+            key=bag_key,
+            asset_key=asset_key,
+            bag_key=bag_key,
+            name=display_name,
+            display_name=display_name,
             source="local",
             description="Locally installed rosbag",
             installed=True,
@@ -282,13 +410,14 @@ def _scan_rosbags(rosbag_root: Path) -> Dict[str, RosbagEntry]:
             topic_types=topic_types,
             message_counts=meta.get("message_counts", {}),
             image_topics=meta.get("image_topics", []),
+            topic_details=topic_details,
+            storage_identifier=meta.get("storage_identifier", ""),
             raw_image_compatible=raw_compatible,
             compatibility_note=note,
             downloadable=False,
+            content_types=", ".join(sorted({t for t in topic_types.values() if t})),
         )
-        # A catalog key currently represents one playable bag. Keep the first
-        # deterministic match if an archive contains multiple metadata files.
-        installed.setdefault(key, entry)
+        installed.append(entry)
     return installed
 
 
@@ -406,18 +535,21 @@ def discover_datasets(
             rosbag_root = str(candidate)
 
     # ── merge installed + downloadable bags ──────────────────────────────────
-    installed_map: Dict[str, RosbagEntry] = {}
+    installed_entries: List[RosbagEntry] = []
     if rosbag_root:
-        installed_map = _scan_rosbags(Path(rosbag_root))
+        installed_entries = _scan_rosbags(Path(rosbag_root))
 
     rosbag_entries: List[Dict[str, Any]] = []
+    installed_by_asset: Dict[str, List[RosbagEntry]] = {}
+    for e in installed_entries:
+        installed_by_asset.setdefault(e.asset_key or e.key, []).append(e)
 
-    # Start with downloadable definitions and overlay installed state.
-    seen_keys: set = set()
+    # Start with downloadable definitions and overlay single-bag installs.
     for dinfo in _DOWNLOADABLE_BAGS:
         key = dinfo["key"]
-        if key in installed_map:
-            entry = installed_map[key]
+        asset_entries = installed_by_asset.get(key, [])
+        if len(asset_entries) == 1 and asset_entries[0].key == key:
+            entry = asset_entries[0]
             entry.downloadable = True
             entry.download_source = dinfo["source"]
             entry.content_types = dinfo.get("content_types", "")
@@ -428,25 +560,29 @@ def discover_datasets(
             if "raw_image_compatible" in dinfo:
                 entry.raw_image_compatible = bool(dinfo["raw_image_compatible"])
                 entry.compatibility_note = dinfo.get("compatibility_note", "")
+            rosbag_entries.append(entry.to_dict())
         else:
-            entry = RosbagEntry(
-                key=key,
-                name=dinfo["name"],
-                source=dinfo["source"],
-                description=dinfo["description"],
-                installed=False,
-                downloadable=True,
-                download_source=dinfo["source"],
-                content_types=dinfo.get("content_types", ""),
-                raw_image_compatible=bool(dinfo.get("raw_image_compatible", False)),
-                compatibility_note=dinfo.get("compatibility_note", ""),
-            )
-        rosbag_entries.append(entry.to_dict())
-        seen_keys.add(key)
+            if not asset_entries:
+                entry = RosbagEntry(
+                    key=key,
+                    asset_key=key,
+                    bag_key=key,
+                    name=dinfo["name"],
+                    display_name=dinfo["name"],
+                    source=dinfo["source"],
+                    description=dinfo["description"],
+                    installed=False,
+                    downloadable=True,
+                    download_source=dinfo["source"],
+                    content_types=dinfo.get("content_types", ""),
+                    raw_image_compatible=bool(dinfo.get("raw_image_compatible", False)),
+                    compatibility_note=dinfo.get("compatibility_note", ""),
+                )
+                rosbag_entries.append(entry.to_dict())
 
-    # Append any extra locally-installed bags not in the downloadable list.
-    for key, entry in sorted(installed_map.items()):
-        if key not in seen_keys:
+    # Append installed playable bags (multi-bag assets and non-downloadable assets).
+    for entry in sorted(installed_entries, key=lambda e: e.key):
+        if not any(e.get("key") == entry.key for e in rosbag_entries):
             rosbag_entries.append(entry.to_dict())
 
     # ── image datasets ────────────────────────────────────────────────────────

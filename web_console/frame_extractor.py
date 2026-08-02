@@ -71,6 +71,7 @@ _MANIFEST_FILENAME = "frame_dataset.json"
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+_BAG_KEY_RE = re.compile(r"^[a-zA-Z0-9_.:-]{1,200}$")
 
 # Allowed image file extension for frame images served by the web console.
 _FRAME_IMAGE_EXT = ".jpg"
@@ -176,8 +177,8 @@ class FrameDatasetManifest:
 def validate_extraction_params(body: Dict[str, Any]) -> Optional[str]:
     """Validate a raw extraction request body dict.  Returns an error string or None."""
     bag_key = body.get("bag_key", "")
-    if not bag_key or not re.match(r"^[a-zA-Z0-9_-]{1,64}$", str(bag_key)):
-        return "bag_key is required and must match [a-zA-Z0-9_-]{1,64}"
+    if not bag_key or not _BAG_KEY_RE.match(str(bag_key)):
+        return "bag_key is required and must match [a-zA-Z0-9_.:-]{1,200}"
     image_topic = body.get("image_topic", "")
     if not image_topic or not str(image_topic).startswith("/"):
         return "image_topic is required and must start with '/'"
@@ -200,7 +201,7 @@ def validate_extraction_params(body: Dict[str, Any]) -> Optional[str]:
 
 def _validate_params_object(params: ExtractionParams) -> Optional[str]:
     """Validate an ExtractionParams dataclass instance.  Returns an error string or None."""
-    if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", params.bag_key):
+    if not _BAG_KEY_RE.match(params.bag_key):
         return "Invalid bag_key"
     if not params.image_topic or not params.image_topic.startswith("/"):
         return "image_topic must be a non-empty ROS topic path starting with '/'"
