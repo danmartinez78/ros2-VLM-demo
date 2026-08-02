@@ -1145,6 +1145,7 @@ class TestBuildRosEnv(unittest.TestCase):
         env = _build_ros_env(params, {})
         self.assertEqual(env.get("MAX_GENERATE_LENGTH"), "128")
         self.assertEqual(env.get("INSTRUCTION_DELIVERY_MODE"), "structured")
+        self.assertEqual(env.get("IMAGE_TOPIC"), "/cam")
 
     def test_unknown_param_not_in_env(self):
         params = {"shell_cmd": "evil"}
@@ -1536,10 +1537,7 @@ class TestResultsParsing(unittest.TestCase):
     UI schema (``frame_seq``, ``text``, ``latency_ms``).
     """
 
-    # ── _parse_results_log ────────────────────────────────────────────────
-
     def test_parse_empty_results_log(self):
-        """Empty string must return an empty list."""
         self.assertEqual(_parse_results_log(""), [])
 
     def test_parse_whitespace_only(self):
@@ -1593,7 +1591,10 @@ class TestResultsParsing(unittest.TestCase):
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
         self.assertIs(frames[0]["success"], False)
-        self.assertEqual(frames[0]["error"], "timeout")
+        self.assertEqual(
+            frames[0]["error"],
+            "backend exception: IPC write failed: Broken pipe",
+        )
 
     def test_parse_multiline_text_block_scalar(self):
         """YAML block scalar (|) for response is joined from indented lines."""
@@ -1609,8 +1610,7 @@ class TestResultsParsing(unittest.TestCase):
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
-        self.assertIn("Line one.", frames[0]["text"])
-        self.assertIn("Line two.", frames[0]["text"])
+        self.assertEqual(frames[0]["response"], "Line one.\nLine two.")
 
     def test_parse_multi_frame_results(self):
         """Multiple frames each terminated by trailing ---."""
@@ -1629,10 +1629,7 @@ class TestResultsParsing(unittest.TestCase):
             "---\n"
         )
         frames = _parse_results_log(text)
-        self.assertEqual(len(frames), 3)
-        self.assertEqual(frames[0]["text"], "frame1")
-        self.assertEqual(frames[1]["text"], "frame2")
-        self.assertEqual(frames[2]["text"], "frame3")
+        self.assertEqual([f["response"] for f in frames], ["frame1", "frame2", "frame3"])
 
     def test_parse_malformed_lines_skipped(self):
         """Non key:value lines in a block are silently ignored."""

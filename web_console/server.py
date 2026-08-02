@@ -103,7 +103,7 @@ def _now_iso() -> str:
 
 
 def _parse_results_log(text: str) -> list:
-    """Parse ros2 topic echo YAML output for a VlmResult topic into frame dicts.
+    """Parse real ros2 topic echo output for VlmResult messages.
 
     Real ``ros2 topic echo`` output starts each message with the message fields
     and ends each message with a ``---`` separator.  The parser accumulates
@@ -237,6 +237,57 @@ def _parse_results_log(text: str) -> list:
     # Incomplete trailing content (no closing ---) is intentionally discarded.
     return frames
 
+        for line in block.splitlines():
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip(" "))
+
+            if pending_key is not None:
+                if stripped and indent > pending_indent:
+                    pending_lines.append(
+                        line[pending_indent + 2:]
+                        if len(line) > pending_indent + 2 else stripped
+                    )
+                    continue
+                flush_pending()
+
+            if indent == 0:
+                in_header = stripped == "header:"
+                in_stamp = False
+                if ": " not in line:
+                    continue
+                key, _, raw = line.partition(": ")
+                key = key.strip()
+                if key not in scalar_fields:
+                    continue
+                raw = raw.strip()
+                if raw in (">", ">-", "|", "|-"):
+                    pending_key = key
+                    pending_indent = indent
+                else:
+                    frame[key] = _scalar(raw)
+                continue
+
+            if in_header and indent == 2 and stripped == "stamp:":
+                in_stamp = True
+                continue
+            if in_header and in_stamp and indent >= 4 and ": " in stripped:
+                key, _, raw = stripped.partition(": ")
+                try:
+                    if key == "sec":
+                        stamp_sec = int(raw)
+                    elif key == "nanosec":
+                        stamp_nanosec = int(raw)
+                except ValueError:
+                    pass
+
+        flush_pending()
+        if stamp_sec is not None:
+            frame["source_timestamp_ns"] = (
+                stamp_sec * 1_000_000_000 + (stamp_nanosec or 0)
+            )
+        if any(key in frame for key in ("success", "response", "frame_sequence")):
+            frames.append(frame)
+    return frames
 
 def _parse_benchmark_jsonl(text: str) -> list:
     """Parse a benchmark.jsonl file; returns all valid JSON object records.
