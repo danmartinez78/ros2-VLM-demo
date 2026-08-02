@@ -26,6 +26,7 @@ POST /api/extract/<run_id>/cancel               → cancel frame extraction run
 GET  /api/runs/<run_id>/reviews                 → JSON list of review annotations for a run
 POST /api/runs/<run_id>/reviews                 → JSON body → upsert review annotation
 GET  /api/compare                               → JSON comparison of two runs aligned by frame
+GET  /api/sequences                             → JSON list of all discovered sequences (ros_static_fixture, nuscenes_scene, jaad_clip)
 """
 from __future__ import annotations
 
@@ -47,6 +48,7 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
 from .dataset_catalog import build_download_command, discover_datasets
+from .sequence_catalog import discover_sequences
 from .experiment_engine import (
     ExperimentDefinition,
     _VALID_STRATEGIES,
@@ -468,6 +470,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_list_models()
             elif path == "/api/datasets":
                 self._api_list_datasets()
+            elif path == "/api/sequences":
+                self._api_list_sequences()
             elif path == "/api/profiles":
                 self._api_list_profiles()
             elif path == "/api/frame-datasets":
@@ -987,6 +991,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             video_root=cfg.get("video_dataset_dir"),
         )
         self._send_json(200, catalog)
+
+    def _api_list_sequences(self) -> None:
+        """Return all discovered sequences from the sequence catalog.
+
+        Uses ``discover_sequences()`` with dataset roots from the server config.
+        The response includes ``ros_static_fixture``, ``nuscenes_scene``, and
+        ``jaad_clip`` sequences; source paths are never included in the response.
+        """
+        cfg = self.server_instance.config
+        catalog = discover_datasets(
+            rosbag_root=cfg.get("rosbag_dir"),
+            image_root=cfg.get("image_dataset_dir"),
+            video_root=cfg.get("video_dataset_dir"),
+        )
+        result = discover_sequences(
+            rosbag_catalog_entries=catalog.get("rosbags", []),
+            nuscenes_root=cfg.get("nuscenes_dir"),
+            jaad_root=cfg.get("jaad_dir"),
+        )
+        self._send_json(200, result)
 
     def _api_dataset_download(self) -> None:
         """Initiate a rosbag download via the existing download_rosbags.sh script.
