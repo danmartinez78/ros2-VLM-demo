@@ -28,6 +28,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -100,6 +101,34 @@ def _compute_effective_end_offset(args) -> "Optional[float]":
     return None
 
 
+def _detect_storage_id(bag_path: str) -> str:
+    """Return the rosbag2 storage plugin for bag_path.
+
+    Prefer the authoritative storage_identifier in metadata.yaml. The
+    extension fallback also supports direct bag-file paths and incomplete
+    metadata. An empty string lets rosbag2 attempt plugin auto-detection.
+    """
+    path = Path(bag_path)
+    metadata_path = path / "metadata.yaml" if path.is_dir() else path.parent / "metadata.yaml"
+    try:
+        text = metadata_path.read_text(encoding="utf-8", errors="replace")
+        match = re.search(
+            r"(?m)^\\s*storage_identifier:\\s*['\\\"]?([^'\\\"\\s#]+)",
+            text,
+        )
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+
+    candidates = [path] if path.is_file() else list(path.glob("*"))
+    if any(candidate.suffix.lower() == ".mcap" for candidate in candidates):
+        return "mcap"
+    if any(candidate.suffix.lower() == ".db3" for candidate in candidates):
+        return "sqlite3"
+    return ""
+
+
 def main(argv=None) -> int:
     args = _parse_args(argv)
 
@@ -126,7 +155,7 @@ def main(argv=None) -> int:
         print(f"[extract_bag_frames] Import error: {exc}", file=sys.stderr)
         return 2
 
-    storage_options = StorageOptions(uri=args.bag_path, storage_id="sqlite3")
+    storage_options = StorageOptions(\n        uri=args.bag_path, storage_id=_detect_storage_id(args.bag_path)\n    )
     converter_options = ConverterOptions(
         input_serialization_format="cdr",
         output_serialization_format="cdr",
