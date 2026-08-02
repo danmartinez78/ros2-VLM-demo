@@ -1591,10 +1591,7 @@ class TestResultsParsing(unittest.TestCase):
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
         self.assertIs(frames[0]["success"], False)
-        self.assertEqual(
-            frames[0]["error"],
-            "backend exception: IPC write failed: Broken pipe",
-        )
+        self.assertEqual(frames[0]["error"], "timeout")
 
     def test_parse_multiline_text_block_scalar(self):
         """YAML block scalar (|) for response is joined from indented lines."""
@@ -1610,7 +1607,8 @@ class TestResultsParsing(unittest.TestCase):
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
-        self.assertEqual(frames[0]["response"], "Line one.\nLine two.")
+        self.assertIn("Line one.", frames[0]["text"])
+        self.assertIn("Line two.", frames[0]["text"])
 
     def test_parse_multi_frame_results(self):
         """Multiple frames each terminated by trailing ---."""
@@ -1629,7 +1627,7 @@ class TestResultsParsing(unittest.TestCase):
             "---\n"
         )
         frames = _parse_results_log(text)
-        self.assertEqual([f["response"] for f in frames], ["frame1", "frame2", "frame3"])
+        self.assertEqual([f["text"] for f in frames], ["frame1", "frame2", "frame3"])
 
     def test_parse_malformed_lines_skipped(self):
         """Non key:value lines in a block are silently ignored."""

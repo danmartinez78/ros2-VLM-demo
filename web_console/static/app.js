@@ -450,29 +450,22 @@ function _renderRosDetail(container, data) {
       // Frame header: index, success/fail badge
       var fhdr = document.createElement("div");
       fhdr.className = "result-header";
-      fhdr.appendChild(_el("span", "card-title", "Frame " + (frame.frame_sequence !== undefined ? frame.frame_sequence : idx + 1)));
+      fhdr.appendChild(_el("span", "card-title", "Frame " + (frame.frame_seq !== undefined ? frame.frame_seq : idx + 1)));
       if (frame.success === true) {
         fhdr.appendChild(_badge("OK", "ok"));
       } else if (frame.success === false) {
         fhdr.appendChild(_badge("FAIL", "fail"));
       }
-      if (frame.inference_seconds !== undefined) {
-        fhdr.appendChild(
-          _el("span", "result-latency", Number(frame.inference_seconds).toFixed(3) + " s")
-        );
+      if (frame.latency_ms !== undefined) {
+        fhdr.appendChild(_el("span", "result-latency", frame.latency_ms.toFixed(0) + " ms"));
       }
       if (frame.source_timestamp_ns !== undefined) {
         var ts = new Date(frame.source_timestamp_ns / 1e6);
         fhdr.appendChild(_el("span", "result-meta", ts.toISOString().replace("T", " ").replace("Z", " UTC")));
       }
       fc.appendChild(fhdr);
-      if (frame.source_timestamp_ns !== undefined) {
-        fc.appendChild(
-          _el("div", "result-meta", "Source timestamp: " + frame.source_timestamp_ns + " ns")
-        );
-      }
-      if (frame.response) {
-        fc.appendChild(_el("div", "result-text", frame.response));
+      if (frame.text) {
+        fc.appendChild(_el("div", "result-text", frame.text));
       } else if (frame.error) {
         fc.appendChild(_el("div", "result-error", frame.error));
       }
