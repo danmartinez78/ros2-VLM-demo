@@ -63,6 +63,7 @@ function navigate(viewId) {
   else if (viewId === "frame-explorer") { _loadFrameExplorer(); }
   else if (viewId === "profiles") { _loadProfiles(); }
   else if (viewId === "compare") { _loadCompare(); }
+  else if (viewId === "experiment") { _loadExpDatasets(); _loadExpProfiles(); }
 }
 
 document.addEventListener("DOMContentLoaded", function() {
@@ -669,22 +670,77 @@ async function _pollRosLogs(runId) {
 }
 
 // Frame-sequence experiment
+var _activeExperimentRunId = null;
+
+async function _loadExpDatasets() {
+  var sel = document.getElementById("exp-dataset-id");
+  if (!sel) return;
+  try {
+    var data = await _apiGet("/api/frame-datasets");
+    var datasets = data.datasets || [];
+    _empty(sel);
+    var blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "— select a frame dataset —";
+    sel.appendChild(blank);
+    datasets.forEach(function(ds) {
+      var opt = document.createElement("option");
+      opt.value = ds.dataset_id;
+      opt.textContent = (ds.bag_key || ds.dataset_id) + " (" + (ds.frame_count || "?") + " frames)";
+      sel.appendChild(opt);
+    });
+  } catch (e) { /* leave empty */ }
+}
+
+async function _loadExpProfiles() {
+  var sel = document.getElementById("exp-profile-name");
+  if (!sel) return;
+  try {
+    var data = await _apiGet("/api/profiles");
+    var profiles = data.profiles || [];
+    _empty(sel);
+    var blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "— none (use fields below) —";
+    sel.appendChild(blank);
+    profiles.forEach(function(p) {
+      var opt = document.createElement("option");
+      opt.value = p.name;
+      opt.textContent = p.name + (p.version ? " v" + p.version : "");
+      sel.appendChild(opt);
+    });
+  } catch (e) { /* leave empty */ }
+}
+
 async function submitExperiment() {
   var btn = document.getElementById("exp-submit-btn");
+  var cancelBtn = document.getElementById("exp-cancel-btn");
   var resultEl = document.getElementById("exp-result");
   if (btn) btn.disabled = true;
+  if (cancelBtn) cancelBtn.style.display = "";
   _empty(resultEl);
 
-  var pathsRaw = (document.getElementById("exp-image-paths") || {}).value || "";
-  var imagePaths = pathsRaw.split("\n")
-    .map(function(s) { return s.trim(); })
-    .filter(function(s) { return s.length > 0; });
+  var datasetId = ((document.getElementById("exp-dataset-id") || {}).value || "").trim();
+  if (!datasetId) {
+    _append(resultEl, _el("div", "alert error", "Please select a frame dataset first."));
+    if (btn) btn.disabled = false;
+    if (cancelBtn) cancelBtn.style.display = "none";
+    return;
+  }
+
+  var indicesRaw = ((document.getElementById("exp-frame-indices") || {}).value || "").trim();
+  var frameIndices = null;
+  if (indicesRaw) {
+    frameIndices = indicesRaw.split(",")
+      .map(function(s) { return parseInt(s.trim(), 10); })
+      .filter(function(n) { return !isNaN(n); });
+  }
+
+  var profileName = ((document.getElementById("exp-profile-name") || {}).value || "").trim() || null;
 
   var params = {
+    frame_dataset_id: datasetId,
     strategy: (document.getElementById("exp-strategy") || {}).value || "single_frame",
-    image_paths: imagePaths,
-    task_prompt: ((document.getElementById("exp-prompt") || {}).value || "").trim(),
-    system_instruction: ((document.getElementById("exp-system") || {}).value || "").trim(),
     observation_history_max_entries: parseInt(
       (document.getElementById("exp-history-entries") || {}).value || "0", 10),
     observation_history_max_chars: parseInt(
@@ -699,14 +755,23 @@ async function submitExperiment() {
       (document.getElementById("exp-timeout") || {}).value || "120", 10),
     notes: ((document.getElementById("exp-notes") || {}).value || "").trim()
   };
+  if (frameIndices !== null) params.frame_indices = frameIndices;
+  if (profileName) {
+    params.profile_name = profileName;
+  } else {
+    params.task_prompt = ((document.getElementById("exp-prompt") || {}).value || "").trim();
+    params.system_instruction = ((document.getElementById("exp-system") || {}).value || "").trim();
+  }
 
   try {
     var result = await _apiPost("/api/experiment/run", params);
     if (result.status >= 400) {
       _append(resultEl,
         _el("div", "alert error", "Error: " + (result.body.error || result.status)));
+      if (cancelBtn) cancelBtn.style.display = "none";
     } else {
       var runId = result.body.run_id;
+      _activeExperimentRunId = runId;
       _append(resultEl,
         _el("div", "alert success",
           "Experiment started (run_id: " + runId + ").\n" +
@@ -715,9 +780,24 @@ async function submitExperiment() {
     }
   } catch (e) {
     _append(resultEl, _el("div", "alert error", "Error: " + e.message));
+    if (cancelBtn) cancelBtn.style.display = "none";
   } finally {
     if (btn) btn.disabled = false;
   }
+}
+
+async function cancelExperiment() {
+  var runId = _activeExperimentRunId;
+  if (!runId) return;
+  try {
+    await _apiPost("/api/experiment/" + runId + "/cancel", {});
+    var resultEl = document.getElementById("exp-result");
+    if (resultEl) {
+      _append(resultEl, _el("div", "alert", "Cancellation requested — stopping after current frame."));
+    }
+  } catch (e) { /* ignore */ }
+  var cancelBtn = document.getElementById("exp-cancel-btn");
+  if (cancelBtn) cancelBtn.style.display = "none";
 }
 
 async function _pollExperimentResult(runId, statusEl) {
@@ -727,11 +807,32 @@ async function _pollExperimentResult(runId, statusEl) {
     await new Promise(function(r) { setTimeout(r, 2000); });
     try {
       var data = await _apiGet("/api/runs/" + runId);
-      if (data.status === "completed" || data.status === "failed") {
+      var status = data.status;
+      // Update progress if available.
+      var prog = data.progress_frames;
+      var total = data.image_count;
+      if (prog != null && total != null && status === "running") {
+        var progEl = document.getElementById("exp-progress-" + runId);
+        if (!progEl) {
+          progEl = _el("div", "run-progress", "");
+          progEl.id = "exp-progress-" + runId;
+          if (statusEl) statusEl.appendChild(progEl);
+        }
+        progEl.textContent = "Progress: " + prog + " / " + total + " frames";
+      }
+      if (status === "completed" || status === "failed" || status === "stopped") {
+        _activeExperimentRunId = null;
+        var cancelBtn = document.getElementById("exp-cancel-btn");
+        if (cancelBtn) cancelBtn.style.display = "none";
         _empty(statusEl);
-        if (data.status === "completed") {
+        if (status === "completed") {
           _append(statusEl, _el("div", "alert success",
             "Experiment complete! Showing results…"));
+          navigate("runs");
+          setTimeout(function() { _showRunDetail(runId); }, 50);
+        } else if (status === "stopped") {
+          _append(statusEl, _el("div", "alert",
+            "Experiment stopped (cancelled). Partial results available in Runs view."));
           navigate("runs");
           setTimeout(function() { _showRunDetail(runId); }, 50);
         } else {

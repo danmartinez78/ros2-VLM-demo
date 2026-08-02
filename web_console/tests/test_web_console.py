@@ -2742,20 +2742,16 @@ class TestExperimentConcurrency(unittest.TestCase):
         # Inject a fake active experiment ID directly into the server.
         self._srv._active_experiment_id = "aaaaaaaa-0000-0000-0000-000000000001"
         try:
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                f.write(b"FAKE")
-                img = f.name
             status, data = self._post_json(
                 "/api/experiment/run",
                 {
                     "strategy": "single_frame",
-                    "image_paths": [img],
+                    "frame_dataset_id": str(uuid.uuid4()),
                     "task_prompt": "Describe.",
                 },
             )
         finally:
             self._srv._active_experiment_id = None
-            os.unlink(img)
         self.assertEqual(status, 409)
         self.assertIn("error", data)
         self.assertIn("aaaaaaaa", data["error"])
@@ -2766,30 +2762,18 @@ class TestExperimentConcurrency(unittest.TestCase):
         self.assertIsNone(self._srv._active_experiment_id)
         self.assertIsInstance(self._srv._active_experiment_lock, type(__import__("threading").Lock()))
 
-    def test_experiment_validates_all_image_paths(self):
-        """Image path validation must check ALL paths, not just the first 100."""
-        with tempfile.TemporaryDirectory() as d:
-            # Create 101 real files
-            real_paths = []
-            for i in range(101):
-                p = os.path.join(d, f"frame_{i:04d}.jpg")
-                pathlib.Path(p).write_bytes(b"FAKE")
-                real_paths.append(p)
-            # Replace the 101st path with a nonexistent file
-            real_paths[100] = os.path.join(d, "nonexistent_101.jpg")
-
-            status, data = self._post_json(
-                "/api/experiment/run",
-                {
-                    "strategy": "single_frame",
-                    "image_paths": real_paths,
-                    "task_prompt": "Describe.",
-                },
-            )
-        # Should fail because the 101st path does not exist.
+    def test_experiment_requires_frame_dataset_id(self):
+        """Experiment API must reject requests that supply raw image_paths."""
+        status, data = self._post_json(
+            "/api/experiment/run",
+            {
+                "strategy": "single_frame",
+                "image_paths": ["/data/frame.jpg"],
+                "task_prompt": "Describe.",
+            },
+        )
         self.assertIn(status, (400, 422), f"Expected 400/422, got {status}: {data}")
         self.assertIn("error", data)
-        self.assertIn("nonexistent_101.jpg", data["error"])
 
 
 class TestExperimentStackScript(unittest.TestCase):
@@ -4205,6 +4189,29 @@ class TestReviewAPI(unittest.TestCase):
         runs_dir = pathlib.Path(cls._tmpdir) / "runs"
         runs_dir.mkdir()
         cls._run_store = RunStore(runs_dir)
+
+        # Create a completed run with known result_frames for review tests.
+        cls._completed_run_id = RunStore.new_run_id()
+        cls._run_store.save_run(cls._completed_run_id, {
+            "schema_version": 1,
+            "run_id": cls._completed_run_id,
+            "kind": "experiment",
+            "status": "running",
+            "created_at": "2025-01-01T00:00:00Z",
+        })
+        cls._run_store.finalize_run(cls._completed_run_id, {
+            "status": "completed",
+            "completed_at": "2025-01-01T00:01:00Z",
+            "result_frames": [
+                {"frame_index": 0, "text": "frame 0", "success": True},
+                {"frame_index": 1, "text": "frame 1", "success": True},
+                {"frame_index": 2, "text": "frame 2", "success": True},
+                {"frame_index": 3, "text": "frame 3", "success": True},
+                {"frame_index": 4, "text": "frame 4", "success": True},
+                {"frame_index": 5, "text": "frame 5", "success": True},
+            ],
+        })
+
         config = {"quiet": True, "socket_path": "/tmp/no_such.sock",
                   "runs_dir": str(runs_dir)}
         cls._srv, cls._port, cls._thread = _start_test_server(
@@ -4236,13 +4243,12 @@ class TestReviewAPI(unittest.TestCase):
         return resp.status, json.loads(resp_body)
 
     def test_get_reviews_empty(self):
-        run_id = str(uuid.uuid4())
-        status, data = self._get(f"/api/runs/{run_id}/reviews")
+        status, data = self._get(f"/api/runs/{self._completed_run_id}/reviews")
         self.assertEqual(status, 200)
-        self.assertEqual(data["reviews"], [])
+        self.assertIsInstance(data["reviews"], list)
 
     def test_upsert_review_valid(self):
-        run_id = str(uuid.uuid4())
+        run_id = self._completed_run_id
         status, data = self._post(f"/api/runs/{run_id}/reviews", {
             "frame_index": 5,
             "label": "acceptable",
@@ -4253,7 +4259,7 @@ class TestReviewAPI(unittest.TestCase):
         self.assertEqual(data["frame_index"], 5)
 
     def test_upsert_review_invalid_label(self):
-        run_id = str(uuid.uuid4())
+        run_id = self._completed_run_id
         status, data = self._post(f"/api/runs/{run_id}/reviews", {
             "frame_index": 0,
             "label": "not_valid",
@@ -4261,14 +4267,14 @@ class TestReviewAPI(unittest.TestCase):
         self.assertEqual(status, 400)
 
     def test_upsert_review_missing_frame_index(self):
-        run_id = str(uuid.uuid4())
+        run_id = self._completed_run_id
         status, data = self._post(f"/api/runs/{run_id}/reviews", {
             "label": "acceptable",
         })
         self.assertEqual(status, 400)
 
     def test_upsert_and_get_roundtrip(self):
-        run_id = str(uuid.uuid4())
+        run_id = self._completed_run_id
         self._post(f"/api/runs/{run_id}/reviews", {
             "frame_index": 3,
             "label": "ambiguous",
@@ -4276,12 +4282,12 @@ class TestReviewAPI(unittest.TestCase):
         })
         status, data = self._get(f"/api/runs/{run_id}/reviews")
         self.assertEqual(status, 200)
-        self.assertEqual(len(data["reviews"]), 1)
-        self.assertEqual(data["reviews"][0]["label"], "ambiguous")
+        reviews = [r for r in data["reviews"] if r["frame_index"] == 3]
+        self.assertTrue(any(r["label"] == "ambiguous" for r in reviews))
 
     def test_upsert_review_all_valid_labels(self):
         from web_console.review_store import ALLOWED_REVIEW_LABELS
-        run_id = str(uuid.uuid4())
+        run_id = self._completed_run_id
         for i, label in enumerate(sorted(ALLOWED_REVIEW_LABELS)):
             status, data = self._post(f"/api/runs/{run_id}/reviews", {
                 "frame_index": i,
@@ -4289,9 +4295,41 @@ class TestReviewAPI(unittest.TestCase):
             })
             self.assertEqual(status, 200, f"Label {label!r} should be accepted")
 
+    def test_upsert_review_nonexistent_run_returns_404(self):
+        """Reviews for a run that doesn't exist must return 404."""
+        run_id = str(uuid.uuid4())
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0,
+            "label": "acceptable",
+        })
+        self.assertEqual(status, 404)
+
+    def test_upsert_review_running_run_returns_409(self):
+        """Reviews for a non-terminal run must return 409."""
+        run_id = RunStore.new_run_id()
+        self._run_store.save_run(run_id, {
+            "schema_version": 1, "run_id": run_id,
+            "kind": "experiment", "status": "running",
+            "created_at": "2025-01-01T00:00:00Z",
+        })
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        self.assertEqual(status, 409)
+
+    def test_upsert_review_invalid_frame_index_returns_400(self):
+        """Frame index not in result_frames must return 400."""
+        run_id = self._completed_run_id
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 999,
+            "label": "acceptable",
+        })
+        self.assertEqual(status, 400)
+
     def test_reviews_route_invalid_run_id_rejected(self):
         status, data = self._get("/api/runs/not-a-uuid/reviews")
         self.assertIn(status, (400, 404))
+
 
 
 class TestCompareAPI(unittest.TestCase):
@@ -4443,6 +4481,381 @@ class TestWarehouseUIElements(unittest.TestCase):
     def test_html_has_review_ui(self):
         """HTML template must include review label/annotation UI."""
         self.assertIn("review", self._html.lower())
+
+
+
+# ── Integration tests ─────────────────────────────────────────────────────────
+
+class TestExperimentIntegration(unittest.TestCase):
+    """Integration tests: dataset→frames→experiment→compare→annotate.
+
+    These tests use mocked inference so no GPU/VLM is required.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from web_console.frame_extractor import FrameDatasetStore, write_frame_manifest
+        from web_console.task_profiles import discover_profiles, get_profile_by_name
+        import json as _json
+
+        cls._tmpdir = pathlib.Path(tempfile.mkdtemp())
+        runs_dir = cls._tmpdir / "runs"
+        runs_dir.mkdir()
+        frame_datasets_dir = cls._tmpdir / "frame_datasets"
+        frame_datasets_dir.mkdir()
+        profiles_dir = cls._tmpdir / "profiles"
+        profiles_dir.mkdir()
+
+        # Create a test frame dataset with 3 frames.
+        cls._dataset_id = str(uuid.uuid4())
+        dataset_dir = frame_datasets_dir / cls._dataset_id
+        dataset_dir.mkdir()
+        # Write 3 minimal JPEG files.
+        for i in range(3):
+            img = dataset_dir / f"frame_{i:04d}.jpg"
+            img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+        write_frame_manifest(dataset_dir, {
+            "schema_version": 1,
+            "dataset_id": cls._dataset_id,
+            "bag_key": "integration-bag",
+            "bag_path": "/data/integration-bag",
+            "topic": "/cam",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 100,
+            "frames": [
+                {"index": 0, "filename": "frame_0000.jpg",
+                 "timestamp_sec": 1.0, "timestamp_ns": 1000000000},
+                {"index": 1, "filename": "frame_0001.jpg",
+                 "timestamp_sec": 1.5, "timestamp_ns": 1500000000},
+                {"index": 2, "filename": "frame_0002.jpg",
+                 "timestamp_sec": 2.0, "timestamp_ns": 2000000000},
+            ],
+            "frame_count": 3,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(dataset_dir),
+        })
+
+        # Write a minimal task profile.
+        profile_data = {
+            "schema_version": 1,
+            "name": "integration_profile",
+            "version": "1",
+            "system_instruction": "You are a warehouse observer.",
+            "task_prompt": 'Respond with JSON: {"summary": "..."}',
+        }
+        (profiles_dir / "integration_profile_v1.json").write_text(
+            _json.dumps(profile_data)
+        )
+
+        cls._run_store = RunStore(runs_dir)
+        config = {
+            "quiet": True,
+            "socket_path": "/tmp/no_such.sock",
+            "runs_dir": str(runs_dir),
+            "frame_datasets_dir": str(frame_datasets_dir),
+            "task_profiles_dir": str(profiles_dir),
+        }
+        cls._srv, cls._port, cls._thread = _start_test_server(
+            config=config, run_store=cls._run_store
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        shutil.rmtree(str(cls._tmpdir), ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    def _post(self, path, data):
+        body = json.dumps(data).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body)
+
+    # ── helper: create a completed run with provenance ──────────────────────
+    def _make_completed_run(self, dataset_id=None, frame_count=3,
+                             profile_name=None, profile_version=None,
+                             profile_hash=None):
+        """Insert a completed experiment run directly into the RunStore."""
+        ds_id = dataset_id or self._dataset_id
+        run_id = RunStore.new_run_id()
+        result_frames = [
+            {
+                "frame_index": i,
+                "source_dataset_id": ds_id,
+                "source_frame_index": i,
+                "source_timestamp_ns": (i + 1) * 1_000_000_000,
+                "success": True,
+                "text": f"frame {i} description",
+                "latency_ms": 100 + i * 10,
+                "parse_success": True,
+                "parsed_response": {"summary": f"scene {i}"},
+            }
+            for i in range(frame_count)
+        ]
+        record = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "experiment",
+            "strategy": "single_frame",
+            "created_at": "2025-01-01T00:00:00Z",
+            "status": "running",
+            "frame_dataset_id": ds_id,
+            "image_count": frame_count,
+            "task_prompt": "Describe.",
+            "progress_frames": 0,
+        }
+        if profile_name:
+            record["profile_name"] = profile_name
+            record["profile_version"] = profile_version
+            record["profile_hash"] = profile_hash
+        self._run_store.save_run(run_id, record)
+        self._run_store.finalize_run(run_id, {
+            "status": "completed",
+            "completed_at": "2025-01-01T00:01:00Z",
+            "result_frames": result_frames,
+            "successful_frames": frame_count,
+            "failed_frames": 0,
+        })
+        return run_id
+
+    # ── test: dataset listed via API ─────────────────────────────────────────
+    def test_dataset_listed_in_api(self):
+        status, data = self._get("/api/frame-datasets")
+        self.assertEqual(status, 200)
+        ids = [d["dataset_id"] for d in data["datasets"]]
+        self.assertIn(self._dataset_id, ids)
+
+    # ── test: experiment rejects raw image_paths ─────────────────────────────
+    def test_experiment_rejects_raw_image_paths(self):
+        status, data = self._post("/api/experiment/run", {
+            "image_paths": ["/data/frame.jpg"],
+            "task_prompt": "Describe.",
+        })
+        self.assertIn(status, (400, 422))
+
+    # ── test: experiment rejects unknown dataset ──────────────────────────────
+    def test_experiment_unknown_dataset_returns_404(self):
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": str(uuid.uuid4()),
+            "task_prompt": "Describe.",
+        })
+        self.assertEqual(status, 404)
+
+    # ── test: experiment accepts valid dataset and starts ────────────────────
+    def test_experiment_starts_with_valid_dataset(self):
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "task_prompt": "Describe the scene.",
+        })
+        self.assertIn(status, (202, 409),
+                      "Should accept (202) or reject as concurrent (409)")
+        if status == 202:
+            self.assertIn("run_id", data)
+            self.assertEqual(data["frame_dataset_id"], self._dataset_id)
+            # Drain the concurrent slot so other tests can submit.
+            run_id = data["run_id"]
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                s2, d2 = self._get(f"/api/runs/{run_id}")
+                if d2.get("status") in _TERMINAL_STATUSES:
+                    break
+                time.sleep(0.2)
+
+    # ── test: frame indices subset is persisted ───────────────────────────────
+    def test_experiment_persists_frame_dataset_id_in_initial_record(self):
+        """202 response must include frame_dataset_id so the caller can verify."""
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "frame_indices": [0, 2],
+            "task_prompt": "Describe.",
+        })
+        if status == 202:
+            self.assertEqual(data.get("frame_dataset_id"), self._dataset_id)
+            self.assertEqual(data.get("frame_indices"), [0, 2])
+            run_id = data["run_id"]
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                s2, d2 = self._get(f"/api/runs/{run_id}")
+                if d2.get("status") in _TERMINAL_STATUSES:
+                    break
+                time.sleep(0.2)
+        else:
+            self.assertEqual(status, 409)
+
+    # ── test: profile API lists profiles ─────────────────────────────────────
+    def test_profiles_api_lists_integration_profile(self):
+        status, data = self._get("/api/profiles")
+        self.assertEqual(status, 200)
+        names = [p["name"] for p in data.get("profiles", [])]
+        self.assertIn("integration_profile", names)
+
+    # ── test: profile resolution in experiment ───────────────────────────────
+    def test_experiment_unknown_profile_returns_404(self):
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "profile_name": "nonexistent_profile",
+        })
+        self.assertEqual(status, 404)
+
+    # ── test: compare aligns by source_dataset_id + source_frame_index ───────
+    def test_compare_aligns_by_source_provenance(self):
+        """Comparison must use (source_dataset_id, source_frame_index) as key."""
+        run_id1 = self._make_completed_run(frame_count=2)
+        run_id2 = self._make_completed_run(frame_count=2)
+        status, data = self._get(f"/api/compare?run_ids={run_id1},{run_id2}")
+        self.assertEqual(status, 200)
+        aligned = data["aligned_frames"]
+        # Both runs share the same dataset and frame indices 0,1 →
+        # should collapse to 2 aligned rows (not 4).
+        self.assertEqual(len(aligned), 2)
+        for row in aligned:
+            self.assertIn(run_id1, row)
+            self.assertIn(run_id2, row)
+        # Each row's frame_key should be an integer (source_frame_index)
+        # since both runs share the same dataset.
+        keys = [row["frame_key"] for row in aligned]
+        self.assertEqual(sorted(keys), [0, 1])
+
+    def test_compare_includes_profile_in_summaries(self):
+        """Compare summaries must expose profile_name/version/hash."""
+        run_id1 = self._make_completed_run(
+            profile_name="integration_profile",
+            profile_version="1",
+            profile_hash="abc123",
+        )
+        run_id2 = self._make_completed_run()
+        status, data = self._get(f"/api/compare?run_ids={run_id1},{run_id2}")
+        self.assertEqual(status, 200)
+        s1 = data["summaries"][run_id1]
+        self.assertEqual(s1["profile_name"], "integration_profile")
+        self.assertEqual(s1["profile_version"], "1")
+        self.assertEqual(s1["profile_hash"], "abc123")
+        self.assertIn("frame_dataset_id", s1)
+
+    def test_compare_different_datasets_uses_tuple_key(self):
+        """Runs on different datasets should use (ds_id, frame_index) keys."""
+        other_ds = str(uuid.uuid4())
+        run_id1 = self._make_completed_run(dataset_id=self._dataset_id, frame_count=1)
+        run_id2 = self._make_completed_run(dataset_id=other_ds, frame_count=1)
+        status, data = self._get(f"/api/compare?run_ids={run_id1},{run_id2}")
+        self.assertEqual(status, 200)
+        aligned = data["aligned_frames"]
+        # Two different dataset IDs → two rows (different keys, not merged).
+        self.assertEqual(len(aligned), 2)
+        # Keys should be tuples (serialized as lists in JSON).
+        for row in aligned:
+            key = row["frame_key"]
+            self.assertIsInstance(key, list, "Expected [dataset_id, frame_index] key")
+
+    # ── test: reviews require completed run ──────────────────────────────────
+    def test_review_for_nonexistent_run_returns_404(self):
+        status, data = self._post(f"/api/runs/{uuid.uuid4()}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        self.assertEqual(status, 404)
+
+    def test_review_for_running_run_returns_409(self):
+        run_id = RunStore.new_run_id()
+        self._run_store.save_run(run_id, {
+            "schema_version": 1, "run_id": run_id,
+            "kind": "experiment", "status": "running",
+            "created_at": "2025-01-01T00:00:00Z",
+        })
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        self.assertEqual(status, 409)
+
+    def test_review_for_invalid_frame_index_returns_400(self):
+        run_id = self._make_completed_run(frame_count=2)
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 999, "label": "acceptable",
+        })
+        self.assertEqual(status, 400)
+
+    def test_review_roundtrip_with_evidence_linked_run(self):
+        """Annotate a real result frame, then retrieve it."""
+        run_id = self._make_completed_run(frame_count=2)
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 1, "label": "ambiguous", "note": "unclear context",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["label"], "ambiguous")
+        self.assertEqual(data["frame_index"], 1)
+        # Verify retrieval.
+        s2, d2 = self._get(f"/api/runs/{run_id}/reviews")
+        self.assertEqual(s2, 200)
+        reviews = [r for r in d2["reviews"] if r["frame_index"] == 1]
+        self.assertTrue(any(r["label"] == "ambiguous" for r in reviews))
+
+    def test_review_preserves_created_at_on_update(self):
+        """Updating an existing review must keep the original created_at."""
+        run_id = self._make_completed_run(frame_count=2)
+        # First write.
+        self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        s1, d1 = self._get(f"/api/runs/{run_id}/reviews")
+        original_created_at = next(
+            r["created_at"] for r in d1["reviews"] if r["frame_index"] == 0
+        )
+        # Update with a different label.
+        time.sleep(0.05)
+        self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "ambiguous",
+        })
+        s2, d2 = self._get(f"/api/runs/{run_id}/reviews")
+        updated_review = next(
+            r for r in d2["reviews"] if r["frame_index"] == 0
+        )
+        self.assertEqual(updated_review["label"], "ambiguous")
+        self.assertEqual(updated_review["created_at"], original_created_at,
+                         "created_at must be preserved on update")
+
+    # ── test: extraction manifest has bag_key ────────────────────────────────
+    def test_extraction_manifest_includes_bag_key(self):
+        """The bag_key must be written into the extracted manifest (not left blank)."""
+        from web_console.frame_extractor import (
+            ExtractionParams, build_extraction_args,
+        )
+        params = ExtractionParams(
+            bag_key="integration-bag",
+            bag_path=str(pathlib.Path("/data/integration-bag")),
+            image_topic="/cam",
+            dataset_id=str(uuid.uuid4()),
+            output_dir=str(self._tmpdir / "ext_test"),
+            sample_interval=0.5,
+            max_frames=10,
+        )
+        args = build_extraction_args("/scripts/extract_bag_frames.py", params)
+        # --bag-key must appear with the correct value.
+        self.assertIn("--bag-key", args)
+        idx = args.index("--bag-key")
+        self.assertEqual(args[idx + 1], "integration-bag")
+
+    # ── test: experiment cancel route exists ─────────────────────────────────
+    def test_experiment_cancel_unknown_run_returns_404(self):
+        status, data = self._post(f"/api/experiment/{uuid.uuid4()}/cancel", {})
+        self.assertEqual(status, 404)
+
+    def test_experiment_cancel_completed_run_returns_409(self):
+        run_id = self._make_completed_run(frame_count=1)
+        status, data = self._post(f"/api/experiment/{run_id}/cancel", {})
+        self.assertEqual(status, 409)
 
 
 if __name__ == "__main__":

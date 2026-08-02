@@ -258,6 +258,7 @@ def build_extraction_args(
         "--start-offset", str(params.start_offset),
         "--max-frames", str(params.max_frames),
         "--dataset-id", params.dataset_id,
+        "--bag-key", params.bag_key,
     ]
     if params.end_offset is not None:
         args += ["--end-offset", str(params.end_offset)]

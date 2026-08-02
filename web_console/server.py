@@ -509,6 +509,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_ros_stop()
             elif path == "/api/experiment/run":
                 self._api_experiment_run()
+            elif _EXPERIMENT_CANCEL_RE.match(path):
+                run_id = _EXPERIMENT_CANCEL_RE.match(path).group(1)
+                self._api_experiment_cancel(run_id)
             elif path == "/api/datasets/download":
                 self._api_dataset_download()
             elif path == "/api/extract":
@@ -1073,13 +1076,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     # ── ROS-independent experiment API ────────────────────────────────────────
 
     def _api_experiment_run(self) -> None:
-        """Submit a ROS-independent experiment run.
+        """Submit a ROS-independent experiment run backed by a frame dataset.
 
         Accepts a JSON body with keys:
+          frame_dataset_id       — UUID of an extracted frame dataset (required)
+          frame_indices          — list of int frame indices to run (default: all)
+          profile_name           — task profile name to resolve (optional)
+          task_prompt            — task prompt (overrides profile; required if no profile)
+          system_instruction     — optional system instruction (overrides profile)
           strategy               — "single_frame" or "single_frame_observation_history"
-          image_paths            — list of absolute image paths (max 10 000)
-          task_prompt            — task prompt string
-          system_instruction     — optional system instruction
           observation_history_max_entries  — int (default 0)
           observation_history_max_chars    — int (default 4000)
           max_generate_length    — int (default 96)
@@ -1089,27 +1094,112 @@ class ConsoleHandler(BaseHTTPRequestHandler):
           timeout_seconds        — int (default 120)
           notes                  — optional reproducibility notes
 
-        Image paths must be absolute and the files must exist at request time.
+        Image paths are resolved exclusively through FrameDatasetStore; no raw
+        paths are accepted from the browser.
         The experiment runs in a background thread to avoid blocking the HTTP
         server.
         """
         cfg = self.server_instance.config
+        srv = self.server_instance
         body = self._read_json_body()
         if body is None:
             return
+
+        # ── concurrency gate (checked first so 409 beats 400) ───────────────
+        with srv._active_experiment_lock:
+            if srv._active_experiment_id is not None:
+                self._send_error(
+                    409,
+                    f"Experiment already in progress: {srv._active_experiment_id}. "
+                    "Wait for it to complete or poll /api/runs/<id> for status.",
+                )
+                return
+
+        # ── resolve frame dataset ────────────────────────────────────────────
+        frame_dataset_id = str(body.get("frame_dataset_id", "")).strip()
+        if not _is_safe_dataset_id(frame_dataset_id):
+            self._send_error(400, "frame_dataset_id is required and must be a valid UUID")
+            return
+
+        frame_store = self.server_instance.frame_dataset_store
+        manifest_data = frame_store.get_manifest(frame_dataset_id)
+        if manifest_data is None:
+            self._send_error(404, f"Frame dataset not found: {frame_dataset_id!r}")
+            return
+
+        all_frames = manifest_data.get("frames", [])
+        if not all_frames:
+            self._send_error(400, "Frame dataset is empty")
+            return
+
+        # Determine which frame indices to use.
+        frame_indices_raw = body.get("frame_indices")
+        if frame_indices_raw is not None:
+            try:
+                frame_indices = [int(i) for i in frame_indices_raw]
+            except (TypeError, ValueError):
+                self._send_error(400, "frame_indices must be a list of integers")
+                return
+        else:
+            frame_indices = [f["index"] for f in all_frames]
+
+        if not frame_indices:
+            self._send_error(400, "No frames selected")
+            return
+
+        # Build the list of (path, frame_record) for selected indices.
+        frame_index_map = {f["index"]: f for f in all_frames}
+        selected_records: list = []
+        for fi in frame_indices:
+            img_path = frame_store.get_frame_path(frame_dataset_id, fi)
+            if img_path is None:
+                self._send_error(400, f"Frame index {fi} not found in dataset {frame_dataset_id!r}")
+                return
+            rec = frame_index_map.get(fi, {})
+            selected_records.append({
+                "path": str(img_path),
+                "frame_index": fi,
+                "timestamp_ns": rec.get("timestamp_ns"),
+            })
+
+        image_paths = [r["path"] for r in selected_records]
+        source_frame_records = [
+            {"frame_index": r["frame_index"], "timestamp_ns": r["timestamp_ns"]}
+            for r in selected_records
+        ]
+
+        # ── resolve profile ──────────────────────────────────────────────────
+        profile_name = str(body.get("profile_name", "")).strip() or None
+        resolved_profile = None
+        if profile_name:
+            profiles_dir = cfg.get("task_profiles_dir") or str(
+                pathlib.Path(__file__).parent.parent / "config" / "task_profiles"
+            )
+            from .task_profiles import discover_profiles, get_profile_by_name
+            profiles = discover_profiles(profiles_dir)
+            resolved_profile = get_profile_by_name(profiles, profile_name)
+            if resolved_profile is None:
+                self._send_error(404, f"Task profile not found: {profile_name!r}")
+                return
+
+        # Determine system_instruction and task_prompt (body overrides profile).
+        if resolved_profile is not None:
+            default_system = resolved_profile.system_instruction
+            default_task = resolved_profile.task_prompt
+        else:
+            default_system = "You are a vision observer. Base claims on the current image."
+            default_task = ""
+
+        task_prompt = str(body.get("task_prompt", default_task)).strip()
+        system_instruction = str(body.get("system_instruction", default_system)).strip()
 
         # ── build ExperimentDefinition ───────────────────────────────────────
         try:
             defn = ExperimentDefinition(
                 strategy=str(body.get("strategy", "single_frame")),
-                image_paths=[str(p) for p in body.get("image_paths", [])],
-                task_prompt=str(body.get("task_prompt", "")).strip(),
-                system_instruction=str(
-                    body.get(
-                        "system_instruction",
-                        "You are a vision observer. Base claims on the current image.",
-                    )
-                ),
+                image_paths=image_paths,
+                task_prompt=task_prompt,
+                system_instruction=system_instruction,
                 observation_history_max_entries=int(
                     body.get("observation_history_max_entries", 0)
                 ),
@@ -1122,6 +1212,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 top_k=int(body.get("top_k", 20)),
                 timeout_seconds=int(body.get("timeout_seconds", 120)),
                 notes=str(body.get("notes", "")),
+                source_dataset_id=frame_dataset_id,
+                source_frame_records=source_frame_records,
+                profile_name=resolved_profile.name if resolved_profile else None,
+                profile_version=resolved_profile.version if resolved_profile else None,
+                profile_hash=resolved_profile.prompt_hash if resolved_profile else None,
             )
         except (TypeError, ValueError) as exc:
             self._send_error(400, f"Invalid parameter: {exc}")
@@ -1132,35 +1227,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(400, error)
             return
 
-        # Validate that ALL image files exist before marking the run active.
-        # A partial check (e.g. first-100-only) allows large runs to start with
-        # unchecked paths that will fail mid-experiment.
-        for img_path in defn.image_paths:
-            if not os.path.isabs(img_path):
-                self._send_error(400, f"image_paths must be absolute: {img_path!r}")
-                return
-            if not os.path.isfile(img_path):
-                self._send_error(400, f"Image file not found: {img_path!r}")
-                return
+        if not task_prompt:
+            self._send_error(400, "task_prompt is required (provide it directly or via profile_name)")
+            return
 
         run_id = defn.experiment_id
         defn.run_id = run_id
-        srv = self.server_instance
         run_store = srv.run_store
 
-        # Bounded experiment coordinator: reject concurrent submissions.
+        # Register run_id in coordinator slot (concurrency gate was already
+        # checked at entry; claim the slot now).
         with srv._active_experiment_lock:
-            if srv._active_experiment_id is not None:
-                self._send_error(
-                    409,
-                    f"Experiment already in progress: {srv._active_experiment_id}. "
-                    "Wait for it to complete or poll /api/runs/<id> for status.",
-                )
-                return
             srv._active_experiment_id = run_id
 
         artifact_dir = run_store.base_dir / run_id / "artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        # Register cancellation event.
+        cancel_event = threading.Event()
+        with srv._cancel_events_lock:
+            srv._experiment_cancel_events[run_id] = cancel_event
 
         initial_record: Dict[str, Any] = {
             "schema_version": 1,
@@ -1169,7 +1255,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "strategy": defn.strategy,
             "created_at": defn.created_at,
             "image_count": len(defn.image_paths),
+            "frame_dataset_id": frame_dataset_id,
+            "frame_indices": frame_indices,
             "task_prompt": defn.task_prompt,
+            "system_instruction": defn.system_instruction,
             "observation_history_max_entries": defn.observation_history_max_entries,
             "max_generate_length": defn.max_generate_length,
             "temperature": defn.temperature,
@@ -1178,11 +1267,23 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "timeout_seconds": defn.timeout_seconds,
             "notes": defn.notes,
             "status": "running",
+            "progress_frames": 0,
         }
+        if resolved_profile is not None:
+            initial_record["profile_name"] = resolved_profile.name
+            initial_record["profile_version"] = resolved_profile.version
+            initial_record["profile_hash"] = resolved_profile.prompt_hash
         run_store.save_run(run_id, initial_record)
 
         cli_path = cfg.get("cli_path", "edge_vlm_cli")
         socket_path = cfg.get("socket_path", "/tmp/edge_vlm.sock")
+        _profile_for_parsing = resolved_profile  # captured in closure
+
+        def _on_frame(idx: int, fr: Any) -> None:
+            """Update progress in the manifest after each frame completes."""
+            run_store.update_run_if_status(run_id, "running", {
+                "progress_frames": idx + 1,
+            })
 
         def _run_in_background() -> None:
             try:
@@ -1191,33 +1292,53 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     cli_path=cli_path,
                     socket_path=socket_path,
                     artifact_dir=artifact_dir,
+                    cancel_fn=lambda: cancel_event.is_set(),
+                    on_frame=_on_frame,
                 )
+                cancelled = cancel_event.is_set()
                 successful = [r for r in results if r.success]
                 failed = [r for r in results if not r.success]
                 latencies = [r.latency_ms for r in successful]
+
+                # Build result_frames with full provenance and parsed output.
+                result_frames = []
+                for r in results:
+                    parsed_out = parse_structured_output(r.text, _profile_for_parsing)
+                    frame_rec: Dict[str, Any] = {
+                        "frame_index": r.frame_index,
+                        "success": r.success,
+                        "text": r.text,
+                        "error": r.error,
+                        "latency_ms": r.latency_ms,
+                        "history_entries_used": r.history_entries_used,
+                        "repetition_flag": r.repetition_flag,
+                        "parse_success": parsed_out.parse_success,
+                        "parse_error": parsed_out.parse_error,
+                        "malformed_flag": parsed_out.malformed_flag,
+                        "parsed_response": parsed_out.parsed,
+                    }
+                    if r.source_dataset_id is not None:
+                        frame_rec["source_dataset_id"] = r.source_dataset_id
+                    if r.source_frame_index is not None:
+                        frame_rec["source_frame_index"] = r.source_frame_index
+                    if r.source_timestamp_ns is not None:
+                        frame_rec["source_timestamp_ns"] = r.source_timestamp_ns
+                    result_frames.append(frame_rec)
+
+                final_status = "stopped" if cancelled else "completed"
                 run_store.finalize_run(run_id, {
-                    "status": "completed",
+                    "status": final_status,
                     "completed_at": _now_iso(),
-                    "success": True,
+                    "success": not cancelled and bool(successful),
                     "successful_frames": len(successful),
                     "failed_frames": len(failed),
+                    "progress_frames": len(results),
                     "repetition_flags": sum(1 for r in results if r.repetition_flag),
                     "mean_latency_ms": (
                         round(sum(latencies) / len(latencies), 2)
                         if latencies else None
                     ),
-                    "result_frames": [
-                        {
-                            "frame_index": r.frame_index,
-                            "success": r.success,
-                            "text": r.text,
-                            "error": r.error,
-                            "latency_ms": r.latency_ms,
-                            "history_entries_used": r.history_entries_used,
-                            "repetition_flag": r.repetition_flag,
-                        }
-                        for r in results[:50]  # cap at 50 for manifest size
-                    ],
+                    "result_frames": result_frames,
                 })
             except Exception as exc:
                 run_store.finalize_run(run_id, {
@@ -1231,9 +1352,33 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 with srv._active_experiment_lock:
                     if srv._active_experiment_id == run_id:
                         srv._active_experiment_id = None
+                with srv._cancel_events_lock:
+                    srv._experiment_cancel_events.pop(run_id, None)
 
         threading.Thread(target=_run_in_background, daemon=True).start()
         self._send_json(202, initial_record)
+
+    def _api_experiment_cancel(self, run_id: str) -> None:
+        """Signal a running experiment to stop between frames."""
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        srv = self.server_instance
+        with srv._cancel_events_lock:
+            event = srv._experiment_cancel_events.get(run_id)
+        if event is None:
+            # Check if run exists at all.
+            record = srv.run_store.get_run(run_id)
+            if record is None:
+                self._send_error(404, "Run not found")
+                return
+            if record.get("status") in _TERMINAL_STATUSES:
+                self._send_error(409, "Experiment already completed")
+                return
+            self._send_error(404, "No active cancellable experiment with that run_id")
+            return
+        event.set()
+        self._send_json(200, {"run_id": run_id, "cancelling": True})
 
     # ── task profile API ─────────────────────────────────────────────────────
 
@@ -1458,6 +1603,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if not _is_safe_run_id(run_id):
             self._send_error(400, "Invalid run_id")
             return
+        run_store = self.server_instance.run_store
+        record = run_store.get_run(run_id)
+        if record is None:
+            self._send_error(404, "Run not found")
+            return
+        if record.get("status") not in _TERMINAL_STATUSES:
+            self._send_error(409, "Run is not completed; reviews require a terminal run")
+            return
         body = self._read_json_body()
         if body is None:
             return
@@ -1465,9 +1618,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if error:
             self._send_error(400, error)
             return
+        frame_index = int(body["frame_index"])
+        # Verify frame_index exists in the run's result_frames.
+        result_frames = record.get("result_frames", [])
+        frame_indices_in_run = {f.get("frame_index") for f in result_frames if isinstance(f, dict)}
+        if result_frames and frame_index not in frame_indices_in_run:
+            self._send_error(400, f"Frame index {frame_index} does not exist in run results")
+            return
         annotation = ReviewAnnotation(
             run_id=run_id,
-            frame_index=int(body["frame_index"]),
+            frame_index=frame_index,
             label=body["label"],
             note=body.get("note", ""),
             created_at=_now_iso(),
@@ -1490,9 +1650,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     # ── comparison API ────────────────────────────────────────────────────────
 
     def _api_compare_runs(self, parsed: Any) -> None:
-        """Align two or more runs by source frame/timestamp.
+        """Align two or more runs by source dataset+frame identity.
 
         Query string: ?run_ids=<id1>,<id2>[,<id3>...]
+
+        Alignment key preference:
+          1. (source_dataset_id, source_frame_index) — exact provenance
+          2. source_frame_index alone (same dataset implied when all runs share one)
+          3. frame_index (local iteration index, fallback for old-format runs)
         """
         from urllib.parse import parse_qs
         qs = parse_qs(parsed.query)
@@ -1518,12 +1683,28 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return
             manifests[rid] = m
 
-        # Extract per-frame results from each run; key by (source_path or frame_index).
+        # Determine whether ALL runs share the same source_dataset_id so we
+        # can demote the alignment key from (dataset, frame) to frame-only.
+        dataset_ids = {m.get("frame_dataset_id") for m in manifests.values()}
+        all_same_dataset = (len(dataset_ids) == 1 and None not in dataset_ids)
+
+        def _frame_key(frame_rec: Dict[str, Any]) -> Any:
+            ds_id = frame_rec.get("source_dataset_id")
+            sf_idx = frame_rec.get("source_frame_index")
+            if ds_id is not None and sf_idx is not None:
+                if all_same_dataset:
+                    return sf_idx  # simplify display when datasets match
+                return (ds_id, sf_idx)
+            if sf_idx is not None:
+                return sf_idx
+            return frame_rec.get("frame_index")
+
+        # Extract per-frame results from each run; key by resolved frame key.
         per_run: Dict[str, Dict[Any, Any]] = {}
         for rid, manifest in manifests.items():
             frames: Dict[Any, Any] = {}
             for r in manifest.get("result_frames", []):
-                key = r.get("source_path") or r.get("frame_index")
+                key = _frame_key(r)
                 frames[key] = r
             per_run[rid] = frames
 
@@ -1535,11 +1716,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 if k not in seen:
                     all_keys.append(k)
                     seen.add(k)
-        # Sort numerically where possible.
-        try:
-            all_keys.sort(key=lambda k: int(k) if isinstance(k, int) else 0)
-        except Exception:
-            all_keys.sort(key=str)
+
+        # Sort: tuple keys (dataset_id, frame_index) sort by frame_index then
+        # dataset; plain integer/numeric keys sort numerically.
+        def _sort_key(k: Any):
+            if isinstance(k, tuple):
+                return (1, str(k[0]), k[1] if isinstance(k[1], int) else 0)
+            if isinstance(k, int):
+                return (0, "", k)
+            return (2, str(k), 0)
+
+        all_keys.sort(key=_sort_key)
 
         aligned = []
         for key in all_keys:
@@ -1557,8 +1744,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 "status": manifest.get("status"),
                 "model": manifest.get("model"),
                 "profile": manifest.get("profile"),
+                "profile_name": manifest.get("profile_name"),
+                "profile_version": manifest.get("profile_version"),
+                "profile_hash": manifest.get("profile_hash"),
                 "strategy": manifest.get("strategy"),
                 "created_at": manifest.get("created_at"),
+                "frame_dataset_id": manifest.get("frame_dataset_id"),
                 "mean_latency_ms": manifest.get("mean_latency_ms"),
                 "successful_frames": manifest.get("successful_frames"),
                 "failed_frames": manifest.get("failed_frames"),
@@ -1631,6 +1822,9 @@ _FRAME_IMAGE_RE = re.compile(
 )
 _EXTRACT_CANCEL_RE = re.compile(
     r"^/api/extract/(" + _UUID_PATTERN + r")/cancel$"
+)
+_EXPERIMENT_CANCEL_RE = re.compile(
+    r"^/api/experiment/(" + _UUID_PATTERN + r")/cancel$"
 )
 
 
@@ -1723,6 +1917,9 @@ class ConsoleServer(ThreadingHTTPServer):
         # Bounded experiment coordinator: at most one active experiment at a time.
         self._active_experiment_lock = threading.Lock()
         self._active_experiment_id: Optional[str] = None
+        # Per-experiment cancellation events.
+        self._experiment_cancel_events: Dict[str, threading.Event] = {}
+        self._cancel_events_lock = threading.Lock()
 
         def handler(*args: Any, **kwargs: Any) -> None:
             h = ConsoleHandler(*args, **kwargs)
@@ -1871,10 +2068,28 @@ _INDEX_TEMPLATE = """\
   <div class="panel">
     <div class="panel-title">Frame-Sequence Experiment (ROS-independent)</div>
     <fieldset>
-      <legend>Source</legend>
+      <legend>Source Dataset</legend>
       <label>
-        <span class="label-text">Image paths (one per line, absolute)</span>
-        <textarea id="exp-image-paths" rows="4" cols="70" placeholder="/data/frame_001.jpg&#10;/data/frame_002.jpg"></textarea>
+        <span class="label-text">Frame dataset</span>
+        <select id="exp-dataset-id">
+          <option value="">— select a frame dataset —</option>
+        </select>
+        <button type="button" class="small secondary" onclick="_loadExpDatasets()">Refresh</button>
+      </label>
+      <label>
+        <span class="label-text">Frame indices (comma-separated; leave blank = all)</span>
+        <input type="text" id="exp-frame-indices" size="70" placeholder="0,1,2,…  (leave blank for all frames)">
+      </label>
+      <div id="exp-dataset-info" style="font-size:0.85em;color:#666;margin-top:4px"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Task Profile</legend>
+      <label>
+        <span class="label-text">Profile (optional — overrides prompt fields below)</span>
+        <select id="exp-profile-name">
+          <option value="">— none (use fields below) —</option>
+        </select>
+        <button type="button" class="small secondary" onclick="_loadExpProfiles()">Refresh</button>
       </label>
     </fieldset>
     <fieldset>
@@ -1896,14 +2111,14 @@ _INDEX_TEMPLATE = """\
       </label>
     </fieldset>
     <fieldset>
-      <legend>Prompt</legend>
+      <legend>Prompt (ignored when profile is selected)</legend>
       <label>
         <span class="label-text">System instruction</span>
         <input type="text" id="exp-system" value="You are a vision observer. Base claims on the current image." size="70">
       </label>
       <label>
         <span class="label-text">Task prompt</span>
-        <input type="text" id="exp-prompt" value="Describe the scene." size="70" required>
+        <input type="text" id="exp-prompt" value="Describe the scene." size="70">
       </label>
     </fieldset>
     <fieldset>
@@ -1937,6 +2152,7 @@ _INDEX_TEMPLATE = """\
       </label>
     </fieldset>
     <button type="button" id="exp-submit-btn" onclick="submitExperiment()">Submit Experiment</button>
+    <button type="button" id="exp-cancel-btn" onclick="cancelExperiment()" style="display:none" class="danger">Cancel</button>
     <div id="exp-result"></div>
   </div>
 

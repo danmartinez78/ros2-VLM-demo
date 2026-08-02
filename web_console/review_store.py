@@ -195,7 +195,12 @@ class ReviewStore:
             updated = False
             for i, r in enumerate(reviews):
                 if r.get("frame_index") == annotation.frame_index:
-                    reviews[i] = annotation.to_dict()
+                    # Preserve the original creation timestamp on update.
+                    d = annotation.to_dict()
+                    original_created_at = r.get("created_at")
+                    if original_created_at:
+                        d["created_at"] = original_created_at
+                    reviews[i] = d
                     updated = True
                     break
             if not updated:

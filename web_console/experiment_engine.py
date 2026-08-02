@@ -47,7 +47,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .inference_client import (
     ALLOWED_IMAGE_EXTENSIONS,
@@ -126,6 +126,20 @@ class ExperimentDefinition:
     notes: str = ""
     """Free-form notes for reproducibility."""
 
+    # ── source provenance (set by server when running from a frame dataset) ──
+    source_dataset_id: Optional[str] = None
+    """UUID of the FrameDataset this experiment draws from, or None."""
+
+    source_frame_records: Optional[List[Dict[str, Any]]] = None
+    """Ordered list of {frame_index, timestamp_ns} dicts, parallel to image_paths."""
+
+    # ── profile provenance (set by server when a task profile is selected) ──
+    profile_name: Optional[str] = None
+    """Name of the task profile used (e.g. 'warehouse_awareness'), or None."""
+
+    profile_version: Optional[str] = None
+    profile_hash: Optional[str] = None
+
 
 @dataclass
 class FrameResult:
@@ -141,6 +155,16 @@ class FrameResult:
     history_entries_used: int = 0
     repetition_flag: bool = False
     """Set when the response appears repetitive relative to recent history."""
+
+    # ── source provenance ─────────────────────────────────────────────────────
+    source_dataset_id: Optional[str] = None
+    """UUID of the frame dataset this image came from."""
+
+    source_frame_index: Optional[int] = None
+    """Frame index within the source dataset (may differ from iteration index)."""
+
+    source_timestamp_ns: Optional[int] = None
+    """Timestamp of the source frame in nanoseconds."""
 
 
 @dataclass
@@ -306,6 +330,8 @@ def run_experiment(
     socket_path: str = "/tmp/edge_vlm.sock",
     artifact_dir: Optional[Path] = None,
     inference_fn: Optional[InferenceFn] = None,
+    cancel_fn: Optional[Callable[[], bool]] = None,
+    on_frame: Optional[Callable[[int, "FrameResult"], None]] = None,
 ) -> List[FrameResult]:
     """Execute the experiment described by *defn* and return per-frame results.
 
@@ -351,6 +377,8 @@ def run_experiment(
             socket_path=socket_path,
             artifact_dir=artifact_dir,
             inference_fn=inference_fn,
+            cancel_fn=cancel_fn,
+            on_frame=on_frame,
         )
     elif defn.strategy == "single_frame_observation_history":
         return _run_observation_history(
@@ -359,6 +387,8 @@ def run_experiment(
             socket_path=socket_path,
             artifact_dir=artifact_dir,
             inference_fn=inference_fn,
+            cancel_fn=cancel_fn,
+            on_frame=on_frame,
         )
     else:
         # Unreachable after validate_definition, but defensive.
@@ -372,6 +402,8 @@ def _run_single_frame(
     socket_path: str,
     artifact_dir: Optional[Path],
     inference_fn: InferenceFn,
+    cancel_fn: Optional[Callable[[], bool]] = None,
+    on_frame: Optional[Callable[[int, "FrameResult"], None]] = None,
 ) -> List[FrameResult]:
     """Strategy: single_frame — no accumulated context between frames."""
     prompt = _build_prompt(defn.task_prompt, defn.system_instruction, [], 0)
@@ -379,6 +411,9 @@ def _run_single_frame(
     jsonl_records: List[Dict[str, Any]] = []
 
     for idx, image_path in enumerate(defn.image_paths):
+        if cancel_fn is not None and cancel_fn():
+            break
+
         t0 = time.monotonic()
         infer_result = inference_fn(
             cli_path=cli_path,
@@ -393,6 +428,11 @@ def _run_single_frame(
         )
         elapsed_ms = (time.monotonic() - t0) * 1000.0
 
+        src_rec = (
+            defn.source_frame_records[idx]
+            if defn.source_frame_records and idx < len(defn.source_frame_records)
+            else None
+        )
         fr = FrameResult(
             frame_index=idx,
             image_path=image_path,
@@ -402,12 +442,17 @@ def _run_single_frame(
             error=infer_result.error,
             latency_ms=round(elapsed_ms, 2),
             history_entries_used=0,
+            source_dataset_id=defn.source_dataset_id,
+            source_frame_index=src_rec.get("frame_index") if src_rec else None,
+            source_timestamp_ns=src_rec.get("timestamp_ns") if src_rec else None,
         )
         results.append(fr)
         if artifact_dir is not None:
             jsonl_records.append(
                 _frame_result_to_record(fr, defn, record_type="frame")
             )
+        if on_frame is not None:
+            on_frame(idx, fr)
 
     if artifact_dir is not None:
         _write_artifact_jsonl(artifact_dir, "experiment.jsonl", jsonl_records)
@@ -423,6 +468,8 @@ def _run_observation_history(
     socket_path: str,
     artifact_dir: Optional[Path],
     inference_fn: InferenceFn,
+    cancel_fn: Optional[Callable[[], bool]] = None,
+    on_frame: Optional[Callable[[int, "FrameResult"], None]] = None,
 ) -> List[FrameResult]:
     """Strategy: single_frame_observation_history.
 
@@ -437,6 +484,9 @@ def _run_observation_history(
     jsonl_records: List[Dict[str, Any]] = []
 
     for idx, image_path in enumerate(defn.image_paths):
+        if cancel_fn is not None and cancel_fn():
+            break
+
         prompt = _build_prompt(
             defn.task_prompt,
             defn.system_instruction,
@@ -462,6 +512,11 @@ def _run_observation_history(
         if infer_result.success and infer_result.text and history:
             rep_flag = _compute_repetition(infer_result.text, history)
 
+        src_rec = (
+            defn.source_frame_records[idx]
+            if defn.source_frame_records and idx < len(defn.source_frame_records)
+            else None
+        )
         fr = FrameResult(
             frame_index=idx,
             image_path=image_path,
@@ -472,12 +527,17 @@ def _run_observation_history(
             latency_ms=round(elapsed_ms, 2),
             history_entries_used=len(history),
             repetition_flag=rep_flag,
+            source_dataset_id=defn.source_dataset_id,
+            source_frame_index=src_rec.get("frame_index") if src_rec else None,
+            source_timestamp_ns=src_rec.get("timestamp_ns") if src_rec else None,
         )
         results.append(fr)
         if artifact_dir is not None:
             jsonl_records.append(
                 _frame_result_to_record(fr, defn, record_type="frame")
             )
+        if on_frame is not None:
+            on_frame(idx, fr)
 
         # Update history only on success.
         if infer_result.success and infer_result.text:
@@ -497,7 +557,7 @@ def _frame_result_to_record(
     defn: ExperimentDefinition,
     record_type: str = "frame",
 ) -> Dict[str, Any]:
-    return {
+    rec: Dict[str, Any] = {
         "schema_version": _SCHEMA_VERSION,
         "record_type": record_type,
         "experiment_id": defn.experiment_id,
@@ -512,6 +572,13 @@ def _frame_result_to_record(
         "repetition_flag": fr.repetition_flag,
         "timestamp": _now_iso(),
     }
+    if fr.source_dataset_id is not None:
+        rec["source_dataset_id"] = fr.source_dataset_id
+    if fr.source_frame_index is not None:
+        rec["source_frame_index"] = fr.source_frame_index
+    if fr.source_timestamp_ns is not None:
+        rec["source_timestamp_ns"] = fr.source_timestamp_ns
+    return rec
 
 
 def _write_manifest(
@@ -554,6 +621,14 @@ def _write_manifest(
         },
         "notes": defn.notes,
     }
+    if defn.source_dataset_id is not None:
+        summary["source_dataset_id"] = defn.source_dataset_id
+    if defn.profile_name is not None:
+        summary["profile_name"] = defn.profile_name
+    if defn.profile_version is not None:
+        summary["profile_version"] = defn.profile_version
+    if defn.profile_hash is not None:
+        summary["profile_hash"] = defn.profile_hash
 
     tmp = artifact_dir / "_manifest.tmp"
     manifest_path = artifact_dir / "manifest.json"

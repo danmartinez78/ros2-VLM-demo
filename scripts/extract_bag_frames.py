@@ -42,8 +42,10 @@ def _parse_args(argv=None):
     p.add_argument("--output-dir", required=True, help="Output directory for frames and manifest")
     p.add_argument("--topic", required=True, help="ROS topic name (sensor_msgs/Image)")
     p.add_argument("--dataset-id", required=True, help="Dataset UUID")
+    p.add_argument("--bag-key", default="", help="Catalog key for the rosbag (e.g. 'image-proc')")
     p.add_argument("--start-offset", type=float, default=0.0, help="Start time offset (seconds)")
     p.add_argument("--end-offset", type=float, default=None, help="End time offset (seconds)")
+    p.add_argument("--duration", type=float, default=None, help="Play duration in seconds (alternative to end-offset)")
     p.add_argument("--sample-interval", type=float, default=0.5, help="Minimum interval between frames (seconds)")
     p.add_argument("--max-frames", type=int, default=100, help="Maximum frames to extract")
     p.add_argument("--target-count", type=int, default=None, help="Target number of frames (auto-compute interval)")
@@ -216,7 +218,7 @@ def main(argv=None) -> int:
     manifest = {
         "schema_version": 1,
         "dataset_id": args.dataset_id,
-        "bag_key": "",  # caller fills this in from the catalog key
+        "bag_key": args.bag_key,
         "bag_path": args.bag_path,
         "topic": args.topic,
         "start_offset_sec": args.start_offset,
