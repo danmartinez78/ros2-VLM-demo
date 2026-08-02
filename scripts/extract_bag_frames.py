@@ -155,7 +155,9 @@ def main(argv=None) -> int:
         print(f"[extract_bag_frames] Import error: {exc}", file=sys.stderr)
         return 2
 
-    storage_options = StorageOptions(\n        uri=args.bag_path, storage_id=_detect_storage_id(args.bag_path)\n    )
+    storage_options = StorageOptions(
+        uri=args.bag_path, storage_id=_detect_storage_id(args.bag_path)
+    )
     converter_options = ConverterOptions(
         input_serialization_format="cdr",
         output_serialization_format="cdr",
