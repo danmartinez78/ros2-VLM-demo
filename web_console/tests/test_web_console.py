@@ -4602,6 +4602,221 @@ class TestWarehouseUIElements(unittest.TestCase):
         self.assertIn("review", self._html.lower())
 
 
+class TestExtractionPanelUI(unittest.TestCase):
+    """Behavioral coverage for the frame-extraction panel in app.js and the HTML template."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = cls._js_path.read_text(encoding="utf-8")
+        from web_console import server as _srv_mod
+        cls._html = _srv_mod._INDEX_TEMPLATE
+
+    # ── HTML structure ────────────────────────────────────────────────────────
+
+    def test_html_has_extraction_panel(self):
+        """HTML template must include an extraction-panel element in the Frame Explorer view."""
+        self.assertIn("extraction-panel", self._html)
+
+    def test_html_has_extract_bag_key_select(self):
+        """HTML template must have a bag-key <select> for extraction."""
+        self.assertIn("extract-bag-key", self._html)
+
+    def test_html_has_extract_image_topic_input(self):
+        """HTML template must have an image-topic input for extraction."""
+        self.assertIn("extract-image-topic", self._html)
+
+    def test_html_has_extract_start_offset(self):
+        """HTML template must have a start-offset control."""
+        self.assertIn("extract-start-offset", self._html)
+
+    def test_html_has_extract_duration(self):
+        """HTML template must have a duration control."""
+        self.assertIn("extract-duration", self._html)
+
+    def test_html_has_extract_sample_interval(self):
+        """HTML template must have a sample-interval control."""
+        self.assertIn("extract-sample-interval", self._html)
+
+    def test_html_has_extract_target_count(self):
+        """HTML template must have a target-count control."""
+        self.assertIn("extract-target-count", self._html)
+
+    def test_html_has_extract_max_frames(self):
+        """HTML template must have a max-frames control."""
+        self.assertIn("extract-max-frames", self._html)
+
+    def test_html_has_extract_start_button(self):
+        """HTML template must have an Extract Frames start button."""
+        self.assertIn("extract-start-btn", self._html)
+
+    def test_html_has_extract_cancel_button(self):
+        """HTML template must have an extraction cancel button."""
+        self.assertIn("extract-cancel-btn", self._html)
+
+    def test_html_has_extract_status_element(self):
+        """HTML template must have a status/progress element for extraction."""
+        self.assertIn("extract-status", self._html)
+
+    def test_html_extraction_panel_in_frame_explorer_view(self):
+        """The extraction panel must be inside the frame-explorer view section."""
+        start = self._html.find('id="view-frame-explorer"')
+        end = self._html.find('id="view-profiles"')
+        self.assertGreater(start, -1, "view-frame-explorer not found")
+        self.assertGreater(end, start, "view-profiles must follow view-frame-explorer")
+        explorer_section = self._html[start:end]
+        self.assertIn("extraction-panel", explorer_section)
+
+    # ── JS functions ──────────────────────────────────────────────────────────
+
+    def test_app_js_has_load_extraction_bags(self):
+        """app.js must define _loadExtractionBags()."""
+        self.assertIn("function _loadExtractionBags(", self._js)
+
+    def test_app_js_load_extraction_bags_fetches_datasets(self):
+        """_loadExtractionBags must call /api/datasets to enumerate installed bags."""
+        self.assertIn("/api/datasets", self._js)
+
+    def test_app_js_has_submit_extract_panel(self):
+        """app.js must define _submitExtractPanel()."""
+        self.assertIn("function _submitExtractPanel(", self._js)
+
+    def test_app_js_submit_calls_start_extraction(self):
+        """_submitExtractPanel must invoke _startExtraction()."""
+        self.assertIn("_startExtraction(", self._js)
+
+    def test_app_js_has_poll_extraction_run(self):
+        """app.js must define _pollExtractionRun()."""
+        self.assertIn("function _pollExtractionRun(", self._js)
+
+    def test_app_js_poll_extraction_fetches_run_status(self):
+        """_pollExtractionRun must poll /api/runs/ to check status."""
+        self.assertIn("/api/runs/", self._js)
+
+    def test_app_js_poll_extraction_opens_dataset_on_completion(self):
+        """_pollExtractionRun must call _openFrameDataset on completion."""
+        self.assertIn("_openFrameDataset(", self._js)
+
+    def test_app_js_poll_extraction_refreshes_frame_explorer(self):
+        """_pollExtractionRun must refresh the frame-dataset list on completion."""
+        self.assertIn("_loadFrameExplorer()", self._js)
+
+    def test_app_js_has_cancel_extraction_run(self):
+        """app.js must define _cancelExtractionRun()."""
+        self.assertIn("function _cancelExtractionRun(", self._js)
+
+    def test_app_js_cancel_extraction_run_calls_cancel_extraction(self):
+        """_cancelExtractionRun must call _cancelExtraction()."""
+        self.assertIn("_cancelExtraction(", self._js)
+
+    def test_app_js_has_on_extract_bag_change(self):
+        """app.js must define _onExtractBagChange() for topic auto-fill."""
+        self.assertIn("function _onExtractBagChange(", self._js)
+
+    def test_app_js_navigate_frame_explorer_calls_load_extraction_bags(self):
+        """navigate() must call _loadExtractionBags() when switching to frame-explorer."""
+        self.assertIn("_loadExtractionBags()", self._js)
+
+    # ── API integration: extraction panel workflow ────────────────────────────
+
+    @classmethod
+    def _make_srv(cls):
+        """Start a minimal test server with a rosbag catalog entry."""
+        import tempfile as _tempfile
+        tmpdir = pathlib.Path(_tempfile.mkdtemp())
+        bag_dir = tmpdir / "bags" / "test-bag"
+        bag_dir.mkdir(parents=True)
+        # Write a minimal metadata.yaml so the scanner recognises it.
+        meta = {"rosbag2_bagfile_information": {
+            "duration": {"nanoseconds": 5000000000},
+            "topics_with_message_count": [
+                {"topic_metadata": {"name": "/cam/image_raw", "type": "sensor_msgs/msg/Image"},
+                 "message_count": 10}
+            ]
+        }}
+        import yaml as _yaml
+        try:
+            (bag_dir / "metadata.yaml").write_text(_yaml.dump(meta))
+        except ImportError:
+            (bag_dir / "metadata.yaml").write_text("")
+        config = {
+            "quiet": True,
+            "socket_path": "/tmp/no_such.sock",
+            "rosbag_dir": str(tmpdir / "bags"),
+            "runs_dir": str(tmpdir / "runs"),
+        }
+        srv, port, thread = _start_test_server(config=config)
+        return srv, port, thread, tmpdir
+
+    def test_api_datasets_returns_rosbags_list(self):
+        """GET /api/datasets must return a rosbags list (used by extraction panel)."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/api/datasets")
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+            self.assertEqual(resp.status, 200)
+            self.assertIn("rosbags", body)
+            self.assertIsInstance(body["rosbags"], list)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_extract_panel_cancel_returns_404_for_unknown_run(self):
+        """POST /api/extract/<unknown>/cancel must return 404."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            run_id = str(uuid.uuid4())
+            body = json.dumps({}).encode()
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", f"/api/extract/{run_id}/cancel", body=body,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(body))})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 404)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_extract_panel_start_rejects_unknown_bag(self):
+        """POST /api/extract with a bag_key not in catalog must return 400."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            payload = json.dumps({"bag_key": "does-not-exist", "image_topic": "/cam"}).encode()
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/api/extract", body=payload,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(payload))})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+            self.assertEqual(resp.status, 400)
+            self.assertIn("error", body)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_extract_panel_start_rejects_missing_topic(self):
+        """POST /api/extract without image_topic must return 400."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            payload = json.dumps({"bag_key": "some-bag"}).encode()
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/api/extract", body=payload,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(payload))})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 400)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 # ── Integration tests ─────────────────────────────────────────────────────────
 

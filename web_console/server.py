@@ -2289,6 +2289,46 @@ _INDEX_TEMPLATE = """\
 
 <!-- ── Frame Explorer view ──────────────────────────────────────────────────── -->
 <div id="view-frame-explorer" class="view">
+  <div class="panel extraction-panel">
+    <div class="panel-title">Extract Frames from Rosbag</div>
+    <div class="form-row">
+      <label class="label-text">Rosbag
+        <select id="extract-bag-key" onchange="_onExtractBagChange()">
+          <option value="">— select an installed rosbag —</option>
+        </select>
+      </label>
+      <label class="label-text">Image topic
+        <input id="extract-image-topic" type="text" placeholder="/camera/image_raw" size="32">
+      </label>
+    </div>
+    <div class="form-row">
+      <label class="label-text">Start offset (s)
+        <input id="extract-start-offset" type="number" value="0" min="0" step="0.1" size="8">
+      </label>
+      <label class="label-text">Duration (s) <span class="muted">(overrides end offset)</span>
+        <input id="extract-duration" type="number" min="0" step="1" size="8" placeholder="all">
+      </label>
+      <label class="label-text">End offset (s)
+        <input id="extract-end-offset" type="number" min="0" step="0.1" size="8" placeholder="end">
+      </label>
+    </div>
+    <div class="form-row">
+      <label class="label-text">Sample interval (s) <span class="muted">(or use target count)</span>
+        <input id="extract-sample-interval" type="number" min="0" step="0.1" size="8" placeholder="auto">
+      </label>
+      <label class="label-text">Target frame count
+        <input id="extract-target-count" type="number" min="1" step="1" size="6" placeholder="auto">
+      </label>
+      <label class="label-text">Max frames
+        <input id="extract-max-frames" type="number" value="100" min="1" max="5000" size="6">
+      </label>
+    </div>
+    <div class="form-row">
+      <button id="extract-start-btn" onclick="_submitExtractPanel()">Extract Frames</button>
+      <button id="extract-cancel-btn" class="secondary" onclick="_cancelExtractionRun()" style="display:none">Cancel</button>
+      <span id="extract-status" class="muted" style="margin-left:1rem"></span>
+    </div>
+  </div>
   <div class="panel">
     <div class="panel-title">Frame Datasets
       <button class="secondary small" onclick="_loadFrameExplorer()" style="margin-left:auto">Refresh</button>

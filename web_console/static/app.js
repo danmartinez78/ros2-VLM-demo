@@ -57,10 +57,10 @@ function navigate(viewId) {
   });
   if (viewId === "dashboard") { _loadDashboard(); }
   else if (viewId === "models") { _loadModels(); }
-  else if (viewId === "datasets") { _loadDatasets(); }
+  else if (viewId === "datasets") { _loadDatasets(); _loadExtractionBags(); }
   else if (viewId === "runs") { _loadRuns(); }
   else if (viewId === "diagnostics") { _loadDiagnostics(); }
-  else if (viewId === "frame-explorer") { _loadFrameExplorer(); }
+  else if (viewId === "frame-explorer") { _loadFrameExplorer(); _loadExtractionBags(); }
   else if (viewId === "profiles") { _loadProfiles(); }
   else if (viewId === "compare") { _loadCompare(); }
   else if (viewId === "experiment") { _loadExpDatasets(); _loadExpProfiles(); }
@@ -1211,6 +1211,162 @@ async function _startExtraction(bagKey, imageTopic, options) {
 
 async function _cancelExtraction(runId) {
   return _apiPost("/api/extract/" + runId + "/cancel", {});
+}
+
+/* ── Extraction panel ────────────────────────────────────────────────────── */
+
+/** Active extraction run ID for the panel (null when idle). */
+var _extractionRunId = null;
+
+/**
+ * Populate the bag-key <select> in the extraction panel with installed rosbags
+ * from the catalog.
+ */
+async function _loadExtractionBags() {
+  var sel = document.getElementById("extract-bag-key");
+  if (!sel) return;
+  try {
+    var data = await _apiGet("/api/datasets");
+    var bags = (data.rosbags || []).filter(function(b) { return b.installed; });
+    _empty(sel);
+    var blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "— select an installed rosbag —";
+    sel.appendChild(blank);
+    bags.forEach(function(bag) {
+      var opt = document.createElement("option");
+      opt.value = bag.key;
+      opt.textContent = bag.name + (bag.duration_seconds ? " (" + bag.duration_seconds.toFixed(1) + "s)" : "");
+      if (bag.image_topics && bag.image_topics.length > 0) {
+        opt.dataset.defaultTopic = bag.image_topics[0];
+      }
+      sel.appendChild(opt);
+    });
+  } catch (e) { /* leave empty on error */ }
+}
+
+/**
+ * Read the extraction panel form and start a frame extraction run.
+ * Wires up progress polling and auto-opens the dataset on completion.
+ */
+async function _submitExtractPanel() {
+  var startBtn = document.getElementById("extract-start-btn");
+  var cancelBtn = document.getElementById("extract-cancel-btn");
+  var statusEl = document.getElementById("extract-status");
+
+  var bagKey = (document.getElementById("extract-bag-key") || {}).value || "";
+  var topic = (document.getElementById("extract-image-topic") || {}).value || "";
+  var startOffset = parseFloat((document.getElementById("extract-start-offset") || {}).value || "0") || 0;
+  var durationVal = (document.getElementById("extract-duration") || {}).value || "";
+  var endOffsetVal = (document.getElementById("extract-end-offset") || {}).value || "";
+  var sampleInterval = (document.getElementById("extract-sample-interval") || {}).value || "";
+  var targetCount = (document.getElementById("extract-target-count") || {}).value || "";
+  var maxFrames = parseInt((document.getElementById("extract-max-frames") || {}).value || "100", 10) || 100;
+
+  if (!bagKey || !topic) {
+    if (statusEl) statusEl.textContent = "Select a bag and enter an image topic.";
+    return;
+  }
+
+  var options = { start_offset: startOffset, max_frames: maxFrames };
+  if (durationVal) options.duration = parseFloat(durationVal);
+  if (endOffsetVal) options.end_offset = parseFloat(endOffsetVal);
+  if (sampleInterval) options.sample_interval = parseFloat(sampleInterval);
+  if (targetCount) options.target_sample_count = parseInt(targetCount, 10);
+
+  if (startBtn) startBtn.disabled = true;
+  if (cancelBtn) { cancelBtn.disabled = false; _show(cancelBtn); }
+  if (statusEl) statusEl.textContent = "Starting extraction…";
+
+  try {
+    var result = await _startExtraction(bagKey, topic, options);
+    if (result.status !== 202) {
+      if (statusEl) statusEl.textContent = "Error: " + (result.body.error || result.status);
+      if (startBtn) startBtn.disabled = false;
+      if (cancelBtn) _hide(cancelBtn);
+      return;
+    }
+    _extractionRunId = result.body.run_id;
+    if (statusEl) statusEl.textContent = "Extracting… run " + _extractionRunId.slice(0, 8);
+    _pollExtractionRun(_extractionRunId, statusEl, startBtn, cancelBtn);
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "Error: " + e.message;
+    if (startBtn) startBtn.disabled = false;
+    if (cancelBtn) _hide(cancelBtn);
+  }
+}
+
+/**
+ * Poll an extraction run until it reaches a terminal state, then refresh the
+ * frame-dataset list and auto-open the new dataset.
+ */
+async function _pollExtractionRun(runId, statusEl, startBtn, cancelBtn) {
+  var maxPolls = 600;
+  var count = 0;
+  while (count++ < maxPolls) {
+    await new Promise(function(r) { setTimeout(r, 1500); });
+    if (_extractionRunId !== runId) return;  // superseded
+    try {
+      var data = await _apiGet("/api/runs/" + runId);
+      var status = data.status || "unknown";
+      if (statusEl) statusEl.textContent = "Status: " + status;
+      if (status === "completed") {
+        _extractionRunId = null;
+        if (startBtn) startBtn.disabled = false;
+        if (cancelBtn) _hide(cancelBtn);
+        if (statusEl) statusEl.textContent = "Extraction complete. Loading dataset…";
+        // Refresh frame-dataset list and open the new dataset.
+        await _loadFrameExplorer();
+        var datasetId = data.dataset_id;
+        if (datasetId) {
+          await _openFrameDataset(datasetId);
+          var explorerPanel = document.getElementById("frame-explorer-viewer");
+          if (explorerPanel) _show(explorerPanel);
+        }
+        if (statusEl) statusEl.textContent = "Done. Dataset: " + (datasetId || "?");
+        return;
+      } else if (status === "failed" || status === "stopped" || status === "ros_unavailable") {
+        _extractionRunId = null;
+        if (startBtn) startBtn.disabled = false;
+        if (cancelBtn) _hide(cancelBtn);
+        if (statusEl) statusEl.textContent = "Extraction " + status;
+        return;
+      }
+    } catch (e) { /* keep polling */ }
+  }
+  if (statusEl) statusEl.textContent = "Polling timed out.";
+  if (startBtn) startBtn.disabled = false;
+  if (cancelBtn) _hide(cancelBtn);
+}
+
+/**
+ * Cancel the currently active extraction run from the panel.
+ */
+async function _cancelExtractionRun() {
+  var cancelBtn = document.getElementById("extract-cancel-btn");
+  var statusEl = document.getElementById("extract-status");
+  var runId = _extractionRunId;
+  if (!runId) return;
+  if (cancelBtn) cancelBtn.disabled = true;
+  try {
+    await _cancelExtraction(runId);
+    if (statusEl) statusEl.textContent = "Cancelling…";
+  } catch (e) {
+    if (statusEl) statusEl.textContent = "Cancel error: " + e.message;
+  }
+}
+
+/**
+ * Auto-populate the image topic field when the bag selection changes.
+ */
+function _onExtractBagChange() {
+  var sel = document.getElementById("extract-bag-key");
+  var topicEl = document.getElementById("extract-image-topic");
+  if (!sel || !topicEl) return;
+  var selected = sel.options[sel.selectedIndex];
+  if (selected && selected.dataset.defaultTopic) {
+    topicEl.value = selected.dataset.defaultTopic;
+  }
 }
 
 /* ── Frame Explorer view ─────────────────────────────────────────────────── */
