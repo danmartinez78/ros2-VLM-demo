@@ -4723,6 +4723,26 @@ class TestExtractionPanelUI(unittest.TestCase):
         """_pollExtractionRun must poll /api/runs/ to check status."""
         self.assertIn("/api/runs/", self._js)
 
+    def test_open_frame_dataset_reveals_viewer(self):
+        """Opening a saved dataset must reveal the persistent frame viewer."""
+        start = self._js.find("async function _openFrameDataset(")
+        end = self._js.find("function _renderFrameStrip(", start)
+        self.assertGreater(start, -1)
+        self.assertGreater(end, start)
+        function_body = self._js[start:end]
+        self.assertIn('document.getElementById("frame-explorer-viewer")', function_body)
+        self.assertIn("_show(viewerEl)", function_body)
+
+    def test_frame_explorer_css_bounds_preview_and_thumbnails(self):
+        """Frames must render as one bounded preview plus a compact filmstrip."""
+        css_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "style.css"
+        css = css_path.read_text(encoding="utf-8")
+        self.assertIn(".frame-preview-img", css)
+        self.assertIn(".thumb-strip", css)
+        self.assertIn("overflow-x: auto", css)
+        self.assertIn(".frame-thumb", css)
+        self.assertIn("object-fit: cover", css)
+
     def test_app_js_poll_extraction_opens_dataset_on_completion(self):
         """_pollExtractionRun must call _openFrameDataset on completion."""
         self.assertIn("_openFrameDataset(", self._js)
