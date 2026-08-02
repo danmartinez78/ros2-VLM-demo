@@ -2298,8 +2298,18 @@ _INDEX_TEMPLATE = """\
         </select>
       </label>
       <label class="label-text">Image topic
-        <input id="extract-image-topic" type="text" placeholder="/camera/image_raw" size="32">
+        <select id="extract-image-topic-select" onchange="_onExtractTopicSelectionChange()">
+          <option value="">— select a bag first —</option>
+        </select>
       </label>
+    </div>
+    <div class="form-row">
+      <span id="extract-topic-help" class="muted"></span>
+      <label class="label-text" style="margin-left:auto">
+        <input id="extract-topic-advanced" type="checkbox" onchange="_onExtractTopicAdvancedToggle()">
+        Advanced: manual topic override
+      </label>
+      <input id="extract-image-topic" type="text" placeholder="/camera/image_raw" size="32" style="display:none" oninput="_onExtractTopicAdvancedToggle()">
     </div>
     <div class="form-row">
       <label class="label-text">Start offset (s)
@@ -2384,6 +2394,5 @@ _INDEX_TEMPLATE = """\
 </body>
 </html>
 """
-
 
 

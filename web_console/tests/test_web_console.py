@@ -2582,6 +2582,64 @@ class TestDatasetCatalog(unittest.TestCase):
             self.assertEqual(len(data["video_datasets"]), 1)
             self.assertEqual(data["video_datasets"][0]["name"], "clip.mp4")
 
+    def test_discover_datasets_emits_unique_bag_keys_for_nested_multi_bag_assets(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = pathlib.Path(root) / "nvblox" / "isaac_ros_nvblox"
+            for name in ("galileo_people_3_2", "galileo_static_3_2", "quickstart"):
+                bag_dir = base / name
+                bag_dir.mkdir(parents=True, exist_ok=True)
+                (bag_dir / "metadata.yaml").write_text(
+                    "rosbag2_bagfile_information:\n"
+                    "  storage_identifier: mcap\n"
+                    "  topics_with_message_count:\n"
+                    "    - topic_metadata:\n"
+                    "        name: /camera0/color/image_raw\n"
+                    "        type: sensor_msgs/msg/Image\n"
+                    "      message_count: 10\n",
+                    encoding="utf-8",
+                )
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+            installed = [b for b in data["rosbags"] if b.get("installed") and b.get("asset_key") == "nvblox"]
+            self.assertEqual(len(installed), 3)
+            keys = [b["bag_key"] for b in installed]
+            self.assertEqual(len(keys), len(set(keys)))
+            self.assertTrue(all(k.startswith("nvblox:") for k in keys))
+
+    def test_metadata_block_and_flow_forms_extract_topic_details(self):
+        with tempfile.TemporaryDirectory() as root:
+            block_dir = pathlib.Path(root) / "asset_block" / "bag0"
+            block_dir.mkdir(parents=True)
+            (block_dir / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  storage_identifier: sqlite3\n"
+                "  topics_with_message_count:\n"
+                "    - topic_metadata:\n"
+                "        name: /camera/depth/image_raw\n"
+                "        type: sensor_msgs/msg/Image\n"
+                "      message_count: 7\n",
+                encoding="utf-8",
+            )
+            flow_dir = pathlib.Path(root) / "asset_flow" / "bag0"
+            flow_dir.mkdir(parents=True)
+            (flow_dir / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  storage_identifier: mcap\n"
+                "  topics_with_message_count:\n"
+                "    - topic_metadata: {name: /camera/image_compressed, type: sensor_msgs/msg/CompressedImage}\n"
+                "      message_count: 42\n",
+                encoding="utf-8",
+            )
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+            block_entry = next(b for b in data["rosbags"] if b["asset_key"] == "asset_block")
+            flow_entry = next(b for b in data["rosbags"] if b["asset_key"] == "asset_flow")
+            self.assertEqual(block_entry["storage_identifier"], "sqlite3")
+            self.assertEqual(flow_entry["storage_identifier"], "mcap")
+            self.assertEqual(block_entry["topic_details"][0]["message_count"], 7)
+            self.assertEqual(block_entry["topic_details"][0]["modality"], "depth")
+            self.assertTrue(block_entry["topic_details"][0]["selectable"])
+            self.assertEqual(flow_entry["topic_details"][0]["modality"], "compressed")
+            self.assertFalse(flow_entry["topic_details"][0]["selectable"])
+
 
 # ── new API route smoke tests ─────────────────────────────────────────────────
 
@@ -2916,6 +2974,45 @@ class TestRosbagCompatibility(unittest.TestCase):
         entry = next(b for b in data["rosbags"] if b["key"] == "my_h264_bag")
         self.assertFalse(entry["raw_image_compatible"])
         self.assertNotEqual(entry["compatibility_note"], "")
+        self.assertTrue(any(t["modality"] == "compressed" for t in entry["topic_details"]))
+
+    def test_depth_and_infrared_topics_are_labeled(self):
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata:\n"
+            "        name: /camera/depth/image_raw\n"
+            "        type: sensor_msgs/msg/Image\n"
+            "      message_count: 2\n"
+            "    - topic_metadata:\n"
+            "        name: /camera/infra1/image_raw\n"
+            "        type: sensor_msgs/msg/Image\n"
+            "      message_count: 3\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            self._make_bag(root, "modality_bag", metadata)
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "modality_bag")
+        by_name = {t["name"]: t for t in entry["topic_details"]}
+        self.assertEqual(by_name["/camera/depth/image_raw"]["modality"], "depth")
+        self.assertEqual(by_name["/camera/infra1/image_raw"]["modality"], "infrared")
+
+    def test_non_image_topics_not_selectable(self):
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata:\n"
+            "        name: /scan\n"
+            "        type: sensor_msgs/msg/LaserScan\n"
+            "      message_count: 1\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            self._make_bag(root, "no_image_bag", metadata)
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "no_image_bag")
+        self.assertFalse(entry["raw_image_compatible"])
+        self.assertEqual(entry["image_topics"], [])
+        self.assertFalse(any(t["selectable"] for t in entry["topic_details"]))
 
     def test_h264_installed_bag_uses_catalog_compatibility_note(self):
         """When the h264 bag is installed, the catalog note overrides the parsed note."""
@@ -3700,6 +3797,14 @@ class TestFrameExtractorValidation(unittest.TestCase):
             "image_topic": "/cam",
         })
         self.assertIsNotNone(err)
+
+    def test_validate_extraction_params_accepts_colon_bag_key(self):
+        from web_console.frame_extractor import validate_extraction_params
+        err = validate_extraction_params({
+            "bag_key": "nvblox:isaac_ros_nvblox:galileo_people_3_2",
+            "image_topic": "/cam/image_raw",
+        })
+        self.assertIsNone(err)
 
     def test_validate_extraction_params_max_frames_capped(self):
         from web_console.frame_extractor import validate_extraction_params
@@ -4653,8 +4758,20 @@ class TestExtractionPanelUI(unittest.TestCase):
         self.assertIn("extract-bag-key", self._html)
 
     def test_html_has_extract_image_topic_input(self):
-        """HTML template must have an image-topic input for extraction."""
+        """HTML template must have a manual image-topic input for advanced fallback."""
         self.assertIn("extract-image-topic", self._html)
+
+    def test_html_has_extract_image_topic_selector(self):
+        """HTML template must have a topic selector populated from metadata."""
+        self.assertIn("extract-image-topic-select", self._html)
+
+    def test_html_has_extract_advanced_toggle(self):
+        """HTML template must include explicit advanced fallback toggle."""
+        self.assertIn("extract-topic-advanced", self._html)
+
+    def test_html_has_extract_topic_help(self):
+        """HTML template must include explanation area for topic compatibility state."""
+        self.assertIn("extract-topic-help", self._html)
 
     def test_html_has_extract_start_offset(self):
         """HTML template must have a start-offset control."""
@@ -4763,6 +4880,32 @@ class TestExtractionPanelUI(unittest.TestCase):
         """app.js must define _onExtractBagChange() for topic auto-fill."""
         self.assertIn("function _onExtractBagChange(", self._js)
 
+    def test_app_js_supports_advanced_topic_fallback_toggle(self):
+        self.assertIn("function _onExtractTopicAdvancedToggle(", self._js)
+        self.assertIn("manual override", self._js)
+
+    def test_app_js_requires_valid_topic_before_extraction(self):
+        """The extraction button must remain disabled until a topic is selected."""
+        start = self._js.find("function _onExtractBagChange(")
+        end = self._js.find("function _onExtractTopicSelectionChange(", start)
+        self.assertGreater(start, -1)
+        self.assertGreater(end, start)
+        body = self._js[start:end]
+        self.assertIn("startBtn.disabled = true", body)
+        self.assertIn(": !topicSel.value", body)
+
+    def test_manual_topic_input_updates_button_state(self):
+        """Advanced manual entry must react to input and require non-empty text."""
+        self.assertIn('oninput="_onExtractTopicAdvancedToggle()"', self._html)
+        start = self._js.find("function _onExtractTopicAdvancedToggle(")
+        self.assertGreater(start, -1)
+        body = self._js[start:]
+        self.assertIn("startBtn.disabled = !input.value.trim()", body)
+
+    def test_app_js_handles_no_supported_topic_state(self):
+        self.assertIn("no raw Image topics discovered", self._js)
+        self.assertIn("CompressedImage topics require decoding", self._js)
+
     def test_app_js_navigate_frame_explorer_calls_load_extraction_bags(self):
         """navigate() must call _loadExtractionBags() when switching to frame-explorer."""
         self.assertIn("_loadExtractionBags()", self._js)
@@ -4777,18 +4920,18 @@ class TestExtractionPanelUI(unittest.TestCase):
         bag_dir = tmpdir / "bags" / "test-bag"
         bag_dir.mkdir(parents=True)
         # Write a minimal metadata.yaml so the scanner recognises it.
-        meta = {"rosbag2_bagfile_information": {
-            "duration": {"nanoseconds": 5000000000},
-            "topics_with_message_count": [
-                {"topic_metadata": {"name": "/cam/image_raw", "type": "sensor_msgs/msg/Image"},
-                 "message_count": 10}
-            ]
-        }}
-        import yaml as _yaml
-        try:
-            (bag_dir / "metadata.yaml").write_text(_yaml.dump(meta))
-        except ImportError:
-            (bag_dir / "metadata.yaml").write_text("")
+        (bag_dir / "metadata.yaml").write_text(
+            "rosbag2_bagfile_information:\n"
+            "  storage_identifier: mcap\n"
+            "  duration:\n"
+            "    nanoseconds: 5000000000\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata:\n"
+            "        name: /cam/image_raw\n"
+            "        type: sensor_msgs/msg/Image\n"
+            "      message_count: 10\n",
+            encoding="utf-8",
+        )
         config = {
             "quiet": True,
             "socket_path": "/tmp/no_such.sock",
@@ -4810,6 +4953,13 @@ class TestExtractionPanelUI(unittest.TestCase):
             self.assertEqual(resp.status, 200)
             self.assertIn("rosbags", body)
             self.assertIsInstance(body["rosbags"], list)
+            installed = [b for b in body["rosbags"] if b.get("installed")]
+            self.assertTrue(installed)
+            first = installed[0]
+            self.assertIn("bag_key", first)
+            self.assertIn("asset_key", first)
+            self.assertIn("storage_identifier", first)
+            self.assertIn("topic_details", first)
         finally:
             srv.shutdown()
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -4859,6 +5009,25 @@ class TestExtractionPanelUI(unittest.TestCase):
             conn.request("POST", "/api/extract", body=payload,
                          headers={"Content-Type": "application/json",
                                   "Content-Length": str(len(payload))})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 400)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_extract_panel_start_rejects_traversal_shaped_bag_key(self):
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            payload = json.dumps({"bag_key": "../../etc/passwd", "image_topic": "/cam"}).encode()
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/api/extract",
+                body=payload,
+                headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+            )
             resp = conn.getresponse()
             resp.read()
             conn.close()

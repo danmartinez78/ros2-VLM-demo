@@ -424,8 +424,15 @@ function _renderBagTile(bag) {
     if (bag.duration_seconds != null) {
       tile.appendChild(_el("div", "tile-meta", "Duration: " + bag.duration_seconds.toFixed(1) + "s"));
     }
-    if (bag.topics && bag.topics.length > 0) {
-      tile.appendChild(_el("div", "tile-meta", "Topics: " + bag.topics.join(", ")));
+    var topicNames = [];
+    if (bag.topic_names && bag.topic_names.length > 0) {
+      topicNames = bag.topic_names;
+    } else if (bag.topics && bag.topics.length > 0) {
+      if (typeof bag.topics[0] === "string") topicNames = bag.topics;
+      else topicNames = bag.topics.map(function(t) { return t.name; });
+    }
+    if (topicNames.length > 0) {
+      tile.appendChild(_el("div", "tile-meta", "Topics: " + topicNames.join(", ")));
     }
   }
   if (bag.content_types) {
@@ -1217,6 +1224,7 @@ async function _cancelExtraction(runId) {
 
 /** Active extraction run ID for the panel (null when idle). */
 var _extractionRunId = null;
+var _extractionBagsByKey = {};
 
 /**
  * Populate the bag-key <select> in the extraction panel with installed rosbags
@@ -1228,20 +1236,23 @@ async function _loadExtractionBags() {
   try {
     var data = await _apiGet("/api/datasets");
     var bags = (data.rosbags || []).filter(function(b) { return b.installed; });
+    _extractionBagsByKey = {};
     _empty(sel);
     var blank = document.createElement("option");
     blank.value = "";
     blank.textContent = "— select an installed rosbag —";
     sel.appendChild(blank);
     bags.forEach(function(bag) {
+      _extractionBagsByKey[bag.key] = bag;
       var opt = document.createElement("option");
       opt.value = bag.key;
-      opt.textContent = bag.name + (bag.duration_seconds ? " (" + bag.duration_seconds.toFixed(1) + "s)" : "");
-      if (bag.image_topics && bag.image_topics.length > 0) {
-        opt.dataset.defaultTopic = bag.image_topics[0];
-      }
+      var label = bag.display_name || bag.name || bag.key;
+      if (bag.storage_identifier) label += " [" + bag.storage_identifier + "]";
+      if (bag.duration_seconds) label += " (" + bag.duration_seconds.toFixed(1) + "s)";
+      opt.textContent = label;
       sel.appendChild(opt);
     });
+    _onExtractBagChange();
   } catch (e) { /* leave empty on error */ }
 }
 
@@ -1255,7 +1266,15 @@ async function _submitExtractPanel() {
   var statusEl = document.getElementById("extract-status");
 
   var bagKey = (document.getElementById("extract-bag-key") || {}).value || "";
-  var topic = (document.getElementById("extract-image-topic") || {}).value || "";
+  var topicSelect = document.getElementById("extract-image-topic-select");
+  var topicAdvanced = document.getElementById("extract-topic-advanced");
+  var topicInput = document.getElementById("extract-image-topic");
+  var topic = "";
+  if (topicAdvanced && topicAdvanced.checked) {
+    topic = (topicInput || {}).value || "";
+  } else {
+    topic = (topicSelect || {}).value || "";
+  }
   var startOffset = parseFloat((document.getElementById("extract-start-offset") || {}).value || "0") || 0;
   var durationVal = (document.getElementById("extract-duration") || {}).value || "";
   var endOffsetVal = (document.getElementById("extract-end-offset") || {}).value || "";
@@ -1264,7 +1283,7 @@ async function _submitExtractPanel() {
   var maxFrames = parseInt((document.getElementById("extract-max-frames") || {}).value || "100", 10) || 100;
 
   if (!bagKey || !topic) {
-    if (statusEl) statusEl.textContent = "Select a bag and enter an image topic.";
+    if (statusEl) statusEl.textContent = "Select a bag and choose a supported image topic.";
     return;
   }
 
@@ -1361,11 +1380,98 @@ async function _cancelExtractionRun() {
  */
 function _onExtractBagChange() {
   var sel = document.getElementById("extract-bag-key");
-  var topicEl = document.getElementById("extract-image-topic");
-  if (!sel || !topicEl) return;
-  var selected = sel.options[sel.selectedIndex];
-  if (selected && selected.dataset.defaultTopic) {
-    topicEl.value = selected.dataset.defaultTopic;
+  var topicSel = document.getElementById("extract-image-topic-select");
+  var topicHelp = document.getElementById("extract-topic-help");
+  var topicInput = document.getElementById("extract-image-topic");
+  var topicAdvanced = document.getElementById("extract-topic-advanced");
+  var startBtn = document.getElementById("extract-start-btn");
+  if (!sel || !topicSel) return;
+
+  _empty(topicSel);
+  var bag = _extractionBagsByKey[sel.value];
+  if (!bag) {
+    topicSel.appendChild(new Option("— select a bag first —", ""));
+    if (topicHelp) topicHelp.textContent = "";
+    if (startBtn) startBtn.disabled = true;
+    return;
+  }
+
+  var topicRows = Array.isArray(bag.topic_details) ? bag.topic_details : [];
+  var selectable = topicRows.filter(function(t) { return t && t.selectable; });
+  var fallbackSelectable = [];
+  if (selectable.length === 0 && bag.image_topics && bag.image_topics.length > 0) {
+    fallbackSelectable = bag.image_topics.map(function(name) {
+      return { name: name, type: (bag.topic_types || {})[name] || "sensor_msgs/msg/Image", selectable: true, modality: "image" };
+    });
+  }
+  if (selectable.length === 0) selectable = fallbackSelectable;
+
+  if (selectable.length === 0) {
+    topicSel.appendChild(new Option("— no raw Image topics discovered —", ""));
+    if (topicHelp) {
+      var compressed = topicRows.some(function(t) { return t && t.type === "sensor_msgs/msg/CompressedImage"; });
+      topicHelp.textContent = compressed
+        ? "No directly compatible raw image topic. CompressedImage topics require decoding."
+        : "No compatible raw image topic in metadata. Use Advanced manual override only for legacy/incomplete metadata.";
+    }
+    if (topicInput) topicInput.value = "";
+    if (startBtn) {
+      startBtn.disabled = !(topicAdvanced && topicAdvanced.checked && topicInput && topicInput.value.trim());
+    }
+    return;
+  }
+
+  if (selectable.length > 1) {
+    topicSel.appendChild(new Option("— select an image topic —", ""));
+  }
+  selectable.forEach(function(t) {
+    var countTxt = (typeof t.message_count === "number") ? (" · " + t.message_count + " msgs") : "";
+    var modality = t.modality ? (" · " + t.modality) : "";
+    var label = t.name + " (" + (t.type || "unknown") + countTxt + modality + ")";
+    var opt = new Option(label, t.name);
+    if (selectable.length === 1) opt.selected = true;
+    topicSel.appendChild(opt);
+  });
+  if (selectable.length === 1 && topicInput) {
+    topicInput.value = selectable[0].name;
+  }
+  if (topicHelp) {
+    topicHelp.textContent = selectable.length === 1
+      ? "Auto-selected the only directly compatible raw image topic."
+      : "Multiple compatible topics found. Please choose one.";
+  }
+  if (startBtn) {
+    startBtn.disabled = topicAdvanced && topicAdvanced.checked
+      ? !(topicInput && topicInput.value.trim())
+      : !topicSel.value;
+  }
+}
+
+function _onExtractTopicSelectionChange() {
+  var topicSel = document.getElementById("extract-image-topic-select");
+  var topicInput = document.getElementById("extract-image-topic");
+  var topicAdvanced = document.getElementById("extract-topic-advanced");
+  var startBtn = document.getElementById("extract-start-btn");
+  if (!topicSel || !topicInput) return;
+  if (topicSel.value) topicInput.value = topicSel.value;
+  if (startBtn && !(topicAdvanced && topicAdvanced.checked)) {
+    startBtn.disabled = !topicSel.value;
+  }
+}
+
+function _onExtractTopicAdvancedToggle() {
+  var advanced = document.getElementById("extract-topic-advanced");
+  var input = document.getElementById("extract-image-topic");
+  var sel = document.getElementById("extract-image-topic-select");
+  var startBtn = document.getElementById("extract-start-btn");
+  if (!advanced || !input || !sel) return;
+  if (advanced.checked) {
+    _show(input);
+    if (!input.value && sel.value) input.value = sel.value;
+    if (startBtn) startBtn.disabled = !input.value.trim();
+  } else {
+    _hide(input);
+    _onExtractTopicSelectionChange();
   }
 }
 
@@ -1645,4 +1751,3 @@ function _renderReviewUI(runId, frameIndex, containerEl) {
   });
   containerEl.appendChild(noteInput);
 }
-
