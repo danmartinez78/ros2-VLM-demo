@@ -1392,7 +1392,7 @@ function _onExtractBagChange() {
   if (!bag) {
     topicSel.appendChild(new Option("— select a bag first —", ""));
     if (topicHelp) topicHelp.textContent = "";
-    if (startBtn) startBtn.disabled = false;
+    if (startBtn) startBtn.disabled = true;
     return;
   }
 
@@ -1414,8 +1414,10 @@ function _onExtractBagChange() {
         ? "No directly compatible raw image topic. CompressedImage topics require decoding."
         : "No compatible raw image topic in metadata. Use Advanced manual override only for legacy/incomplete metadata.";
     }
-    if (startBtn) startBtn.disabled = !(topicAdvanced && topicAdvanced.checked);
     if (topicInput) topicInput.value = "";
+    if (startBtn) {
+      startBtn.disabled = !(topicAdvanced && topicAdvanced.checked && topicInput && topicInput.value.trim());
+    }
     return;
   }
 
@@ -1438,7 +1440,11 @@ function _onExtractBagChange() {
       ? "Auto-selected the only directly compatible raw image topic."
       : "Multiple compatible topics found. Please choose one.";
   }
-  if (startBtn) startBtn.disabled = false;
+  if (startBtn) {
+    startBtn.disabled = topicAdvanced && topicAdvanced.checked
+      ? !(topicInput && topicInput.value.trim())
+      : !topicSel.value;
+  }
 }
 
 function _onExtractTopicSelectionChange() {
@@ -1462,7 +1468,7 @@ function _onExtractTopicAdvancedToggle() {
   if (advanced.checked) {
     _show(input);
     if (!input.value && sel.value) input.value = sel.value;
-    if (startBtn) startBtn.disabled = false;
+    if (startBtn) startBtn.disabled = !input.value.trim();
   } else {
     _hide(input);
     _onExtractTopicSelectionChange();
