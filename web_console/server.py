@@ -66,6 +66,10 @@ _ALLOWED_ROS_PARAMS = frozenset(
     }
 )
 
+# Allowlisted artifact filenames produced by run_image_proc_test.sh.
+# The script writes these into $ARTIFACT_DIR; no other filenames are captured.
+_ROS_ARTIFACT_ALLOWLIST = ("manifest.json", "benchmark.jsonl", "launch.log", "results.log")
+
 _STATIC_DIR = pathlib.Path(__file__).parent / "static"
 _CONTENT_TYPES: Dict[str, str] = {
     ".css": "text/css; charset=utf-8",
@@ -382,8 +386,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         run_id = RunStore.new_run_id()
         run_store = self.server_instance.run_store
 
-        # Create the per-run artifact directory (same as the run store dir for this run).
-        artifact_dir = run_store.base_dir / run_id
+        # Use a nested artifacts/ subdirectory for ARTIFACT_DIR so that the
+        # script's own manifest.json (and other outputs) never overwrite the
+        # console-owned manifest at <run_id>/manifest.json.
+        artifact_dir = run_store.base_dir / run_id / "artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         # Only allowlisted env vars are forwarded; no arbitrary env injection.
@@ -413,7 +419,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "created_at": _now_iso(),
             "params": params,
             "status": "starting",
-            "artifact_dir": str(artifact_dir),
         }
         run_store.save_run(run_id, initial_record)
 
@@ -434,20 +439,28 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 status_str = "failed"
                 success = False
 
-            # Collect JSON artifact files written by the ROS script into the
-            # per-run directory (e.g. result.json, metrics.json).
+            # Scan the nested artifacts/ subdirectory for the bounded set of
+            # files written by run_image_proc_test.sh.  Log files are referenced
+            # by relative path only (not embedded); manifest.json is parsed and
+            # stored as script_manifest so the console manifest is never
+            # overwritten by the script's own manifest.json.
             run_dir = run_store.run_dir(rid)
-            artifacts: Dict[str, Any] = {}
+            artifact_rel_paths: list = []
+            script_manifest: Optional[Dict[str, Any]] = None
             if run_dir is not None:
-                for candidate in ("result.json", "metrics.json"):
-                    p = run_dir / candidate
-                    if p.is_file():
-                        try:
-                            artifacts[candidate] = json.loads(
-                                p.read_text(encoding="utf-8")
-                            )
-                        except (json.JSONDecodeError, OSError):
-                            artifacts[candidate] = None
+                artifacts_subdir = run_dir / "artifacts"
+                if artifacts_subdir.is_dir():
+                    for name in _ROS_ARTIFACT_ALLOWLIST:
+                        p = artifacts_subdir / name
+                        if p.is_file():
+                            artifact_rel_paths.append(f"artifacts/{name}")
+                            if name == "manifest.json":
+                                try:
+                                    script_manifest = json.loads(
+                                        p.read_text(encoding="utf-8")
+                                    )
+                                except (json.JSONDecodeError, OSError):
+                                    pass
 
             updates: Dict[str, Any] = {
                 "status": status_str,
@@ -456,8 +469,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 "success": success,
                 "log_lines": log_lines[:200],
             }
-            if artifacts:
-                updates["artifacts"] = artifacts
+            if artifact_rel_paths:
+                updates["artifacts"] = artifact_rel_paths
+            if script_manifest is not None:
+                updates["script_manifest"] = script_manifest
 
             # finalize_run is a no-op if the run is already terminal (idempotency guard).
             run_store.finalize_run(rid, updates)

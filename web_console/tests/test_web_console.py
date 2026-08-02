@@ -1299,28 +1299,75 @@ class TestRosRunFinalization(unittest.TestCase):
         self.assertIn("completed_at", record)
 
     def test_artifact_captured_in_manifest(self):
-        """Artifacts written to $ARTIFACT_DIR are included in the finalized manifest."""
+        """Artifacts written by the real script layout are captured in the console manifest.
+
+        ARTIFACT_DIR is a nested artifacts/ subdirectory so the console's
+        manifest.json is never overwritten by the script's manifest.json.
+        The finalized console manifest must contain:
+          - safe relative artifact paths in 'artifacts'
+          - parsed script manifest.json content in 'script_manifest'
+        """
         script = (
             "#!/bin/bash\n"
             'mkdir -p "$ARTIFACT_DIR"\n'
-            'echo \'{"score": 1.0, "pass": true}\' > "$ARTIFACT_DIR/result.json"\n'
+            'echo \'{"schema_version": 1, "successful_results_observed": 1}\' > "$ARTIFACT_DIR/manifest.json"\n'
+            'echo \'{"latency_ms": 42}\' > "$ARTIFACT_DIR/benchmark.jsonl"\n'
+            'echo "launch output" > "$ARTIFACT_DIR/launch.log"\n'
+            'echo "result: true" > "$ARTIFACT_DIR/results.log"\n'
             "exit 0\n"
         )
         status, data = self._start_ros(script)
         self.assertEqual(status, 202)
         run_id = data["run_id"]
-        # Verify ARTIFACT_DIR was set to the run's directory in the store.
-        self.assertIn("artifact_dir", data)
 
         record = self._poll_terminal(run_id, timeout=10.0)
         self.assertEqual(record.get("status"), "completed")
-        artifacts = record.get("artifacts", {})
-        self.assertIn(
-            "result.json", artifacts,
-            "result.json written to ARTIFACT_DIR must appear in finalized manifest",
+        self.assertEqual(record.get("run_id"), run_id)
+        self.assertEqual(record.get("kind"), "ros")
+
+        # artifacts must be a list of safe relative paths
+        artifacts = record.get("artifacts", [])
+        self.assertIsInstance(artifacts, list)
+        self.assertIn("artifacts/manifest.json", artifacts)
+        self.assertIn("artifacts/benchmark.jsonl", artifacts)
+        self.assertIn("artifacts/launch.log", artifacts)
+        self.assertIn("artifacts/results.log", artifacts)
+
+        # script_manifest must be parsed from artifacts/manifest.json
+        script_manifest = record.get("script_manifest")
+        self.assertIsNotNone(script_manifest, "script_manifest must be parsed from artifacts/manifest.json")
+        self.assertEqual(script_manifest.get("schema_version"), 1)
+        self.assertEqual(script_manifest.get("successful_results_observed"), 1)
+
+    def test_console_manifest_not_overwritten_by_script(self):
+        """Script writing to ARTIFACT_DIR must not overwrite the console manifest.json.
+
+        The real run_image_proc_test.sh writes <ARTIFACT_DIR>/manifest.json.
+        Because ARTIFACT_DIR is now <run_id>/artifacts/, the console's own
+        <run_id>/manifest.json must remain intact with run_id, kind, schema_version=1,
+        and a terminal status.
+        """
+        script = (
+            "#!/bin/bash\n"
+            'mkdir -p "$ARTIFACT_DIR"\n'
+            # Simulate the script writing its own manifest.json with a different schema
+            'echo \'{"schema_version": 999, "hostile": true}\' > "$ARTIFACT_DIR/manifest.json"\n'
+            "exit 0\n"
         )
-        self.assertAlmostEqual(artifacts["result.json"].get("score"), 1.0)
-        self.assertTrue(artifacts["result.json"].get("pass"))
+        status, data = self._start_ros(script)
+        self.assertEqual(status, 202)
+        run_id = data["run_id"]
+
+        record = self._poll_terminal(run_id, timeout=10.0)
+        # Console manifest must retain its own fields
+        self.assertEqual(record.get("run_id"), run_id)
+        self.assertEqual(record.get("kind"), "ros")
+        self.assertIn(record.get("status"), _TERMINAL_STATUSES)
+        # schema_version 1 is the console schema, not 999 from the script artifact
+        self.assertEqual(record.get("schema_version"), 1,
+                         "Console manifest schema_version must not be overwritten by script artifact")
+        self.assertNotIn("hostile", record,
+                         "Console manifest must not contain keys from the script's manifest.json")
 
     def test_logs_api_includes_terminal_flag(self):
         """GET /api/runs/<id>/logs must include 'terminal' and 'status' fields."""

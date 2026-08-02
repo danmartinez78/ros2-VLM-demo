@@ -161,9 +161,26 @@ information.
 
 ## Artifact locations and retention
 
-| Path | Contents |
-|---|---|
-| `~/.web_console/runs/<run_id>/manifest.json` | Full run record (config + results) |
+Each run is stored under `~/.web_console/runs/<run_id>/` (configurable with
+`--runs-dir`).  The console exclusively owns `manifest.json` in that directory;
+the ROS experiment script writes its outputs into the nested `artifacts/`
+subdirectory so the two manifests never collide.
+
+| Path | Owner | Contents |
+|---|---|---|
+| `…/<run_id>/manifest.json` | web-console | Full run record: config, params, status, lifecycle timestamps, artifact paths, parsed script manifest |
+| `…/<run_id>/artifacts/manifest.json` | `run_image_proc_test.sh` | Script run manifest (git commit, bag path, engine dirs, result counts) |
+| `…/<run_id>/artifacts/benchmark.jsonl` | `run_image_proc_test.sh` | Per-frame inference latency (one JSON object per line) |
+| `…/<run_id>/artifacts/launch.log` | `run_image_proc_test.sh` | `ros2 launch` stdout/stderr |
+| `…/<run_id>/artifacts/results.log` | `run_image_proc_test.sh` | `ros2 topic echo` output for `/vlm/result` |
+
+When the experiment finishes, the console manifest is updated with:
+- `"artifacts"` — list of safe relative paths (e.g. `["artifacts/manifest.json", "artifacts/benchmark.jsonl", …]`)
+- `"script_manifest"` — parsed contents of `artifacts/manifest.json` (summary of the script run)
+
+Log file contents are not embedded in the console manifest.  The
+`GET /api/runs/<run_id>/logs` endpoint exposes the bounded in-memory log captured
+during the run.
 
 The 100 most recent runs are retained; older directories are removed
 automatically when a new run is saved.
