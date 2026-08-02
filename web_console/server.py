@@ -2309,7 +2309,7 @@ _INDEX_TEMPLATE = """\
         <input id="extract-topic-advanced" type="checkbox" onchange="_onExtractTopicAdvancedToggle()">
         Advanced: manual topic override
       </label>
-      <input id="extract-image-topic" type="text" placeholder="/camera/image_raw" size="32" style="display:none">
+      <input id="extract-image-topic" type="text" placeholder="/camera/image_raw" size="32" style="display:none" oninput="_onExtractTopicAdvancedToggle()">
     </div>
     <div class="form-row">
       <label class="label-text">Start offset (s)
