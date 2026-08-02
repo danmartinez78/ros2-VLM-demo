@@ -52,12 +52,13 @@ def get_server_pid(socket_path: str) -> Optional[int]:
         for line in result.stdout.splitlines():
             if socket_path not in line:
                 continue
-            match = re.search(r"pid=(\\d+)", line)
+            match = re.search(r"pid=(\d+)", line)
             if match:
                 return int(match.group(1))
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         pass
     return None
+
 
 def get_gpu_status() -> Dict[str, Any]:
     """Run nvidia-smi and return bounded GPU information.
