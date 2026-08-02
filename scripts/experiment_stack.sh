@@ -223,6 +223,118 @@ _socket_has_listener() {
   fi
 }
 
+# Return the PID of the process listening on the given Unix-domain socket,
+# or empty string if it cannot be determined.
+_socket_listener_pid() {
+  local path="$1"
+  [[ -S "${path}" ]] || return 0
+  if command -v ss >/dev/null 2>&1; then
+    ss -lxnp 2>/dev/null | grep -F "${path}" \
+      | grep -oP 'pid=\K[0-9]+' | head -1 || true
+  fi
+}
+
+# Given a PID, return argv[1] (the first positional argument) from
+# /proc/<pid>/cmdline, which for edge_vlm_server is the LLM engine directory.
+# Returns empty string when /proc is unavailable or the file cannot be read.
+_proc_argv1() {
+  local pid="$1"
+  if [[ -r "/proc/${pid}/cmdline" ]]; then
+    # cmdline is NUL-delimited; extract field 2 (0-indexed: argv[1])
+    tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | sed -n '2p' || true
+  fi
+}
+
+# Verify that the socket at SOCKET_PATH (if it has a live listener) is either
+# unowned or is running an LLM engine directory that matches the requested
+# EDGE_VLM_LLM_ENGINE_DIR.
+#
+# Behaviour when NO_SERVER=0 (we intend to start the server ourselves):
+#   - No live listener → OK, nothing to do
+#   - Live listener, PID belongs to our owned server → OK (already caught above)
+#   - Live listener, external, --model not specified → fail with instructions
+#   - Live listener, external, --model specified, LLM dir matches → allow reuse
+#   - Live listener, external, --model specified, LLM dir mismatch → fail
+#   - Live listener, external, --model specified, can't verify → fail
+#
+# Sets the variable _REUSE_EXTERNAL_SOCKET=1 when reuse is authorised.
+_REUSE_EXTERNAL_SOCKET=0
+_check_socket_model_conflict() {
+  local sock="${SOCKET_PATH}"
+  _REUSE_EXTERNAL_SOCKET=0
+
+  # Only relevant when we intend to start the server ourselves.
+  [[ "${NO_SERVER:-0}" == "1" ]] && return 0
+
+  # Nothing to check if the socket has no live listener.
+  _socket_has_listener "${sock}" || return 0
+
+  # Is it one of our own owned pids?
+  local owned_pid
+  owned_pid=$(_live_pid "${SERVER_PID_FILE}" 2>/dev/null || true)
+  local listener_pid
+  listener_pid=$(_socket_listener_pid "${sock}")
+
+  if [[ -n "${owned_pid}" && "${owned_pid}" == "${listener_pid}" ]]; then
+    # Our own server is already holding the socket — handled by the already-running
+    # check above; just return cleanly.
+    return 0
+  fi
+
+  # External listener detected.
+  if [[ -z "${SELECTED_MODEL:-}" && -z "${EDGE_VLM_LLM_ENGINE_DIR:-}" ]]; then
+    _error "Socket ${sock} is already in use by an external service."
+    _error "Use --no-server to connect to the existing service explicitly,"
+    _error "or stop the external service before starting the stack."
+    return 1
+  fi
+
+  # --model was specified (or LLM dir is set); try to verify the running model.
+  local desired_llm_dir="${EDGE_VLM_LLM_ENGINE_DIR:-}"
+  if [[ -z "${desired_llm_dir}" ]]; then
+    # Shouldn't reach here if _resolve_model ran, but guard anyway.
+    _error "Socket ${sock} is already in use by an external service."
+    _error "Use --no-server to connect to it, or stop it first."
+    return 1
+  fi
+
+  if [[ -z "${listener_pid}" ]]; then
+    _error "Socket ${sock} is in use by an unidentifiable external service."
+    _error "Cannot verify whether it is running the requested model '${EDGE_VLM_MODEL_NAME:-${desired_llm_dir}}'."
+    _error "Stop the external service first, or use --no-server if you intend to reuse it."
+    return 1
+  fi
+
+  local detected_llm_dir
+  detected_llm_dir=$(_proc_argv1 "${listener_pid}")
+
+  if [[ -z "${detected_llm_dir}" ]]; then
+    _error "Socket ${sock} is in use by an external service (PID ${listener_pid}) whose"
+    _error "loaded model cannot be verified (could not read /proc/${listener_pid}/cmdline)."
+    _error "Stop the external service first, or use --no-server if you intend to reuse it."
+    return 1
+  fi
+
+  # Normalise both paths for comparison (resolve symlinks when possible).
+  local norm_desired norm_detected
+  norm_desired=$(realpath -m "${desired_llm_dir}" 2>/dev/null || echo "${desired_llm_dir}")
+  norm_detected=$(realpath -m "${detected_llm_dir}" 2>/dev/null || echo "${detected_llm_dir}")
+
+  if [[ "${norm_desired}" == "${norm_detected}" ]]; then
+    _info "Socket ${sock} is in use by an external service (PID ${listener_pid})"
+    _info "running the requested model: ${detected_llm_dir}"
+    _info "Reusing the external service (equivalent to --no-server)."
+    _REUSE_EXTERNAL_SOCKET=1
+    return 0
+  fi
+
+  _error "Model conflict: socket ${sock} is in use by an external service (PID ${listener_pid})"
+  _error "  Loaded model  : ${detected_llm_dir}"
+  _error "  Requested     : ${desired_llm_dir}"
+  _error "Stop the existing service first, or use --no-server if you intend to use it."
+  return 1
+}
+
 # Remove a stale socket only if it is stale (no listener) and we previously
 # marked it as owned by this script (SOCKET_OWNER_FILE present).
 _maybe_remove_stale_socket() {
@@ -546,6 +658,15 @@ cmd_start() {
   _warn_if_non_loopback "${WEB_HOST}"
   _validate || return 1
 
+  # ── check for external socket listener / model conflict ───────────────────
+  # Must run after _resolve_model (so EDGE_VLM_LLM_ENGINE_DIR is set) and after
+  # _validate (so we know NO_SERVER is finalised).
+  _check_socket_model_conflict || return 1
+  if [[ "${_REUSE_EXTERNAL_SOCKET}" == "1" ]]; then
+    # The external service is running the correct model; treat as --no-server.
+    NO_SERVER=1
+  fi
+
   # ── write config snapshot ─────────────────────────────────────────────────
 
   cat > "${STACK_CONFIG}" <<CONF
@@ -784,14 +905,33 @@ cmd_status() {
   else
     echo "  status: degraded (see above)"
   fi
-  # ── active model ──────────────────────────────────────────────────────────
+  # ── active model (desired from config + actual from running process) ───────
   if [[ -f "${STACK_CONFIG}" ]]; then
     local cfg_model cfg_llm_dir
     cfg_model=$(grep '^ACTIVE_MODEL=' "${STACK_CONFIG}" | cut -d= -f2 2>/dev/null || true)
     cfg_llm_dir=$(grep '^ACTIVE_MODEL_LLM_DIR=' "${STACK_CONFIG}" | cut -d= -f2 2>/dev/null || true)
     if [[ -n "${cfg_model}" ]]; then
-      echo "  active model    : ${cfg_model}"
-      [[ -n "${cfg_llm_dir}" ]] && echo "  llm engine dir  : ${cfg_llm_dir}"
+      echo "  requested model : ${cfg_model}"
+      [[ -n "${cfg_llm_dir}" ]] && echo "  requested llm   : ${cfg_llm_dir}"
+    fi
+  fi
+  # Surface the actual LLM engine dir from the running server's process cmdline.
+  if [[ -n "${server_pid}" ]]; then
+    local running_llm_dir
+    running_llm_dir=$(_proc_argv1 "${server_pid}")
+    if [[ -n "${running_llm_dir}" ]]; then
+      echo "  running llm dir : ${running_llm_dir}"
+    fi
+  else
+    # Check for an external listener on the socket.
+    local ext_pid ext_llm_dir
+    ext_pid=$(_socket_listener_pid "${sock_path}")
+    if [[ -n "${ext_pid}" ]]; then
+      ext_llm_dir=$(_proc_argv1 "${ext_pid}")
+      if [[ -n "${ext_llm_dir}" ]]; then
+        echo "  external service: PID ${ext_pid}"
+        echo "  running llm dir : ${ext_llm_dir}"
+      fi
     fi
   fi
   echo "  runtime dir: ${STACK_RUN_DIR}"

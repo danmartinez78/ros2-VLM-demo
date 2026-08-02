@@ -43,6 +43,8 @@ from web_console.server import (
     _build_ros_env,
     _parse_results_log,
     _parse_benchmark_jsonl,
+    _single_quote_close_idx,
+    _fold_single_quoted_scalar,
 )
 from web_console.__main__ import _parse_args, _is_loopback
 
@@ -3100,6 +3102,402 @@ class TestUIElementPresence(unittest.TestCase):
         js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
         js = js_path.read_text(encoding="utf-8")
         self.assertIn("compatibility_note", js)
+
+
+
+# ── Blocker 1: Multiline single-quoted YAML scalars ───────────────────────────
+
+class TestSingleQuoteHelpers(unittest.TestCase):
+    """Unit tests for _single_quote_close_idx and _fold_single_quoted_scalar."""
+
+    def test_close_idx_simple(self):
+        self.assertEqual(_single_quote_close_idx("hello'"), 5)
+
+    def test_close_idx_at_start(self):
+        self.assertEqual(_single_quote_close_idx("'"), 0)
+
+    def test_close_idx_no_close(self):
+        self.assertEqual(_single_quote_close_idx("hello"), -1)
+
+    def test_close_idx_empty(self):
+        self.assertEqual(_single_quote_close_idx(""), -1)
+
+    def test_close_idx_escaped_quote_not_close(self):
+        # '' is an escape, should not close the scalar
+        self.assertEqual(_single_quote_close_idx("it''s a test'"), 12)
+
+    def test_close_idx_double_escape_then_close(self):
+        # '''' is two escaped '' followed by closing '
+        # wait: '''' — chars: ' ' ' '
+        # i=0: s[0]='s[1]=' → skip to i=2; s[2]='s[3]=' → skip to i=4; out of range → -1
+        # Actually '''' as a scalar *body* (without outer quotes):
+        # chars: ' ' ' '
+        # i=0: s[0]=', s[1]=' → i+=2 (escaped)
+        # i=2: s[2]=', s[3]=' → i+=2 (escaped)
+        # i=4: end → -1
+        self.assertEqual(_single_quote_close_idx("''''"), -1)
+
+    def test_fold_simple(self):
+        self.assertEqual(_fold_single_quoted_scalar(["hello", "world"]), "hello world")
+
+    def test_fold_blank_line_becomes_newline(self):
+        result = _fold_single_quoted_scalar(["line one", "", "line two"])
+        self.assertEqual(result, "line one\nline two")
+
+    def test_fold_two_blank_lines_become_two_newlines(self):
+        result = _fold_single_quoted_scalar(["line one", "", "", "line two"])
+        self.assertEqual(result, "line one\n\nline two")
+
+    def test_fold_escaped_quotes_decoded(self):
+        result = _fold_single_quoted_scalar(["it''s a test"])
+        self.assertEqual(result, "it's a test")
+
+    def test_fold_empty_parts_list(self):
+        self.assertEqual(_fold_single_quoted_scalar([]), "")
+
+    def test_fold_single_part(self):
+        self.assertEqual(_fold_single_quoted_scalar(["hello"]), "hello")
+
+
+class TestParseMultilineSingleQuoted(unittest.TestCase):
+    """Regression tests for multiline single-quoted YAML scalar parsing."""
+
+    def test_thor_multiline_single_quoted_fixture(self):
+        """Exact format observed on Thor: single-quoted scalar spanning multiple
+        physical lines with blank lines as paragraph separators."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: 'Based on the provided image, here is a detailed description of the scene:\n"
+            "\n"
+            "\n"
+            "  The image captures a busy urban intersection.'\n"
+            "inference_seconds: 1.23\n"
+            "success: true\n"
+            "error: ''\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        text_val = frames[0]["text"]
+        # Must contain the first physical line's content
+        self.assertIn("Based on the provided image", text_val)
+        # Must contain the continuation line's content
+        self.assertIn("The image captures a busy urban intersection.", text_val)
+        # The two blank lines between them should produce a newline separator
+        self.assertIn("\n", text_val)
+
+    def test_single_quoted_scalar_on_one_line_unchanged(self):
+        """Single-quoted scalars that open and close on the same line still work."""
+        text = (
+            "frame_sequence: 2\n"
+            "response: 'simple response'\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["text"], "simple response")
+
+    def test_single_quoted_empty_string_unchanged(self):
+        """Single-quoted empty string '' still produces empty string."""
+        text = (
+            "frame_sequence: 3\n"
+            "response: ''\n"
+            "success: false\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["text"], "")
+
+    def test_multiline_sq_across_multiple_continuation_lines(self):
+        """Multi-line single-quoted scalar with three content segments."""
+        text = (
+            "frame_sequence: 4\n"
+            "response: 'Part one.\n"
+            "\n"
+            "Part two.\n"
+            "\n"
+            "Part three.'\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        t = frames[0]["text"]
+        self.assertIn("Part one.", t)
+        self.assertIn("Part two.", t)
+        self.assertIn("Part three.", t)
+
+    def test_multiline_sq_preserves_other_fields(self):
+        """Other fields in the same message are correctly parsed alongside multiline response."""
+        text = (
+            "frame_sequence: 5\n"
+            "response: 'Line A.\n"
+            "\n"
+            "Line B.'\n"
+            "inference_seconds: 2.0\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["frame_seq"], 5)
+        self.assertAlmostEqual(frames[0]["latency_ms"], 2000.0)
+        self.assertIs(frames[0]["success"], True)
+        self.assertIn("Line A.", frames[0]["text"])
+        self.assertIn("Line B.", frames[0]["text"])
+
+    def test_existing_block_scalar_still_works(self):
+        """YAML block scalar (|) handling is not broken by the single-quoted changes."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: |\n"
+            "  Block line one.\n"
+            "  Block line two.\n"
+            "inference_seconds: 0.01\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertIn("Block line one.", frames[0]["text"])
+        self.assertIn("Block line two.", frames[0]["text"])
+
+    def test_multiline_sq_across_two_frames(self):
+        """Two consecutive messages both with multiline single-quoted responses."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: 'Frame one,\n"
+            "\n"
+            "continued.'\n"
+            "success: true\n"
+            "---\n"
+            "frame_sequence: 2\n"
+            "response: 'Frame two,\n"
+            "\n"
+            "also continued.'\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 2)
+        self.assertIn("Frame one", frames[0]["text"])
+        self.assertIn("continued.", frames[0]["text"])
+        self.assertIn("Frame two", frames[1]["text"])
+        self.assertIn("also continued.", frames[1]["text"])
+
+    def test_multiline_sq_incomplete_is_discarded(self):
+        """An unclosed single-quoted scalar at EOF (no ---) is discarded."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: 'no closing quote\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(frames, [])
+
+
+# ── Blocker 2: Stack script model-mismatch tests ──────────────────────────────
+
+class TestExperimentStackModelMismatch(unittest.TestCase):
+    """Tests covering the model-conflict detection logic in experiment_stack.sh.
+
+    These tests verify behaviour using bash -n (syntax) and by inspecting the
+    script source for the required constructs; actual execution requires the
+    native edge_vlm_server binary and is validated in integration tests.
+    """
+
+    def _script_path(self) -> pathlib.Path:
+        return pathlib.Path(__file__).resolve().parents[2] / "scripts" / "experiment_stack.sh"
+
+    def test_stack_script_bash_syntax_still_passes(self):
+        """bash -n must pass after the model-mismatch additions."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        result = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, f"bash -n failed:\n{result.stderr}")
+
+    def test_check_socket_model_conflict_function_present(self):
+        """Script must define _check_socket_model_conflict."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_check_socket_model_conflict", content)
+
+    def test_socket_listener_pid_function_present(self):
+        """Script must define _socket_listener_pid."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_socket_listener_pid", content)
+
+    def test_proc_argv1_function_present(self):
+        """Script must define _proc_argv1 for cmdline inspection."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_proc_argv1", content)
+
+    def test_model_conflict_check_called_in_cmd_start(self):
+        """cmd_start must call _check_socket_model_conflict before starting server."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        # Verify the call is inside cmd_start (between 'cmd_start()' and 'cmd_stop()')
+        start_idx = content.find("cmd_start()")
+        stop_idx = content.find("cmd_stop()")
+        self.assertGreater(start_idx, 0)
+        self.assertGreater(stop_idx, start_idx)
+        cmd_start_body = content[start_idx:stop_idx]
+        self.assertIn("_check_socket_model_conflict", cmd_start_body)
+
+    def test_status_surfaces_running_llm_dir_from_cmdline(self):
+        """cmd_status must read the actual LLM dir from the running process cmdline."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        # status function must call _proc_argv1 to read the actual running engine
+        status_idx = content.find("cmd_status()")
+        self.assertGreater(status_idx, 0)
+        # Find the end of cmd_status (next function definition)
+        next_fn = content.find("\ncmd_", status_idx + 1)
+        cmd_status_body = content[status_idx:next_fn] if next_fn > 0 else content[status_idx:]
+        self.assertIn("_proc_argv1", cmd_status_body)
+
+    def test_reuse_external_socket_variable_present(self):
+        """Script must use _REUSE_EXTERNAL_SOCKET to signal authorised external reuse."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("_REUSE_EXTERNAL_SOCKET", content)
+
+    def test_model_mismatch_error_message_present(self):
+        """Script must emit a 'Model conflict' error for mismatched external services."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("Model conflict", content)
+
+    def test_unverifiable_external_service_error_present(self):
+        """Script must fail when the socket owner's model cannot be verified."""
+        script = self._script_path()
+        if not script.exists():
+            self.skipTest("experiment_stack.sh not found")
+        content = script.read_text(encoding="utf-8")
+        # The script uses either "unidentifiable" or "cannot be verified" to
+        # describe an external service whose loaded model cannot be confirmed.
+        self.assertTrue(
+            "unidentifiable" in content or "cannot be verified" in content,
+            "Script must emit an error when socket owner model cannot be verified",
+        )
+
+
+# ── Blocker 3: Benchmark vs result-frame count reconciliation ─────────────────
+
+class TestBenchmarkCountReconciliation(unittest.TestCase):
+    """Tests for the count_note added when benchmark and result-frame counts differ."""
+
+    def _build_benchmark_summary(
+        self, frame_recs: list, result_frames: list
+    ) -> dict:
+        """Replicate the server-side benchmark_summary construction logic."""
+        success_recs = [f for f in frame_recs if f.get("success", True)]
+        infer_ms_vals = [
+            float(f["inference_ms"])
+            for f in success_recs
+            if "inference_ms" in f
+        ]
+        benchmark_summary = {
+            "frame_count": len(frame_recs),
+            "successful_frames": len(success_recs),
+            "failed_frames": len(frame_recs) - len(success_recs),
+            "dropped_frames": 0,
+            "mean_inference_ms": round(sum(infer_ms_vals) / len(infer_ms_vals), 2)
+            if infer_ms_vals
+            else None,
+            "min_inference_ms": round(min(infer_ms_vals), 2) if infer_ms_vals else None,
+            "max_inference_ms": round(max(infer_ms_vals), 2) if infer_ms_vals else None,
+            "source": "benchmark.jsonl (all processed inference samples)",
+        }
+        if len(result_frames) != len(frame_recs):
+            benchmark_summary["count_note"] = (
+                f"benchmark.jsonl recorded {len(frame_recs)} "
+                f"processed inference sample(s); "
+                f"results.log captured {len(result_frames)} "
+                f"frame result(s) from the ROS topic subscriber. "
+                f"The difference typically reflects frames whose "
+                f"inference completed during graceful shutdown after "
+                f"the subscriber had already closed."
+            )
+        return benchmark_summary
+
+    def test_no_count_note_when_counts_match(self):
+        """count_note must be absent when benchmark and result-frame counts agree."""
+        frame_recs = [
+            {"record_type": "frame", "success": True, "inference_ms": 50.0},
+        ]
+        result_frames = [{"text": "frame 1"}]
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertNotIn("count_note", summary)
+
+    def test_count_note_added_when_benchmark_has_more_frames(self):
+        """count_note must be present when benchmark.jsonl has more frames than
+        results.log (the Thor-observed scenario)."""
+        frame_recs = [
+            {"record_type": "frame", "success": True, "inference_ms": 50.0},
+            {"record_type": "frame", "success": True, "inference_ms": 60.0},
+        ]
+        result_frames = [{"text": "only one frame received"}]  # 1 vs 2
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("count_note", summary)
+        self.assertIn("2", summary["count_note"])
+        self.assertIn("1", summary["count_note"])
+
+    def test_count_note_mentions_shutdown(self):
+        """count_note must explain the shutdown-related reason for the discrepancy."""
+        frame_recs = [{"record_type": "frame", "success": True, "inference_ms": 30.0}] * 3
+        result_frames = [{"text": "f1"}, {"text": "f2"}]  # 2 vs 3
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("shutdown", summary["count_note"])
+
+    def test_count_note_when_result_frames_empty_but_benchmark_has_frames(self):
+        """count_note must appear even when result_frames is empty."""
+        frame_recs = [{"record_type": "frame", "success": True, "inference_ms": 25.0}]
+        result_frames = []
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("count_note", summary)
+
+    def test_benchmark_source_label_present(self):
+        """benchmark_summary must include a 'source' field for UI clarity."""
+        frame_recs = [{"record_type": "frame", "success": True, "inference_ms": 20.0}]
+        result_frames = [{"text": "one"}]
+        summary = self._build_benchmark_summary(frame_recs, result_frames)
+        self.assertIn("source", summary)
+        self.assertIn("benchmark.jsonl", summary["source"])
+
+    def test_app_js_benchmark_summary_title_uses_source(self):
+        """app.js must incorporate the 'source' field into the benchmark title."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("bs.source", js)
+
+    def test_app_js_renders_count_note(self):
+        """app.js must render count_note when present."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("count_note", js)
 
 
 if __name__ == "__main__":

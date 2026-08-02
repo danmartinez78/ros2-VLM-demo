@@ -895,6 +895,9 @@ function _renderRunDetail(el, run) {
   // Benchmark summary (ROS runs)
   if (run.benchmark_summary) {
     var bs = run.benchmark_summary;
+    var bsTitle = "Benchmark Summary";
+    if (bs.source) { bsTitle += " — " + bs.source; }
+    el.appendChild(_el("div", "panel-title", bsTitle));
     var bsEl = _el("div", "result-meta");
     bsEl.appendChild(_text(
       "Frames: " + bs.frame_count +
@@ -905,8 +908,12 @@ function _renderRunDetail(el, run) {
       " | Min: " + _fmtLatency(bs.min_inference_ms) +
       " | Max: " + _fmtLatency(bs.max_inference_ms)
     ));
-    el.appendChild(_el("div", "panel-title", "Benchmark Summary"));
     el.appendChild(bsEl);
+    if (bs.count_note) {
+      var noteEl = _el("div", "result-meta");
+      noteEl.appendChild(_text("\u26a0\ufe0f " + bs.count_note));
+      el.appendChild(noteEl);
+    }
   }
 
   el.appendChild(_el("hr", "separator"));

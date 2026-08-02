@@ -111,6 +111,48 @@ def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+def _single_quote_close_idx(s: str) -> int:
+    """Return the index of the first unescaped closing single-quote in *s*, or -1.
+
+    Within a YAML single-quoted scalar ``''`` is an escaped literal quote and
+    does **not** close the scalar; a lone ``'`` does.
+    """
+    i = 0
+    while i < len(s):
+        if s[i] == "'":
+            if i + 1 < len(s) and s[i + 1] == "'":
+                i += 2  # escaped '' — skip both chars
+            else:
+                return i  # unescaped ' — closing quote
+        else:
+            i += 1
+    return -1
+
+
+def _fold_single_quoted_scalar(parts: list) -> str:
+    """Apply YAML single-quoted scalar line-folding to a list of string parts.
+
+    Rules (matching YAML 1.2 §7.4 single-quoted scalars):
+      - Adjacent non-empty parts are joined with a single space.
+      - Empty parts (blank physical lines) introduce a ``\\n`` in the result.
+      - ``''`` sequences are decoded to a literal ``'``.
+    """
+    segments: list = []
+    pending_nl = 0
+    for part in parts:
+        if not part:
+            pending_nl += 1
+        else:
+            if segments:
+                if pending_nl:
+                    segments.append("\n" * pending_nl)
+                else:
+                    segments.append(" ")
+            segments.append(part)
+            pending_nl = 0
+    return "".join(segments).replace("''", "'")
+
+
 def _parse_results_log(text: str) -> list:
     """Parse real ros2 topic echo output for VlmResult messages.
 
@@ -126,6 +168,11 @@ def _parse_results_log(text: str) -> list:
     Block-scalar indicators (``>`` ``>-`` ``|`` ``|-``) are handled by
     collecting subsequent indented lines as a single space-joined string.
 
+    Single-quoted scalars that span multiple physical lines (as emitted by
+    ``ros2 topic echo`` for long ``response`` fields) are reassembled using
+    YAML single-quoted line-folding: blank lines become ``\\n``, and adjacent
+    non-empty continuation lines are joined with a space.
+
     Field names are normalised to the canonical UI schema on output:
       * ``frame_sequence`` → ``frame_seq``
       * ``response``       → ``text``
@@ -137,6 +184,9 @@ def _parse_results_log(text: str) -> list:
     current: Dict[str, Any] = {}
     pending_key: Optional[str] = None
     pending_lines: list = []
+    # Single-quoted multi-line scalar state
+    pending_sq_key: Optional[str] = None
+    pending_sq_lines: list = []
     _stamp_sec: Optional[int] = None
     _stamp_nanosec: Optional[int] = None
     _in_header: bool = False
@@ -144,12 +194,18 @@ def _parse_results_log(text: str) -> list:
 
     def _flush_frame() -> None:
         nonlocal current, pending_key, pending_lines
+        nonlocal pending_sq_key, pending_sq_lines
         nonlocal _stamp_sec, _stamp_nanosec, _in_header, _in_stamp
         # Finalise any pending block-scalar value.
         if pending_key is not None:
             current[pending_key] = " ".join(l.strip() for l in pending_lines)
             pending_key = None
             pending_lines = []
+        # Finalise any pending single-quoted multi-line scalar.
+        if pending_sq_key is not None:
+            current[pending_sq_key] = _fold_single_quoted_scalar(pending_sq_lines)
+            pending_sq_key = None
+            pending_sq_lines = []
         if not current:
             # Reset timestamp state even for empty blocks.
             _stamp_sec = None
@@ -189,7 +245,19 @@ def _parse_results_log(text: str) -> list:
         if stripped == "---":
             _flush_frame()
             continue
-        # Continuation of a YAML block scalar (indented under the pending key).
+        # ── single-quoted multi-line scalar continuation ──────────────────────
+        if pending_sq_key is not None:
+            close_idx = _single_quote_close_idx(stripped)
+            if close_idx >= 0:
+                # Found the closing quote on this line.
+                pending_sq_lines.append(stripped[:close_idx])
+                current[pending_sq_key] = _fold_single_quoted_scalar(pending_sq_lines)
+                pending_sq_key = None
+                pending_sq_lines = []
+            else:
+                pending_sq_lines.append(stripped)
+            continue
+        # ── block-scalar continuation (indented under the pending key) ────────
         if pending_key is not None:
             if line.startswith((" ", "\t")):
                 pending_lines.append(stripped)
@@ -228,8 +296,34 @@ def _parse_results_log(text: str) -> list:
             if raw in (">", ">-", "|", "|-"):
                 pending_key = key
                 pending_lines = []
+            elif raw.startswith("'"):
+                # Single-quoted scalar: check if it closes on the same line.
+                inner = raw[1:]  # strip the opening '
+                close_idx = _single_quote_close_idx(inner)
+                if close_idx >= 0:
+                    # Entire scalar is on this line.
+                    val_str = inner[:close_idx].replace("''", "'")
+                    if val_str.lower() == "true":
+                        current[key] = True
+                    elif val_str.lower() == "false":
+                        current[key] = False
+                    elif val_str == "":
+                        current[key] = ""
+                    else:
+                        try:
+                            current[key] = (
+                                float(val_str)
+                                if ("." in val_str or "e" in val_str.lower())
+                                else int(val_str)
+                            )
+                        except ValueError:
+                            current[key] = val_str
+                else:
+                    # Multi-line single-quoted scalar: opening content on this line.
+                    pending_sq_key = key
+                    pending_sq_lines = [inner]
             else:
-                val_str = raw.strip("'\"")
+                val_str = raw.strip("\"")
                 if val_str.lower() == "true":
                     current[key] = True
                 elif val_str.lower() == "false":
@@ -730,7 +824,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                         round(max(infer_ms_vals), 2)
                                         if infer_ms_vals else None
                                     ),
+                                   # Source label for UI clarity.
+                                   "source": "benchmark.jsonl (all processed inference samples)",
                                 }
+                                # When benchmark and ROS-topic counts diverge, add
+                                # an explanatory note so the UI can surface it.
+                                if len(result_frames) != len(frame_recs):
+                                   benchmark_summary["count_note"] = (
+                                       f"benchmark.jsonl recorded {len(frame_recs)} "
+                                       f"processed inference sample(s); "
+                                       f"results.log captured {len(result_frames)} "
+                                       f"frame result(s) from the ROS topic subscriber. "
+                                       f"The difference typically reflects frames whose "
+                                       f"inference completed during graceful shutdown after "
+                                       f"the subscriber had already closed."
+                                   )
                         except OSError:
                             pass
 
