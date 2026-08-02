@@ -105,39 +105,82 @@ def _now_iso() -> str:
 def _parse_results_log(text: str) -> list:
     """Parse ros2 topic echo YAML output for a VlmResult topic into frame dicts.
 
-    Each message block is delimited by ``---`` markers.  Only top-level scalar
-    fields are extracted; nested YAML objects (e.g. ``header:``, ``stamp:``)
-    are skipped.  Block-scalar indicators (``>`` ``>-`` ``|`` ``|-``) are
-    handled by collecting subsequent indented lines as a single string.
+    Real ``ros2 topic echo`` output starts each message with the message fields
+    and ends each message with a ``---`` separator.  The parser accumulates
+    top-level scalar fields until the trailing ``---`` marker flushes the
+    collected values as a completed frame.  Incomplete trailing content (no
+    closing ``---``) is discarded.
+
+    Nested fields under ``header:`` → ``stamp:`` are parsed to extract
+    ``sec`` and ``nanosec`` and returned as ``source_timestamp_ns``.
+
+    Block-scalar indicators (``>`` ``>-`` ``|`` ``|-``) are handled by
+    collecting subsequent indented lines as a single space-joined string.
+
+    Field names are normalised to the canonical UI schema on output:
+      * ``frame_sequence`` → ``frame_seq``
+      * ``response``       → ``text``
+      * ``inference_seconds`` → ``latency_ms``  (multiplied by 1 000)
 
     Returns an empty list on empty or entirely malformed input.
     """
     frames: list = []
     current: Dict[str, Any] = {}
-    in_block = False
     pending_key: Optional[str] = None
     pending_lines: list = []
+    _stamp_sec: Optional[int] = None
+    _stamp_nanosec: Optional[int] = None
+    _in_header: bool = False
+    _in_stamp: bool = False
 
-    def _flush() -> None:
-        nonlocal current, in_block, pending_key, pending_lines
+    def _flush_frame() -> None:
+        nonlocal current, pending_key, pending_lines
+        nonlocal _stamp_sec, _stamp_nanosec, _in_header, _in_stamp
+        # Finalise any pending block-scalar value.
         if pending_key is not None:
             current[pending_key] = " ".join(l.strip() for l in pending_lines)
             pending_key = None
             pending_lines = []
-        if in_block and current:
-            frames.append(current)
+        if not current:
+            # Reset timestamp state even for empty blocks.
+            _stamp_sec = None
+            _stamp_nanosec = None
+            _in_header = False
+            _in_stamp = False
+            return
+        # Normalise to the canonical UI schema.
+        frame: Dict[str, Any] = {}
+        for k, v in current.items():
+            if k == "frame_sequence":
+                frame["frame_seq"] = v
+            elif k == "response":
+                frame["text"] = v
+            elif k == "inference_seconds":
+                try:
+                    frame["latency_ms"] = float(v) * 1000.0
+                except (TypeError, ValueError):
+                    frame["latency_ms"] = v
+            else:
+                frame[k] = v
+        # Attach source timestamp when both components were parsed.
+        if _stamp_sec is not None:
+            ns = _stamp_sec * 1_000_000_000
+            if _stamp_nanosec is not None:
+                ns += _stamp_nanosec
+            frame["source_timestamp_ns"] = ns
+        frames.append(frame)
         current = {}
-        in_block = False
+        _stamp_sec = None
+        _stamp_nanosec = None
+        _in_header = False
+        _in_stamp = False
 
     for line in text.splitlines():
         stripped = line.strip()
         if stripped == "---":
-            _flush()
-            in_block = True
+            _flush_frame()
             continue
-        if not in_block:
-            continue
-        # Continuation of a YAML block scalar
+        # Continuation of a YAML block scalar (indented under the pending key).
         if pending_key is not None:
             if line.startswith((" ", "\t")):
                 pending_lines.append(stripped)
@@ -146,8 +189,30 @@ def _parse_results_log(text: str) -> list:
                 current[pending_key] = " ".join(l.strip() for l in pending_lines)
                 pending_key = None
                 pending_lines = []
-        # Top-level key: value pair (not indented)
-        if ": " in line and not line.startswith((" ", "\t")):
+        # Indented lines: track header → stamp → sec/nanosec hierarchy.
+        if line.startswith((" ", "\t")):
+            if _in_header and stripped == "stamp:":
+                _in_stamp = True
+            elif _in_stamp and ": " in stripped:
+                k, _, v = stripped.partition(": ")
+                k = k.strip()
+                v = v.strip()
+                try:
+                    if k == "sec":
+                        _stamp_sec = int(v)
+                    elif k == "nanosec":
+                        _stamp_nanosec = int(v)
+                except ValueError:
+                    pass
+            continue
+        # Top-level line: reset nesting context.
+        _in_stamp = False
+        if stripped == "header:":
+            _in_header = True
+            continue
+        _in_header = False
+        # Top-level key: value pair.
+        if ": " in line:
             key, _, raw = line.partition(": ")
             key = key.strip()
             raw = raw.strip()
@@ -169,8 +234,7 @@ def _parse_results_log(text: str) -> list:
                         )
                     except ValueError:
                         current[key] = val_str
-        # Top-level nested key without value (stamp:, header:) — skip
-    _flush()
+    # Incomplete trailing content (no closing ---) is intentionally discarded.
     return frames
 
 
@@ -583,7 +647,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                             if frame_recs:
                                 success_recs = [f for f in frame_recs if f.get("success", True)]
                                 infer_ms_vals = [
-                                    f.get("inference_seconds", 0) * 1000 for f in success_recs
+                                    f.get("inference_ms", 0) for f in success_recs
                                 ]
                                 benchmark_summary = {
                                     "frame_count": len(frame_recs),

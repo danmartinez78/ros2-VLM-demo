@@ -12,13 +12,15 @@
 #   SYSTEM_INSTRUCTION         Optional structured system message
 #   TEST_PROMPT                Optional per-frame prompt override
 #   ARTIFACT_DIR               Preserve logs, timing JSONL, and run manifest here
+#   IMAGE_TOPIC                ROS image topic to subscribe to
+#                              (default: /hawk_0_left_rgb_image)
 set -Eeuo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 asset_root="${ROSBAG_DIR:-${repo_root}/test_data/rosbags}/image-proc"
 env_file="${EDGE_VLM_ENV_FILE:-${repo_root}/scripts/edge_vlm_env.sh}"
-image_topic="/hawk_0_left_rgb_image"
+image_topic="${IMAGE_TOPIC:-/hawk_0_left_rgb_image}"
 result_topic="/vlm/result"
 worker_socket="${WORKER_SOCKET_PATH:-/tmp/edge_vlm.sock}"
 playback_duration="${PLAYBACK_DURATION_SECONDS:-20}"

@@ -1527,7 +1527,14 @@ class TestStartupBind(unittest.TestCase):
 # ── result-log / benchmark parsers ───────────────────────────────────────────
 
 class TestResultsParsing(unittest.TestCase):
-    """CPU-only tests for server-side artifact parsers."""
+    """CPU-only tests for server-side artifact parsers.
+
+    All results.log fixtures use the real ``ros2 topic echo`` format:
+    fields first, ``---`` as a *trailing* message separator.  Field names
+    match the actual VlmResult message (``frame_sequence``, ``response``,
+    ``inference_seconds``); the parser normalises these to the canonical
+    UI schema (``frame_seq``, ``text``, ``latency_ms``).
+    """
 
     # ── _parse_results_log ────────────────────────────────────────────────
 
@@ -1539,28 +1546,49 @@ class TestResultsParsing(unittest.TestCase):
         self.assertEqual(_parse_results_log("   \n   "), [])
 
     def test_parse_no_separator_is_empty(self):
-        """A file without any --- separators produces no frames."""
-        text = "text: hello\nsuccess: true\n"
+        """A file without any trailing --- separator produces no frames
+        (treated as incomplete/truncated output)."""
+        text = "frame_sequence: 1\nresponse: hello\nsuccess: true\n"
         self.assertEqual(_parse_results_log(text), [])
 
     def test_parse_single_successful_frame(self):
+        """Single frame with real ROS field names and trailing separator."""
         text = (
-            "---\n"
+            "header:\n"
+            "  stamp:\n"
+            "    sec: 1753830000\n"
+            "    nanosec: 500000000\n"
+            "  frame_id: ''\n"
+            "frame_sequence: 1\n"
+            "response: A dog is running.\n"
+            "inference_seconds: 0.0425\n"
             "success: true\n"
-            "text: A dog is running.\n"
-            "latency_ms: 42.5\n"
+            "error: ''\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
         self.assertIs(frames[0]["success"], True)
+        # Field names must be normalised to the UI schema
         self.assertEqual(frames[0]["text"], "A dog is running.")
-        self.assertAlmostEqual(frames[0]["latency_ms"], 42.5)
+        self.assertAlmostEqual(frames[0]["latency_ms"], 42.5, places=2)
+        self.assertEqual(frames[0]["frame_seq"], 1)
+        # Source timestamp: 1753830000 * 1e9 + 500_000_000
+        self.assertEqual(frames[0]["source_timestamp_ns"], 1753830000_500_000_000)
+        # Raw ROS names must NOT appear in the output
+        self.assertNotIn("response", frames[0])
+        self.assertNotIn("frame_sequence", frames[0])
+        self.assertNotIn("inference_seconds", frames[0])
 
     def test_parse_single_failed_frame(self):
+        """Failed frame: success=false with error message."""
         text = (
-            "---\n"
+            "frame_sequence: 2\n"
+            "response: ''\n"
+            "inference_seconds: 0.0\n"
             "success: false\n"
             "error: timeout\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
@@ -1568,14 +1596,16 @@ class TestResultsParsing(unittest.TestCase):
         self.assertEqual(frames[0]["error"], "timeout")
 
     def test_parse_multiline_text_block_scalar(self):
-        """YAML block scalar (|) value joined from indented lines."""
+        """YAML block scalar (|) for response is joined from indented lines."""
         text = (
-            "---\n"
-            "success: true\n"
-            "text: |\n"
+            "frame_sequence: 1\n"
+            "response: |\n"
             "  Line one.\n"
             "  Line two.\n"
-            "latency_ms: 10\n"
+            "inference_seconds: 0.01\n"
+            "success: true\n"
+            "error: ''\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
@@ -1583,16 +1613,20 @@ class TestResultsParsing(unittest.TestCase):
         self.assertIn("Line two.", frames[0]["text"])
 
     def test_parse_multi_frame_results(self):
+        """Multiple frames each terminated by trailing ---."""
         text = (
-            "---\n"
+            "frame_sequence: 1\n"
+            "response: frame1\n"
             "success: true\n"
-            "text: frame1\n"
             "---\n"
+            "frame_sequence: 2\n"
+            "response: frame2\n"
             "success: false\n"
-            "text: frame2\n"
             "---\n"
+            "frame_sequence: 3\n"
+            "response: frame3\n"
             "success: true\n"
-            "text: frame3\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 3)
@@ -1603,14 +1637,132 @@ class TestResultsParsing(unittest.TestCase):
     def test_parse_malformed_lines_skipped(self):
         """Non key:value lines in a block are silently ignored."""
         text = (
-            "---\n"
             ":::not_a_key\n"
             "success: true\n"
-            "text: ok\n"
+            "response: ok\n"
+            "---\n"
         )
         frames = _parse_results_log(text)
         self.assertEqual(len(frames), 1)
         self.assertEqual(frames[0]["text"], "ok")
+
+    def test_parse_incomplete_trailing_block_discarded(self):
+        """Content after the last --- with no closing --- is discarded."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: complete\n"
+            "success: true\n"
+            "---\n"
+            "frame_sequence: 2\n"
+            "response: incomplete\n"
+        )
+        frames = _parse_results_log(text)
+        # Only the terminated frame is returned
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["text"], "complete")
+
+    def test_parse_field_names_normalised(self):
+        """frame_sequence, response, inference_seconds are normalised to UI names."""
+        text = (
+            "frame_sequence: 7\n"
+            "response: hello world\n"
+            "inference_seconds: 1.5\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        f = frames[0]
+        self.assertEqual(f["frame_seq"], 7)
+        self.assertEqual(f["text"], "hello world")
+        self.assertAlmostEqual(f["latency_ms"], 1500.0)
+        self.assertNotIn("frame_sequence", f)
+        self.assertNotIn("response", f)
+        self.assertNotIn("inference_seconds", f)
+
+    def test_parse_source_timestamp_ns_from_header(self):
+        """sec and nanosec under header.stamp are combined into source_timestamp_ns."""
+        text = (
+            "header:\n"
+            "  stamp:\n"
+            "    sec: 1000000000\n"
+            "    nanosec: 250000000\n"
+            "  frame_id: ''\n"
+            "frame_sequence: 1\n"
+            "response: timestamped\n"
+            "inference_seconds: 0.1\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        expected_ns = 1000000000 * 1_000_000_000 + 250000000
+        self.assertEqual(frames[0]["source_timestamp_ns"], expected_ns)
+
+    def test_parse_no_source_timestamp_when_header_absent(self):
+        """Frames without a header block must not have source_timestamp_ns."""
+        text = (
+            "frame_sequence: 1\n"
+            "response: no header\n"
+            "inference_seconds: 0.2\n"
+            "success: true\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertNotIn("source_timestamp_ns", frames[0])
+
+    def test_parse_real_thor_output_fixture(self):
+        """Full two-frame fixture matching the real ros2 topic echo VlmResult format
+        observed on Thor.  Validates all normalised keys and source_timestamp_ns."""
+        text = (
+            "header:\n"
+            "  stamp:\n"
+            "    sec: 1753830042\n"
+            "    nanosec: 123456789\n"
+            "  frame_id: ''\n"
+            "frame_sequence: 1\n"
+            "response: A construction crane is visible in the upper left of the frame.\n"
+            "inference_seconds: 0.847\n"
+            "success: true\n"
+            "error: ''\n"
+            "---\n"
+            "header:\n"
+            "  stamp:\n"
+            "    sec: 1753830043\n"
+            "    nanosec: 987654321\n"
+            "  frame_id: ''\n"
+            "frame_sequence: 2\n"
+            "response: ''\n"
+            "inference_seconds: 0.0\n"
+            "success: false\n"
+            "error: timeout waiting for worker\n"
+            "---\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 2)
+
+        f0 = frames[0]
+        self.assertEqual(f0["frame_seq"], 1)
+        self.assertIs(f0["success"], True)
+        self.assertEqual(
+            f0["text"],
+            "A construction crane is visible in the upper left of the frame.",
+        )
+        self.assertAlmostEqual(f0["latency_ms"], 847.0, places=1)
+        self.assertEqual(
+            f0["source_timestamp_ns"],
+            1753830042 * 1_000_000_000 + 123456789,
+        )
+
+        f1 = frames[1]
+        self.assertEqual(f1["frame_seq"], 2)
+        self.assertIs(f1["success"], False)
+        self.assertEqual(f1["error"], "timeout waiting for worker")
+        self.assertEqual(
+            f1["source_timestamp_ns"],
+            1753830043 * 1_000_000_000 + 987654321,
+        )
 
     # ── _parse_benchmark_jsonl ────────────────────────────────────────────
 
@@ -1795,6 +1947,77 @@ class TestExternalServiceMode(unittest.TestCase):
                     self.assertTrue(rec.get("external_worker"),
                                     "external_worker must be preserved in final manifest")
                     self.assertIn(rec.get("status"), _TERMINAL_STATUSES)
+                finally:
+                    srv.shutdown()
+
+    # ── IMAGE_TOPIC env var ────────────────────────────────────────────────
+
+    def test_build_ros_env_image_topic_forwarded_as_IMAGE_TOPIC(self):
+        """image_topic param must appear as IMAGE_TOPIC in the subprocess env."""
+        params = {"image_topic": "/camera/color/image_raw"}
+        env = _build_ros_env(params, self._cfg(), start_worker=True)
+        self.assertEqual(env.get("IMAGE_TOPIC"), "/camera/color/image_raw")
+
+    def test_build_ros_env_default_image_topic_not_set_when_absent(self):
+        """When image_topic is not in params, IMAGE_TOPIC must not be added
+        (the script honours its own default of /hawk_0_left_rgb_image)."""
+        env = _build_ros_env({}, self._cfg(), start_worker=True)
+        self.assertNotIn("IMAGE_TOPIC", env)
+
+    def test_api_ros_start_image_topic_reaches_subprocess_env(self):
+        """IMAGE_TOPIC env var supplied from the web form must be passed to
+        the script subprocess; a fake script echoes it to a capture file and
+        proves the value matches what the form sent."""
+        with _TempDir() as tmp:
+            run_store = RunStore(tmp)
+            capture_file = tmp / "captured_topic.txt"
+            fake_script = tmp / "fake_ros.sh"
+            fake_script.write_text(
+                "#!/bin/bash\n"
+                f'echo "${{IMAGE_TOPIC:-NOT_SET}}" > "{capture_file}"\n'
+                "exit 0\n"
+            )
+            fake_script.chmod(0o755)
+            cfg = {
+                "socket_path": "",
+                "quiet": True,
+                "ros_script_path": str(fake_script),
+            }
+            with patch("web_console.server.check_server_reachable",
+                       return_value={"reachable": False}):
+                srv = ConsoleServer(host="127.0.0.1", port=0, config=cfg,
+                                    run_store=run_store)
+                thread = threading.Thread(target=srv.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    time.sleep(0.1)
+                    host, port = srv.server_address
+                    conn = HTTPConnection(host, port, timeout=10)
+                    body_bytes = json.dumps({
+                        "params": {"image_topic": "/hawk_0_left_rgb_image"}
+                    }).encode()
+                    conn.request(
+                        "POST", "/api/ros/start", body=body_bytes,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Content-Length": str(len(body_bytes)),
+                        },
+                    )
+                    resp = conn.getresponse()
+                    data = json.loads(resp.read())
+                    self.assertIn(resp.status, (200, 202))
+                    run_id = data.get("run_id")
+                    # Wait for the script to complete so the capture file is written
+                    for _ in range(30):
+                        rec = run_store.get_run(run_id)
+                        if rec and rec.get("status") in _TERMINAL_STATUSES:
+                            break
+                        time.sleep(0.1)
+                    self.assertTrue(capture_file.is_file(),
+                                    "Script did not write the capture file")
+                    captured = capture_file.read_text().strip()
+                    self.assertEqual(captured, "/hawk_0_left_rgb_image",
+                                     "IMAGE_TOPIC env var did not reach the subprocess")
                 finally:
                     srv.shutdown()
 

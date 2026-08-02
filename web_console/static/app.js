@@ -459,6 +459,10 @@ function _renderRosDetail(container, data) {
       if (frame.latency_ms !== undefined) {
         fhdr.appendChild(_el("span", "result-latency", frame.latency_ms.toFixed(0) + " ms"));
       }
+      if (frame.source_timestamp_ns !== undefined) {
+        var ts = new Date(frame.source_timestamp_ns / 1e6);
+        fhdr.appendChild(_el("span", "result-meta", ts.toISOString().replace("T", " ").replace("Z", " UTC")));
+      }
       fc.appendChild(fhdr);
       if (frame.text) {
         fc.appendChild(_el("div", "result-text", frame.text));
