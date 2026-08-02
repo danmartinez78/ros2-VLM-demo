@@ -47,6 +47,26 @@ def _parse_args(argv=None):
         help="Path to the ROS experiment shell script",
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress request logging")
+    parser.add_argument(
+        "--workspace-dir",
+        default="",
+        help="Edge-LLM workspace root (overrides EDGE_VLM_WORKSPACE_DIR)",
+    )
+    parser.add_argument(
+        "--rosbag-dir",
+        default="",
+        help="Root directory containing installed rosbags (overrides ROSBAG_DIR)",
+    )
+    parser.add_argument(
+        "--image-dataset-dir",
+        default="",
+        help="Root directory containing image-directory datasets",
+    )
+    parser.add_argument(
+        "--video-dataset-dir",
+        default="",
+        help="Root directory containing video files",
+    )
     return parser.parse_args(argv)
 
 
@@ -83,6 +103,10 @@ def main(argv=None) -> None:
         "runs_dir": args.runs_dir,
         "ros_script_path": args.ros_script,
         "quiet": args.quiet,
+        "workspace_dir": args.workspace_dir or None,
+        "rosbag_dir": args.rosbag_dir or None,
+        "image_dataset_dir": args.image_dataset_dir or None,
+        "video_dataset_dir": args.video_dataset_dir or None,
     }
     srv = ConsoleServer(host=args.host, port=args.port, config=config)
 

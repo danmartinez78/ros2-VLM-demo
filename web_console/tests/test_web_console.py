@@ -2017,5 +2017,641 @@ class TestExternalServiceMode(unittest.TestCase):
                     srv.shutdown()
 
 
+# ── experiment engine tests ───────────────────────────────────────────────────
+
+from web_console.experiment_engine import (
+    ExperimentDefinition,
+    FrameResult,
+    validate_definition,
+    run_experiment,
+    _truncate_history,
+    _compute_repetition,
+    _build_prompt,
+    compute_history_matrix,
+)
+from web_console.model_catalog import (
+    discover_models,
+    _make_model_id,
+    _profile_from_env,
+    _scan_workspace,
+)
+from web_console.dataset_catalog import (
+    discover_datasets,
+    build_download_command,
+    _DOWNLOADABLE_BAGS,
+)
+
+
+class TestExperimentEngineValidation(unittest.TestCase):
+
+    def _valid_defn(self, **kwargs):
+        base = dict(
+            strategy="single_frame",
+            image_paths=["/data/frame.jpg"],
+            task_prompt="Describe the scene.",
+        )
+        base.update(kwargs)
+        return ExperimentDefinition(**base)
+
+    def test_valid_definition_returns_none(self):
+        defn = self._valid_defn()
+        self.assertIsNone(validate_definition(defn))
+
+    def test_invalid_strategy(self):
+        defn = self._valid_defn(strategy="unknown_strategy")
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn("Unknown strategy", err)
+
+    def test_empty_image_paths(self):
+        defn = self._valid_defn(image_paths=[])
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn("image_paths", err)
+
+    def test_unsupported_image_extension(self):
+        defn = self._valid_defn(image_paths=["/data/frame.xyz"])
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn(".xyz", err)
+
+    def test_empty_prompt(self):
+        defn = self._valid_defn(task_prompt="")
+        err = validate_definition(defn)
+        self.assertIsNotNone(err)
+        self.assertIn("task_prompt", err)
+
+    def test_max_generate_length_out_of_range(self):
+        defn = self._valid_defn(max_generate_length=0)
+        self.assertIsNotNone(validate_definition(defn))
+        defn2 = self._valid_defn(max_generate_length=4097)
+        self.assertIsNotNone(validate_definition(defn2))
+
+    def test_temperature_out_of_range(self):
+        defn = self._valid_defn(temperature=2.5)
+        self.assertIsNotNone(validate_definition(defn))
+
+    def test_top_p_out_of_range(self):
+        defn = self._valid_defn(top_p=0.0)
+        self.assertIsNotNone(validate_definition(defn))
+
+    def test_history_entries_out_of_range(self):
+        defn = self._valid_defn(observation_history_max_entries=257)
+        self.assertIsNotNone(validate_definition(defn))
+
+    def test_history_strategy_valid(self):
+        defn = self._valid_defn(
+            strategy="single_frame_observation_history",
+            observation_history_max_entries=3,
+        )
+        self.assertIsNone(validate_definition(defn))
+
+
+class TestExperimentEngineHistoryHelpers(unittest.TestCase):
+
+    def test_truncate_history_empty(self):
+        self.assertEqual(_truncate_history([], 100), "")
+
+    def test_truncate_history_fits(self):
+        result = _truncate_history(["a", "b", "c"], 1000)
+        self.assertEqual(result, "a; b; c")
+
+    def test_truncate_history_respects_budget(self):
+        # With budget of 1 char, only the most-recent entry ("c") fits.
+        result = _truncate_history(["long_entry_here", "b", "c"], 1)
+        self.assertEqual(result, "c")
+
+    def test_truncate_history_zero_budget(self):
+        self.assertEqual(_truncate_history(["a", "b"], 0), "")
+
+    def test_compute_repetition_no_history(self):
+        self.assertFalse(_compute_repetition("hello world", []))
+
+    def test_compute_repetition_identical(self):
+        text = "the quick brown fox jumps over the lazy dog"
+        self.assertTrue(_compute_repetition(text, [text]))
+
+    def test_compute_repetition_distinct(self):
+        t1 = "red apple on a wooden table near the window sill outside"
+        t2 = "blue ocean with waves crashing against rocky cliffs far away"
+        self.assertFalse(_compute_repetition(t1, [t2]))
+
+    def test_build_prompt_no_history(self):
+        result = _build_prompt("What is this?", "You are an observer.", [], 1000)
+        self.assertIn("What is this?", result)
+        self.assertIn("You are an observer.", result)
+        self.assertNotIn("Prior observations", result)
+
+    def test_build_prompt_with_history(self):
+        result = _build_prompt("What changed?", "", ["First obs.", "Second obs."], 1000)
+        self.assertIn("Prior observations", result)
+        self.assertIn("First obs.", result)
+
+
+class TestExperimentEngineSingleFrame(unittest.TestCase):
+
+    def _make_inference_fn(self, text="Test response", success=True):
+        """Return a mock inference function that returns a fixed InferenceResult."""
+        from web_console.inference_client import InferenceResult
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                max_generate_length=64, temperature=0.2, top_p=0.9, top_k=20,
+                timeout=30.0, timeout_seconds=30.0, **kwargs):
+            return InferenceResult(
+                success=success,
+                text=text,
+                error="" if success else "mock error",
+                inference_seconds=0.05,
+            )
+        return _fn
+
+    def test_single_frame_returns_one_result_per_image(self):
+        with tempfile.TemporaryDirectory() as d:
+            img = pathlib.Path(d) / "img.jpg"
+            img.write_bytes(b"FAKE")
+            defn = ExperimentDefinition(
+                strategy="single_frame",
+                image_paths=[str(img)],
+                task_prompt="Describe.",
+            )
+            results = run_experiment(
+                defn,
+                inference_fn=self._make_inference_fn(),
+                socket_path="/tmp/fake.sock",
+            )
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].success)
+            self.assertEqual(results[0].text, "Test response")
+
+    def test_single_frame_multiple_images(self):
+        with tempfile.TemporaryDirectory() as d:
+            imgs = []
+            for i in range(3):
+                p = pathlib.Path(d) / f"f{i}.png"
+                p.write_bytes(b"FAKE")
+                imgs.append(str(p))
+            defn = ExperimentDefinition(
+                strategy="single_frame",
+                image_paths=imgs,
+                task_prompt="Describe.",
+            )
+            results = run_experiment(
+                defn,
+                inference_fn=self._make_inference_fn(),
+                socket_path="/tmp/fake.sock",
+            )
+            self.assertEqual(len(results), 3)
+            for i, r in enumerate(results):
+                self.assertEqual(r.frame_index, i)
+
+    def test_single_frame_writes_artifact(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = pathlib.Path(d)
+            img = tmp / "img.jpg"
+            img.write_bytes(b"FAKE")
+            artifact_dir = tmp / "artifacts"
+            defn = ExperimentDefinition(
+                strategy="single_frame",
+                image_paths=[str(img)],
+                task_prompt="What?",
+            )
+            run_experiment(
+                defn,
+                inference_fn=self._make_inference_fn(),
+                socket_path="/tmp/fake.sock",
+                artifact_dir=artifact_dir,
+            )
+            self.assertTrue((artifact_dir / "experiment.jsonl").exists())
+            self.assertTrue((artifact_dir / "manifest.json").exists())
+
+    def test_invalid_definition_raises(self):
+        defn = ExperimentDefinition(
+            strategy="bad_strategy",
+            image_paths=["/data/frame.jpg"],
+            task_prompt="X",
+        )
+        with self.assertRaises(ValueError):
+            run_experiment(defn, inference_fn=self._make_inference_fn())
+
+
+class TestExperimentEngineObservationHistory(unittest.TestCase):
+
+    def _make_inference_fn(self, responses=None):
+        from web_console.inference_client import InferenceResult
+        responses = responses or []
+        counter = [0]
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                max_generate_length=64, temperature=0.2, top_p=0.9, top_k=20,
+                timeout=30.0, timeout_seconds=30.0, **kwargs):
+            idx = counter[0]
+            counter[0] += 1
+            text = responses[idx] if idx < len(responses) else f"Response {idx}"
+            return InferenceResult(success=True, text=text, error="",
+                                   inference_seconds=0.01)
+        return _fn
+
+    def test_history_not_used_for_depth_zero(self):
+        prompts_seen = []
+
+        from web_console.inference_client import InferenceResult
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                timeout_seconds=30.0, **kw):
+            prompts_seen.append(prompt)
+            return InferenceResult(success=True, text="resp", error="",
+                                   inference_seconds=0.01)
+
+        with tempfile.TemporaryDirectory() as d:
+            imgs = [str(pathlib.Path(d) / f"f{i}.jpg") for i in range(2)]
+            for p in imgs:
+                pathlib.Path(p).write_bytes(b"FAKE")
+            defn = ExperimentDefinition(
+                strategy="single_frame_observation_history",
+                image_paths=imgs,
+                task_prompt="Describe.",
+                observation_history_max_entries=0,
+            )
+            run_experiment(defn, inference_fn=_fn, socket_path="/tmp/fake.sock")
+        # History depth 0 — "Prior observations" should never appear.
+        for p in prompts_seen:
+            self.assertNotIn("Prior observations", p)
+
+    def test_history_accumulates_with_depth_2(self):
+        prompts_seen = []
+        from web_console.inference_client import InferenceResult
+        counter = [0]
+
+        def _fn(image_path=None, prompt=None, *, cli_path="", socket_path="",
+                timeout_seconds=30.0, **kw):
+            prompts_seen.append(prompt)
+            counter[0] += 1
+            return InferenceResult(success=True, text=f"Obs{counter[0]}",
+                                   error="", inference_seconds=0.01)
+
+        with tempfile.TemporaryDirectory() as d:
+            imgs = [str(pathlib.Path(d) / f"f{i}.jpg") for i in range(3)]
+            for p in imgs:
+                pathlib.Path(p).write_bytes(b"FAKE")
+            defn = ExperimentDefinition(
+                strategy="single_frame_observation_history",
+                image_paths=imgs,
+                task_prompt="Describe.",
+                observation_history_max_entries=2,
+                observation_history_max_chars=10000,
+            )
+            run_experiment(defn, inference_fn=_fn, socket_path="/tmp/fake.sock")
+        # Second prompt should contain "Prior observations"
+        self.assertNotIn("Prior observations", prompts_seen[0])
+        self.assertIn("Prior observations", prompts_seen[1])
+        self.assertIn("Prior observations", prompts_seen[2])
+
+
+class TestComputeHistoryMatrix(unittest.TestCase):
+
+    def test_matrix_sorts_by_depth(self):
+        """compute_history_matrix should sort rows by observation_history_max_entries."""
+        manifests = [
+            {
+                "experiment_id": "aaa",
+                "strategy": "single_frame_observation_history",
+                "image_count": 2,
+                "successful_frames": 2,
+                "failed_frames": 0,
+                "repetition_flags": 0,
+                "mean_latency_ms": 50.0,
+                "min_latency_ms": 40.0,
+                "max_latency_ms": 60.0,
+                "definition": {
+                    "observation_history_max_entries": 3,
+                    "task_prompt": "Describe.",
+                    "max_generate_length": 96,
+                    "temperature": 0.2,
+                },
+            },
+            {
+                "experiment_id": "bbb",
+                "strategy": "single_frame",
+                "image_count": 2,
+                "successful_frames": 2,
+                "failed_frames": 0,
+                "repetition_flags": 0,
+                "mean_latency_ms": 45.0,
+                "min_latency_ms": 42.0,
+                "max_latency_ms": 48.0,
+                "definition": {
+                    "observation_history_max_entries": 0,
+                    "task_prompt": "Describe.",
+                    "max_generate_length": 96,
+                    "temperature": 0.2,
+                },
+            },
+        ]
+        rows = compute_history_matrix(manifests)
+        self.assertEqual(len(rows), 2)
+        # depth=0 should come first
+        self.assertEqual(rows[0]["history_depth"], 0)
+        self.assertEqual(rows[1]["history_depth"], 3)
+
+    def test_matrix_empty_input(self):
+        rows = compute_history_matrix([])
+        self.assertEqual(rows, [])
+
+
+# ── model catalog tests ───────────────────────────────────────────────────────
+
+
+class TestModelCatalog(unittest.TestCase):
+
+    def test_make_model_id_stable(self):
+        id1 = _make_model_id("MyModel", "/some/path")
+        id2 = _make_model_id("MyModel", "/some/path")
+        self.assertEqual(id1, id2)
+        self.assertIn("MyModel", id1)
+
+    def test_make_model_id_no_path(self):
+        model_id = _make_model_id("TestModel", "")
+        self.assertEqual(model_id, "TestModel")
+
+    def test_profile_from_env_none_when_no_vars(self):
+        env_backup = {}
+        for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR"):
+            env_backup[k] = os.environ.pop(k, None)
+        try:
+            result = _profile_from_env()
+            self.assertIsNone(result)
+        finally:
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_profile_from_env_with_name_and_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            env_backup = {
+                k: os.environ.pop(k, None)
+                for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR",
+                           "EDGE_VLM_MULTIMODAL_ENGINE_DIR", "EDGELLM_PLUGIN_PATH",
+                           "EDGE_VLM_WORKSPACE_DIR")
+            }
+            try:
+                os.environ["EDGE_VLM_MODEL_NAME"] = "FakeModel"
+                os.environ["EDGE_VLM_LLM_ENGINE_DIR"] = d
+                profile = _profile_from_env()
+                self.assertIsNotNone(profile)
+                self.assertEqual(profile.model_name, "FakeModel")
+                self.assertTrue(profile.is_active)
+                self.assertTrue(profile.llm_engine_exists)
+            finally:
+                for k, v in env_backup.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
+
+    def test_scan_workspace_empty_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            profiles = _scan_workspace(d)
+            self.assertEqual(profiles, [])
+
+    def test_scan_workspace_finds_model(self):
+        with tempfile.TemporaryDirectory() as ws:
+            model_dir = pathlib.Path(ws) / "FakeModel" / "engine"
+            model_dir.mkdir(parents=True)
+            (model_dir / "llm").mkdir()
+            profiles = _scan_workspace(ws)
+            self.assertEqual(len(profiles), 1)
+            self.assertEqual(profiles[0].model_name, "FakeModel")
+            self.assertTrue(profiles[0].multimodal_engine_exists)
+
+    def test_scan_workspace_skips_hidden(self):
+        with tempfile.TemporaryDirectory() as ws:
+            hidden = pathlib.Path(ws) / ".hidden" / "engine"
+            hidden.mkdir(parents=True)
+            profiles = _scan_workspace(ws)
+            self.assertEqual(profiles, [])
+
+    def test_discover_models_empty(self):
+        env_backup = {}
+        for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR",
+                   "EDGE_VLM_WORKSPACE_DIR"):
+            env_backup[k] = os.environ.pop(k, None)
+        try:
+            profiles = discover_models(workspace_dir="")
+            self.assertIsInstance(profiles, list)
+        finally:
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_discover_models_deduplicates(self):
+        """When env points at the same model dir as workspace scan, no duplicates."""
+        with tempfile.TemporaryDirectory() as ws:
+            model_dir = pathlib.Path(ws) / "AModel" / "engine"
+            (model_dir / "llm").mkdir(parents=True)
+            env_backup = {
+                k: os.environ.pop(k, None)
+                for k in ("EDGE_VLM_MODEL_NAME", "EDGE_VLM_LLM_ENGINE_DIR",
+                           "EDGE_VLM_MULTIMODAL_ENGINE_DIR", "EDGELLM_PLUGIN_PATH")
+            }
+            try:
+                os.environ["EDGE_VLM_MODEL_NAME"] = "AModel"
+                os.environ["EDGE_VLM_LLM_ENGINE_DIR"] = str(model_dir / "llm")
+                profiles = discover_models(workspace_dir=ws)
+                ids = [p.model_id for p in profiles]
+                self.assertEqual(len(ids), len(set(ids)), "Duplicate model IDs")
+            finally:
+                for k, v in env_backup.items():
+                    if v is not None:
+                        os.environ[k] = v
+                    else:
+                        os.environ.pop(k, None)
+
+
+# ── dataset catalog tests ─────────────────────────────────────────────────────
+
+
+class TestDatasetCatalog(unittest.TestCase):
+
+    def test_build_download_command_known_key(self):
+        cmd = build_download_command("/scripts/download.sh", "image-proc")
+        self.assertIsNotNone(cmd)
+        self.assertIsInstance(cmd, list)
+        self.assertIn("image-proc", cmd)
+        self.assertNotIn(True, cmd)   # no shell=True via bool leak
+
+    def test_build_download_command_h264(self):
+        cmd = build_download_command("/scripts/download.sh", "h264")
+        self.assertIsNotNone(cmd)
+        self.assertIn("h264", cmd)
+
+    def test_build_download_command_unknown_key_returns_none(self):
+        self.assertIsNone(
+            build_download_command("/scripts/download.sh", "arbitrary_key")
+        )
+
+    def test_build_download_command_traversal_returns_none(self):
+        self.assertIsNone(
+            build_download_command("/scripts/download.sh", "../../../etc/passwd")
+        )
+
+    def test_build_download_command_empty_key_returns_none(self):
+        self.assertIsNone(build_download_command("/scripts/download.sh", ""))
+
+    def test_downloadable_bags_keys_unique(self):
+        keys = [d["key"] for d in _DOWNLOADABLE_BAGS]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def test_discover_datasets_no_dirs(self):
+        data = discover_datasets(rosbag_root="/nonexistent/dir",
+                                 image_root=None, video_root=None)
+        self.assertIn("rosbags", data)
+        self.assertIn("image_datasets", data)
+        self.assertIn("video_datasets", data)
+        # Should still list downloadable bags
+        self.assertGreater(len(data["rosbags"]), 0)
+        # All listed bags that are not locally installed should be downloadable
+        for bag in data["rosbags"]:
+            if not bag["installed"]:
+                self.assertTrue(bag["downloadable"])
+
+    def test_discover_datasets_with_image_dir(self):
+        with tempfile.TemporaryDirectory() as root:
+            img_root = pathlib.Path(root) / "images"
+            dataset_dir = img_root / "my_dataset"
+            dataset_dir.mkdir(parents=True)
+            (dataset_dir / "frame_000.jpg").write_bytes(b"FAKE")
+            (dataset_dir / "frame_001.png").write_bytes(b"FAKE")
+
+            data = discover_datasets(rosbag_root="/nonexistent",
+                                     image_root=str(img_root), video_root=None)
+            self.assertEqual(len(data["image_datasets"]), 1)
+            self.assertEqual(data["image_datasets"][0]["name"], "my_dataset")
+            self.assertEqual(data["image_datasets"][0]["image_count"], 2)
+
+    def test_discover_datasets_with_video_dir(self):
+        with tempfile.TemporaryDirectory() as root:
+            vid_root = pathlib.Path(root) / "videos"
+            vid_root.mkdir()
+            (vid_root / "clip.mp4").write_bytes(b"FAKE")
+
+            data = discover_datasets(rosbag_root="/nonexistent",
+                                     image_root=None, video_root=str(vid_root))
+            self.assertEqual(len(data["video_datasets"]), 1)
+            self.assertEqual(data["video_datasets"][0]["name"], "clip.mp4")
+
+
+# ── new API route smoke tests ─────────────────────────────────────────────────
+
+
+class TestNewAPIRoutes(unittest.TestCase):
+    """Smoke tests for /api/models and /api/datasets served by ConsoleServer."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(self._tmp)
+        cfg = {
+            "socket_path": "",
+            "quiet": True,
+            "workspace_dir": "",
+            "rosbag_dir": "/nonexistent",
+            "image_dataset_dir": "",
+            "video_dataset_dir": "",
+        }
+        with patch("web_console.server.check_server_reachable",
+                   return_value={"reachable": False}):
+            self._srv = ConsoleServer(
+                host="127.0.0.1", port=0, config=cfg, run_store=run_store
+            )
+        self._thread = threading.Thread(target=self._srv.serve_forever, daemon=True)
+        self._thread.start()
+        time.sleep(0.1)
+        self._host, self._port = self._srv.server_address
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body) if body else {}
+
+    def test_api_models_returns_200(self):
+        status, data = self._get("/api/models")
+        self.assertEqual(status, 200)
+        self.assertIn("models", data)
+        self.assertIsInstance(data["models"], list)
+
+    def test_api_datasets_returns_200(self):
+        status, data = self._get("/api/datasets")
+        self.assertEqual(status, 200)
+        self.assertIn("rosbags", data)
+        self.assertIn("image_datasets", data)
+        self.assertIn("video_datasets", data)
+
+    def test_index_contains_workbench_title(self):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertIn(b"edge_vlm_ros", body)
+        self.assertIn(b"Workbench", body)
+
+    def test_api_datasets_download_unknown_key_returns_400(self):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        body_bytes = json.dumps({"bag_key": "UNKNOWN_BAG"}).encode()
+        conn.request(
+            "POST", "/api/datasets/download", body=body_bytes,
+            headers={"Content-Type": "application/json",
+                     "Content-Length": str(len(body_bytes))},
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertIn(resp.status, (400, 422))
+
+    def test_api_experiment_run_invalid_definition_returns_422(self):
+        conn = HTTPConnection(self._host, self._port, timeout=5)
+        body_bytes = json.dumps({
+            "strategy": "bad_strategy",
+            "image_paths": ["/data/frame.jpg"],
+            "task_prompt": "Describe.",
+        }).encode()
+        conn.request(
+            "POST", "/api/experiment/run", body=body_bytes,
+            headers={"Content-Type": "application/json",
+                     "Content-Length": str(len(body_bytes))},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        self.assertIn(resp.status, (400, 422))
+
+
+# ── experiment_stack.sh bash syntax test ──────────────────────────────────────
+
+
+class TestExperimentStackScript(unittest.TestCase):
+    """Verify experiment_stack.sh passes bash -n syntax check."""
+
+    def test_bash_syntax_check(self):
+        script = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "experiment_stack.sh"
+        if not script.is_file():
+            self.skipTest(f"experiment_stack.sh not found at {script}")
+        if shutil.which("bash") is None:
+            self.skipTest("bash not available")
+        result = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"bash -n failed:\n{result.stderr}")
+
+
 if __name__ == "__main__":
     unittest.main()
