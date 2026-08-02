@@ -2305,7 +2305,7 @@ _INDEX_TEMPLATE = """\
       <label class="label-text">Start offset (s)
         <input id="extract-start-offset" type="number" value="0" min="0" step="0.1" size="8">
       </label>
-      <label class="label-text">Duration (s) <span class="muted">(overrides end offset)</span>
+      <label class="label-text">Duration (s) <span class="muted">(end offset takes precedence)</span>
         <input id="extract-duration" type="number" min="0" step="1" size="8" placeholder="all">
       </label>
       <label class="label-text">End offset (s)
