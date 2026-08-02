@@ -406,21 +406,31 @@ _validate() {
     fi
   fi
 
-  # Validate service binary (skip if --no-server)
+  # Validate service binary (skip only when --no-server was explicit).
   if [[ "${NO_SERVER:-0}" != "1" ]]; then
     local server_bin="${SERVER_BIN}"
     if ! command -v "${server_bin}" >/dev/null 2>&1 && [[ ! -x "${server_bin}" ]]; then
-      _warn "edge_vlm_server binary not found at '${server_bin}'"
-      _warn "Set SERVER_BIN or pass --server-bin, or use --no-server to skip"
-      _warn "Proceeding without native inference service (workbench only)"
-      NO_SERVER=1
+      _error "edge_vlm_server binary not found at '${server_bin}'"
+      _error "Set EDGE_VLM_SERVER_BIN, pass --server-bin, or explicitly use --no-server."
+      ok=1
     fi
   fi
 
-  # Validate CLI binary
+  # The web workbench invokes the CLI for standalone and sequence experiments.
   if ! command -v "${CLI_BIN}" >/dev/null 2>&1 && [[ ! -x "${CLI_BIN}" ]]; then
-    _warn "edge_vlm_cli binary not found at '${CLI_BIN}'"
-    _warn "Standalone inference via web console will fail until the CLI is available"
+    _error "edge_vlm_cli binary not found at '${CLI_BIN}'"
+    _error "Set EDGE_VLM_CLI_BIN or pass --cli-bin."
+    ok=1
+  fi
+
+  # Validate watchdog timing before passing positional values to the server.
+  if ! [[ "${SERVER_REQUEST_TIMEOUT}" =~ ^[1-9][0-9]*$ ]] ||
+     ! [[ "${SERVER_INFERENCE_DEADLINE}" =~ ^[1-9][0-9]*$ ]]; then
+    _error "Server request timeout and inference deadline must be positive integers."
+    ok=1
+  elif (( SERVER_INFERENCE_DEADLINE >= SERVER_REQUEST_TIMEOUT )); then
+    _error "Server inference deadline (${SERVER_INFERENCE_DEADLINE}s) must be less than request timeout (${SERVER_REQUEST_TIMEOUT}s)."
+    ok=1
   fi
 
   # Validate required engine bundle when starting the server.
