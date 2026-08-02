@@ -66,9 +66,12 @@ async function refreshStatus() {
         row.className = "card-meta";
         var namePart = _el("span", "gpu-name", g.name);
         row.appendChild(namePart);
+        var memoryText =
+          g.memory_used_mib === "[N/A]" || g.memory_total_mib === "[N/A]"
+            ? "Unified memory (VRAM split not reported)"
+            : "VRAM: " + g.memory_used_mib + "/" + g.memory_total_mib + " MiB";
         row.appendChild(document.createTextNode(
-          " | Util: " + g.utilization_pct + "% | VRAM: " +
-          g.memory_used_mib + "/" + g.memory_total_mib + " MiB"
+          " | Util: " + g.utilization_pct + "% | " + memoryText
         ));
         gpuEl.appendChild(row);
       });
@@ -194,7 +197,9 @@ async function _fetchLogs(runId) {
     // Stop polling when the run has reached a terminal state.
     if (data.terminal) {
       if (_rosLogInterval) { clearInterval(_rosLogInterval); _rosLogInterval = null; }
-      refreshHistory();
+      hideActiveRun();
+      await refreshHistory();
+      await loadRun(runId);
     }
   } catch (_) {}
 }
@@ -431,9 +436,20 @@ function _renderRosDetail(container, data) {
   if (bs) {
     var bsCard = document.createElement("div");
     bsCard.className = "result-meta";
-    var bsParts = ["frames: " + bs.frame_count, "successful: " + bs.successful_frames];
+    var bsParts = [
+      "frames: " + bs.frame_count,
+      "successful: " + bs.successful_frames,
+      "failed: " + (bs.failed_frames || 0),
+      "dropped: " + (bs.dropped_frames || 0)
+    ];
     if (bs.mean_inference_ms !== null && bs.mean_inference_ms !== undefined) {
-      bsParts.push("mean inference: " + bs.mean_inference_ms.toFixed(0) + " ms");
+      bsParts.push("mean: " + bs.mean_inference_ms.toFixed(0) + " ms");
+    }
+    if (bs.min_inference_ms !== null && bs.min_inference_ms !== undefined) {
+      bsParts.push("min: " + bs.min_inference_ms.toFixed(0) + " ms");
+    }
+    if (bs.max_inference_ms !== null && bs.max_inference_ms !== undefined) {
+      bsParts.push("max: " + bs.max_inference_ms.toFixed(0) + " ms");
     }
     bsCard.textContent = bsParts.join(" | ");
     container.appendChild(bsCard);
