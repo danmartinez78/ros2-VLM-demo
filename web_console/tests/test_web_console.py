@@ -2544,6 +2544,30 @@ class TestDatasetCatalog(unittest.TestCase):
             self.assertEqual(data["image_datasets"][0]["name"], "my_dataset")
             self.assertEqual(data["image_datasets"][0]["image_count"], 2)
 
+    def test_discover_datasets_detects_nested_downloaded_asset(self):
+        """Nested NGC bags merge into their top-level downloadable entry."""
+        with tempfile.TemporaryDirectory() as root:
+            bag_dir = (
+                pathlib.Path(root)
+                / "h264"
+                / "isaac_ros_h264_decoder"
+                / "quickstart"
+            )
+            bag_dir.mkdir(parents=True)
+            (bag_dir / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n"
+                "  duration: {nanoseconds: 1000000000}\n",
+                encoding="utf-8",
+            )
+
+            data = discover_datasets(
+                rosbag_root=root, image_root=None, video_root=None
+            )
+            h264 = next(b for b in data["rosbags"] if b["key"] == "h264")
+            self.assertTrue(h264["installed"])
+            self.assertTrue(h264["downloadable"])
+            self.assertEqual(h264["local_path"], str(bag_dir))
+
     def test_discover_datasets_with_video_dir(self):
         with tempfile.TemporaryDirectory() as root:
             vid_root = pathlib.Path(root) / "videos"
