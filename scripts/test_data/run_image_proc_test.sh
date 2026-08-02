@@ -31,7 +31,13 @@ observation_history_max_chars="${OBSERVATION_HISTORY_MAX_CHARS:-0}"
 system_instruction="${SYSTEM_INSTRUCTION:-}"
 test_prompt="${TEST_PROMPT:-}"
 artifact_dir="${ARTIFACT_DIR:-}"
+start_worker="${START_WORKER:-true}"
 benchmark_output_file=""
+
+if [[ "${start_worker}" != "true" && "${start_worker}" != "false" ]]; then
+  echo "START_WORKER must be 'true' or 'false'; got '${start_worker}'." >&2
+  exit 2
+fi
 
 for value_name in playback_duration result_timeout max_generate_length success_results_required; do
   value="${!value_name}"
@@ -165,53 +171,91 @@ for variable in EDGE_VLM_LLM_ENGINE_DIR EDGE_VLM_MULTIMODAL_ENGINE_DIR EDGELLM_P
   fi
 done
 
-# Refuse to attach assertions or automatic cleanup to an existing deployment.
-# Print process-group commands because killing only the worker may let ros2 launch respawn it.
-existing_reasoners="$(pgrep -f '/edge_vlm_ros_node($| )' 2>/dev/null || true)"
-existing_workers="$(pgrep -f '/edge_vlm_server($| )' 2>/dev/null || true)"
-if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
-  detected_pids="$(
-    printf '%s\n%s\n' "${existing_reasoners}" "${existing_workers}" |
-      sed '/^[[:space:]]*$/d' |
-      sort -nu
-  )"
-  detected_pid_csv="$(printf '%s\n' "${detected_pids}" | paste -sd, -)"
-  own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || true
-  detected_pgids="$(
-    ps -o pgid= -p "${detected_pid_csv}" 2>/dev/null |
-      tr -d ' ' |
-      sed '/^$/d' |
-      sort -nu |
-      awk -v own="${own_pgid}" '$1 != 0 && $1 != own'
-  )"
-
-  echo "Existing edge_vlm_ros deployment processes detected; stop them before testing." >&2
-  ps -o pid,ppid,pgid,sid,etime,stat,cmd -p "${detected_pid_csv}" >&2 || true
-  echo >&2
-  echo "Run the following commands, then rerun this test:" >&2
-  if [[ -n "${detected_pgids}" ]]; then
-    while IFS= read -r pgid; do
-      printf 'kill -TERM -- -%q\n' "${pgid}" >&2
-    done <<< "${detected_pgids}"
-    echo "sleep 3" >&2
-    while IFS= read -r pgid; do
-      printf 'kill -KILL -- -%q 2>/dev/null || true\n' "${pgid}" >&2
-    done <<< "${detected_pgids}"
-  else
-    echo "# Could not identify a safe process group; inspect the process table above." >&2
+# Preflight: check for conflicting processes and service readiness.
+if [[ "${start_worker}" == "false" ]]; then
+  # External-service mode: the edge_vlm_server is expected to already be running.
+  # Reject only a pre-existing edge_vlm_ros_node — it conflicts with this launch.
+  # The running edge_vlm_server and its socket are intentionally left untouched.
+  existing_reasoners="$(pgrep -f '/edge_vlm_ros_node($| )' 2>/dev/null || true)"
+  if [[ -n "${existing_reasoners}" ]]; then
+    echo "Existing edge_vlm_ros_node detected; stop it before testing." >&2
+    ps -o pid,ppid,pgid,etime,stat,cmd -p "${existing_reasoners}" 2>/dev/null || true
+    test_passed=true
+    exit 1
   fi
-  printf 'rm -f -- %q\n' "${worker_socket}" >&2
+  # Require the worker socket to exist and be reachable.
+  if [[ ! -e "${worker_socket}" ]]; then
+    echo "Worker socket not found: ${worker_socket}" >&2
+    echo "Start edge_vlm_server before running in START_WORKER=false mode." >&2
+    test_passed=true
+    exit 1
+  fi
+  if ! python3 - "${worker_socket}" <<'PY' 2>/dev/null
+import socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(1)
+    s.connect(sys.argv[1])
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+  then
+    echo "Worker socket is present but not accepting connections: ${worker_socket}" >&2
+    echo "Ensure edge_vlm_server is running and accepting requests before retrying." >&2
+    test_passed=true
+    exit 1
+  fi
+else
+  # Default self-managed mode: refuse to attach to an existing deployment.
+  # Print process-group commands because killing only the worker may let ros2 launch respawn it.
+  existing_reasoners="$(pgrep -f '/edge_vlm_ros_node($| )' 2>/dev/null || true)"
+  existing_workers="$(pgrep -f '/edge_vlm_server($| )' 2>/dev/null || true)"
+  if [[ -n "${existing_reasoners}" || -n "${existing_workers}" ]]; then
+    detected_pids="$(
+      printf '%s\n%s\n' "${existing_reasoners}" "${existing_workers}" |
+        sed '/^[[:space:]]*$/d' |
+        sort -nu
+    )"
+    detected_pid_csv="$(printf '%s\n' "${detected_pids}" | paste -sd, -)"
+    own_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" || true
+    detected_pgids="$(
+      ps -o pgid= -p "${detected_pid_csv}" 2>/dev/null |
+        tr -d ' ' |
+        sed '/^$/d' |
+        sort -nu |
+        awk -v own="${own_pgid}" '$1 != 0 && $1 != own'
+    )"
 
-  # A preflight refusal is not a launched-test failure, so discard empty logs.
-  test_passed=true
-  exit 1
-fi
-if [[ -e "${worker_socket}" ]]; then
-  echo "Stale worker socket exists: ${worker_socket}" >&2
-  echo "No edge_vlm_ros process was found. Remove the stale socket with:" >&2
-  printf 'rm -f -- %q\n' "${worker_socket}" >&2
-  test_passed=true
-  exit 1
+    echo "Existing edge_vlm_ros deployment processes detected; stop them before testing." >&2
+    ps -o pid,ppid,pgid,sid,etime,stat,cmd -p "${detected_pid_csv}" >&2 || true
+    echo >&2
+    echo "Run the following commands, then rerun this test:" >&2
+    if [[ -n "${detected_pgids}" ]]; then
+      while IFS= read -r pgid; do
+        printf 'kill -TERM -- -%q\n' "${pgid}" >&2
+      done <<< "${detected_pgids}"
+      echo "sleep 3" >&2
+      while IFS= read -r pgid; do
+        printf 'kill -KILL -- -%q 2>/dev/null || true\n' "${pgid}" >&2
+      done <<< "${detected_pgids}"
+    else
+      echo "# Could not identify a safe process group; inspect the process table above." >&2
+    fi
+    printf 'rm -f -- %q\n' "${worker_socket}" >&2
+
+    # A preflight refusal is not a launched-test failure, so discard empty logs.
+    test_passed=true
+    exit 1
+  fi
+  if [[ -e "${worker_socket}" ]]; then
+    echo "Stale worker socket exists: ${worker_socket}" >&2
+    echo "No edge_vlm_ros process was found. Remove the stale socket with:" >&2
+    printf 'rm -f -- %q\n' "${worker_socket}" >&2
+    test_passed=true
+    exit 1
+  fi
 fi
 
 echo "Starting edge_vlm_ros reasoner on ${image_topic}..."
@@ -237,6 +281,9 @@ launch_args=(
 [[ -n "${system_instruction}" ]] && launch_args+=(system_instruction:="${system_instruction}")
 [[ -n "${test_prompt}" ]] && launch_args+=(prompt:="${test_prompt}")
 [[ -n "${benchmark_output_file}" ]] && launch_args+=(benchmark_output_file:="${benchmark_output_file}")
+if [[ "${start_worker}" == "false" ]]; then
+  launch_args+=(start_worker:=false worker_socket_path:="${worker_socket}")
+fi
 
 setsid ros2 launch edge_vlm_ros edge_vlm.launch.py \
   "${launch_args[@]}" >"${launch_log}" 2>&1 &
@@ -361,20 +408,44 @@ test_passed=true
 cleanup
 trap - EXIT INT TERM
 
-orphan_workers="$(pgrep -f "edge_vlm_server.*${worker_socket}" 2>/dev/null || true)"
-if [[ -n "${orphan_workers}" ]]; then
-  echo "FAIL: orphan inference worker(s) remain: ${orphan_workers}" >&2
-  exit 1
-fi
-if [[ -e "${worker_socket}" ]]; then
-  # Preflight established that this test exclusively owned the socket. The
-  # worker is gone, so a remaining pathname is stale launch-cleanup residue.
-  rm -f -- "${worker_socket}"
-  if [[ -e "${worker_socket}" ]]; then
-    echo "FAIL: could not remove stale worker socket after shutdown: ${worker_socket}" >&2
+if [[ "${start_worker}" == "true" ]]; then
+  orphan_workers="$(pgrep -f "edge_vlm_server.*${worker_socket}" 2>/dev/null || true)"
+  if [[ -n "${orphan_workers}" ]]; then
+    echo "FAIL: orphan inference worker(s) remain: ${orphan_workers}" >&2
     exit 1
   fi
-  echo "Removed stale worker socket after confirmed worker shutdown."
+  if [[ -e "${worker_socket}" ]]; then
+    # Preflight established that this test exclusively owned the socket. The
+    # worker is gone, so a remaining pathname is stale launch-cleanup residue.
+    rm -f -- "${worker_socket}"
+    if [[ -e "${worker_socket}" ]]; then
+      echo "FAIL: could not remove stale worker socket after shutdown: ${worker_socket}" >&2
+      exit 1
+    fi
+    echo "Removed stale worker socket after confirmed worker shutdown."
+  fi
+else
+  # External-service mode: verify the service we did not start is still running.
+  if [[ ! -e "${worker_socket}" ]]; then
+    echo "FAIL: external worker socket was removed during test: ${worker_socket}" >&2
+    exit 1
+  fi
+  if ! python3 - "${worker_socket}" <<'PY' 2>/dev/null
+import socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(1)
+    s.connect(sys.argv[1])
+    s.close()
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+PY
+  then
+    echo "FAIL: external worker socket is no longer reachable after test: ${worker_socket}" >&2
+    exit 1
+  fi
+  echo "External worker service verified: socket still reachable at ${worker_socket}."
 fi
 
 echo "PASS: successful reasoning result received and all test processes cleaned up."

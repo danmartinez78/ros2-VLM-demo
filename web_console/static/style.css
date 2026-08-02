@@ -50,6 +50,9 @@ section h2 {
   color: #16213e;
   border-bottom: 1px solid #eee;
   padding-bottom: 0.4rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 
 label {
@@ -130,6 +133,137 @@ pre {
   font-size: 0.9rem;
 }
 
+/* ── status cards ──────────────────────────────────────────────────────── */
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.status-card {
+  background: #f8f9fc;
+  border: 1px solid #d0d7e3;
+  border-radius: 6px;
+  padding: 0.65rem 0.9rem;
+}
+
+.card-title {
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #555;
+  margin-bottom: 0.35rem;
+}
+
+.card-meta {
+  font-size: 0.85rem;
+  color: #333;
+  margin-top: 0.2rem;
+}
+
+.gpu-name {
+  font-weight: 600;
+}
+
+/* ── result cards ──────────────────────────────────────────────────────── */
+
+.result-card {
+  background: #f8f9fc;
+  border: 1px solid #d0d7e3;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin-top: 0.5rem;
+}
+
+.result-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.result-latency {
+  font-size: 0.85rem;
+  color: #555;
+  font-variant-numeric: tabular-nums;
+}
+
+.result-text {
+  background: #fff;
+  border: 1px solid #e0e4ea;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.92rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 0.35rem;
+}
+
+.result-error {
+  color: #c0392b;
+  font-size: 0.9rem;
+  margin-bottom: 0.35rem;
+}
+
+.result-meta {
+  font-size: 0.82rem;
+  color: #666;
+  margin-top: 0.2rem;
+}
+
+.run-kind {
+  font-weight: 600;
+  font-size: 0.92rem;
+  margin-right: 0.25rem;
+}
+
+.frame-card {
+  background: #fff;
+  border: 1px solid #e0e4ea;
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  margin-top: 0.4rem;
+}
+
+.artifact-list {
+  font-size: 0.85rem;
+  margin: 0.25rem 0 0 1.2rem;
+  padding: 0;
+}
+
+/* ── collapsible raw diagnostics ──────────────────────────────────────── */
+
+.raw-details {
+  margin-top: 0.5rem;
+}
+
+.raw-details > summary {
+  cursor: pointer;
+  font-size: 0.83rem;
+  color: #0f3460;
+  user-select: none;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.raw-details > summary::before {
+  content: "▶";
+  font-size: 0.7rem;
+  transition: transform 0.15s;
+}
+
+.raw-details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+/* ── run history table ────────────────────────────────────────────────── */
+
 table.runs {
   width: 100%;
   border-collapse: collapse;
@@ -145,3 +279,4 @@ table.runs th, table.runs td {
 table.runs th { font-weight: 600; background: #f0f2f5; }
 table.runs a { color: #0f3460; text-decoration: none; }
 table.runs a:hover { text-decoration: underline; }
+

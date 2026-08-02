@@ -41,6 +41,8 @@ from web_console.server import (
     _parse_multipart,
     _validate_ros_params,
     _build_ros_env,
+    _parse_results_log,
+    _parse_benchmark_jsonl,
 )
 from web_console.__main__ import _parse_args, _is_loopback
 
@@ -1520,6 +1522,281 @@ class TestStartupBind(unittest.TestCase):
         output = captured.getvalue()
         self.assertNotIn("WARNING", output)
         self.assertNotIn("NO AUTHENTICATION", output)
+
+
+# ── result-log / benchmark parsers ───────────────────────────────────────────
+
+class TestResultsParsing(unittest.TestCase):
+    """CPU-only tests for server-side artifact parsers."""
+
+    # ── _parse_results_log ────────────────────────────────────────────────
+
+    def test_parse_empty_results_log(self):
+        """Empty string must return an empty list."""
+        self.assertEqual(_parse_results_log(""), [])
+
+    def test_parse_whitespace_only(self):
+        self.assertEqual(_parse_results_log("   \n   "), [])
+
+    def test_parse_no_separator_is_empty(self):
+        """A file without any --- separators produces no frames."""
+        text = "text: hello\nsuccess: true\n"
+        self.assertEqual(_parse_results_log(text), [])
+
+    def test_parse_single_successful_frame(self):
+        text = (
+            "---\n"
+            "success: true\n"
+            "text: A dog is running.\n"
+            "latency_ms: 42.5\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertIs(frames[0]["success"], True)
+        self.assertEqual(frames[0]["text"], "A dog is running.")
+        self.assertAlmostEqual(frames[0]["latency_ms"], 42.5)
+
+    def test_parse_single_failed_frame(self):
+        text = (
+            "---\n"
+            "success: false\n"
+            "error: timeout\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertIs(frames[0]["success"], False)
+        self.assertEqual(frames[0]["error"], "timeout")
+
+    def test_parse_multiline_text_block_scalar(self):
+        """YAML block scalar (|) value joined from indented lines."""
+        text = (
+            "---\n"
+            "success: true\n"
+            "text: |\n"
+            "  Line one.\n"
+            "  Line two.\n"
+            "latency_ms: 10\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertIn("Line one.", frames[0]["text"])
+        self.assertIn("Line two.", frames[0]["text"])
+
+    def test_parse_multi_frame_results(self):
+        text = (
+            "---\n"
+            "success: true\n"
+            "text: frame1\n"
+            "---\n"
+            "success: false\n"
+            "text: frame2\n"
+            "---\n"
+            "success: true\n"
+            "text: frame3\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 3)
+        self.assertEqual(frames[0]["text"], "frame1")
+        self.assertEqual(frames[1]["text"], "frame2")
+        self.assertEqual(frames[2]["text"], "frame3")
+
+    def test_parse_malformed_lines_skipped(self):
+        """Non key:value lines in a block are silently ignored."""
+        text = (
+            "---\n"
+            ":::not_a_key\n"
+            "success: true\n"
+            "text: ok\n"
+        )
+        frames = _parse_results_log(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[0]["text"], "ok")
+
+    # ── _parse_benchmark_jsonl ────────────────────────────────────────────
+
+    def test_parse_benchmark_jsonl_empty(self):
+        self.assertEqual(_parse_benchmark_jsonl(""), [])
+
+    def test_parse_benchmark_jsonl_valid(self):
+        lines = (
+            '{"record_type": "frame", "inference_ms": 30.0, "success": true}\n'
+            '{"record_type": "frame", "inference_ms": 50.0, "success": false}\n'
+        )
+        records = _parse_benchmark_jsonl(lines)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["inference_ms"], 30.0)
+
+    def test_parse_benchmark_jsonl_skips_malformed_lines(self):
+        lines = (
+            '{"record_type": "frame", "inference_ms": 10.0}\n'
+            'NOT JSON\n'
+            '{"record_type": "summary"}\n'
+        )
+        records = _parse_benchmark_jsonl(lines)
+        self.assertEqual(len(records), 2)
+
+    def test_parse_benchmark_jsonl_skips_non_dict(self):
+        lines = '["not", "a", "dict"]\n{"record_type": "frame"}\n'
+        records = _parse_benchmark_jsonl(lines)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["record_type"], "frame")
+
+    def test_benchmark_summary_computed_correctly(self):
+        """_parse_benchmark_jsonl returns records; benchmark_summary is computed
+        by the server from record_type=frame entries."""
+        lines = (
+            '{"record_type": "frame", "inference_ms": 20.0, "success": true}\n'
+            '{"record_type": "frame", "inference_ms": 40.0, "success": true}\n'
+            '{"record_type": "frame", "inference_ms": 60.0, "success": false}\n'
+            '{"record_type": "summary", "total": 3}\n'
+        )
+        records = _parse_benchmark_jsonl(lines)
+        frame_records = [r for r in records if r.get("record_type") == "frame"]
+        self.assertEqual(len(frame_records), 3)
+        successful = [r for r in frame_records if r.get("success")]
+        mean_ms = sum(r["inference_ms"] for r in frame_records) / len(frame_records)
+        self.assertAlmostEqual(mean_ms, 40.0)
+        self.assertEqual(len(successful), 2)
+
+
+# ── external-service (START_WORKER=false) mode ────────────────────────────────
+
+class TestExternalServiceMode(unittest.TestCase):
+    """CPU-only tests for _build_ros_env start_worker parameter and
+    _api_ros_start mode-selection based on service reachability."""
+
+    def _cfg(self, socket_path: str = "/tmp/test.sock") -> dict:
+        return {"socket_path": socket_path}
+
+    # ── _build_ros_env ────────────────────────────────────────────────────
+
+    def test_build_ros_env_start_worker_true_does_not_set_env_var(self):
+        env = _build_ros_env({}, self._cfg(), start_worker=True)
+        self.assertNotIn("START_WORKER", env)
+
+    def test_build_ros_env_start_worker_false_sets_env_var(self):
+        env = _build_ros_env({}, self._cfg(), start_worker=False)
+        self.assertEqual(env.get("START_WORKER"), "false")
+
+    def test_build_ros_env_start_worker_false_sets_socket_path(self):
+        cfg = self._cfg(socket_path="/run/edge_vlm.sock")
+        env = _build_ros_env({}, cfg, start_worker=False)
+        self.assertEqual(env.get("WORKER_SOCKET_PATH"), "/run/edge_vlm.sock")
+
+    def test_build_ros_env_start_worker_false_empty_socket_no_env_var(self):
+        """Empty socket_path must not set WORKER_SOCKET_PATH."""
+        cfg = {"socket_path": ""}
+        env = _build_ros_env({}, cfg, start_worker=False)
+        self.assertNotIn("WORKER_SOCKET_PATH", env)
+
+    def test_build_ros_env_start_worker_true_no_socket_path_env(self):
+        """start_worker=True must never override WORKER_SOCKET_PATH."""
+        env = _build_ros_env({}, self._cfg(), start_worker=True)
+        self.assertNotIn("WORKER_SOCKET_PATH", env)
+
+    # ── API mode selection ────────────────────────────────────────────────
+
+    def _make_ros_start_request(self, srv: ConsoleServer) -> dict:
+        """POST /api/ros/start and return parsed JSON response."""
+        host, port = srv.server_address
+        conn = HTTPConnection(host, port, timeout=10)
+        body_bytes = json.dumps({"params": {}}).encode()
+        conn.request(
+            "POST",
+            "/api/ros/start",
+            body=body_bytes,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body_bytes)),
+            },
+        )
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read())
+
+    def test_api_ros_start_selects_external_mode_when_service_reachable(self):
+        """When the standalone service is reachable, the run manifest must
+        record external_worker=True and START_WORKER=false must be set."""
+        with _TempDir() as tmp:
+            run_store = RunStore(tmp)
+            cfg = {"socket_path": "/tmp/nonexistent.sock", "quiet": True}
+            # Fake script: exits 0 immediately
+            fake_script = tmp / "fake_ros.sh"
+            fake_script.write_text("#!/bin/sh\nexit 0\n")
+            fake_script.chmod(0o755)
+            cfg["ros_script_path"] = str(fake_script)
+            # Mock check_server_reachable to return True (service is running)
+            with patch("web_console.server.check_server_reachable", return_value={"reachable": True}):
+                srv = ConsoleServer(host="127.0.0.1", port=0, config=cfg,
+                                    run_store=run_store)
+                thread = threading.Thread(target=srv.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    time.sleep(0.1)
+                    status, data = self._make_ros_start_request(srv)
+                    self.assertIn(status, (200, 202))
+                    self.assertTrue(data.get("external_worker"),
+                                    f"external_worker not True in {data}")
+                finally:
+                    srv.shutdown()
+
+    def test_api_ros_start_selects_self_managed_when_service_unreachable(self):
+        """When the standalone service is not reachable, external_worker must
+        be False and START_WORKER must not be overridden to false."""
+        with _TempDir() as tmp:
+            run_store = RunStore(tmp)
+            cfg = {"socket_path": "/tmp/nonexistent.sock", "quiet": True}
+            fake_script = tmp / "fake_ros.sh"
+            fake_script.write_text("#!/bin/sh\nexit 0\n")
+            fake_script.chmod(0o755)
+            cfg["ros_script_path"] = str(fake_script)
+            # Mock check_server_reachable to return False (no service)
+            with patch("web_console.server.check_server_reachable", return_value={"reachable": False}):
+                srv = ConsoleServer(host="127.0.0.1", port=0, config=cfg,
+                                    run_store=run_store)
+                thread = threading.Thread(target=srv.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    time.sleep(0.1)
+                    status, data = self._make_ros_start_request(srv)
+                    self.assertIn(status, (200, 202))
+                    self.assertFalse(data.get("external_worker"),
+                                     f"external_worker should be False in {data}")
+                finally:
+                    srv.shutdown()
+
+    def test_external_worker_flag_preserved_in_manifest_after_completion(self):
+        """external_worker=True written in 'starting' manifest must survive
+        finalization by the completion callback."""
+        with _TempDir() as tmp:
+            run_store = RunStore(tmp)
+            cfg = {"socket_path": "/tmp/nonexistent.sock", "quiet": True}
+            fake_script = tmp / "fast_exit.sh"
+            fake_script.write_text("#!/bin/sh\nexit 0\n")
+            fake_script.chmod(0o755)
+            cfg["ros_script_path"] = str(fake_script)
+            with patch("web_console.server.check_server_reachable", return_value={"reachable": True}):
+                srv = ConsoleServer(host="127.0.0.1", port=0, config=cfg,
+                                    run_store=run_store)
+                thread = threading.Thread(target=srv.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    time.sleep(0.1)
+                    status, data = self._make_ros_start_request(srv)
+                    self.assertIn(status, (200, 202))
+                    run_id = data.get("run_id")
+                    # Allow the child process to exit and the callback to fire.
+                    for _ in range(30):
+                        rec = run_store.get_run(run_id)
+                        if rec and rec.get("status") in _TERMINAL_STATUSES:
+                            break
+                        time.sleep(0.1)
+                    rec = run_store.get_run(run_id)
+                    self.assertIsNotNone(rec)
+                    self.assertTrue(rec.get("external_worker"),
+                                    "external_worker must be preserved in final manifest")
+                    self.assertIn(rec.get("status"), _TERMINAL_STATUSES)
+                finally:
+                    srv.shutdown()
 
 
 if __name__ == "__main__":

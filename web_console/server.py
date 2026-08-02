@@ -44,7 +44,7 @@ from .inference_client import (
 )
 from .process_manager import ProcessManager
 from .run_store import RunStore, _is_safe_run_id, _TERMINAL_STATUSES
-from .status_collector import collect_status
+from .status_collector import collect_status, check_server_reachable
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -100,6 +100,98 @@ _STATIC_MAP: Dict[str, pathlib.Path] = _build_static_map()
 
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _parse_results_log(text: str) -> list:
+    """Parse ros2 topic echo YAML output for a VlmResult topic into frame dicts.
+
+    Each message block is delimited by ``---`` markers.  Only top-level scalar
+    fields are extracted; nested YAML objects (e.g. ``header:``, ``stamp:``)
+    are skipped.  Block-scalar indicators (``>`` ``>-`` ``|`` ``|-``) are
+    handled by collecting subsequent indented lines as a single string.
+
+    Returns an empty list on empty or entirely malformed input.
+    """
+    frames: list = []
+    current: Dict[str, Any] = {}
+    in_block = False
+    pending_key: Optional[str] = None
+    pending_lines: list = []
+
+    def _flush() -> None:
+        nonlocal current, in_block, pending_key, pending_lines
+        if pending_key is not None:
+            current[pending_key] = " ".join(l.strip() for l in pending_lines)
+            pending_key = None
+            pending_lines = []
+        if in_block and current:
+            frames.append(current)
+        current = {}
+        in_block = False
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "---":
+            _flush()
+            in_block = True
+            continue
+        if not in_block:
+            continue
+        # Continuation of a YAML block scalar
+        if pending_key is not None:
+            if line.startswith((" ", "\t")):
+                pending_lines.append(stripped)
+                continue
+            else:
+                current[pending_key] = " ".join(l.strip() for l in pending_lines)
+                pending_key = None
+                pending_lines = []
+        # Top-level key: value pair (not indented)
+        if ": " in line and not line.startswith((" ", "\t")):
+            key, _, raw = line.partition(": ")
+            key = key.strip()
+            raw = raw.strip()
+            if raw in (">", ">-", "|", "|-"):
+                pending_key = key
+                pending_lines = []
+            else:
+                val_str = raw.strip("'\"")
+                if val_str.lower() == "true":
+                    current[key] = True
+                elif val_str.lower() == "false":
+                    current[key] = False
+                elif val_str == "":
+                    current[key] = ""
+                else:
+                    try:
+                        current[key] = (
+                            float(val_str) if ("." in val_str or "e" in val_str.lower()) else int(val_str)
+                        )
+                    except ValueError:
+                        current[key] = val_str
+        # Top-level nested key without value (stamp:, header:) — skip
+    _flush()
+    return frames
+
+
+def _parse_benchmark_jsonl(text: str) -> list:
+    """Parse a benchmark.jsonl file; returns all valid JSON object records.
+
+    Malformed lines are silently skipped so a single corrupt entry does not
+    discard an entire session.
+    """
+    records: list = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+            if isinstance(record, dict):
+                records.append(record)
+        except json.JSONDecodeError:
+            pass
+    return records
 
 
 def _json_response(data: Any) -> bytes:
@@ -392,8 +484,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         artifact_dir = run_store.base_dir / run_id / "artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
+        # Detect whether the standalone inference service is already reachable.
+        # If so, run the script in external-service mode (START_WORKER=false)
+        # so the ROS adapter reuses the running service instead of starting
+        # a competing worker. The service's socket and process are left untouched.
+        socket_path = cfg.get("socket_path", "")
+        server_status = check_server_reachable(socket_path) if socket_path else {"reachable": False}
+        use_external_worker: bool = bool(server_status.get("reachable"))
+
         # Only allowlisted env vars are forwarded; no arbitrary env injection.
-        env = _build_ros_env(params, cfg, artifact_dir)
+        env = _build_ros_env(params, cfg, artifact_dir, start_worker=not use_external_worker)
 
         script_path = cfg.get(
             "ros_script_path",
@@ -419,6 +519,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "created_at": _now_iso(),
             "params": params,
             "status": "starting",
+            "external_worker": use_external_worker,
         }
         run_store.save_run(run_id, initial_record)
 
@@ -447,6 +548,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             run_dir = run_store.run_dir(rid)
             artifact_rel_paths: list = []
             script_manifest: Optional[Dict[str, Any]] = None
+            result_frames: list = []
+            benchmark_summary: Optional[Dict[str, Any]] = None
             if run_dir is not None:
                 artifacts_subdir = run_dir / "artifacts"
                 if artifacts_subdir.is_dir():
@@ -461,6 +564,37 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                                     )
                                 except (json.JSONDecodeError, OSError):
                                     pass
+                    # Parse structured results for display
+                    results_path = artifacts_subdir / "results.log"
+                    bench_path = artifacts_subdir / "benchmark.jsonl"
+                    if results_path.is_file():
+                        try:
+                            result_frames = _parse_results_log(
+                                results_path.read_text(encoding="utf-8", errors="replace")
+                            )[:50]
+                        except OSError:
+                            pass
+                    if bench_path.is_file():
+                        try:
+                            bench_records = _parse_benchmark_jsonl(
+                                bench_path.read_text(encoding="utf-8", errors="replace")
+                            )
+                            frame_recs = [r for r in bench_records if r.get("record_type") == "frame"]
+                            if frame_recs:
+                                success_recs = [f for f in frame_recs if f.get("success", True)]
+                                infer_ms_vals = [
+                                    f.get("inference_seconds", 0) * 1000 for f in success_recs
+                                ]
+                                benchmark_summary = {
+                                    "frame_count": len(frame_recs),
+                                    "successful_frames": len(success_recs),
+                                    "mean_inference_ms": (
+                                        round(sum(infer_ms_vals) / len(infer_ms_vals), 2)
+                                        if infer_ms_vals else None
+                                    ),
+                                }
+                        except OSError:
+                            pass
 
             updates: Dict[str, Any] = {
                 "status": status_str,
@@ -473,6 +607,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 updates["artifacts"] = artifact_rel_paths
             if script_manifest is not None:
                 updates["script_manifest"] = script_manifest
+            if result_frames:
+                updates["result_frames"] = result_frames
+            if benchmark_summary is not None:
+                updates["benchmark_summary"] = benchmark_summary
 
             # finalize_run is a no-op if the run is already terminal (idempotency guard).
             run_store.finalize_run(rid, updates)
@@ -585,12 +723,19 @@ def _build_ros_env(
     params: Dict[str, Any],
     cfg: Dict[str, Any],
     artifact_dir: Optional[pathlib.Path] = None,
+    start_worker: bool = True,
 ) -> Dict[str, str]:
     """Build a subprocess environment for the ROS experiment script.
 
     Only allowlisted parameters are passed; no arbitrary values are forwarded.
     When *artifact_dir* is supplied it is set as ARTIFACT_DIR so the script
     knows where to write result/metrics files.
+
+    When *start_worker* is ``False`` the environment variable ``START_WORKER``
+    is set to ``"false"`` and ``WORKER_SOCKET_PATH`` is forwarded from the
+    console's configured socket path.  The script then connects the ROS adapter
+    to the already-running standalone service instead of launching its own
+    worker.
     """
     env = os.environ.copy()
     _map: Dict[str, str] = {
@@ -613,6 +758,12 @@ def _build_ros_env(
         env["ARTIFACT_DIR"] = str(artifact_dir)
     elif cfg.get("artifact_dir"):
         env["ARTIFACT_DIR"] = str(cfg["artifact_dir"])
+    # External-service mode: signal the script not to start its own worker.
+    if not start_worker:
+        env["START_WORKER"] = "false"
+        socket_path = cfg.get("socket_path", "")
+        if socket_path:
+            env["WORKER_SOCKET_PATH"] = socket_path
     return env
 
 
@@ -687,23 +838,38 @@ def _render_runs_table(runs: list) -> str:
         run_id = html.escape(r.get("run_id", ""))
         kind = html.escape(r.get("kind", ""))
         created = html.escape(r.get("created_at", ""))
+        status = html.escape(r.get("status", ""))
         success = r.get("success", None)
         badge = ""
         if success is True:
             badge = "<span class='badge ok'>OK</span>"
         elif success is False:
             badge = "<span class='badge fail'>FAIL</span>"
+        elif status in ("running", "starting"):
+            badge = "<span class='badge running'>Running</span>"
+        # Latency: inference_seconds for standalone; mean_inference_ms for ROS
+        latency_str = ""
+        if kind == "standalone":
+            secs = r.get("inference_seconds")
+            if secs is not None:
+                latency_str = f"{secs:.3f} s"
+        elif kind == "ros":
+            bsumm = r.get("benchmark_summary") or {}
+            mean_ms = bsumm.get("mean_inference_ms")
+            if mean_ms is not None:
+                latency_str = f"{mean_ms:.0f} ms"
         rows.append(
             f"<tr>"
-            f"<td><a href='#' onclick=\"loadRun('{run_id}')\">{run_id[:8]}…</a></td>"
+            f"<td><a href='#' onclick=\"loadRun('{run_id}'); return false;\">{run_id[:8]}…</a></td>"
             f"<td>{kind}</td>"
-            f"<td>{created}</td>"
             f"<td>{badge}</td>"
+            f"<td>{created[:19].replace('T', ' ')}</td>"
+            f"<td>{latency_str}</td>"
             f"</tr>"
         )
     return (
         "<table class='runs'><thead><tr>"
-        "<th>Run</th><th>Kind</th><th>Created</th><th>Status</th>"
+        "<th>Run</th><th>Kind</th><th>Status</th><th>Created</th><th>Latency</th>"
         "</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
@@ -729,9 +895,25 @@ _INDEX_TEMPLATE = """\
 <main>
 
 <section id="status-section">
-  <h2>Status</h2>
-  <pre id="status-out">Loading…</pre>
-  <button onclick="refreshStatus()">Refresh</button>
+  <h2>Status <button onclick="refreshStatus()" style="margin-left:0.5rem">Refresh</button></h2>
+  <div id="status-cards" class="card-grid">
+    <div class="status-card" id="service-card">
+      <div class="card-title">Inference Service</div>
+      <div id="service-details"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="status-card" id="gpu-card">
+      <div class="card-title">GPU</div>
+      <div id="gpu-details"><span class="muted">Loading…</span></div>
+    </div>
+    <div class="status-card" id="active-run-card">
+      <div class="card-title">Active ROS Run</div>
+      <div id="active-run-status"><span class="muted">None</span></div>
+    </div>
+  </div>
+  <details class="raw-details">
+    <summary>Raw status JSON</summary>
+    <pre id="status-out"></pre>
+  </details>
 </section>
 
 <section id="infer-section">
@@ -745,7 +927,11 @@ _INDEX_TEMPLATE = """\
     <label>top-k: <input type="number" name="top_k" value="20" min="1" max="200"></label><br>
     <button type="button" onclick="submitInfer()">Run Inference</button>
   </form>
-  <pre id="infer-out"></pre>
+  <div id="infer-result-card" style="display:none" class="result-card"></div>
+  <details id="infer-raw-details" class="raw-details" style="display:none">
+    <summary>Full record (JSON)</summary>
+    <pre id="infer-out"></pre>
+  </details>
 </section>
 
 <section id="ros-section">
@@ -771,12 +957,16 @@ _INDEX_TEMPLATE = """\
     <label>Required results: <input id="ros-required" type="number" value="1" min="1" max="100"></label><br>
     <button type="button" onclick="startRos()">Start ROS Experiment</button>
   </div>
-  <pre id="ros-out"></pre>
+  <div id="ros-start-out" style="display:none" class="muted"></div>
   <div id="ros-logs-area" style="display:none">
     <h3>Live Logs</h3>
     <pre id="ros-logs"></pre>
     <button onclick="pollLogs()">Refresh Logs</button>
   </div>
+  <details id="ros-raw-details" class="raw-details" style="display:none">
+    <summary>Raw start response (JSON)</summary>
+    <pre id="ros-out"></pre>
+  </details>
 </section>
 
 <section id="history-section">
@@ -785,7 +975,11 @@ _INDEX_TEMPLATE = """\
   <div id="runs-table">{{RUNS_TABLE}}</div>
   <div id="run-detail" style="display:none">
     <h3>Run Detail</h3>
-    <pre id="run-detail-out"></pre>
+    <div id="run-detail-cards"></div>
+    <details class="raw-details">
+      <summary>Raw JSON</summary>
+      <pre id="run-detail-out"></pre>
+    </details>
   </div>
 </section>
 
