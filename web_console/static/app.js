@@ -1413,6 +1413,8 @@ async function _openFrameDataset(datasetId) {
     var manifest = await _apiGet("/api/frame-datasets/" + datasetId);
     _frameExplorerFrames = manifest.frames || [];
     _frameExplorerSelected = 0;
+    var viewerEl = document.getElementById("frame-explorer-viewer");
+    if (viewerEl) _show(viewerEl);
     _renderFrameStrip(datasetId, manifest.frames);
     if (manifest.frames && manifest.frames.length > 0) {
       _showFrame(datasetId, 0, manifest.frames[0]);
