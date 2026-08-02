@@ -3837,6 +3837,36 @@ class TestFrameExtractorValidation(unittest.TestCase):
         ])
         self.assertIsNone(_compute_effective_end_offset(args))
 
+    def test_detect_storage_id_from_mcap_metadata(self):
+        """Storage plugin must follow metadata.yaml instead of assuming sqlite3."""
+        from scripts.extract_bag_frames import _detect_storage_id
+        with tempfile.TemporaryDirectory() as tmp:
+            bag = pathlib.Path(tmp)
+            (bag / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n  storage_identifier: mcap\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_detect_storage_id(str(bag)), "mcap")
+
+    def test_detect_storage_id_from_sqlite_metadata(self):
+        """SQLite bags remain supported through their metadata identifier."""
+        from scripts.extract_bag_frames import _detect_storage_id
+        with tempfile.TemporaryDirectory() as tmp:
+            bag = pathlib.Path(tmp)
+            (bag / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n  storage_identifier: sqlite3\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_detect_storage_id(str(bag)), "sqlite3")
+
+    def test_detect_storage_id_falls_back_to_extension(self):
+        """Direct or incomplete bag paths use their data-file extension."""
+        from scripts.extract_bag_frames import _detect_storage_id
+        with tempfile.TemporaryDirectory() as tmp:
+            bag = pathlib.Path(tmp)
+            (bag / "data_0.mcap").touch()
+            self.assertEqual(_detect_storage_id(str(bag)), "mcap")
+
     def test_manifest_records_effective_end_offset_sec(self):
         """build_extraction_args must pass --duration; manifest field must be present."""
         from web_console.frame_extractor import ExtractionParams, build_extraction_args
