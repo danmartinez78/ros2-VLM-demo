@@ -4884,6 +4884,24 @@ class TestExtractionPanelUI(unittest.TestCase):
         self.assertIn("function _onExtractTopicAdvancedToggle(", self._js)
         self.assertIn("manual override", self._js)
 
+    def test_app_js_requires_valid_topic_before_extraction(self):
+        """The extraction button must remain disabled until a topic is selected."""
+        start = self._js.find("function _onExtractBagChange(")
+        end = self._js.find("function _onExtractTopicSelectionChange(", start)
+        self.assertGreater(start, -1)
+        self.assertGreater(end, start)
+        body = self._js[start:end]
+        self.assertIn("startBtn.disabled = true", body)
+        self.assertIn(": !topicSel.value", body)
+
+    def test_manual_topic_input_updates_button_state(self):
+        """Advanced manual entry must react to input and require non-empty text."""
+        self.assertIn('oninput="_onExtractTopicAdvancedToggle()"', self._html)
+        start = self._js.find("function _onExtractTopicAdvancedToggle(")
+        self.assertGreater(start, -1)
+        body = self._js[start:]
+        self.assertIn("startBtn.disabled = !input.value.trim()", body)
+
     def test_app_js_handles_no_supported_topic_state(self):
         self.assertIn("no raw Image topics discovered", self._js)
         self.assertIn("CompressedImage topics require decoding", self._js)
