@@ -6393,7 +6393,403 @@ class TestSequencesApiEndpoint(unittest.TestCase):
         # "source_path" should never appear in any serialised sequence.
         self.assertNotIn("source_path", serialised)
 
+    def test_get_sequences_no_absolute_paths_in_provenance(self):
+        """Provenance must not contain absolute server-side paths."""
+        status, data = self._get("/api/sequences")
+        self.assertEqual(status, 200)
+        serialised = json.dumps(data)
+        # Real filesystem path prefixes must not leak.
+        for prefix in ("/tmp", "/data", "/home", "/var", "/opt"):
+            self.assertNotIn(prefix, serialised,
+                             msg=f"Server path prefix {prefix!r} found in response")
 
+
+class TestJaadLabelIndexSchema(unittest.TestCase):
+    """Tests for the canonical {"clips": [...]} label index schema."""
+
+    def _make_jaad_dir_with_clips_schema(
+        self,
+        tmp: pathlib.Path,
+        clips: int = 2,
+    ) -> pathlib.Path:
+        """Build a JAAD directory with the canonical {"clips":[...]} index."""
+        clips_dir = tmp / "extracted" / "JAAD_clips"
+        clips_dir.mkdir(parents=True)
+        prepared = tmp / "prepared"
+        prepared.mkdir(exist_ok=True)
+
+        clip_entries = []
+        for i in range(1, clips + 1):
+            stem = f"video_{i:04d}"
+            (clips_dir / f"{stem}.mp4").write_bytes(b"FAKE_MP4_DATA")
+            clip_entries.append({
+                "clip_id": stem,
+                "track_count": 3,
+                "crossing_count": 12,
+                "not_crossing_count": 6,
+                "walking_count": 9,
+            })
+        index = {"clips": clip_entries}
+        (prepared / "jaad-clip-label-index.json").write_text(
+            json.dumps(index), encoding="utf-8"
+        )
+        return tmp
+
+    def test_canonical_clips_schema_parsed(self):
+        """discover_jaad_clips reads stats from {"clips":[...]} index."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir_with_clips_schema(pathlib.Path(tmp), clips=2)
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 2)
+            for s in seqs:
+                summary = s.annotation_summary
+                self.assertEqual(summary.get("track_count"), 3,
+                                 msg=f"track_count not loaded from clips schema for {s.sequence_id}")
+                self.assertEqual(summary.get("crossing_count"), 12)
+                self.assertEqual(summary.get("not_crossing_count"), 6)
+
+    def test_canonical_clips_schema_preferred_over_xml(self):
+        """When canonical index exists, XML is not parsed (even if present)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir_with_clips_schema(pathlib.Path(tmp), clips=1)
+            # Add an XML annotation with different counts.
+            ann_dir = root / "annotations"
+            ann_dir.mkdir(exist_ok=True)
+            xml = (
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<annotations>\n"
+                "  <meta><task>"
+                "<start_frame>0</start_frame><stop_frame>99</stop_frame>"
+                "</task></meta>\n"
+                '  <track id="0" label="pedestrian">\n'
+                '    <box frame="0" outside="0"><attribute name="cross">crossing</attribute>'
+                "</box>\n"
+                "  </track>\n"
+                "</annotations>\n"
+            )
+            (ann_dir / "video_0001.xml").write_text(xml, encoding="utf-8")
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 1)
+            # Stats must come from the index (track_count=3), not XML (track_count=1).
+            self.assertEqual(seqs[0].annotation_summary.get("track_count"), 3)
+
+    def test_xml_fallback_when_clip_missing_from_index(self):
+        """When index exists but a clip is absent, XML fallback is used."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            clips_dir = root / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            prepared = root / "prepared"
+            prepared.mkdir(exist_ok=True)
+            ann_dir = root / "annotations"
+            ann_dir.mkdir(exist_ok=True)
+
+            # Only video_0001 in the index; video_0002 is absent.
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            (clips_dir / "video_0002.mp4").write_bytes(b"FAKE")
+            index = {"clips": [{"clip_id": "video_0001", "track_count": 7}]}
+            (prepared / "jaad-clip-label-index.json").write_text(
+                json.dumps(index), encoding="utf-8"
+            )
+            # XML annotation for video_0002 only.
+            xml = (
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<annotations>\n"
+                "  <meta><task>"
+                "<start_frame>0</start_frame><stop_frame>49</stop_frame>"
+                "</task></meta>\n"
+                '  <track id="0" label="pedestrian">\n'
+                '    <box frame="0" outside="0">'
+                '<attribute name="cross">not-crossing</attribute></box>\n'
+                "  </track>\n"
+                "</annotations>\n"
+            )
+            (ann_dir / "video_0002.xml").write_text(xml, encoding="utf-8")
+
+            seqs = {s.sequence_id: s for s in discover_jaad_clips(root)}
+            self.assertIn("video_0001", seqs)
+            self.assertIn("video_0002", seqs)
+            # video_0001 gets stats from the index.
+            self.assertEqual(seqs["video_0001"].annotation_summary.get("track_count"), 7)
+            # video_0002 must fall back to XML (not_crossing_count ≥ 1).
+            self.assertGreaterEqual(
+                seqs["video_0002"].annotation_summary.get("not_crossing_count", 0), 1,
+                msg="XML fallback not used for clip absent from label index",
+            )
+
+    def test_load_jaad_clip_label_index_clips_format(self):
+        """_load_jaad_clip_label_index normalises the {"clips":[...]} format."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prepared = root / "prepared"
+            prepared.mkdir()
+            data = {"clips": [
+                {"clip_id": "video_0001", "track_count": 5},
+                {"clip_id": "video_0002", "track_count": 8},
+            ]}
+            (prepared / "jaad-clip-label-index.json").write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+            result = _load_jaad_clip_label_index(root)
+            self.assertIsNotNone(result)
+            self.assertIn("video_0001", result)
+            self.assertIn("video_0002", result)
+            self.assertEqual(result["video_0001"]["track_count"], 5)
+            self.assertEqual(result["video_0002"]["track_count"], 8)
+
+    def test_load_jaad_clip_label_index_legacy_flat_format(self):
+        """_load_jaad_clip_label_index still accepts the legacy flat dict format."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prepared = root / "prepared"
+            prepared.mkdir()
+            data = {
+                "video_0001": {"track_count": 2},
+                "video_0002": {"track_count": 4},
+            }
+            (prepared / "jaad-clip-label-index.json").write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+            result = _load_jaad_clip_label_index(root)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["video_0001"]["track_count"], 2)
+            self.assertEqual(result["video_0002"]["track_count"], 4)
+
+
+class TestSequenceFrameEndpoint(unittest.TestCase):
+    """Tests for GET /api/sequences/<dataset_id>/<sequence_id>/frames/<n>."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+
+        # Build a tiny nuScenes-style JAAD fixture: one JPEG "frame".
+        # We create a nuscenes_scene entry via direct SequenceEntry construction
+        # so we can inject a real JPEG path without needing an actual nuScenes install.
+        cls.jpeg_path = cls.tmpdir / "frame_0000.jpg"
+        # Minimal valid JPEG header bytes.
+        cls.jpeg_path.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(cls.tmpdir / "runs"),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        # Pre-populate the sequence catalog cache with a synthetic nuScenes entry
+        # that points at the real JPEG we wrote above.
+        fr = FrameRef(
+            index=0,
+            source_id="synthetic-frame-0",
+            timestamp_us=0,
+            source_path=str(cls.jpeg_path),
+            metadata={},
+        )
+        synthetic_seq = SequenceEntry(
+            dataset_id="nuscenes",
+            sequence_id="scene-test",
+            adapter="nuscenes_scene",
+            display_name="Synthetic scene",
+            description="CI fixture",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [synthetic_seq]
+
+        # Also add a ros_static_fixture entry to test the 422 path.
+        bag_dir = cls.tmpdir / "fake_bag"
+        bag_dir.mkdir()
+        fr_ros = FrameRef(
+            index=0,
+            source_id="ros-frame-0",
+            timestamp_us=0,
+            source_path=str(bag_dir),
+            metadata={},
+        )
+        ros_seq = SequenceEntry(
+            dataset_id="ros",
+            sequence_id="fixture-01",
+            adapter="ros_static_fixture",
+            display_name="Fixture",
+            description="",
+            frame_count=1,
+            frame_refs=[fr_ros],
+            annotation_ref=None,
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries.append(ros_seq)
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, body
+
+    def test_nuscenes_frame_returns_200_and_jpeg(self):
+        """A nuScenes frame that exists as a JPEG file is served correctly."""
+        status, body = self._get("/api/sequences/nuscenes/scene-test/frames/0")
+        self.assertEqual(status, 200)
+        # JPEG files start with FF D8.
+        self.assertTrue(body[:2] == b"\xff\xd8",
+                        msg="Response body is not a JPEG")
+
+    def test_unknown_sequence_returns_404(self):
+        status, body = self._get("/api/sequences/nuscenes/nonexistent/frames/0")
+        self.assertEqual(status, 404)
+
+    def test_unknown_dataset_returns_404(self):
+        status, body = self._get("/api/sequences/unknown-ds/scene-test/frames/0")
+        self.assertEqual(status, 404)
+
+    def test_ros_fixture_returns_422(self):
+        """ros_static_fixture entries cannot serve frames directly."""
+        status, body = self._get("/api/sequences/ros/fixture-01/frames/0")
+        self.assertEqual(status, 422)
+
+    def test_invalid_dataset_id_returns_400(self):
+        status, body = self._get("/api/sequences/../evil/scene-test/frames/0")
+        # Router should not match the path-traversal pattern.
+        self.assertIn(status, (400, 404))
+
+    def test_out_of_range_frame_index_returns_400_or_404(self):
+        # The regex only matches \d{1,5} so an 8-digit index is a 404.
+        status, body = self._get("/api/sequences/nuscenes/scene-test/frames/99999999")
+        self.assertIn(status, (400, 404))
+
+
+class TestSequencesExperimentEndpoint(unittest.TestCase):
+    """Tests for POST /api/sequences/experiment."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+
+        # Real JPEG for materialisation.
+        cls.jpeg_path = cls.tmpdir / "frame_0.jpg"
+        cls.jpeg_path.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(cls.tmpdir / "runs"),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        fr = FrameRef(
+            index=0,
+            source_id="sf0",
+            timestamp_us=0,
+            source_path=str(cls.jpeg_path),
+            metadata={},
+        )
+        nuscenes_seq = SequenceEntry(
+            dataset_id="nuscenes",
+            sequence_id="scene-exp",
+            adapter="nuscenes_scene",
+            display_name="Exp scene",
+            description="",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+        )
+        ros_seq = SequenceEntry(
+            dataset_id="ros",
+            sequence_id="fixture-exp",
+            adapter="ros_static_fixture",
+            display_name="ROS fixture",
+            description="",
+            frame_count=0,
+            frame_refs=[],
+            annotation_ref=None,
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [nuscenes_seq, ros_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _post(self, path, payload):
+        body = json.dumps(payload).encode()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, json.loads(raw.decode()) if raw else {}
+
+    def test_missing_dataset_id_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "sequence_id": "scene-exp",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
+
+    def test_missing_sequence_id_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "nuscenes",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
+
+    def test_unknown_sequence_returns_404(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "nuscenes",
+            "sequence_id": "does-not-exist",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 404)
+
+    def test_ros_fixture_returns_422(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "ros",
+            "sequence_id": "fixture-exp",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 422)
+
+    def test_missing_task_prompt_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "nuscenes",
+            "sequence_id": "scene-exp",
+        })
+        self.assertEqual(status, 400)
+
+    def test_path_traversal_dataset_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "../../etc",
+            "sequence_id": "scene-exp",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":

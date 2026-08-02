@@ -290,7 +290,6 @@ def discover_ros_static_fixtures(
                 provenance={
                     "source": "rosbag",
                     "bag_key": bag_key,
-                    "local_path": local_path,
                 },
             )
         )
@@ -448,7 +447,6 @@ def discover_nuscenes_scenes(
                     "scene_token": str(scene_rec.get("token", "")),
                     "scene_name": scene_name,
                     "channel": channel,
-                    "nuscenes_root": str(nuscenes_root),
                 },
             )
         )
@@ -617,13 +615,31 @@ def _load_jaad_clip_label_index(
     """Load the pre-built JAAD clip label index if present.
 
     Looks for ``prepared/jaad-clip-label-index.json`` under *jaad_root*.
+    Normalises two formats into a ``{clip_id: entry}`` mapping:
+
+    * New format (canonical): ``{"clips": [{"clip_id": "video_0001", ...}, ...]}``
+    * Legacy flat format: ``{"video_0001": {...}, ...}``
+
     Returns None if the file is absent or unparseable.
     """
     idx_path = jaad_root / "prepared" / "jaad-clip-label-index.json"
     data = _load_json_file(idx_path)
     if not isinstance(data, dict):
         return None
-    return data
+    # Normalise {"clips": [...]} list format → {clip_id: entry} mapping.
+    if "clips" in data and isinstance(data["clips"], list):
+        normalised: Dict[str, Any] = {}
+        for entry in data["clips"]:
+            if not isinstance(entry, dict):
+                continue
+            cid = entry.get("clip_id") or entry.get("stem") or ""
+            if cid:
+                normalised[str(cid)] = entry
+        return normalised if normalised else None
+    # Legacy flat dict: {clip_id: entry} — return as-is if values are dicts.
+    if all(isinstance(v, dict) for v in data.values()):
+        return data
+    return None
 
 
 def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
@@ -699,6 +715,10 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
             clip_entry = label_index.get(stem)
             if isinstance(clip_entry, dict):
                 annotation_summary.update(clip_entry)
+            elif primary_annotation_path is not None:
+                # Clip not found in index — fall back to XML for this clip.
+                xml_summary = _parse_jaad_xml_summary(primary_annotation_path)
+                annotation_summary.update(xml_summary)
         elif primary_annotation_path is not None:
             xml_summary = _parse_jaad_xml_summary(primary_annotation_path)
             annotation_summary.update(xml_summary)
@@ -756,9 +776,7 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
                 provenance={
                     "source": "jaad",
                     "video_stem": stem,
-                    "video_path": str(mp4_path),
                     "video_metadata": vid_meta,
-                    "jaad_root": str(jaad_root),
                 },
             )
         )
@@ -770,19 +788,26 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
 
 
 def resolve_sequence_frame_path(
-    sequences: List[SequenceEntry],
+    sequences: List["SequenceEntry"],
     dataset_id: str,
     sequence_id: str,
     frame_index: int,
 ) -> Optional[Path]:
     """Return the server-side source path for a specific frame.
 
-    Used during materialisation; the result is never forwarded to the browser.
+    For ``nuscenes_scene`` entries the source path is the absolute JPEG path
+    and the return value can be served directly as an image.
+
+    For ``jaad_clip`` entries the source path is the MP4 file; use
+    :func:`materialize_sequence_frame` to extract individual JPEG bytes.
+
+    For ``ros_static_fixture`` entries the source path is a bag directory; frame
+    extraction requires the rosbag extraction pipeline and returns ``None`` here.
 
     Parameters
     ----------
     sequences:
-        Pre-discovered sequence list from ``discover_sequences()``.
+        Pre-discovered sequence list (``SequenceEntry`` objects, not dicts).
     dataset_id:
         Dataset identifier (browser-provided, validated against catalog).
     sequence_id:
@@ -801,14 +826,164 @@ def resolve_sequence_frame_path(
         if seq.dataset_id == dataset_id and seq.sequence_id == sequence_id:
             for fr in seq.frame_refs:
                 if fr.index == frame_index:
-                    p = Path(fr.source_path)
-                    if p.exists():
+                    sp = fr.source_path
+                    if not sp:
+                        return None
+                    p = Path(sp)
+                    # Only return the path when it points to a regular file.
+                    # ROS bag source_paths are directories and are rejected here.
+                    if p.is_file():
                         return p
             return None
     return None
 
 
+def _extract_mp4_frame_bytes(mp4_path: Path, frame_index: int) -> Optional[bytes]:
+    """Extract a single frame from an MP4 as JPEG bytes using ffmpeg.
+
+    Uses ``ffmpeg``'s ``select`` filter to pick the exact zero-based frame.
+    Returns ``None`` if ``ffmpeg`` is unavailable or the extraction fails.
+    Never raises.
+    """
+    try:
+        import subprocess as _sp
+        proc = _sp.run(
+            [
+                "ffmpeg", "-y",
+                "-i", str(mp4_path),
+                "-vf", f"select=eq(n\\,{int(frame_index)})",
+                "-vsync", "0",
+                "-vframes", "1",
+                "-f", "image2",
+                "-vcodec", "mjpeg",
+                "pipe:1",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            return proc.stdout
+    except Exception:
+        pass
+    return None
+
+
+def materialize_sequence_frame(
+    sequences: List["SequenceEntry"],
+    dataset_id: str,
+    sequence_id: str,
+    frame_index: int,
+) -> Optional[bytes]:
+    """Return JPEG bytes for a single sequence frame.
+
+    Handles per-adapter extraction logic:
+
+    ``nuscenes_scene``
+        Reads the existing JPEG directly from ``source_path``.
+    ``jaad_clip``
+        Calls ``ffmpeg`` to extract frame *frame_index* from the MP4.
+        Returns ``None`` when ``ffmpeg`` is unavailable.
+    ``ros_static_fixture``
+        Always returns ``None`` — use the rosbag extraction pipeline instead.
+
+    Parameters
+    ----------
+    sequences:
+        Raw ``SequenceEntry`` list (not serialised dicts).
+    dataset_id, sequence_id, frame_index:
+        Frame identity; validated against the catalog before any I/O.
+
+    Returns
+    -------
+    bytes or None
+        JPEG image bytes, or ``None`` when the frame cannot be materialised.
+    """
+    if not _is_safe_id(dataset_id) or not _is_safe_id(sequence_id):
+        return None
+    for seq in sequences:
+        if seq.dataset_id != dataset_id or seq.sequence_id != sequence_id:
+            continue
+        for fr in seq.frame_refs:
+            if fr.index != frame_index:
+                continue
+            if seq.adapter == "ros_static_fixture":
+                return None
+            sp = fr.source_path
+            if not sp:
+                return None
+            p = Path(sp)
+            if not p.exists():
+                return None
+            if seq.adapter == "nuscenes_scene":
+                # source_path is already a JPEG/PNG image file.
+                try:
+                    return p.read_bytes()
+                except OSError:
+                    return None
+            if seq.adapter == "jaad_clip":
+                # source_path is the MP4; extract the specific frame.
+                return _extract_mp4_frame_bytes(p, frame_index)
+        return None
+    return None
+
+
 # ── public API ────────────────────────────────────────────────────────────────
+
+
+def _build_sequence_list(
+    rosbag_catalog_entries: Optional[List[Dict[str, Any]]],
+    nuscenes_root: Optional[str],
+    jaad_root: Optional[str],
+) -> Tuple[List["SequenceEntry"], List[str]]:
+    """Build a raw ``SequenceEntry`` list from all configured adapters.
+
+    Returns ``(entries, errors)`` where *errors* is a list of non-fatal
+    discovery error strings.  Paths in *entries* are server-side only and
+    must never be forwarded to the browser.
+
+    This is the internal counterpart of :func:`discover_sequences`; the server
+    calls it directly when it needs the raw entries for frame serving or
+    sequence-based experiments.
+    """
+    sequences: List[SequenceEntry] = []
+    errors: List[str] = []
+
+    # ── ros_static_fixture ────────────────────────────────────────────────────
+    if rosbag_catalog_entries:
+        try:
+            sequences.extend(discover_ros_static_fixtures(rosbag_catalog_entries))
+        except Exception as exc:
+            errors.append(f"ros_static_fixture discovery error: {exc}")
+
+    # ── nuscenes_scene ────────────────────────────────────────────────────────
+    if nuscenes_root is None:
+        nuscenes_root = os.environ.get("NUSCENES_DIR", "")
+    if not nuscenes_root:
+        here = Path(__file__).parent.parent
+        candidate = here / "test_data" / "datasets" / "nuscenes-mini"
+        if candidate.is_dir():
+            nuscenes_root = str(candidate)
+    if nuscenes_root:
+        try:
+            sequences.extend(discover_nuscenes_scenes(Path(nuscenes_root)))
+        except Exception as exc:
+            errors.append(f"nuscenes_scene discovery error: {exc}")
+
+    # ── jaad_clip ─────────────────────────────────────────────────────────────
+    if jaad_root is None:
+        jaad_root = os.environ.get("JAAD_DIR", "")
+    if not jaad_root:
+        here = Path(__file__).parent.parent
+        candidate = here / "test_data" / "datasets" / "jaad"
+        if candidate.is_dir():
+            jaad_root = str(candidate)
+    if jaad_root:
+        try:
+            sequences.extend(discover_jaad_clips(Path(jaad_root)))
+        except Exception as exc:
+            errors.append(f"jaad_clip discovery error: {exc}")
+
+    return sequences, errors
 
 
 def discover_sequences(
@@ -842,48 +1017,10 @@ def discover_sequences(
         ``adapter_counts``   — {adapter: count} summary
         ``errors``           — list of non-fatal error strings encountered
     """
-    sequences: List[SequenceEntry] = []
-    errors: List[str] = []
+    sequences, errors = _build_sequence_list(
+        rosbag_catalog_entries, nuscenes_root, jaad_root
+    )
 
-    # ── ros_static_fixture ────────────────────────────────────────────────────
-    if rosbag_catalog_entries:
-        try:
-            static_seqs = discover_ros_static_fixtures(rosbag_catalog_entries)
-            sequences.extend(static_seqs)
-        except Exception as exc:
-            errors.append(f"ros_static_fixture discovery error: {exc}")
-
-    # ── nuscenes_scene ────────────────────────────────────────────────────────
-    if nuscenes_root is None:
-        nuscenes_root = os.environ.get("NUSCENES_DIR", "")
-    if not nuscenes_root:
-        here = Path(__file__).parent.parent
-        candidate = here / "test_data" / "datasets" / "nuscenes-mini"
-        if candidate.is_dir():
-            nuscenes_root = str(candidate)
-    if nuscenes_root:
-        try:
-            nu_seqs = discover_nuscenes_scenes(Path(nuscenes_root))
-            sequences.extend(nu_seqs)
-        except Exception as exc:
-            errors.append(f"nuscenes_scene discovery error: {exc}")
-
-    # ── jaad_clip ─────────────────────────────────────────────────────────────
-    if jaad_root is None:
-        jaad_root = os.environ.get("JAAD_DIR", "")
-    if not jaad_root:
-        here = Path(__file__).parent.parent
-        candidate = here / "test_data" / "datasets" / "jaad"
-        if candidate.is_dir():
-            jaad_root = str(candidate)
-    if jaad_root:
-        try:
-            jaad_seqs = discover_jaad_clips(Path(jaad_root))
-            sequences.extend(jaad_seqs)
-        except Exception as exc:
-            errors.append(f"jaad_clip discovery error: {exc}")
-
-    # ── build grouped output ─────────────────────────────────────────────────
     seq_dicts = [s.to_dict() for s in sequences]
 
     by_dataset: Dict[str, List[Dict[str, Any]]] = {}
@@ -900,3 +1037,4 @@ def discover_sequences(
         "adapter_counts": adapter_counts,
         "errors": errors,
     }
+

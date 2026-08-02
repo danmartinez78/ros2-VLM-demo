@@ -27,6 +27,8 @@ GET  /api/runs/<run_id>/reviews                 → JSON list of review annotati
 POST /api/runs/<run_id>/reviews                 → JSON body → upsert review annotation
 GET  /api/compare                               → JSON comparison of two runs aligned by frame
 GET  /api/sequences                             → JSON list of all discovered sequences (ros_static_fixture, nuscenes_scene, jaad_clip)
+GET  /api/sequences/<dataset_id>/<sequence_id>/frames/<n> → JPEG frame from sequence catalog (nuScenes or JAAD)
+POST /api/sequences/experiment                  → JSON body → run experiment from sequence catalog selection
 """
 from __future__ import annotations
 
@@ -48,7 +50,12 @@ from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
 from .dataset_catalog import build_download_command, discover_datasets
-from .sequence_catalog import discover_sequences
+from .sequence_catalog import (
+    SequenceEntry,
+    _build_sequence_list,
+    discover_sequences,
+    materialize_sequence_frame,
+)
 from .experiment_engine import (
     ExperimentDefinition,
     _VALID_STRATEGIES,
@@ -478,6 +485,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_list_frame_datasets()
             elif path == "/api/compare":
                 self._api_compare_runs(parsed)
+            elif _SEQ_FRAME_RE.match(path):
+                m = _SEQ_FRAME_RE.match(path)
+                self._api_serve_sequence_frame(m.group(1), m.group(2), int(m.group(3)))
             elif _RUN_RE.match(path) and path.endswith("/logs"):
                 run_id = _RUN_RE.match(path).group(1)
                 self._api_get_run_logs(run_id)
@@ -513,6 +523,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_ros_stop()
             elif path == "/api/experiment/run":
                 self._api_experiment_run()
+            elif path == "/api/sequences/experiment":
+                self._api_sequences_experiment()
             elif _EXPERIMENT_CANCEL_RE.match(path):
                 run_id = _EXPERIMENT_CANCEL_RE.match(path).group(1)
                 self._api_experiment_cancel(run_id)
@@ -998,6 +1010,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         Uses ``discover_sequences()`` with dataset roots from the server config.
         The response includes ``ros_static_fixture``, ``nuscenes_scene``, and
         ``jaad_clip`` sequences; source paths are never included in the response.
+        Also refreshes the server-side sequence catalog cache used by the frame
+        serving and sequence experiment endpoints.
         """
         cfg = self.server_instance.config
         catalog = discover_datasets(
@@ -1005,12 +1019,411 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             image_root=cfg.get("image_dataset_dir"),
             video_root=cfg.get("video_dataset_dir"),
         )
-        result = discover_sequences(
+        # Build raw entries (with source paths) for the server cache.
+        entries, errors = _build_sequence_list(
             rosbag_catalog_entries=catalog.get("rosbags", []),
             nuscenes_root=cfg.get("nuscenes_dir"),
             jaad_root=cfg.get("jaad_dir"),
         )
-        self._send_json(200, result)
+        srv = self.server_instance
+        with srv._sequence_catalog_lock:
+            srv._sequence_catalog_entries = entries
+
+        # Serialise for the browser (source paths excluded via to_dict()).
+        seq_dicts = [s.to_dict() for s in entries]
+        by_dataset: Dict[str, Any] = {}
+        for s in seq_dicts:
+            by_dataset.setdefault(s["dataset_id"], []).append(s)
+        adapter_counts: Dict[str, int] = {}
+        for s in entries:
+            adapter_counts[s.adapter] = adapter_counts.get(s.adapter, 0) + 1
+        self._send_json(200, {
+            "sequences": seq_dicts,
+            "by_dataset": by_dataset,
+            "adapter_counts": adapter_counts,
+            "errors": errors,
+        })
+
+    def _get_sequence_entries(self) -> list:
+        """Return the cached sequence entries, rebuilding if empty.
+
+        Used by frame-serving and experiment endpoints that need server-side
+        source paths.  Never returns ``None``.
+        """
+        srv = self.server_instance
+        with srv._sequence_catalog_lock:
+            if srv._sequence_catalog_entries is not None:
+                return srv._sequence_catalog_entries
+
+        # Cache is empty — build fresh.
+        cfg = srv.config
+        catalog = discover_datasets(
+            rosbag_root=cfg.get("rosbag_dir"),
+            image_root=cfg.get("image_dataset_dir"),
+            video_root=cfg.get("video_dataset_dir"),
+        )
+        entries, _errors = _build_sequence_list(
+            rosbag_catalog_entries=catalog.get("rosbags", []),
+            nuscenes_root=cfg.get("nuscenes_dir"),
+            jaad_root=cfg.get("jaad_dir"),
+        )
+        with srv._sequence_catalog_lock:
+            srv._sequence_catalog_entries = entries
+        return entries
+
+    def _api_serve_sequence_frame(
+        self, dataset_id: str, sequence_id: str, frame_index: int
+    ) -> None:
+        """Serve a single frame from the sequence catalog as a JPEG.
+
+        Validates ``dataset_id`` and ``sequence_id`` against the server-side
+        sequence catalog before performing any I/O.  Never reads arbitrary
+        filesystem paths supplied by the browser.
+
+        For ``nuscenes_scene`` entries the pre-existing JPEG is streamed
+        directly.  For ``jaad_clip`` entries ``ffmpeg`` is used to extract the
+        frame; a 422 is returned when ``ffmpeg`` is not available.
+        ``ros_static_fixture`` entries require the rosbag extraction pipeline
+        and return 422.
+        """
+        from .sequence_catalog import _is_safe_id as _sid_check
+        if not _sid_check(dataset_id) or not _sid_check(sequence_id):
+            self._send_error(400, "Invalid dataset_id or sequence_id")
+            return
+        if frame_index < 0 or frame_index > _MAX_FRAME_INDEX:
+            self._send_error(400, "Frame index out of range")
+            return
+
+        entries = self._get_sequence_entries()
+        data = materialize_sequence_frame(
+            entries, dataset_id, sequence_id, frame_index
+        )
+        if data is None:
+            # Check if the sequence/frame exists at all to give a better error.
+            found_seq = any(
+                s.dataset_id == dataset_id and s.sequence_id == sequence_id
+                for s in entries
+            )
+            if not found_seq:
+                self._send_error(404, "Sequence not found")
+                return
+            found_adapter = next(
+                (s.adapter for s in entries
+                 if s.dataset_id == dataset_id and s.sequence_id == sequence_id),
+                None,
+            )
+            if found_adapter == "ros_static_fixture":
+                self._send_error(
+                    422,
+                    "Static-fixture bags cannot serve frames directly; "
+                    "use /api/extract to extract frames first.",
+                )
+                return
+            self._send_error(
+                422,
+                "Frame could not be materialised. "
+                "Ensure ffmpeg is installed for JAAD clips.",
+            )
+            return
+        self._send_response(200, data, "image/jpeg")
+
+    def _api_sequences_experiment(self) -> None:
+        """Run a ROS-independent experiment from a sequence-catalog selection.
+
+        Accepts a JSON body with keys:
+          dataset_id             — sequence catalog dataset identifier (required)
+          sequence_id            — sequence identifier within the dataset (required)
+          frame_indices          — list of int frame indices to run (default: all)
+          profile_name           — task profile name (optional)
+          task_prompt            — task prompt (required if no profile)
+          system_instruction     — optional system instruction (overrides profile)
+          strategy               — "single_frame" or "single_frame_observation_history"
+          observation_history_max_entries  — int (default 0)
+          observation_history_max_chars    — int (default 4000)
+          max_generate_length    — int (default 96)
+          temperature            — float (default 0.2)
+          top_p                  — float (default 0.9)
+          top_k                  — int (default 20)
+          timeout_seconds        — int (default 120)
+          notes                  — optional reproducibility notes
+
+        Frames are materialised to a temporary directory that is cleaned up
+        after the experiment completes.  Image paths are never accepted from
+        the browser — they are resolved exclusively through the sequence catalog.
+
+        The run manifest records ``adapter``, ``dataset_id``, ``sequence_id``,
+        and ``frame_source_ids`` so results can be traced back to the exact
+        source frames.
+        """
+        import tempfile as _tempfile
+        import shutil as _shutil
+        from .sequence_catalog import _is_safe_id as _sid_check
+
+        cfg = self.server_instance.config
+        srv = self.server_instance
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        # ── concurrency gate ─────────────────────────────────────────────────
+        with srv._active_experiment_lock:
+            if srv._active_experiment_id is not None:
+                self._send_error(
+                    409,
+                    f"Experiment already in progress: {srv._active_experiment_id}. "
+                    "Wait for it to complete or poll /api/runs/<id> for status.",
+                )
+                return
+
+        # ── validate IDs ─────────────────────────────────────────────────────
+        dataset_id = str(body.get("dataset_id", "")).strip()
+        sequence_id = str(body.get("sequence_id", "")).strip()
+        if not _sid_check(dataset_id) or not _sid_check(sequence_id):
+            self._send_error(400, "dataset_id and sequence_id are required valid identifiers")
+            return
+
+        # ── resolve sequence from catalog ─────────────────────────────────────
+        entries = self._get_sequence_entries()
+        seq_entry = next(
+            (s for s in entries
+             if s.dataset_id == dataset_id and s.sequence_id == sequence_id),
+            None,
+        )
+        if seq_entry is None:
+            self._send_error(404, f"Sequence not found: {dataset_id!r}/{sequence_id!r}")
+            return
+
+        if seq_entry.adapter == "ros_static_fixture":
+            self._send_error(
+                422,
+                "ros_static_fixture sequences cannot be used for sequence experiments; "
+                "use /api/extract to extract frames first, then /api/experiment/run.",
+            )
+            return
+
+        # ── determine frame selection ─────────────────────────────────────────
+        frame_indices_raw = body.get("frame_indices")
+        if frame_indices_raw is not None:
+            try:
+                frame_indices = [int(i) for i in frame_indices_raw]
+            except (TypeError, ValueError):
+                self._send_error(400, "frame_indices must be a list of integers")
+                return
+        else:
+            frame_indices = [fr.index for fr in seq_entry.frame_refs]
+
+        if not frame_indices:
+            self._send_error(400, "No frames selected (sequence may have no indexed frames)")
+            return
+
+        # ── resolve profile ───────────────────────────────────────────────────
+        profile_name = str(body.get("profile_name", "")).strip() or None
+        resolved_profile = None
+        if profile_name:
+            profiles_dir = cfg.get("task_profiles_dir") or str(
+                pathlib.Path(__file__).parent.parent / "config" / "task_profiles"
+            )
+            from .task_profiles import discover_profiles, get_profile_by_name
+            profiles = discover_profiles(profiles_dir)
+            resolved_profile = get_profile_by_name(profiles, profile_name)
+            if resolved_profile is None:
+                self._send_error(404, f"Task profile not found: {profile_name!r}")
+                return
+
+        if resolved_profile is not None:
+            if "task_prompt" in body or "system_instruction" in body:
+                self._send_error(
+                    400,
+                    "task_prompt and system_instruction may not override a named profile; "
+                    "omit them or remove profile_name",
+                )
+                return
+            task_prompt = resolved_profile.task_prompt
+            system_instruction = resolved_profile.system_instruction
+        else:
+            system_instruction = str(
+                body.get(
+                    "system_instruction",
+                    "You are a vision observer. Base claims on the current image.",
+                )
+            ).strip()
+            task_prompt = str(body.get("task_prompt", "")).strip()
+
+        if not task_prompt:
+            self._send_error(
+                400,
+                "task_prompt is required (provide it directly or via profile_name)",
+            )
+            return
+
+        # Build an index map for quick lookup.
+        fr_by_index = {fr.index: fr for fr in seq_entry.frame_refs}
+
+        # ── materialise frames into a temp directory ──────────────────────────
+        try:
+            tmp_dir = pathlib.Path(_tempfile.mkdtemp(prefix="seq_exp_"))
+        except OSError as exc:
+            self._send_error(500, f"Failed to create temp directory: {exc}")
+            return
+
+        image_paths: list = []
+        source_frame_records: list = []
+        frame_source_ids: list = []
+        for fi in frame_indices:
+            frame_data = materialize_sequence_frame(entries, dataset_id, sequence_id, fi)
+            if frame_data is None:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._send_error(
+                    422,
+                    f"Frame {fi} could not be materialised from "
+                    f"{seq_entry.adapter!r} sequence. "
+                    "Ensure ffmpeg is installed for JAAD clips.",
+                )
+                return
+            img_path = tmp_dir / f"frame_{fi:06d}.jpg"
+            try:
+                img_path.write_bytes(frame_data)
+            except OSError as exc:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._send_error(500, f"Failed to write temp frame {fi}: {exc}")
+                return
+            image_paths.append(str(img_path))
+            fr_rec = fr_by_index.get(fi)
+            source_frame_records.append({
+                "frame_index": fi,
+                "source_id": fr_rec.source_id if fr_rec else None,
+                "timestamp_us": fr_rec.timestamp_us if fr_rec else None,
+            })
+            if fr_rec:
+                frame_source_ids.append(fr_rec.source_id)
+
+        # ── build ExperimentDefinition ────────────────────────────────────────
+        try:
+            defn = ExperimentDefinition(
+                strategy=str(body.get("strategy", "single_frame")),
+                image_paths=image_paths,
+                task_prompt=task_prompt,
+                system_instruction=system_instruction,
+                observation_history_max_entries=int(
+                    body.get("observation_history_max_entries", 0)
+                ),
+                observation_history_max_chars=int(
+                    body.get("observation_history_max_chars", 4000)
+                ),
+                max_generate_length=int(body.get("max_generate_length", 96)),
+                temperature=float(body.get("temperature", 0.2)),
+                top_p=float(body.get("top_p", 0.9)),
+                top_k=int(body.get("top_k", 20)),
+                timeout_seconds=int(body.get("timeout_seconds", 120)),
+                notes=str(body.get("notes", "")),
+                source_dataset_id=None,
+                source_frame_records=source_frame_records,
+                profile_name=resolved_profile.name if resolved_profile else None,
+                profile_version=resolved_profile.version if resolved_profile else None,
+                profile_hash=resolved_profile.prompt_hash if resolved_profile else None,
+            )
+        except (TypeError, ValueError) as exc:
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._send_error(400, f"Invalid parameter: {exc}")
+            return
+
+        error = validate_definition(defn)
+        if error:
+            _shutil.rmtree(tmp_dir, ignore_errors=True)
+            self._send_error(400, error)
+            return
+
+        run_id = defn.experiment_id
+        defn.run_id = run_id
+        run_store = srv.run_store
+
+        # Atomically claim the coordinator slot.
+        with srv._active_experiment_lock:
+            if srv._active_experiment_id is not None:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+                self._send_error(
+                    409,
+                    f"Experiment already in progress: {srv._active_experiment_id}. "
+                    "Wait for it to complete or poll /api/runs/<id> for status.",
+                )
+                return
+            srv._active_experiment_id = run_id
+
+        cancel_event = threading.Event()
+        with srv._cancel_events_lock:
+            srv._experiment_cancel_events[run_id] = cancel_event
+
+        initial_record: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "experiment",
+            "created_at": _now_iso(),
+            "status": "starting",
+            "adapter": seq_entry.adapter,
+            "dataset_id": dataset_id,
+            "sequence_id": sequence_id,
+            "frame_count": len(frame_indices),
+            "frame_source_ids": frame_source_ids,
+            "annotation_summary": seq_entry.annotation_summary,
+        }
+        run_store.save_run(run_id, initial_record)
+        run_store.update_run_if_status(run_id, "starting", {"status": "running"})
+
+        def _run_bg() -> None:
+            try:
+                results = run_experiment(
+                    defn,
+                    cancel_fn=lambda: cancel_event.is_set(),
+                )
+            except Exception as exc:
+                run_store.finalize_run(run_id, {
+                    "status": "failed",
+                    "completed_at": _now_iso(),
+                    "success": False,
+                    "error": str(exc),
+                })
+                return
+            finally:
+                _shutil.rmtree(tmp_dir, ignore_errors=True)
+                with srv._active_experiment_lock:
+                    if srv._active_experiment_id == run_id:
+                        srv._active_experiment_id = None
+                with srv._cancel_events_lock:
+                    srv._experiment_cancel_events.pop(run_id, None)
+
+            frame_results = []
+            for r in results:
+                frame_rec: Dict[str, Any] = {
+                    "frame_index": r.frame_index,
+                    "success": r.success,
+                    "latency_ms": r.latency_ms,
+                    "text": r.text,
+                    "error": r.error,
+                }
+                if source_frame_records and r.frame_index < len(source_frame_records):
+                    sfr = source_frame_records[r.frame_index]
+                    frame_rec["source_id"] = sfr.get("source_id")
+                    frame_rec["timestamp_us"] = sfr.get("timestamp_us")
+                frame_results.append(frame_rec)
+
+            was_cancelled = cancel_event.is_set()
+            status_str = "cancelled" if was_cancelled else "completed"
+            run_store.finalize_run(run_id, {
+                "status": status_str,
+                "completed_at": _now_iso(),
+                "success": not was_cancelled and all(r.success for r in results),
+                "frame_results": frame_results,
+                "adapter": seq_entry.adapter,
+                "dataset_id": dataset_id,
+                "sequence_id": sequence_id,
+                "frame_source_ids": frame_source_ids,
+                "annotation_summary": seq_entry.annotation_summary,
+            })
+
+        t = threading.Thread(target=_run_bg, daemon=True)
+        t.start()
+
+        self._send_json(202, run_store.get_run(run_id) or initial_record)
 
     def _api_dataset_download(self) -> None:
         """Initiate a rosbag download via the existing download_rosbags.sh script.
@@ -1867,6 +2280,13 @@ _EXTRACT_CANCEL_RE = re.compile(
 _EXPERIMENT_CANCEL_RE = re.compile(
     r"^/api/experiment/(" + _UUID_PATTERN + r")/cancel$"
 )
+# Sequence catalog frame serving: /api/sequences/<dataset_id>/<sequence_id>/frames/<n>
+_SAFE_ID_SEGMENT = r"[a-zA-Z0-9_.\-]{1,200}"
+_SEQ_FRAME_RE = re.compile(
+    r"^/api/sequences/("
+    + _SAFE_ID_SEGMENT + r")/("
+    + _SAFE_ID_SEGMENT + r")/frames/(\d{1,5})$"
+)
 
 
 # ── ROS env builder ───────────────────────────────────────────────────────────
@@ -1961,6 +2381,10 @@ class ConsoleServer(ThreadingHTTPServer):
         # Per-experiment cancellation events.
         self._experiment_cancel_events: Dict[str, threading.Event] = {}
         self._cancel_events_lock = threading.Lock()
+        # Cached sequence-catalog entries (raw SequenceEntry objects with
+        # server-side source paths; never forwarded to the browser directly).
+        self._sequence_catalog_lock = threading.Lock()
+        self._sequence_catalog_entries: Optional[list] = None
 
         def handler(*args: Any, **kwargs: Any) -> None:
             h = ConsoleHandler(*args, **kwargs)
@@ -2197,6 +2621,77 @@ _INDEX_TEMPLATE = """\
     <div id="exp-result"></div>
   </div>
 
+  <!-- Sequence catalog experiment -->
+  <div class="panel">
+    <div class="panel-title">Sequence Catalog Experiment (nuScenes / JAAD)</div>
+    <fieldset>
+      <legend>Source Sequence</legend>
+      <label>
+        <span class="label-text">Dataset</span>
+        <select id="seqexp-dataset-id" onchange="_onSeqExpDatasetChange()">
+          <option value="">— select a dataset —</option>
+        </select>
+        <button type="button" class="small secondary" onclick="_loadSeqExpDatasets()">Refresh</button>
+      </label>
+      <label>
+        <span class="label-text">Sequence</span>
+        <select id="seqexp-sequence-id">
+          <option value="">— select a sequence —</option>
+        </select>
+      </label>
+      <label>
+        <span class="label-text">Frame indices (comma-separated; leave blank = all)</span>
+        <input type="text" id="seqexp-frame-indices" size="70" placeholder="0,1,2,…  (leave blank for all frames)">
+      </label>
+      <div id="seqexp-selection-info" style="font-size:0.85em;color:#666;margin-top:4px"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Task Profile</legend>
+      <label>
+        <span class="label-text">Profile (optional)</span>
+        <select id="seqexp-profile-name">
+          <option value="">— none (use fields below) —</option>
+        </select>
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Prompt (ignored when profile is selected)</legend>
+      <label>
+        <span class="label-text">System instruction</span>
+        <input type="text" id="seqexp-system" value="You are a vision observer. Base claims on the current image." size="70">
+      </label>
+      <label>
+        <span class="label-text">Task prompt</span>
+        <input type="text" id="seqexp-prompt" value="Describe the scene." size="70">
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Generation Settings</legend>
+      <label>
+        <span class="label-text">Max tokens</span>
+        <input type="number" id="seqexp-max-gen" value="96" min="1" max="4096">
+      </label>
+      <label>
+        <span class="label-text">Temperature</span>
+        <input type="number" id="seqexp-temperature" value="0.2" step="0.01" min="0" max="2">
+      </label>
+      <label>
+        <span class="label-text">Timeout (s)</span>
+        <input type="number" id="seqexp-timeout" value="120" min="1" max="3600">
+      </label>
+    </fieldset>
+    <fieldset>
+      <legend>Reproducibility</legend>
+      <label>
+        <span class="label-text">Notes</span>
+        <input type="text" id="seqexp-notes" size="70" placeholder="Optional free-form notes">
+      </label>
+    </fieldset>
+    <button type="button" id="seqexp-submit-btn" onclick="submitSeqExperiment()">Submit Sequence Experiment</button>
+    <button type="button" id="seqexp-cancel-btn" onclick="cancelSeqExperiment()" style="display:none" class="danger">Cancel</button>
+    <div id="seqexp-result"></div>
+  </div>
+
   <!-- ROS experiment -->
   <div class="panel">
     <div class="panel-title">ROS Image-Proc Experiment (rosbag playback)</div>
@@ -2369,10 +2864,17 @@ _INDEX_TEMPLATE = """\
     </div>
     <div id="frame-dataset-list"><span class="muted">Loading…</span></div>
   </div>
+  <div class="panel">
+    <div class="panel-title">Sequence Catalog (nuScenes / JAAD / ROS fixtures)
+      <button class="secondary small" onclick="_loadSequenceCatalog()" style="margin-left:auto">Refresh</button>
+    </div>
+    <div id="sequence-catalog-list"><span class="muted">Loading…</span></div>
+  </div>
   <div class="panel" id="frame-explorer-viewer" style="display:none">
     <div class="panel-title">Frame Viewer
       <button class="secondary small" onclick="_framePrev()">&#8592; Prev</button>
       <button class="secondary small" onclick="_frameNext()">Next &#8594;</button>
+      <button class="small" id="seq-use-in-exp-btn" style="display:none;margin-left:auto" onclick="_seqUseInExperiment()">Use in Experiment &#8594;</button>
     </div>
     <div id="frame-preview-area"></div>
     <div id="frame-metadata" class="frame-meta"></div>
