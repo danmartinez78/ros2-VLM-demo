@@ -580,6 +580,77 @@ pre {
   margin: 1rem 0;
 }
 
+
+
+/* ── frame explorer ─────────────────────────────────────────────────────── */
+
+#frame-dataset-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.dataset-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+#frame-preview-area {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 260px;
+  max-height: 68vh;
+  overflow: hidden;
+  background: #111827;
+  border-radius: 6px;
+  margin-bottom: 0.6rem;
+}
+
+.frame-preview-img {
+  display: block;
+  max-width: 100%;
+  max-height: 68vh;
+  object-fit: contain;
+}
+
+.frame-meta {
+  margin-bottom: 0.6rem;
+  color: #555;
+  font-size: 0.84rem;
+}
+
+.thumb-strip {
+  display: flex;
+  gap: 0.45rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 0.4rem 0 0.7rem;
+  scroll-snap-type: x proximity;
+}
+
+.frame-thumb {
+  width: 112px;
+  height: 72px;
+  flex: 0 0 auto;
+  object-fit: cover;
+  cursor: pointer;
+  border: 2px solid transparent;
+  border-radius: 4px;
+  opacity: 0.72;
+  scroll-snap-align: start;
+}
+
+.frame-thumb:hover {
+  opacity: 1;
+}
+
+.frame-thumb.selected {
+  border-color: #0f6cbd;
+  opacity: 1;
+}
+
 /* ── responsive tweaks ────────────────────────────────────────────────────── */
 
 @media (max-width: 600px) {

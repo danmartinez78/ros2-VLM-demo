@@ -8,15 +8,24 @@ that interface; a conspicuous warning is printed at startup in that case.
 
 Routes
 ------
-GET  /                        → HTML console page
-GET  /api/status              → JSON server + GPU status
-POST /api/infer               → multipart/form-data image + prompt → JSON result
-POST /api/ros/start           → JSON body → start ROS experiment
-POST /api/ros/stop            → JSON body {run_id} → stop ROS experiment
-GET  /api/runs                → JSON list of recent runs
-GET  /api/runs/<run_id>       → JSON single run manifest
-GET  /api/runs/<run_id>/logs  → JSON log lines for a ROS run
-GET  /static/<path>           → static asset (css/js)
+GET  /                                          → HTML console page
+GET  /api/status                                → JSON server + GPU status
+POST /api/infer                                 → multipart/form-data image + prompt → JSON result
+POST /api/ros/start                             → JSON body → start ROS experiment
+POST /api/ros/stop                              → JSON body {run_id} → stop ROS experiment
+GET  /api/runs                                  → JSON list of recent runs
+GET  /api/runs/<run_id>                         → JSON single run manifest
+GET  /api/runs/<run_id>/logs                    → JSON log lines for a ROS run
+GET  /static/<path>                             → static asset (css/js)
+GET  /api/profiles                              → JSON list of task profiles
+GET  /api/frame-datasets                        → JSON list of frame datasets
+GET  /api/frame-datasets/<dataset_id>           → JSON frame dataset manifest
+GET  /api/frame-datasets/<dataset_id>/frames/<n> → JPEG frame image (bounded, allowlisted)
+POST /api/extract                               → JSON body → start frame extraction from catalog bag
+POST /api/extract/<run_id>/cancel               → cancel frame extraction run
+GET  /api/runs/<run_id>/reviews                 → JSON list of review annotations for a run
+POST /api/runs/<run_id>/reviews                 → JSON body → upsert review annotation
+GET  /api/compare                               → JSON comparison of two runs aligned by frame
 """
 from __future__ import annotations
 
@@ -44,6 +53,14 @@ from .experiment_engine import (
     run_experiment,
     validate_definition,
 )
+from .frame_extractor import (
+    ExtractionParams,
+    FrameDatasetStore,
+    _is_safe_dataset_id,
+    allowlist_bag_path,
+    build_extraction_args,
+    validate_extraction_params,
+)
 from .inference_client import (
     ALLOWED_IMAGE_EXTENSIONS,
     MAX_IMAGE_BYTES,
@@ -51,8 +68,20 @@ from .inference_client import (
 )
 from .model_catalog import discover_models
 from .process_manager import ProcessManager
+from .review_store import (
+    ALLOWED_REVIEW_LABELS,
+    ReviewAnnotation,
+    ReviewStore,
+    validate_review,
+)
 from .run_store import RunStore, _is_safe_run_id, _TERMINAL_STATUSES
 from .status_collector import collect_status, check_server_reachable
+from .task_profiles import (
+    ParsedOutput,
+    TaskProfile,
+    discover_profiles,
+    parse_structured_output,
+)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
@@ -78,6 +107,9 @@ _ALLOWED_ROS_PARAMS = frozenset(
 # Allowlisted artifact filenames produced by run_image_proc_test.sh.
 # The script writes these into $ARTIFACT_DIR; no other filenames are captured.
 _ROS_ARTIFACT_ALLOWLIST = ("manifest.json", "benchmark.jsonl", "launch.log", "results.log")
+
+# Maximum frame index that can be requested via the image-serving route.
+_MAX_FRAME_INDEX = 9999
 
 _STATIC_DIR = pathlib.Path(__file__).parent / "static"
 _CONTENT_TYPES: Dict[str, str] = {
@@ -436,12 +468,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_list_models()
             elif path == "/api/datasets":
                 self._api_list_datasets()
+            elif path == "/api/profiles":
+                self._api_list_profiles()
+            elif path == "/api/frame-datasets":
+                self._api_list_frame_datasets()
+            elif path == "/api/compare":
+                self._api_compare_runs(parsed)
             elif _RUN_RE.match(path) and path.endswith("/logs"):
                 run_id = _RUN_RE.match(path).group(1)
                 self._api_get_run_logs(run_id)
+            elif _RUN_REVIEWS_RE.match(path):
+                run_id = _RUN_REVIEWS_RE.match(path).group(1)
+                self._api_get_reviews(run_id)
             elif _RUN_RE.match(path):
                 run_id = _RUN_RE.match(path).group(1)
                 self._api_get_run(run_id)
+            elif _FRAME_IMAGE_RE.match(path):
+                m = _FRAME_IMAGE_RE.match(path)
+                self._api_serve_frame_image(m.group(1), int(m.group(2)))
+            elif _FRAME_DATASET_RE.match(path):
+                dataset_id = _FRAME_DATASET_RE.match(path).group(1)
+                self._api_get_frame_dataset(dataset_id)
             elif path.startswith("/static/"):
                 self._serve_static(path[len("/static/"):])
             else:
@@ -462,8 +509,19 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self._api_ros_stop()
             elif path == "/api/experiment/run":
                 self._api_experiment_run()
+            elif _EXPERIMENT_CANCEL_RE.match(path):
+                run_id = _EXPERIMENT_CANCEL_RE.match(path).group(1)
+                self._api_experiment_cancel(run_id)
             elif path == "/api/datasets/download":
                 self._api_dataset_download()
+            elif path == "/api/extract":
+                self._api_extract_start()
+            elif _EXTRACT_CANCEL_RE.match(path):
+                run_id = _EXTRACT_CANCEL_RE.match(path).group(1)
+                self._api_extract_cancel(run_id)
+            elif _RUN_REVIEWS_RE.match(path):
+                run_id = _RUN_REVIEWS_RE.match(path).group(1)
+                self._api_upsert_review(run_id)
             else:
                 self._send_error(404, "Not found")
         except Exception:
@@ -1018,13 +1076,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     # ── ROS-independent experiment API ────────────────────────────────────────
 
     def _api_experiment_run(self) -> None:
-        """Submit a ROS-independent experiment run.
+        """Submit a ROS-independent experiment run backed by a frame dataset.
 
         Accepts a JSON body with keys:
+          frame_dataset_id       — UUID of an extracted frame dataset (required)
+          frame_indices          — list of int frame indices to run (default: all)
+          profile_name           — task profile name to resolve (optional)
+          task_prompt            — task prompt (overrides profile; required if no profile)
+          system_instruction     — optional system instruction (overrides profile)
           strategy               — "single_frame" or "single_frame_observation_history"
-          image_paths            — list of absolute image paths (max 10 000)
-          task_prompt            — task prompt string
-          system_instruction     — optional system instruction
           observation_history_max_entries  — int (default 0)
           observation_history_max_chars    — int (default 4000)
           max_generate_length    — int (default 96)
@@ -1034,27 +1094,121 @@ class ConsoleHandler(BaseHTTPRequestHandler):
           timeout_seconds        — int (default 120)
           notes                  — optional reproducibility notes
 
-        Image paths must be absolute and the files must exist at request time.
+        Image paths are resolved exclusively through FrameDatasetStore; no raw
+        paths are accepted from the browser.
         The experiment runs in a background thread to avoid blocking the HTTP
         server.
         """
         cfg = self.server_instance.config
+        srv = self.server_instance
         body = self._read_json_body()
         if body is None:
             return
+
+        # ── concurrency gate (checked first so 409 beats 400) ───────────────
+        with srv._active_experiment_lock:
+            if srv._active_experiment_id is not None:
+                self._send_error(
+                    409,
+                    f"Experiment already in progress: {srv._active_experiment_id}. "
+                    "Wait for it to complete or poll /api/runs/<id> for status.",
+                )
+                return
+
+        # ── resolve frame dataset ────────────────────────────────────────────
+        frame_dataset_id = str(body.get("frame_dataset_id", "")).strip()
+        if not _is_safe_dataset_id(frame_dataset_id):
+            self._send_error(400, "frame_dataset_id is required and must be a valid UUID")
+            return
+
+        frame_store = self.server_instance.frame_dataset_store
+        manifest_data = frame_store.get_manifest(frame_dataset_id)
+        if manifest_data is None:
+            self._send_error(404, f"Frame dataset not found: {frame_dataset_id!r}")
+            return
+
+        all_frames = manifest_data.get("frames", [])
+        if not all_frames:
+            self._send_error(400, "Frame dataset is empty")
+            return
+
+        # Determine which frame indices to use.
+        frame_indices_raw = body.get("frame_indices")
+        if frame_indices_raw is not None:
+            try:
+                frame_indices = [int(i) for i in frame_indices_raw]
+            except (TypeError, ValueError):
+                self._send_error(400, "frame_indices must be a list of integers")
+                return
+        else:
+            frame_indices = [f["index"] for f in all_frames]
+
+        if not frame_indices:
+            self._send_error(400, "No frames selected")
+            return
+
+        # Build the list of (path, frame_record) for selected indices.
+        frame_index_map = {f["index"]: f for f in all_frames}
+        selected_records: list = []
+        for fi in frame_indices:
+            img_path = frame_store.get_frame_path(frame_dataset_id, fi)
+            if img_path is None:
+                self._send_error(400, f"Frame index {fi} not found in dataset {frame_dataset_id!r}")
+                return
+            rec = frame_index_map.get(fi, {})
+            selected_records.append({
+                "path": str(img_path),
+                "frame_index": fi,
+                "timestamp_ns": rec.get("timestamp_ns"),
+            })
+
+        image_paths = [r["path"] for r in selected_records]
+        source_frame_records = [
+            {"frame_index": r["frame_index"], "timestamp_ns": r["timestamp_ns"]}
+            for r in selected_records
+        ]
+
+        # ── resolve profile ──────────────────────────────────────────────────
+        profile_name = str(body.get("profile_name", "")).strip() or None
+        resolved_profile = None
+        if profile_name:
+            profiles_dir = cfg.get("task_profiles_dir") or str(
+                pathlib.Path(__file__).parent.parent / "config" / "task_profiles"
+            )
+            from .task_profiles import discover_profiles, get_profile_by_name
+            profiles = discover_profiles(profiles_dir)
+            resolved_profile = get_profile_by_name(profiles, profile_name)
+            if resolved_profile is None:
+                self._send_error(404, f"Task profile not found: {profile_name!r}")
+                return
+
+        # Determine system_instruction and task_prompt.
+        # When a profile is selected its prompts are authoritative; body overrides
+        # are rejected to ensure that the persisted profile identity matches the
+        # prompt that was actually executed.
+        if resolved_profile is not None:
+            if "task_prompt" in body or "system_instruction" in body:
+                self._send_error(
+                    400,
+                    "task_prompt and system_instruction may not override a named profile; "
+                    "omit them or remove profile_name",
+                )
+                return
+            task_prompt = resolved_profile.task_prompt
+            system_instruction = resolved_profile.system_instruction
+        else:
+            system_instruction = str(
+                body.get("system_instruction", "You are a vision observer. Base claims on the current image.")
+            ).strip()
+            task_prompt = str(body.get("task_prompt", "")).strip()
 
         # ── build ExperimentDefinition ───────────────────────────────────────
         try:
             defn = ExperimentDefinition(
                 strategy=str(body.get("strategy", "single_frame")),
-                image_paths=[str(p) for p in body.get("image_paths", [])],
-                task_prompt=str(body.get("task_prompt", "")).strip(),
-                system_instruction=str(
-                    body.get(
-                        "system_instruction",
-                        "You are a vision observer. Base claims on the current image.",
-                    )
-                ),
+                image_paths=image_paths,
+                task_prompt=task_prompt,
+                system_instruction=system_instruction,
                 observation_history_max_entries=int(
                     body.get("observation_history_max_entries", 0)
                 ),
@@ -1067,6 +1221,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 top_k=int(body.get("top_k", 20)),
                 timeout_seconds=int(body.get("timeout_seconds", 120)),
                 notes=str(body.get("notes", "")),
+                source_dataset_id=frame_dataset_id,
+                source_frame_records=source_frame_records,
+                profile_name=resolved_profile.name if resolved_profile else None,
+                profile_version=resolved_profile.version if resolved_profile else None,
+                profile_hash=resolved_profile.prompt_hash if resolved_profile else None,
             )
         except (TypeError, ValueError) as exc:
             self._send_error(400, f"Invalid parameter: {exc}")
@@ -1077,23 +1236,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(400, error)
             return
 
-        # Validate that ALL image files exist before marking the run active.
-        # A partial check (e.g. first-100-only) allows large runs to start with
-        # unchecked paths that will fail mid-experiment.
-        for img_path in defn.image_paths:
-            if not os.path.isabs(img_path):
-                self._send_error(400, f"image_paths must be absolute: {img_path!r}")
-                return
-            if not os.path.isfile(img_path):
-                self._send_error(400, f"Image file not found: {img_path!r}")
-                return
+        if not task_prompt:
+            self._send_error(400, "task_prompt is required (provide it directly or via profile_name)")
+            return
 
         run_id = defn.experiment_id
         defn.run_id = run_id
-        srv = self.server_instance
         run_store = srv.run_store
 
-        # Bounded experiment coordinator: reject concurrent submissions.
+        # Atomically check-and-claim the coordinator slot.  A second request that
+        # slipped past the early gate (above) while validation was in progress will
+        # be rejected here under the same lock, closing the check/claim race.
         with srv._active_experiment_lock:
             if srv._active_experiment_id is not None:
                 self._send_error(
@@ -1107,6 +1260,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         artifact_dir = run_store.base_dir / run_id / "artifacts"
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
+        # Register cancellation event.
+        cancel_event = threading.Event()
+        with srv._cancel_events_lock:
+            srv._experiment_cancel_events[run_id] = cancel_event
+
         initial_record: Dict[str, Any] = {
             "schema_version": 1,
             "run_id": run_id,
@@ -1114,7 +1272,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "strategy": defn.strategy,
             "created_at": defn.created_at,
             "image_count": len(defn.image_paths),
+            "frame_dataset_id": frame_dataset_id,
+            "frame_indices": frame_indices,
             "task_prompt": defn.task_prompt,
+            "system_instruction": defn.system_instruction,
             "observation_history_max_entries": defn.observation_history_max_entries,
             "max_generate_length": defn.max_generate_length,
             "temperature": defn.temperature,
@@ -1123,11 +1284,23 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "timeout_seconds": defn.timeout_seconds,
             "notes": defn.notes,
             "status": "running",
+            "progress_frames": 0,
         }
+        if resolved_profile is not None:
+            initial_record["profile_name"] = resolved_profile.name
+            initial_record["profile_version"] = resolved_profile.version
+            initial_record["profile_hash"] = resolved_profile.prompt_hash
         run_store.save_run(run_id, initial_record)
 
         cli_path = cfg.get("cli_path", "edge_vlm_cli")
         socket_path = cfg.get("socket_path", "/tmp/edge_vlm.sock")
+        _profile_for_parsing = resolved_profile  # captured in closure
+
+        def _on_frame(idx: int, fr: Any) -> None:
+            """Update progress in the manifest after each frame completes."""
+            run_store.update_run_if_status(run_id, "running", {
+                "progress_frames": idx + 1,
+            })
 
         def _run_in_background() -> None:
             try:
@@ -1136,33 +1309,53 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     cli_path=cli_path,
                     socket_path=socket_path,
                     artifact_dir=artifact_dir,
+                    cancel_fn=lambda: cancel_event.is_set(),
+                    on_frame=_on_frame,
                 )
+                cancelled = cancel_event.is_set()
                 successful = [r for r in results if r.success]
                 failed = [r for r in results if not r.success]
                 latencies = [r.latency_ms for r in successful]
+
+                # Build result_frames with full provenance and parsed output.
+                result_frames = []
+                for r in results:
+                    parsed_out = parse_structured_output(r.text, _profile_for_parsing)
+                    frame_rec: Dict[str, Any] = {
+                        "frame_index": r.frame_index,
+                        "success": r.success,
+                        "text": r.text,
+                        "error": r.error,
+                        "latency_ms": r.latency_ms,
+                        "history_entries_used": r.history_entries_used,
+                        "repetition_flag": r.repetition_flag,
+                        "parse_success": parsed_out.parse_success,
+                        "parse_error": parsed_out.parse_error,
+                        "malformed_flag": parsed_out.malformed_flag,
+                        "parsed_response": parsed_out.parsed,
+                    }
+                    if r.source_dataset_id is not None:
+                        frame_rec["source_dataset_id"] = r.source_dataset_id
+                    if r.source_frame_index is not None:
+                        frame_rec["source_frame_index"] = r.source_frame_index
+                    if r.source_timestamp_ns is not None:
+                        frame_rec["source_timestamp_ns"] = r.source_timestamp_ns
+                    result_frames.append(frame_rec)
+
+                final_status = "stopped" if cancelled else "completed"
                 run_store.finalize_run(run_id, {
-                    "status": "completed",
+                    "status": final_status,
                     "completed_at": _now_iso(),
-                    "success": True,
+                    "success": not cancelled and bool(successful),
                     "successful_frames": len(successful),
                     "failed_frames": len(failed),
+                    "progress_frames": len(results),
                     "repetition_flags": sum(1 for r in results if r.repetition_flag),
                     "mean_latency_ms": (
                         round(sum(latencies) / len(latencies), 2)
                         if latencies else None
                     ),
-                    "result_frames": [
-                        {
-                            "frame_index": r.frame_index,
-                            "success": r.success,
-                            "text": r.text,
-                            "error": r.error,
-                            "latency_ms": r.latency_ms,
-                            "history_entries_used": r.history_entries_used,
-                            "repetition_flag": r.repetition_flag,
-                        }
-                        for r in results[:50]  # cap at 50 for manifest size
-                    ],
+                    "result_frames": result_frames,
                 })
             except Exception as exc:
                 run_store.finalize_run(run_id, {
@@ -1176,9 +1369,415 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 with srv._active_experiment_lock:
                     if srv._active_experiment_id == run_id:
                         srv._active_experiment_id = None
+                with srv._cancel_events_lock:
+                    srv._experiment_cancel_events.pop(run_id, None)
 
         threading.Thread(target=_run_in_background, daemon=True).start()
         self._send_json(202, initial_record)
+
+    def _api_experiment_cancel(self, run_id: str) -> None:
+        """Signal a running experiment to stop between frames."""
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        srv = self.server_instance
+        with srv._cancel_events_lock:
+            event = srv._experiment_cancel_events.get(run_id)
+        if event is None:
+            # Check if run exists at all.
+            record = srv.run_store.get_run(run_id)
+            if record is None:
+                self._send_error(404, "Run not found")
+                return
+            if record.get("status") in _TERMINAL_STATUSES:
+                self._send_error(409, "Experiment already completed")
+                return
+            self._send_error(404, "No active cancellable experiment with that run_id")
+            return
+        event.set()
+        self._send_json(200, {"run_id": run_id, "cancelling": True})
+
+    # ── task profile API ─────────────────────────────────────────────────────
+
+    def _api_list_profiles(self) -> None:
+        cfg = self.server_instance.config
+        profiles_dir = cfg.get("task_profiles_dir") or str(
+            pathlib.Path(__file__).parent.parent / "config" / "task_profiles"
+        )
+        try:
+            profiles = discover_profiles(profiles_dir)
+        except Exception as exc:
+            self._send_error(500, f"Failed to load profiles: {exc}")
+            return
+        self._send_json(200, {
+            "profiles": [
+                {
+                    "profile_id": p.profile_id(),
+                    "name": p.name,
+                    "version": p.version,
+                    "prompt_hash": p.prompt_hash,
+                    "system_instruction": p.system_instruction,
+                    "task_prompt": p.task_prompt,
+                    "schema_example": p.schema_example,
+                }
+                for p in profiles
+            ]
+        })
+
+    # ── frame dataset API ────────────────────────────────────────────────────
+
+    def _api_list_frame_datasets(self) -> None:
+        store = self.server_instance.frame_dataset_store
+        try:
+            datasets = store.list_datasets()
+        except Exception as exc:
+            self._send_error(500, f"Failed to list frame datasets: {exc}")
+            return
+        self._send_json(200, {"datasets": datasets})
+
+    def _api_get_frame_dataset(self, dataset_id: str) -> None:
+        if not _is_safe_dataset_id(dataset_id):
+            self._send_error(400, "Invalid dataset_id")
+            return
+        store = self.server_instance.frame_dataset_store
+        manifest = store.get_manifest(dataset_id)
+        if manifest is None:
+            self._send_error(404, "Dataset not found")
+            return
+        self._send_json(200, manifest)
+
+    def _api_serve_frame_image(self, dataset_id: str, frame_index: int) -> None:
+        if not _is_safe_dataset_id(dataset_id):
+            self._send_error(400, "Invalid dataset_id")
+            return
+        if frame_index < 0 or frame_index > _MAX_FRAME_INDEX:
+            self._send_error(400, "Frame index out of range")
+            return
+        store = self.server_instance.frame_dataset_store
+        img_path = store.get_frame_path(dataset_id, frame_index)
+        if img_path is None:
+            self._send_error(404, "Frame not found")
+            return
+        try:
+            data = img_path.read_bytes()
+        except OSError:
+            self._send_error(404, "Frame not found")
+            return
+        self._send_response(200, data, "image/jpeg")
+
+    # ── frame extraction API ─────────────────────────────────────────────────
+
+    def _api_extract_start(self) -> None:
+        """Start a rosbag frame-extraction run.
+
+        The bag must be an installed catalog entry; no arbitrary paths.
+        """
+        cfg = self.server_instance.config
+        body = self._read_json_body()
+        if body is None:
+            return
+
+        # Validate extraction parameters.
+        error = validate_extraction_params(body)
+        if error:
+            self._send_error(400, error)
+            return
+
+        # Allowlist bag path against catalog.
+        bag_key = body.get("bag_key", "")
+        catalog = discover_datasets(
+            rosbag_root=cfg.get("rosbag_dir"),
+            image_root=cfg.get("image_dataset_dir"),
+            video_root=cfg.get("video_dataset_dir"),
+        )
+        try:
+            bag_path = allowlist_bag_path(bag_key, catalog)
+        except ValueError as exc:
+            self._send_error(400, str(exc))
+            return
+
+        run_id = RunStore.new_run_id()
+        run_store = self.server_instance.run_store
+        frame_store = self.server_instance.frame_dataset_store
+        dataset_id = RunStore.new_run_id()  # unique ID for this dataset
+
+        output_dir = frame_store.base_dir / dataset_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        params = ExtractionParams(
+            bag_key=bag_key,
+            bag_path=bag_path,
+            image_topic=body.get("image_topic", ""),
+            start_offset=body.get("start_offset", 0.0),
+            end_offset=body.get("end_offset"),
+            duration=body.get("duration"),
+            sample_interval=body.get("sample_interval"),
+            target_sample_count=body.get("target_sample_count"),
+            max_frames=body.get("max_frames", 100),
+            dataset_id=dataset_id,
+            output_dir=str(output_dir),
+        )
+
+        script_path = str(
+            pathlib.Path(__file__).parent.parent / "scripts" / "extract_bag_frames.py"
+        )
+        args = build_extraction_args(script_path, params)
+
+        initial_record: Dict[str, Any] = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "extraction",
+            "created_at": _now_iso(),
+            "bag_key": bag_key,
+            "bag_path": bag_path,
+            "dataset_id": dataset_id,
+            "image_topic": params.image_topic,
+            "max_frames": params.max_frames,
+            "output_dir": str(output_dir),
+            "status": "starting",
+        }
+        run_store.save_run(run_id, initial_record)
+
+        def _on_complete(
+            rid: str,
+            exit_code: Optional[int],
+            was_stopped: bool,
+            log_lines: list,
+        ) -> None:
+            status_str = "stopped" if was_stopped else (
+                "completed" if exit_code == 0 else
+                "ros_unavailable" if exit_code == 2 else
+                "failed"
+            )
+            run_store.finalize_run(rid, {
+                "status": status_str,
+                "exit_code": exit_code,
+                "completed_at": _now_iso(),
+                "success": exit_code == 0 and not was_stopped,
+                "log_lines": log_lines[:200],
+            })
+
+        srv = self.server_instance
+        try:
+            pid = srv.process_manager.start_ros_experiment(
+                run_id=run_id,
+                args=args,
+                env=os.environ.copy(),
+                on_complete=_on_complete,
+            )
+        except Exception as exc:
+            run_store.finalize_run(run_id, {
+                "status": "failed",
+                "exit_code": None,
+                "completed_at": _now_iso(),
+                "success": False,
+                "error": str(exc),
+            })
+            self._send_error(500, f"Failed to start extraction: {exc}")
+            return
+
+        run_store.update_run_if_status(run_id, "starting", {"status": "running", "pid": pid})
+        self._send_json(202, run_store.get_run(run_id) or initial_record)
+
+    def _api_extract_cancel(self, run_id: str) -> None:
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        run_store = self.server_instance.run_store
+        manifest = run_store.get_run(run_id)
+        if manifest is None:
+            self._send_error(404, "Run not found")
+            return
+        if manifest.get("kind") != "extraction":
+            self._send_error(400, "Not an extraction run")
+            return
+        stopped = self.server_instance.process_manager.stop_ros_experiment(run_id)
+        self._send_json(200, {"run_id": run_id, "stopped": stopped})
+
+    # ── review annotation API ─────────────────────────────────────────────────
+
+    def _api_get_reviews(self, run_id: str) -> None:
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        review_store = self.server_instance.review_store
+        reviews = review_store.get_reviews(run_id)
+        self._send_json(200, {
+            "run_id": run_id,
+            "reviews": [
+                {
+                    "frame_index": r.frame_index,
+                    "label": r.label,
+                    "note": r.note,
+                    "created_at": r.created_at,
+                    "updated_at": r.updated_at,
+                }
+                for r in reviews
+            ]
+        })
+
+    def _api_upsert_review(self, run_id: str) -> None:
+        if not _is_safe_run_id(run_id):
+            self._send_error(400, "Invalid run_id")
+            return
+        run_store = self.server_instance.run_store
+        record = run_store.get_run(run_id)
+        if record is None:
+            self._send_error(404, "Run not found")
+            return
+        if record.get("status") not in _TERMINAL_STATUSES:
+            self._send_error(409, "Run is not completed; reviews require a terminal run")
+            return
+        body = self._read_json_body()
+        if body is None:
+            return
+        error = validate_review(body)
+        if error:
+            self._send_error(400, error)
+            return
+        frame_index = int(body["frame_index"])
+        # Verify frame_index exists in the run's result_frames.
+        result_frames = record.get("result_frames", [])
+        frame_indices_in_run = {f.get("frame_index") for f in result_frames if isinstance(f, dict)}
+        if result_frames and frame_index not in frame_indices_in_run:
+            self._send_error(400, f"Frame index {frame_index} does not exist in run results")
+            return
+        annotation = ReviewAnnotation(
+            run_id=run_id,
+            frame_index=frame_index,
+            label=body["label"],
+            note=body.get("note", ""),
+            created_at=_now_iso(),
+            updated_at=_now_iso(),
+        )
+        review_store = self.server_instance.review_store
+        try:
+            review_store.upsert_review(annotation)
+        except Exception as exc:
+            self._send_error(500, f"Failed to save review: {exc}")
+            return
+        self._send_json(200, {
+            "run_id": run_id,
+            "frame_index": annotation.frame_index,
+            "label": annotation.label,
+            "note": annotation.note,
+            "updated_at": annotation.updated_at,
+        })
+
+    # ── comparison API ────────────────────────────────────────────────────────
+
+    def _api_compare_runs(self, parsed: Any) -> None:
+        """Align two or more runs by source dataset+frame identity.
+
+        Query string: ?run_ids=<id1>,<id2>[,<id3>...]
+
+        Alignment key preference:
+          1. (source_dataset_id, source_frame_index) — exact provenance
+          2. source_frame_index alone (same dataset implied when all runs share one)
+          3. frame_index (local iteration index, fallback for old-format runs)
+        """
+        from urllib.parse import parse_qs
+        qs = parse_qs(parsed.query)
+        run_ids_param = qs.get("run_ids", [""])[0]
+        run_ids = [r.strip() for r in run_ids_param.split(",") if r.strip()]
+        if len(run_ids) < 2:
+            self._send_error(400, "run_ids must contain at least two run IDs")
+            return
+        if len(run_ids) > 8:
+            self._send_error(400, "run_ids must contain at most eight run IDs")
+            return
+        for rid in run_ids:
+            if not _is_safe_run_id(rid):
+                self._send_error(400, f"Invalid run_id: {rid!r}")
+                return
+
+        run_store = self.server_instance.run_store
+        manifests = {}
+        for rid in run_ids:
+            m = run_store.get_run(rid)
+            if m is None:
+                self._send_error(404, f"Run not found: {rid}")
+                return
+            manifests[rid] = m
+
+        # Determine whether ALL runs share the same source_dataset_id so we
+        # can demote the alignment key from (dataset, frame) to frame-only.
+        dataset_ids = {m.get("frame_dataset_id") for m in manifests.values()}
+        all_same_dataset = (len(dataset_ids) == 1 and None not in dataset_ids)
+
+        def _frame_key(frame_rec: Dict[str, Any]) -> Any:
+            ds_id = frame_rec.get("source_dataset_id")
+            sf_idx = frame_rec.get("source_frame_index")
+            if ds_id is not None and sf_idx is not None:
+                if all_same_dataset:
+                    return sf_idx  # simplify display when datasets match
+                return (ds_id, sf_idx)
+            if sf_idx is not None:
+                return sf_idx
+            return frame_rec.get("frame_index")
+
+        # Extract per-frame results from each run; key by resolved frame key.
+        per_run: Dict[str, Dict[Any, Any]] = {}
+        for rid, manifest in manifests.items():
+            frames: Dict[Any, Any] = {}
+            for r in manifest.get("result_frames", []):
+                key = _frame_key(r)
+                frames[key] = r
+            per_run[rid] = frames
+
+        # Collect all known frame keys across all runs.
+        all_keys: list = []
+        seen: set = set()
+        for rid in run_ids:
+            for k in per_run[rid]:
+                if k not in seen:
+                    all_keys.append(k)
+                    seen.add(k)
+
+        # Sort: tuple keys (dataset_id, frame_index) sort by frame_index then
+        # dataset; plain integer/numeric keys sort numerically.
+        def _sort_key(k: Any):
+            if isinstance(k, tuple):
+                return (1, str(k[0]), k[1] if isinstance(k[1], int) else 0)
+            if isinstance(k, int):
+                return (0, "", k)
+            return (2, str(k), 0)
+
+        all_keys.sort(key=_sort_key)
+
+        aligned = []
+        for key in all_keys:
+            row: Dict[str, Any] = {"frame_key": key}
+            for rid in run_ids:
+                row[rid] = per_run[rid].get(key)
+            aligned.append(row)
+
+        # Build per-run summary stats.
+        summaries = {}
+        for rid, manifest in manifests.items():
+            summaries[rid] = {
+                "run_id": rid,
+                "kind": manifest.get("kind"),
+                "status": manifest.get("status"),
+                "model": manifest.get("model"),
+                "profile": manifest.get("profile"),
+                "profile_name": manifest.get("profile_name"),
+                "profile_version": manifest.get("profile_version"),
+                "profile_hash": manifest.get("profile_hash"),
+                "strategy": manifest.get("strategy"),
+                "created_at": manifest.get("created_at"),
+                "frame_dataset_id": manifest.get("frame_dataset_id"),
+                "mean_latency_ms": manifest.get("mean_latency_ms"),
+                "successful_frames": manifest.get("successful_frames"),
+                "failed_frames": manifest.get("failed_frames"),
+                "repetition_flags": manifest.get("repetition_flags"),
+            }
+
+        self._send_json(200, {
+            "run_ids": run_ids,
+            "aligned_frames": aligned,
+            "summaries": summaries,
+        })
 
     # ── response helpers ──────────────────────────────────────────────────────
 
@@ -1225,8 +1824,24 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
 # ── routing regex ─────────────────────────────────────────────────────────────
 
+_UUID_PATTERN = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 _RUN_RE = re.compile(
     r"^/api/runs/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:/logs)?$"
+)
+_RUN_REVIEWS_RE = re.compile(
+    r"^/api/runs/(" + _UUID_PATTERN + r")/reviews$"
+)
+_FRAME_DATASET_RE = re.compile(
+    r"^/api/frame-datasets/(" + _UUID_PATTERN + r")$"
+)
+_FRAME_IMAGE_RE = re.compile(
+    r"^/api/frame-datasets/(" + _UUID_PATTERN + r")/frames/(\d{1,5})$"
+)
+_EXTRACT_CANCEL_RE = re.compile(
+    r"^/api/extract/(" + _UUID_PATTERN + r")/cancel$"
+)
+_EXPERIMENT_CANCEL_RE = re.compile(
+    r"^/api/experiment/(" + _UUID_PATTERN + r")/cancel$"
 )
 
 
@@ -1298,6 +1913,8 @@ class ConsoleServer(ThreadingHTTPServer):
         config: Optional[Dict[str, Any]] = None,
         process_manager: Optional[ProcessManager] = None,
         run_store: Optional[RunStore] = None,
+        frame_dataset_store: Optional[FrameDatasetStore] = None,
+        review_store: Optional[ReviewStore] = None,
     ) -> None:
         self.config = config or {}
         self.process_manager = process_manager or ProcessManager()
@@ -1305,10 +1922,21 @@ class ConsoleServer(ThreadingHTTPServer):
             self.config.get("runs_dir", pathlib.Path.home() / ".web_console" / "runs")
         )
         self.run_store = run_store or RunStore(runs_dir)
+        frame_datasets_dir = pathlib.Path(
+            self.config.get(
+                "frame_datasets_dir",
+                runs_dir / "frame_datasets",
+            )
+        )
+        self.frame_dataset_store = frame_dataset_store or FrameDatasetStore(frame_datasets_dir)
+        self.review_store = review_store or ReviewStore(runs_dir)
         self._quiet = self.config.get("quiet", False)
         # Bounded experiment coordinator: at most one active experiment at a time.
         self._active_experiment_lock = threading.Lock()
         self._active_experiment_id: Optional[str] = None
+        # Per-experiment cancellation events.
+        self._experiment_cancel_events: Dict[str, threading.Event] = {}
+        self._cancel_events_lock = threading.Lock()
 
         def handler(*args: Any, **kwargs: Any) -> None:
             h = ConsoleHandler(*args, **kwargs)
@@ -1360,8 +1988,11 @@ _INDEX_TEMPLATE = """\
   <button data-view="dashboard" aria-label="Dashboard">Dashboard</button>
   <button data-view="models" aria-label="Models">Models</button>
   <button data-view="datasets" aria-label="Datasets">Datasets</button>
+  <button data-view="frame-explorer" aria-label="Frame Explorer">Frame Explorer</button>
+  <button data-view="profiles" aria-label="Task Profiles">Task Profiles</button>
   <button data-view="experiment" aria-label="Experiment">Experiment</button>
   <button data-view="runs" aria-label="Runs">Runs</button>
+  <button data-view="compare" aria-label="Compare">Compare</button>
   <button data-view="diagnostics" aria-label="Diagnostics">Diagnostics</button>
 </nav>
 <main>
@@ -1454,10 +2085,28 @@ _INDEX_TEMPLATE = """\
   <div class="panel">
     <div class="panel-title">Frame-Sequence Experiment (ROS-independent)</div>
     <fieldset>
-      <legend>Source</legend>
+      <legend>Source Dataset</legend>
       <label>
-        <span class="label-text">Image paths (one per line, absolute)</span>
-        <textarea id="exp-image-paths" rows="4" cols="70" placeholder="/data/frame_001.jpg&#10;/data/frame_002.jpg"></textarea>
+        <span class="label-text">Frame dataset</span>
+        <select id="exp-dataset-id">
+          <option value="">— select a frame dataset —</option>
+        </select>
+        <button type="button" class="small secondary" onclick="_loadExpDatasets()">Refresh</button>
+      </label>
+      <label>
+        <span class="label-text">Frame indices (comma-separated; leave blank = all)</span>
+        <input type="text" id="exp-frame-indices" size="70" placeholder="0,1,2,…  (leave blank for all frames)">
+      </label>
+      <div id="exp-dataset-info" style="font-size:0.85em;color:#666;margin-top:4px"></div>
+    </fieldset>
+    <fieldset>
+      <legend>Task Profile</legend>
+      <label>
+        <span class="label-text">Profile (optional — overrides prompt fields below)</span>
+        <select id="exp-profile-name">
+          <option value="">— none (use fields below) —</option>
+        </select>
+        <button type="button" class="small secondary" onclick="_loadExpProfiles()">Refresh</button>
       </label>
     </fieldset>
     <fieldset>
@@ -1479,14 +2128,14 @@ _INDEX_TEMPLATE = """\
       </label>
     </fieldset>
     <fieldset>
-      <legend>Prompt</legend>
+      <legend>Prompt (ignored when profile is selected)</legend>
       <label>
         <span class="label-text">System instruction</span>
         <input type="text" id="exp-system" value="You are a vision observer. Base claims on the current image." size="70">
       </label>
       <label>
         <span class="label-text">Task prompt</span>
-        <input type="text" id="exp-prompt" value="Describe the scene." size="70" required>
+        <input type="text" id="exp-prompt" value="Describe the scene." size="70">
       </label>
     </fieldset>
     <fieldset>
@@ -1520,6 +2169,7 @@ _INDEX_TEMPLATE = """\
       </label>
     </fieldset>
     <button type="button" id="exp-submit-btn" onclick="submitExperiment()">Submit Experiment</button>
+    <button type="button" id="exp-cancel-btn" onclick="cancelExperiment()" style="display:none" class="danger">Cancel</button>
     <div id="exp-result"></div>
   </div>
 
@@ -1602,6 +2252,10 @@ _INDEX_TEMPLATE = """\
   </div>
   <div id="run-detail" style="display:none" class="panel">
     <div class="panel-title">Run Detail</div>
+    <div id="run-detail-reviews" class="review-panel">
+      <div class="panel-title">Review Annotations</div>
+      <div id="review-list"><span class="muted">Select a run to view reviews.</span></div>
+    </div>
   </div>
 </div>
 
@@ -1630,6 +2284,92 @@ _INDEX_TEMPLATE = """\
       <button class="secondary small" onclick="loadDiagDatasets()" style="margin-left:auto">Refresh</button>
     </div>
     <pre id="diag-datasets-pre">Click Refresh to load.</pre>
+  </div>
+</div>
+
+<!-- ── Frame Explorer view ──────────────────────────────────────────────────── -->
+<div id="view-frame-explorer" class="view">
+  <div class="panel extraction-panel">
+    <div class="panel-title">Extract Frames from Rosbag</div>
+    <div class="form-row">
+      <label class="label-text">Rosbag
+        <select id="extract-bag-key" onchange="_onExtractBagChange()">
+          <option value="">— select an installed rosbag —</option>
+        </select>
+      </label>
+      <label class="label-text">Image topic
+        <input id="extract-image-topic" type="text" placeholder="/camera/image_raw" size="32">
+      </label>
+    </div>
+    <div class="form-row">
+      <label class="label-text">Start offset (s)
+        <input id="extract-start-offset" type="number" value="0" min="0" step="0.1" size="8">
+      </label>
+      <label class="label-text">Duration (s) <span class="muted">(end offset takes precedence)</span>
+        <input id="extract-duration" type="number" min="0" step="1" size="8" placeholder="all">
+      </label>
+      <label class="label-text">End offset (s)
+        <input id="extract-end-offset" type="number" min="0" step="0.1" size="8" placeholder="end">
+      </label>
+    </div>
+    <div class="form-row">
+      <label class="label-text">Sample interval (s) <span class="muted">(or use target count)</span>
+        <input id="extract-sample-interval" type="number" min="0" step="0.1" size="8" placeholder="auto">
+      </label>
+      <label class="label-text">Target frame count
+        <input id="extract-target-count" type="number" min="1" step="1" size="6" placeholder="auto">
+      </label>
+      <label class="label-text">Max frames
+        <input id="extract-max-frames" type="number" value="100" min="1" max="5000" size="6">
+      </label>
+    </div>
+    <div class="form-row">
+      <button id="extract-start-btn" onclick="_submitExtractPanel()">Extract Frames</button>
+      <button id="extract-cancel-btn" class="secondary" onclick="_cancelExtractionRun()" style="display:none">Cancel</button>
+      <span id="extract-status" class="muted" style="margin-left:1rem"></span>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Frame Datasets
+      <button class="secondary small" onclick="_loadFrameExplorer()" style="margin-left:auto">Refresh</button>
+    </div>
+    <div id="frame-dataset-list"><span class="muted">Loading…</span></div>
+  </div>
+  <div class="panel" id="frame-explorer-viewer" style="display:none">
+    <div class="panel-title">Frame Viewer
+      <button class="secondary small" onclick="_framePrev()">&#8592; Prev</button>
+      <button class="secondary small" onclick="_frameNext()">Next &#8594;</button>
+    </div>
+    <div id="frame-preview-area"></div>
+    <div id="frame-metadata" class="frame-meta"></div>
+    <div id="frame-thumbnail-strip" class="thumb-strip"></div>
+    <div id="frame-review-ui" class="review-panel"></div>
+  </div>
+</div>
+
+<!-- ── Task Profiles view ──────────────────────────────────────────────────── -->
+<div id="view-profiles" class="view">
+  <div class="panel">
+    <div class="panel-title">Task Profiles (warehouse awareness &amp; custom)
+      <button class="secondary small" onclick="_loadProfiles()" style="margin-left:auto">Refresh</button>
+    </div>
+    <div id="profiles-list"><span class="muted">Loading…</span></div>
+  </div>
+</div>
+
+<!-- ── Compare view ────────────────────────────────────────────────────────── -->
+<div id="view-compare" class="view">
+  <div class="panel">
+    <div class="panel-title">Compare Runs</div>
+    <div id="compare-form" class="compare-form-row">
+      <label>Run ID 1: <input id="compare-run-id-1" type="text" placeholder="UUID" size="40"></label>
+      <label>Run ID 2: <input id="compare-run-id-2" type="text" placeholder="UUID" size="40"></label>
+      <button onclick="_runCompare()">Compare</button>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Results</div>
+    <div id="compare-results"><span class="muted">Enter run IDs above to compare.</span></div>
   </div>
 </div>
 

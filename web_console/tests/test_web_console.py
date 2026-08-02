@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 from http.client import HTTPConnection
 from unittest.mock import MagicMock, patch
 
@@ -2741,20 +2742,16 @@ class TestExperimentConcurrency(unittest.TestCase):
         # Inject a fake active experiment ID directly into the server.
         self._srv._active_experiment_id = "aaaaaaaa-0000-0000-0000-000000000001"
         try:
-            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-                f.write(b"FAKE")
-                img = f.name
             status, data = self._post_json(
                 "/api/experiment/run",
                 {
                     "strategy": "single_frame",
-                    "image_paths": [img],
+                    "frame_dataset_id": str(uuid.uuid4()),
                     "task_prompt": "Describe.",
                 },
             )
         finally:
             self._srv._active_experiment_id = None
-            os.unlink(img)
         self.assertEqual(status, 409)
         self.assertIn("error", data)
         self.assertIn("aaaaaaaa", data["error"])
@@ -2765,33 +2762,62 @@ class TestExperimentConcurrency(unittest.TestCase):
         self.assertIsNone(self._srv._active_experiment_id)
         self.assertIsInstance(self._srv._active_experiment_lock, type(__import__("threading").Lock()))
 
-    def test_experiment_validates_all_image_paths(self):
-        """Image path validation must check ALL paths, not just the first 100."""
-        with tempfile.TemporaryDirectory() as d:
-            # Create 101 real files
-            real_paths = []
-            for i in range(101):
-                p = os.path.join(d, f"frame_{i:04d}.jpg")
-                pathlib.Path(p).write_bytes(b"FAKE")
-                real_paths.append(p)
-            # Replace the 101st path with a nonexistent file
-            real_paths[100] = os.path.join(d, "nonexistent_101.jpg")
-
-            status, data = self._post_json(
-                "/api/experiment/run",
-                {
-                    "strategy": "single_frame",
-                    "image_paths": real_paths,
-                    "task_prompt": "Describe.",
-                },
-            )
-        # Should fail because the 101st path does not exist.
+    def test_experiment_requires_frame_dataset_id(self):
+        """Experiment API must reject requests that supply raw image_paths."""
+        status, data = self._post_json(
+            "/api/experiment/run",
+            {
+                "strategy": "single_frame",
+                "image_paths": ["/data/frame.jpg"],
+                "task_prompt": "Describe.",
+            },
+        )
         self.assertIn(status, (400, 422), f"Expected 400/422, got {status}: {data}")
         self.assertIn("error", data)
-        self.assertIn("nonexistent_101.jpg", data["error"])
+
+    def test_concurrent_submissions_atomic_claim(self):
+        """Two simultaneous requests must not both receive 202; one must get 409."""
+        # Inject a fake active experiment so the first thread will see 409.
+        # Then verify that even without the pre-injected ID, the atomic claim
+        # in the handler prevents both concurrent submissions from succeeding.
+        results = []
+        errors = []
+
+        def _submit():
+            try:
+                status, data = self._post_json(
+                    "/api/experiment/run",
+                    {
+                        "strategy": "single_frame",
+                        "frame_dataset_id": str(uuid.uuid4()),
+                        "task_prompt": "Describe.",
+                    },
+                )
+                results.append(status)
+            except Exception as exc:
+                errors.append(exc)
+
+        # Simulate race: inject active ID, send two concurrent requests; both
+        # should return 409 because the slot is occupied.
+        self._srv._active_experiment_id = "aaaaaaaa-0000-0000-0000-000000000099"
+        try:
+            threads = [threading.Thread(target=_submit) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+        finally:
+            self._srv._active_experiment_id = None
+
+        self.assertFalse(errors, f"Submission threads raised exceptions: {errors}")
+        # All requests should have been rejected with 409 (slot was occupied).
+        self.assertTrue(
+            all(s == 409 for s in results),
+            f"Expected all 409 when slot occupied, got: {results}",
+        )
 
 
-class TestExperimentStackScript(unittest.TestCase):
+
     """Verify experiment_stack.sh passes bash -n syntax check."""
 
     def test_bash_syntax_check(self):
@@ -3498,6 +3524,1744 @@ class TestBenchmarkCountReconciliation(unittest.TestCase):
         js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
         js = js_path.read_text(encoding="utf-8")
         self.assertIn("count_note", js)
+
+
+# ── Task profile tests ────────────────────────────────────────────────────────
+
+class TestTaskProfiles(unittest.TestCase):
+    """Tests for task_profiles module: loading, hashing, and structured parsing."""
+
+    def _write_profile(self, d, data):
+        p = pathlib.Path(d) / f"{data['name']}_v{data['version']}.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+        return str(p)
+
+    def test_discover_profiles_loads_valid_profile(self):
+        from web_console.task_profiles import discover_profiles
+        with tempfile.TemporaryDirectory() as d:
+            self._write_profile(d, {
+                "name": "test_profile",
+                "version": "1",
+                "system_instruction": "You are a helpful assistant.",
+                "task_prompt": "Describe the scene.",
+                "schema_example": {},
+            })
+            profiles = discover_profiles(d)
+        self.assertEqual(len(profiles), 1)
+        self.assertEqual(profiles[0].name, "test_profile")
+        self.assertEqual(profiles[0].version, "1")
+
+    def test_discover_profiles_empty_dir(self):
+        from web_console.task_profiles import discover_profiles
+        with tempfile.TemporaryDirectory() as d:
+            profiles = discover_profiles(d)
+        self.assertEqual(profiles, [])
+
+    def test_discover_profiles_missing_dir(self):
+        from web_console.task_profiles import discover_profiles
+        profiles = discover_profiles("/tmp/nonexistent_profile_dir_xyz")
+        self.assertEqual(profiles, [])
+
+    def test_profile_id_stable(self):
+        from web_console.task_profiles import TaskProfile
+        p = TaskProfile(
+            name="warehouse_awareness",
+            version="1",
+            description="",
+            system_instruction="sys",
+            task_prompt="task",
+            prompt_hash="abc",
+            profile_path="/tmp/test.json",
+        )
+        self.assertEqual(p.profile_id(), "warehouse_awareness_v1")
+
+    def test_prompt_hash_deterministic(self):
+        from web_console.task_profiles import discover_profiles
+        with tempfile.TemporaryDirectory() as d:
+            self._write_profile(d, {
+                "name": "hash_test",
+                "version": "1",
+                "system_instruction": "sys",
+                "task_prompt": "task",
+                "schema_example": {},
+            })
+            p1 = discover_profiles(d)[0]
+            p2 = discover_profiles(d)[0]
+        self.assertEqual(p1.prompt_hash, p2.prompt_hash)
+        self.assertGreater(len(p1.prompt_hash), 0)
+
+    def test_prompt_hash_changes_with_content(self):
+        from web_console.task_profiles import discover_profiles
+        with tempfile.TemporaryDirectory() as d:
+            self._write_profile(d, {
+                "name": "a",
+                "version": "1",
+                "system_instruction": "sys",
+                "task_prompt": "task A",
+                "schema_example": {},
+            })
+            self._write_profile(d, {
+                "name": "b",
+                "version": "1",
+                "system_instruction": "sys",
+                "task_prompt": "task B",
+                "schema_example": {},
+            })
+            profiles = discover_profiles(d)
+        hashes = {p.prompt_hash for p in profiles}
+        self.assertEqual(len(hashes), 2, "Different prompts must produce different hashes")
+
+    def test_parse_structured_output_valid_json(self):
+        from web_console.task_profiles import parse_structured_output
+        raw = json.dumps({"summary": "all clear", "people": []})
+        result = parse_structured_output(raw)
+        self.assertTrue(result.parsed_ok)
+        self.assertEqual(result.parsed["summary"], "all clear")
+        self.assertEqual(result.raw, raw)
+
+    def test_parse_structured_output_json_in_markdown(self):
+        from web_console.task_profiles import parse_structured_output
+        raw = '```json\n{"summary": "ok"}\n```'
+        result = parse_structured_output(raw)
+        self.assertTrue(result.parsed_ok)
+        self.assertEqual(result.parsed["summary"], "ok")
+
+    def test_parse_structured_output_invalid_json_falls_back(self):
+        from web_console.task_profiles import parse_structured_output
+        raw = "not json at all"
+        result = parse_structured_output(raw)
+        self.assertFalse(result.parsed_ok)
+        self.assertIsNone(result.parsed)
+        self.assertEqual(result.raw, raw)
+
+    def test_parse_structured_output_never_evals(self):
+        """Malicious model output must not be evaluated."""
+        from web_console.task_profiles import parse_structured_output
+        raw = "__import__('os').system('echo hacked')"
+        result = parse_structured_output(raw)
+        self.assertFalse(result.parsed_ok)
+        self.assertIsNone(result.parsed)
+
+    def test_get_profile_by_name(self):
+        from web_console.task_profiles import discover_profiles, get_profile_by_name
+        with tempfile.TemporaryDirectory() as d:
+            self._write_profile(d, {
+                "name": "warehouse_awareness",
+                "version": "1",
+                "system_instruction": "s",
+                "task_prompt": "t",
+                "schema_example": {},
+            })
+            profiles = discover_profiles(d)
+            found = get_profile_by_name(profiles, "warehouse_awareness")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.name, "warehouse_awareness")
+
+    def test_get_profile_by_name_not_found(self):
+        from web_console.task_profiles import get_profile_by_name
+        result = get_profile_by_name([], "missing")
+        self.assertIsNone(result)
+
+    def test_default_warehouse_profile_exists_and_valid(self):
+        """The bundled warehouse_awareness_v1.json must load and parse."""
+        from web_console.task_profiles import discover_profiles
+        profiles_dir = pathlib.Path(__file__).resolve().parents[2] / "config" / "task_profiles"
+        if not profiles_dir.exists():
+            self.skipTest("config/task_profiles directory not found")
+        profiles = discover_profiles(str(profiles_dir))
+        names = [p.name for p in profiles]
+        self.assertIn("warehouse_awareness", names)
+        p = next(x for x in profiles if x.name == "warehouse_awareness")
+        self.assertGreater(len(p.task_prompt), 10)
+        self.assertGreater(len(p.prompt_hash), 10)
+
+
+# ── Frame extractor tests ─────────────────────────────────────────────────────
+
+class TestFrameExtractorValidation(unittest.TestCase):
+    """Tests for frame_extractor: catalog allowlisting, parameter validation, path safety."""
+
+    def test_validate_extraction_params_requires_bag_key(self):
+        from web_console.frame_extractor import validate_extraction_params
+        err = validate_extraction_params({"image_topic": "/cam/image_raw"})
+        self.assertIsNotNone(err)
+        self.assertIn("bag_key", err.lower())
+
+    def test_validate_extraction_params_requires_image_topic(self):
+        from web_console.frame_extractor import validate_extraction_params
+        err = validate_extraction_params({"bag_key": "my-bag"})
+        self.assertIsNotNone(err)
+        self.assertIn("image_topic", err.lower())
+
+    def test_validate_extraction_params_invalid_bag_key_chars(self):
+        from web_console.frame_extractor import validate_extraction_params
+        err = validate_extraction_params({
+            "bag_key": "../../etc/passwd",
+            "image_topic": "/cam",
+        })
+        self.assertIsNotNone(err)
+
+    def test_validate_extraction_params_max_frames_capped(self):
+        from web_console.frame_extractor import validate_extraction_params
+        err = validate_extraction_params({
+            "bag_key": "my-bag",
+            "image_topic": "/cam",
+            "max_frames": 99999,
+        })
+        self.assertIsNotNone(err)
+        self.assertIn("max_frames", err.lower())
+
+    def test_validate_extraction_params_valid(self):
+        from web_console.frame_extractor import validate_extraction_params
+        err = validate_extraction_params({
+            "bag_key": "my-bag",
+            "image_topic": "/cam/image_raw",
+            "max_frames": 50,
+        })
+        self.assertIsNone(err)
+
+    def test_allowlist_bag_path_rejects_unknown_key(self):
+        from web_console.frame_extractor import allowlist_bag_path
+        catalog = {"rosbags": [], "images": [], "videos": []}
+        with self.assertRaises(ValueError):
+            allowlist_bag_path("unknown-key", catalog)
+
+    def test_allowlist_bag_path_rejects_not_installed(self):
+        from web_console.frame_extractor import allowlist_bag_path
+        catalog = {
+            "rosbags": [{"key": "my-bag", "installed": False, "local_path": "/data/my-bag"}],
+            "images": [],
+            "videos": [],
+        }
+        with self.assertRaises(ValueError):
+            allowlist_bag_path("my-bag", catalog)
+
+    def test_allowlist_bag_path_accepts_installed(self):
+        from web_console.frame_extractor import allowlist_bag_path
+        catalog = {
+            "rosbags": [{"key": "my-bag", "installed": True, "local_path": "/data/my-bag"}],
+            "images": [],
+            "videos": [],
+        }
+        path = allowlist_bag_path("my-bag", catalog)
+        self.assertEqual(path, "/data/my-bag")
+
+    def test_build_extraction_args_returns_list(self):
+        from web_console.frame_extractor import ExtractionParams, build_extraction_args
+        params = ExtractionParams(
+            bag_key="my-bag",
+            bag_path="/data/my-bag",
+            image_topic="/cam/image_raw",
+            dataset_id="11111111-1111-1111-1111-111111111111",
+            output_dir="/tmp/test_output",
+            start_offset=0.0,
+            end_offset=None,
+            duration=None,
+            sample_interval=None,
+            target_sample_count=20,
+            max_frames=50,
+        )
+        args = build_extraction_args("/path/to/script.py", params)
+        self.assertIsInstance(args, list)
+        self.assertEqual(args[0], "python3")
+        # Must never contain shell metacharacters in a single joined string
+        full = " ".join(args)
+        self.assertNotIn(";", full)
+        self.assertNotIn("&&", full)
+        self.assertNotIn("$", full)
+
+    def test_is_safe_dataset_id_valid(self):
+        from web_console.frame_extractor import _is_safe_dataset_id
+        self.assertTrue(_is_safe_dataset_id("11111111-1111-1111-1111-111111111111"))
+
+    def test_is_safe_dataset_id_rejects_path(self):
+        from web_console.frame_extractor import _is_safe_dataset_id
+        self.assertFalse(_is_safe_dataset_id("../../etc/passwd"))
+        self.assertFalse(_is_safe_dataset_id("/absolute/path"))
+        self.assertFalse(_is_safe_dataset_id(""))
+
+    # ── behavioral duration tests ────────────────────────────────────────────
+
+    def test_duration_derives_effective_end_offset(self):
+        """--duration must derive effective_end = start + duration (no rosbag2_py needed)."""
+        import sys as _sys
+        _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_REPO_ROOT))
+        from scripts.extract_bag_frames import _parse_args, _compute_effective_end_offset
+
+        args = _parse_args([
+            "--bag-path", "/data/bag",
+            "--output-dir", "/tmp/out",
+            "--topic", "/cam",
+            "--dataset-id", "11111111-1111-1111-1111-111111111111",
+            "--start-offset", "2.0",
+            "--duration", "10.0",
+        ])
+        effective_end = _compute_effective_end_offset(args)
+        self.assertIsNotNone(effective_end)
+        self.assertAlmostEqual(effective_end, 12.0, places=6,
+                               msg="effective_end should be start_offset + duration")
+
+    def test_end_offset_takes_precedence_over_duration(self):
+        """When both --end-offset and --duration are given, --end-offset wins."""
+        import sys as _sys
+        _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_REPO_ROOT))
+        from scripts.extract_bag_frames import _parse_args, _compute_effective_end_offset
+
+        args = _parse_args([
+            "--bag-path", "/data/bag",
+            "--output-dir", "/tmp/out",
+            "--topic", "/cam",
+            "--dataset-id", "11111111-1111-1111-1111-111111111111",
+            "--start-offset", "0.0",
+            "--end-offset", "20.0",
+            "--duration", "5.0",
+        ])
+        effective_end = _compute_effective_end_offset(args)
+        self.assertAlmostEqual(effective_end, 20.0, places=6,
+                               msg="--end-offset must take precedence over --duration")
+
+    def test_no_end_or_duration_returns_none(self):
+        """With neither --end-offset nor --duration, effective end is None (play to bag end)."""
+        import sys as _sys
+        _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
+        _sys.path.insert(0, str(_REPO_ROOT))
+        from scripts.extract_bag_frames import _parse_args, _compute_effective_end_offset
+
+        args = _parse_args([
+            "--bag-path", "/data/bag",
+            "--output-dir", "/tmp/out",
+            "--topic", "/cam",
+            "--dataset-id", "11111111-1111-1111-1111-111111111111",
+        ])
+        self.assertIsNone(_compute_effective_end_offset(args))
+
+    def test_detect_storage_id_from_mcap_metadata(self):
+        """Storage plugin must follow metadata.yaml instead of assuming sqlite3."""
+        from scripts.extract_bag_frames import _detect_storage_id
+        with tempfile.TemporaryDirectory() as tmp:
+            bag = pathlib.Path(tmp)
+            (bag / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n  storage_identifier: mcap\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_detect_storage_id(str(bag)), "mcap")
+
+    def test_detect_storage_id_from_sqlite_metadata(self):
+        """SQLite bags remain supported through their metadata identifier."""
+        from scripts.extract_bag_frames import _detect_storage_id
+        with tempfile.TemporaryDirectory() as tmp:
+            bag = pathlib.Path(tmp)
+            (bag / "metadata.yaml").write_text(
+                "rosbag2_bagfile_information:\n  storage_identifier: sqlite3\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(_detect_storage_id(str(bag)), "sqlite3")
+
+    def test_detect_storage_id_falls_back_to_extension(self):
+        """Direct or incomplete bag paths use their data-file extension."""
+        from scripts.extract_bag_frames import _detect_storage_id
+        with tempfile.TemporaryDirectory() as tmp:
+            bag = pathlib.Path(tmp)
+            (bag / "data_0.mcap").touch()
+            self.assertEqual(_detect_storage_id(str(bag)), "mcap")
+
+    def test_manifest_records_effective_end_offset_sec(self):
+        """build_extraction_args must pass --duration; manifest field must be present."""
+        from web_console.frame_extractor import ExtractionParams, build_extraction_args
+
+        params = ExtractionParams(
+            bag_key="my-bag",
+            bag_path="/data/my-bag",
+            image_topic="/cam",
+            dataset_id="11111111-1111-1111-1111-111111111111",
+            output_dir="/tmp/out",
+            start_offset=2.0,
+            duration=10.0,
+            max_frames=50,
+        )
+        args = build_extraction_args("/path/to/script.py", params)
+        self.assertIn("--duration", args)
+        idx = args.index("--duration")
+        self.assertEqual(args[idx + 1], "10.0")
+        # --end-offset must NOT be present (duration is the mechanism here)
+        self.assertNotIn("--end-offset", args)
+
+
+
+    """Tests for FrameDatasetStore: manifest, path safety, frame listing."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        from web_console.frame_extractor import FrameDatasetStore
+        self._store = FrameDatasetStore(pathlib.Path(self._tmpdir))
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _make_dataset(self, dataset_id, frames=2):
+        from web_console.frame_extractor import write_frame_manifest
+        d = pathlib.Path(self._tmpdir) / dataset_id
+        d.mkdir(parents=True)
+        frame_records = []
+        for i in range(frames):
+            img = d / f"frame_{i:04d}.jpg"
+            img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)  # minimal JPEG header
+            frame_records.append({
+                "index": i,
+                "filename": img.name,
+                "timestamp_sec": float(i),
+                "timestamp_ns": i * 1_000_000_000,
+            })
+        manifest = {
+            "schema_version": 1,
+            "dataset_id": dataset_id,
+            "bag_key": "test-bag",
+            "bag_path": "/data/test-bag",
+            "topic": "/cam",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 100,
+            "frames": frame_records,
+            "frame_count": frames,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(d),
+        }
+        write_frame_manifest(d, manifest)
+        return manifest
+
+    def test_list_datasets_empty(self):
+        datasets = self._store.list_datasets()
+        self.assertEqual(datasets, [])
+
+    def test_list_datasets_after_create(self):
+        dataset_id = "22222222-2222-2222-2222-222222222222"
+        self._make_dataset(dataset_id)
+        datasets = self._store.list_datasets()
+        ids = [d["dataset_id"] for d in datasets]
+        self.assertIn(dataset_id, ids)
+
+    def test_get_manifest_returns_data(self):
+        dataset_id = "33333333-3333-3333-3333-333333333333"
+        self._make_dataset(dataset_id)
+        manifest = self._store.get_manifest(dataset_id)
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest["dataset_id"], dataset_id)
+
+    def test_get_manifest_unknown_returns_none(self):
+        manifest = self._store.get_manifest("44444444-4444-4444-4444-444444444444")
+        self.assertIsNone(manifest)
+
+    def test_get_frame_path_valid(self):
+        dataset_id = "55555555-5555-5555-5555-555555555555"
+        self._make_dataset(dataset_id, frames=3)
+        path = self._store.get_frame_path(dataset_id, 0)
+        self.assertIsNotNone(path)
+        self.assertTrue(path.exists())
+
+    def test_get_frame_path_out_of_range(self):
+        dataset_id = "66666666-6666-6666-6666-666666666666"
+        self._make_dataset(dataset_id, frames=2)
+        path = self._store.get_frame_path(dataset_id, 999)
+        self.assertIsNone(path)
+
+    def test_get_frame_path_rejects_path_traversal(self):
+        """get_frame_path must never escape the dataset directory."""
+        dataset_id = "77777777-7777-7777-7777-777777777777"
+        self._make_dataset(dataset_id, frames=1)
+        # Negative indices are not valid frame indices (already checked upstream)
+        path = self._store.get_frame_path(dataset_id, -1)
+        self.assertIsNone(path)
+
+    def test_get_frame_path_invalid_dataset_id(self):
+        path = self._store.get_frame_path("../../etc", 0)
+        self.assertIsNone(path)
+
+
+# ── Review store tests ────────────────────────────────────────────────────────
+
+class TestReviewStore(unittest.TestCase):
+    """Tests for review_store: annotation CRUD, label validation, thread safety."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.mkdtemp()
+        from web_console.review_store import ReviewStore
+        self._store = ReviewStore(pathlib.Path(self._tmpdir))
+
+    def tearDown(self):
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def _annotation(self, run_id, frame_index=0, label="acceptable"):
+        from web_console.review_store import ReviewAnnotation
+        return ReviewAnnotation(
+            run_id=run_id,
+            frame_index=frame_index,
+            label=label,
+            note="test note",
+            created_at="2025-01-01T00:00:00Z",
+            updated_at="2025-01-01T00:00:00Z",
+        )
+
+    def test_get_reviews_empty(self):
+        reviews = self._store.get_reviews("nonexistent-run")
+        self.assertEqual(reviews, [])
+
+    def test_upsert_and_get(self):
+        run_id = str(uuid.uuid4())
+        ann = self._annotation(run_id, frame_index=3, label="acceptable")
+        self._store.upsert_review(ann)
+        reviews = self._store.get_reviews(run_id)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0].frame_index, 3)
+        self.assertEqual(reviews[0].label, "acceptable")
+
+    def test_upsert_updates_existing(self):
+        run_id = str(uuid.uuid4())
+        ann1 = self._annotation(run_id, frame_index=0, label="acceptable")
+        ann2 = self._annotation(run_id, frame_index=0, label="ambiguous")
+        ann2 = ann2.__class__(
+            run_id=run_id,
+            frame_index=0,
+            label="ambiguous",
+            note="updated",
+            created_at=ann1.created_at,
+            updated_at="2025-01-02T00:00:00Z",
+        )
+        self._store.upsert_review(ann1)
+        self._store.upsert_review(ann2)
+        reviews = self._store.get_reviews(run_id)
+        self.assertEqual(len(reviews), 1, "Upsert should not duplicate")
+        self.assertEqual(reviews[0].label, "ambiguous")
+
+    def test_multiple_frames_stored_separately(self):
+        run_id = str(uuid.uuid4())
+        for i in range(5):
+            ann = self._annotation(run_id, frame_index=i, label="acceptable")
+            self._store.upsert_review(ann)
+        reviews = self._store.get_reviews(run_id)
+        self.assertEqual(len(reviews), 5)
+        indices = sorted(r.frame_index for r in reviews)
+        self.assertEqual(indices, [0, 1, 2, 3, 4])
+
+    def test_validate_review_valid(self):
+        from web_console.review_store import validate_review
+        err = validate_review({"frame_index": 0, "label": "acceptable"})
+        self.assertIsNone(err)
+
+    def test_validate_review_missing_label(self):
+        from web_console.review_store import validate_review
+        err = validate_review({"frame_index": 0})
+        self.assertIsNotNone(err)
+
+    def test_validate_review_invalid_label(self):
+        from web_console.review_store import validate_review
+        err = validate_review({"frame_index": 0, "label": "not_a_valid_label"})
+        self.assertIsNotNone(err)
+
+    def test_validate_review_missing_frame_index(self):
+        from web_console.review_store import validate_review
+        err = validate_review({"label": "acceptable"})
+        self.assertIsNotNone(err)
+
+    def test_validate_review_note_too_long(self):
+        from web_console.review_store import validate_review
+        err = validate_review({"frame_index": 0, "label": "acceptable", "note": "x" * 10001})
+        self.assertIsNotNone(err)
+
+    def test_allowed_labels_all_accepted(self):
+        from web_console.review_store import validate_review, ALLOWED_REVIEW_LABELS
+        for label in ALLOWED_REVIEW_LABELS:
+            err = validate_review({"frame_index": 0, "label": label})
+            self.assertIsNone(err, f"Label {label!r} should be valid")
+
+    def test_persistence_across_instances(self):
+        """Reviews must survive recreating the store."""
+        from web_console.review_store import ReviewStore
+        run_id = str(uuid.uuid4())
+        ann = self._annotation(run_id, frame_index=7, label="ambiguous")
+        self._store.upsert_review(ann)
+        # Recreate store.
+        store2 = ReviewStore(pathlib.Path(self._tmpdir))
+        reviews = store2.get_reviews(run_id)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0].frame_index, 7)
+
+
+# ── New server routes (profiles, frame datasets, extract, reviews, compare) ───
+
+class TestProfilesAPI(unittest.TestCase):
+    """Tests for GET /api/profiles."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        profiles_dir = pathlib.Path(cls._tmpdir) / "profiles"
+        profiles_dir.mkdir()
+        (profiles_dir / "warehouse_awareness_v1.json").write_text(json.dumps({
+            "name": "warehouse_awareness",
+            "version": "1",
+            "system_instruction": "You are a warehouse-awareness assistant.",
+            "task_prompt": "Describe what you see in the warehouse.",
+            "schema_example": {"summary": ""},
+        }), encoding="utf-8")
+        config = {
+            "quiet": True,
+            "socket_path": "/tmp/no_such.sock",
+            "task_profiles_dir": str(profiles_dir),
+        }
+        cls._srv, cls._port, cls._thread = _start_test_server(config=config)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    def test_list_profiles_returns_list(self):
+        status, data = self._get("/api/profiles")
+        self.assertEqual(status, 200)
+        self.assertIn("profiles", data)
+        self.assertIsInstance(data["profiles"], list)
+
+    def test_list_profiles_includes_warehouse(self):
+        status, data = self._get("/api/profiles")
+        names = [p["name"] for p in data["profiles"]]
+        self.assertIn("warehouse_awareness", names)
+
+    def test_list_profiles_has_prompt_hash(self):
+        status, data = self._get("/api/profiles")
+        for p in data["profiles"]:
+            self.assertIn("prompt_hash", p)
+            self.assertGreater(len(p["prompt_hash"]), 0)
+
+    def test_list_profiles_has_profile_id(self):
+        status, data = self._get("/api/profiles")
+        for p in data["profiles"]:
+            self.assertIn("profile_id", p)
+
+
+class TestFrameDatasetAPI(unittest.TestCase):
+    """Tests for GET /api/frame-datasets and frame-image serving."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        runs_dir = pathlib.Path(cls._tmpdir) / "runs"
+        runs_dir.mkdir()
+        frame_datasets_dir = runs_dir / "frame_datasets"
+        frame_datasets_dir.mkdir()
+        from web_console.frame_extractor import FrameDatasetStore, write_frame_manifest
+        cls._frame_store = FrameDatasetStore(frame_datasets_dir)
+        # Create a test dataset.
+        cls._dataset_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        dataset_dir = frame_datasets_dir / cls._dataset_id
+        dataset_dir.mkdir()
+        img = dataset_dir / "frame_0000.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+        write_frame_manifest(dataset_dir, {
+            "schema_version": 1,
+            "dataset_id": cls._dataset_id,
+            "bag_key": "test-bag",
+            "bag_path": "/data/test-bag",
+            "topic": "/cam",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 100,
+            "frames": [{"index": 0, "filename": "frame_0000.jpg",
+                         "timestamp_sec": 1.0, "timestamp_ns": 1000000000}],
+            "frame_count": 1,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(dataset_dir),
+        })
+        config = {
+            "quiet": True,
+            "socket_path": "/tmp/no_such.sock",
+            "frame_datasets_dir": str(frame_datasets_dir),
+        }
+        cls._srv, cls._port, cls._thread = _start_test_server(
+            config=config,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def _get_raw(self, path):
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, body, resp.getheader("Content-Type", "")
+
+    def _get(self, path):
+        status, body, _ = self._get_raw(path)
+        return status, json.loads(body)
+
+    def test_list_frame_datasets_returns_list(self):
+        status, data = self._get("/api/frame-datasets")
+        self.assertEqual(status, 200)
+        self.assertIn("datasets", data)
+
+    def test_list_frame_datasets_contains_our_dataset(self):
+        status, data = self._get("/api/frame-datasets")
+        ids = [d["dataset_id"] for d in data["datasets"]]
+        self.assertIn(self._dataset_id, ids)
+
+    def test_get_frame_dataset_manifest(self):
+        status, data = self._get(f"/api/frame-datasets/{self._dataset_id}")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["dataset_id"], self._dataset_id)
+        self.assertIn("frames", data)
+
+    def test_get_frame_dataset_unknown_returns_404(self):
+        status, data = self._get("/api/frame-datasets/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        self.assertEqual(status, 404)
+
+    def test_get_frame_dataset_invalid_id_returns_400(self):
+        status, data = self._get("/api/frame-datasets/../../etc/passwd")
+        self.assertEqual(status, 404)  # no route match for invalid UUID
+
+    def test_serve_frame_image_returns_jpeg(self):
+        status, body, ct = self._get_raw(f"/api/frame-datasets/{self._dataset_id}/frames/0")
+        self.assertEqual(status, 200)
+        self.assertIn("image/jpeg", ct)
+        self.assertGreater(len(body), 0)
+
+    def test_serve_frame_image_out_of_range_returns_404(self):
+        status, body, _ = self._get_raw(f"/api/frame-datasets/{self._dataset_id}/frames/999")
+        self.assertEqual(status, 404)
+
+    def test_serve_frame_image_unknown_dataset_returns_404(self):
+        status, body, _ = self._get_raw(
+            "/api/frame-datasets/cccccccc-cccc-cccc-cccc-cccccccccccc/frames/0"
+        )
+        self.assertEqual(status, 404)
+
+    def test_serve_frame_image_path_traversal_blocked(self):
+        """Path traversal attempts must not reach the filesystem."""
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        # Encode a path traversal in the frame index portion (not a valid digit sequence)
+        conn.request("GET", f"/api/frame-datasets/{self._dataset_id}/frames/00000")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        # The important thing is no server error and no data from /etc/passwd
+        self.assertIn(resp.status, (200, 404))
+
+
+class TestExtractAPI(unittest.TestCase):
+    """Tests for POST /api/extract and POST /api/extract/<id>/cancel."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        config = {
+            "quiet": True,
+            "socket_path": "/tmp/no_such.sock",
+            "rosbag_dir": cls._tmpdir,
+            "runs_dir": str(pathlib.Path(cls._tmpdir) / "runs"),
+        }
+        cls._srv, cls._port, cls._thread = _start_test_server(config=config)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def _post(self, path, data):
+        body = json.dumps(data).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body)
+
+    def test_extract_missing_bag_key_returns_400(self):
+        status, data = self._post("/api/extract", {"image_topic": "/cam"})
+        self.assertEqual(status, 400)
+
+    def test_extract_missing_image_topic_returns_400(self):
+        status, data = self._post("/api/extract", {"bag_key": "my-bag"})
+        self.assertEqual(status, 400)
+
+    def test_extract_unknown_bag_key_returns_400(self):
+        """Bag keys not in catalog must be rejected."""
+        status, data = self._post("/api/extract", {
+            "bag_key": "not-in-catalog",
+            "image_topic": "/cam",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_extract_cancel_nonexistent_run_returns_404(self):
+        status, data = self._post(
+            "/api/extract/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee/cancel", {}
+        )
+        self.assertEqual(status, 404)
+
+    def test_extract_cancel_non_extraction_run_returns_400(self):
+        """Cancel must reject runs that are not extraction kind."""
+        run_store = self._srv.run_store
+        run_id = RunStore.new_run_id()
+        run_store.save_run(run_id, {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "ros_experiment",
+            "status": "running",
+            "created_at": "2025-01-01T00:00:00Z",
+        })
+        status, data = self._post(f"/api/extract/{run_id}/cancel", {})
+        self.assertEqual(status, 400)
+
+
+class TestReviewAPI(unittest.TestCase):
+    """Tests for POST/GET /api/runs/<run_id>/reviews."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        runs_dir = pathlib.Path(cls._tmpdir) / "runs"
+        runs_dir.mkdir()
+        cls._run_store = RunStore(runs_dir)
+
+        # Create a completed run with known result_frames for review tests.
+        cls._completed_run_id = RunStore.new_run_id()
+        cls._run_store.save_run(cls._completed_run_id, {
+            "schema_version": 1,
+            "run_id": cls._completed_run_id,
+            "kind": "experiment",
+            "status": "running",
+            "created_at": "2025-01-01T00:00:00Z",
+        })
+        cls._run_store.finalize_run(cls._completed_run_id, {
+            "status": "completed",
+            "completed_at": "2025-01-01T00:01:00Z",
+            "result_frames": [
+                {"frame_index": 0, "text": "frame 0", "success": True},
+                {"frame_index": 1, "text": "frame 1", "success": True},
+                {"frame_index": 2, "text": "frame 2", "success": True},
+                {"frame_index": 3, "text": "frame 3", "success": True},
+                {"frame_index": 4, "text": "frame 4", "success": True},
+                {"frame_index": 5, "text": "frame 5", "success": True},
+            ],
+        })
+
+        config = {"quiet": True, "socket_path": "/tmp/no_such.sock",
+                  "runs_dir": str(runs_dir)}
+        cls._srv, cls._port, cls._thread = _start_test_server(
+            config=config, run_store=cls._run_store,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    def _post(self, path, data):
+        body = json.dumps(data).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body)
+
+    def test_get_reviews_empty(self):
+        status, data = self._get(f"/api/runs/{self._completed_run_id}/reviews")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(data["reviews"], list)
+
+    def test_upsert_review_valid(self):
+        run_id = self._completed_run_id
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 5,
+            "label": "acceptable",
+            "note": "looks good",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["label"], "acceptable")
+        self.assertEqual(data["frame_index"], 5)
+
+    def test_upsert_review_invalid_label(self):
+        run_id = self._completed_run_id
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0,
+            "label": "not_valid",
+        })
+        self.assertEqual(status, 400)
+
+    def test_upsert_review_missing_frame_index(self):
+        run_id = self._completed_run_id
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "label": "acceptable",
+        })
+        self.assertEqual(status, 400)
+
+    def test_upsert_and_get_roundtrip(self):
+        run_id = self._completed_run_id
+        self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 3,
+            "label": "ambiguous",
+            "note": "unclear",
+        })
+        status, data = self._get(f"/api/runs/{run_id}/reviews")
+        self.assertEqual(status, 200)
+        reviews = [r for r in data["reviews"] if r["frame_index"] == 3]
+        self.assertTrue(any(r["label"] == "ambiguous" for r in reviews))
+
+    def test_upsert_review_all_valid_labels(self):
+        from web_console.review_store import ALLOWED_REVIEW_LABELS
+        run_id = self._completed_run_id
+        for i, label in enumerate(sorted(ALLOWED_REVIEW_LABELS)):
+            status, data = self._post(f"/api/runs/{run_id}/reviews", {
+                "frame_index": i,
+                "label": label,
+            })
+            self.assertEqual(status, 200, f"Label {label!r} should be accepted")
+
+    def test_upsert_review_nonexistent_run_returns_404(self):
+        """Reviews for a run that doesn't exist must return 404."""
+        run_id = str(uuid.uuid4())
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0,
+            "label": "acceptable",
+        })
+        self.assertEqual(status, 404)
+
+    def test_upsert_review_running_run_returns_409(self):
+        """Reviews for a non-terminal run must return 409."""
+        run_id = RunStore.new_run_id()
+        self._run_store.save_run(run_id, {
+            "schema_version": 1, "run_id": run_id,
+            "kind": "experiment", "status": "running",
+            "created_at": "2025-01-01T00:00:00Z",
+        })
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        self.assertEqual(status, 409)
+
+    def test_upsert_review_invalid_frame_index_returns_400(self):
+        """Frame index not in result_frames must return 400."""
+        run_id = self._completed_run_id
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 999,
+            "label": "acceptable",
+        })
+        self.assertEqual(status, 400)
+
+    def test_reviews_route_invalid_run_id_rejected(self):
+        status, data = self._get("/api/runs/not-a-uuid/reviews")
+        self.assertIn(status, (400, 404))
+
+
+
+class TestCompareAPI(unittest.TestCase):
+    """Tests for GET /api/compare aligned comparison."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._tmpdir = tempfile.mkdtemp()
+        runs_dir = pathlib.Path(cls._tmpdir) / "runs"
+        runs_dir.mkdir()
+        cls._run_store = RunStore(runs_dir)
+        # Create two runs with overlapping frames.
+        cls._run_id1 = RunStore.new_run_id()
+        cls._run_id2 = RunStore.new_run_id()
+        cls._run_store.save_run(cls._run_id1, {
+            "schema_version": 1,
+            "run_id": cls._run_id1,
+            "kind": "experiment",
+            "status": "completed",
+            "created_at": "2025-01-01T00:00:00Z",
+            "model": "model-a",
+            "strategy": "single_frame",
+            "result_frames": [
+                {"frame_index": 0, "text": "frame 0 run 1", "latency_ms": 100},
+                {"frame_index": 1, "text": "frame 1 run 1", "latency_ms": 110},
+            ],
+        })
+        cls._run_store.save_run(cls._run_id2, {
+            "schema_version": 1,
+            "run_id": cls._run_id2,
+            "kind": "experiment",
+            "status": "completed",
+            "created_at": "2025-01-01T01:00:00Z",
+            "model": "model-b",
+            "strategy": "single_frame_observation_history",
+            "result_frames": [
+                {"frame_index": 0, "text": "frame 0 run 2", "latency_ms": 200},
+                {"frame_index": 1, "text": "frame 1 run 2", "latency_ms": 220},
+            ],
+        })
+        config = {"quiet": True, "socket_path": "/tmp/no_such.sock",
+                  "runs_dir": str(runs_dir)}
+        cls._srv, cls._port, cls._thread = _start_test_server(
+            config=config, run_store=cls._run_store,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        shutil.rmtree(cls._tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    def test_compare_two_runs(self):
+        status, data = self._get(
+            f"/api/compare?run_ids={self._run_id1},{self._run_id2}"
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("aligned_frames", data)
+        self.assertIn("summaries", data)
+
+    def test_compare_aligned_frames_cover_both_runs(self):
+        status, data = self._get(
+            f"/api/compare?run_ids={self._run_id1},{self._run_id2}"
+        )
+        aligned = data["aligned_frames"]
+        self.assertEqual(len(aligned), 2)
+        for row in aligned:
+            self.assertIn(self._run_id1, row)
+            self.assertIn(self._run_id2, row)
+
+    def test_compare_summaries_have_metadata(self):
+        status, data = self._get(
+            f"/api/compare?run_ids={self._run_id1},{self._run_id2}"
+        )
+        for run_id in (self._run_id1, self._run_id2):
+            self.assertIn(run_id, data["summaries"])
+            summary = data["summaries"][run_id]
+            self.assertIn("model", summary)
+            self.assertIn("status", summary)
+
+    def test_compare_requires_at_least_two_run_ids(self):
+        status, data = self._get(f"/api/compare?run_ids={self._run_id1}")
+        self.assertEqual(status, 400)
+
+    def test_compare_missing_run_ids_param(self):
+        status, data = self._get("/api/compare")
+        self.assertEqual(status, 400)
+
+    def test_compare_unknown_run_id_returns_404(self):
+        fake_id = str(uuid.uuid4())
+        status, data = self._get(f"/api/compare?run_ids={self._run_id1},{fake_id}")
+        self.assertEqual(status, 404)
+
+    def test_compare_invalid_run_id_returns_400(self):
+        status, data = self._get(
+            f"/api/compare?run_ids={self._run_id1},not-a-uuid"
+        )
+        self.assertEqual(status, 400)
+
+
+# ── UI wiring tests ───────────────────────────────────────────────────────────
+
+class TestWarehouseUIElements(unittest.TestCase):
+    """Check app.js and HTML template for new warehouse workbench UI elements."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = cls._js_path.read_text(encoding="utf-8")
+        # Import server to access the HTML template.
+        from web_console import server as _srv_mod
+        cls._html = _srv_mod._INDEX_TEMPLATE
+
+    def test_app_js_has_frame_datasets_fetch(self):
+        """app.js must call the /api/frame-datasets route."""
+        self.assertIn("/api/frame-datasets", self._js)
+
+    def test_app_js_has_profiles_fetch(self):
+        """app.js must call the /api/profiles route."""
+        self.assertIn("/api/profiles", self._js)
+
+    def test_app_js_has_compare_fetch(self):
+        """app.js must call the /api/compare route."""
+        self.assertIn("/api/compare", self._js)
+
+    def test_app_js_has_reviews_fetch(self):
+        """app.js must call the /api/runs/.../reviews route."""
+        self.assertIn("/reviews", self._js)
+
+    def test_app_js_has_extract_fetch(self):
+        """app.js must call the /api/extract route."""
+        self.assertIn("/api/extract", self._js)
+
+    def test_html_has_frame_explorer_view(self):
+        """HTML template must include a frame-explorer view container."""
+        self.assertIn("frame-explorer", self._html)
+
+    def test_html_has_warehouse_profile_reference(self):
+        """HTML template must reference warehouse or profiles somewhere."""
+        self.assertIn("profile", self._html.lower())
+
+    def test_html_has_review_ui(self):
+        """HTML template must include review label/annotation UI."""
+        self.assertIn("review", self._html.lower())
+
+
+class TestExtractionPanelUI(unittest.TestCase):
+    """Behavioral coverage for the frame-extraction panel in app.js and the HTML template."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = cls._js_path.read_text(encoding="utf-8")
+        from web_console import server as _srv_mod
+        cls._html = _srv_mod._INDEX_TEMPLATE
+
+    # ── HTML structure ────────────────────────────────────────────────────────
+
+    def test_html_has_extraction_panel(self):
+        """HTML template must include an extraction-panel element in the Frame Explorer view."""
+        self.assertIn("extraction-panel", self._html)
+
+    def test_html_has_extract_bag_key_select(self):
+        """HTML template must have a bag-key <select> for extraction."""
+        self.assertIn("extract-bag-key", self._html)
+
+    def test_html_has_extract_image_topic_input(self):
+        """HTML template must have an image-topic input for extraction."""
+        self.assertIn("extract-image-topic", self._html)
+
+    def test_html_has_extract_start_offset(self):
+        """HTML template must have a start-offset control."""
+        self.assertIn("extract-start-offset", self._html)
+
+    def test_html_has_extract_duration(self):
+        """HTML template must have a duration control."""
+        self.assertIn("extract-duration", self._html)
+
+    def test_html_has_extract_sample_interval(self):
+        """HTML template must have a sample-interval control."""
+        self.assertIn("extract-sample-interval", self._html)
+
+    def test_html_has_extract_target_count(self):
+        """HTML template must have a target-count control."""
+        self.assertIn("extract-target-count", self._html)
+
+    def test_html_has_extract_max_frames(self):
+        """HTML template must have a max-frames control."""
+        self.assertIn("extract-max-frames", self._html)
+
+    def test_html_has_extract_start_button(self):
+        """HTML template must have an Extract Frames start button."""
+        self.assertIn("extract-start-btn", self._html)
+
+    def test_html_has_extract_cancel_button(self):
+        """HTML template must have an extraction cancel button."""
+        self.assertIn("extract-cancel-btn", self._html)
+
+    def test_html_has_extract_status_element(self):
+        """HTML template must have a status/progress element for extraction."""
+        self.assertIn("extract-status", self._html)
+
+    def test_html_extraction_panel_in_frame_explorer_view(self):
+        """The extraction panel must be inside the frame-explorer view section."""
+        start = self._html.find('id="view-frame-explorer"')
+        end = self._html.find('id="view-profiles"')
+        self.assertGreater(start, -1, "view-frame-explorer not found")
+        self.assertGreater(end, start, "view-profiles must follow view-frame-explorer")
+        explorer_section = self._html[start:end]
+        self.assertIn("extraction-panel", explorer_section)
+
+    # ── JS functions ──────────────────────────────────────────────────────────
+
+    def test_app_js_has_load_extraction_bags(self):
+        """app.js must define _loadExtractionBags()."""
+        self.assertIn("function _loadExtractionBags(", self._js)
+
+    def test_app_js_load_extraction_bags_fetches_datasets(self):
+        """_loadExtractionBags must call /api/datasets to enumerate installed bags."""
+        self.assertIn("/api/datasets", self._js)
+
+    def test_app_js_has_submit_extract_panel(self):
+        """app.js must define _submitExtractPanel()."""
+        self.assertIn("function _submitExtractPanel(", self._js)
+
+    def test_app_js_submit_calls_start_extraction(self):
+        """_submitExtractPanel must invoke _startExtraction()."""
+        self.assertIn("_startExtraction(", self._js)
+
+    def test_app_js_has_poll_extraction_run(self):
+        """app.js must define _pollExtractionRun()."""
+        self.assertIn("function _pollExtractionRun(", self._js)
+
+    def test_app_js_poll_extraction_fetches_run_status(self):
+        """_pollExtractionRun must poll /api/runs/ to check status."""
+        self.assertIn("/api/runs/", self._js)
+
+    def test_open_frame_dataset_reveals_viewer(self):
+        """Opening a saved dataset must reveal the persistent frame viewer."""
+        start = self._js.find("async function _openFrameDataset(")
+        end = self._js.find("function _renderFrameStrip(", start)
+        self.assertGreater(start, -1)
+        self.assertGreater(end, start)
+        function_body = self._js[start:end]
+        self.assertIn('document.getElementById("frame-explorer-viewer")', function_body)
+        self.assertIn("_show(viewerEl)", function_body)
+
+    def test_frame_explorer_css_bounds_preview_and_thumbnails(self):
+        """Frames must render as one bounded preview plus a compact filmstrip."""
+        css_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "style.css"
+        css = css_path.read_text(encoding="utf-8")
+        self.assertIn(".frame-preview-img", css)
+        self.assertIn(".thumb-strip", css)
+        self.assertIn("overflow-x: auto", css)
+        self.assertIn(".frame-thumb", css)
+        self.assertIn("object-fit: cover", css)
+
+    def test_app_js_poll_extraction_opens_dataset_on_completion(self):
+        """_pollExtractionRun must call _openFrameDataset on completion."""
+        self.assertIn("_openFrameDataset(", self._js)
+
+    def test_app_js_poll_extraction_refreshes_frame_explorer(self):
+        """_pollExtractionRun must refresh the frame-dataset list on completion."""
+        self.assertIn("_loadFrameExplorer()", self._js)
+
+    def test_app_js_has_cancel_extraction_run(self):
+        """app.js must define _cancelExtractionRun()."""
+        self.assertIn("function _cancelExtractionRun(", self._js)
+
+    def test_app_js_cancel_extraction_run_calls_cancel_extraction(self):
+        """_cancelExtractionRun must call _cancelExtraction()."""
+        self.assertIn("_cancelExtraction(", self._js)
+
+    def test_app_js_has_on_extract_bag_change(self):
+        """app.js must define _onExtractBagChange() for topic auto-fill."""
+        self.assertIn("function _onExtractBagChange(", self._js)
+
+    def test_app_js_navigate_frame_explorer_calls_load_extraction_bags(self):
+        """navigate() must call _loadExtractionBags() when switching to frame-explorer."""
+        self.assertIn("_loadExtractionBags()", self._js)
+
+    # ── API integration: extraction panel workflow ────────────────────────────
+
+    @classmethod
+    def _make_srv(cls):
+        """Start a minimal test server with a rosbag catalog entry."""
+        import tempfile as _tempfile
+        tmpdir = pathlib.Path(_tempfile.mkdtemp())
+        bag_dir = tmpdir / "bags" / "test-bag"
+        bag_dir.mkdir(parents=True)
+        # Write a minimal metadata.yaml so the scanner recognises it.
+        meta = {"rosbag2_bagfile_information": {
+            "duration": {"nanoseconds": 5000000000},
+            "topics_with_message_count": [
+                {"topic_metadata": {"name": "/cam/image_raw", "type": "sensor_msgs/msg/Image"},
+                 "message_count": 10}
+            ]
+        }}
+        import yaml as _yaml
+        try:
+            (bag_dir / "metadata.yaml").write_text(_yaml.dump(meta))
+        except ImportError:
+            (bag_dir / "metadata.yaml").write_text("")
+        config = {
+            "quiet": True,
+            "socket_path": "/tmp/no_such.sock",
+            "rosbag_dir": str(tmpdir / "bags"),
+            "runs_dir": str(tmpdir / "runs"),
+        }
+        srv, port, thread = _start_test_server(config=config)
+        return srv, port, thread, tmpdir
+
+    def test_api_datasets_returns_rosbags_list(self):
+        """GET /api/datasets must return a rosbags list (used by extraction panel)."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/api/datasets")
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+            self.assertEqual(resp.status, 200)
+            self.assertIn("rosbags", body)
+            self.assertIsInstance(body["rosbags"], list)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_extract_panel_cancel_returns_404_for_unknown_run(self):
+        """POST /api/extract/<unknown>/cancel must return 404."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            run_id = str(uuid.uuid4())
+            body = json.dumps({}).encode()
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", f"/api/extract/{run_id}/cancel", body=body,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(body))})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 404)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_extract_panel_start_rejects_unknown_bag(self):
+        """POST /api/extract with a bag_key not in catalog must return 400."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            payload = json.dumps({"bag_key": "does-not-exist", "image_topic": "/cam"}).encode()
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/api/extract", body=payload,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(payload))})
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+            self.assertEqual(resp.status, 400)
+            self.assertIn("error", body)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_extract_panel_start_rejects_missing_topic(self):
+        """POST /api/extract without image_topic must return 400."""
+        srv, port, thread, tmpdir = self._make_srv()
+        try:
+            payload = json.dumps({"bag_key": "some-bag"}).encode()
+            conn = HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("POST", "/api/extract", body=payload,
+                         headers={"Content-Type": "application/json",
+                                  "Content-Length": str(len(payload))})
+            resp = conn.getresponse()
+            resp.read()
+            conn.close()
+            self.assertEqual(resp.status, 400)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── Integration tests ─────────────────────────────────────────────────────────
+
+class TestExperimentIntegration(unittest.TestCase):
+    """Integration tests: dataset→frames→experiment→compare→annotate.
+
+    These tests use mocked inference so no GPU/VLM is required.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from web_console.frame_extractor import FrameDatasetStore, write_frame_manifest
+        from web_console.task_profiles import discover_profiles, get_profile_by_name
+        import json as _json
+
+        cls._tmpdir = pathlib.Path(tempfile.mkdtemp())
+        runs_dir = cls._tmpdir / "runs"
+        runs_dir.mkdir()
+        frame_datasets_dir = cls._tmpdir / "frame_datasets"
+        frame_datasets_dir.mkdir()
+        profiles_dir = cls._tmpdir / "profiles"
+        profiles_dir.mkdir()
+
+        # Create a test frame dataset with 3 frames.
+        cls._dataset_id = str(uuid.uuid4())
+        dataset_dir = frame_datasets_dir / cls._dataset_id
+        dataset_dir.mkdir()
+        # Write 3 minimal JPEG files.
+        for i in range(3):
+            img = dataset_dir / f"frame_{i:04d}.jpg"
+            img.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 8)
+        write_frame_manifest(dataset_dir, {
+            "schema_version": 1,
+            "dataset_id": cls._dataset_id,
+            "bag_key": "integration-bag",
+            "bag_path": "/data/integration-bag",
+            "topic": "/cam",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 100,
+            "frames": [
+                {"index": 0, "filename": "frame_0000.jpg",
+                 "timestamp_sec": 1.0, "timestamp_ns": 1000000000},
+                {"index": 1, "filename": "frame_0001.jpg",
+                 "timestamp_sec": 1.5, "timestamp_ns": 1500000000},
+                {"index": 2, "filename": "frame_0002.jpg",
+                 "timestamp_sec": 2.0, "timestamp_ns": 2000000000},
+            ],
+            "frame_count": 3,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(dataset_dir),
+        })
+
+        # Write a minimal task profile.
+        profile_data = {
+            "schema_version": 1,
+            "name": "integration_profile",
+            "version": "1",
+            "system_instruction": "You are a warehouse observer.",
+            "task_prompt": 'Respond with JSON: {"summary": "..."}',
+        }
+        (profiles_dir / "integration_profile_v1.json").write_text(
+            _json.dumps(profile_data)
+        )
+
+        cls._run_store = RunStore(runs_dir)
+        config = {
+            "quiet": True,
+            "socket_path": "/tmp/no_such.sock",
+            "runs_dir": str(runs_dir),
+            "frame_datasets_dir": str(frame_datasets_dir),
+            "task_profiles_dir": str(profiles_dir),
+        }
+        cls._srv, cls._port, cls._thread = _start_test_server(
+            config=config, run_store=cls._run_store
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._srv.shutdown()
+        shutil.rmtree(str(cls._tmpdir), ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    def _post(self, path, data):
+        body = json.dumps(data).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": "application/json",
+                               "Content-Length": str(len(body))})
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body)
+
+    # ── helper: create a completed run with provenance ──────────────────────
+    def _make_completed_run(self, dataset_id=None, frame_count=3,
+                             profile_name=None, profile_version=None,
+                             profile_hash=None):
+        """Insert a completed experiment run directly into the RunStore."""
+        ds_id = dataset_id or self._dataset_id
+        run_id = RunStore.new_run_id()
+        result_frames = [
+            {
+                "frame_index": i,
+                "source_dataset_id": ds_id,
+                "source_frame_index": i,
+                "source_timestamp_ns": (i + 1) * 1_000_000_000,
+                "success": True,
+                "text": f"frame {i} description",
+                "latency_ms": 100 + i * 10,
+                "parse_success": True,
+                "parsed_response": {"summary": f"scene {i}"},
+            }
+            for i in range(frame_count)
+        ]
+        record = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "kind": "experiment",
+            "strategy": "single_frame",
+            "created_at": "2025-01-01T00:00:00Z",
+            "status": "running",
+            "frame_dataset_id": ds_id,
+            "image_count": frame_count,
+            "task_prompt": "Describe.",
+            "progress_frames": 0,
+        }
+        if profile_name:
+            record["profile_name"] = profile_name
+            record["profile_version"] = profile_version
+            record["profile_hash"] = profile_hash
+        self._run_store.save_run(run_id, record)
+        self._run_store.finalize_run(run_id, {
+            "status": "completed",
+            "completed_at": "2025-01-01T00:01:00Z",
+            "result_frames": result_frames,
+            "successful_frames": frame_count,
+            "failed_frames": 0,
+        })
+        return run_id
+
+    # ── test: dataset listed via API ─────────────────────────────────────────
+    def test_dataset_listed_in_api(self):
+        status, data = self._get("/api/frame-datasets")
+        self.assertEqual(status, 200)
+        ids = [d["dataset_id"] for d in data["datasets"]]
+        self.assertIn(self._dataset_id, ids)
+
+    # ── test: experiment rejects raw image_paths ─────────────────────────────
+    def test_experiment_rejects_raw_image_paths(self):
+        status, data = self._post("/api/experiment/run", {
+            "image_paths": ["/data/frame.jpg"],
+            "task_prompt": "Describe.",
+        })
+        self.assertIn(status, (400, 422))
+
+    # ── test: experiment rejects unknown dataset ──────────────────────────────
+    def test_experiment_unknown_dataset_returns_404(self):
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": str(uuid.uuid4()),
+            "task_prompt": "Describe.",
+        })
+        self.assertEqual(status, 404)
+
+    # ── test: experiment accepts valid dataset and starts ────────────────────
+    def test_experiment_starts_with_valid_dataset(self):
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "task_prompt": "Describe the scene.",
+        })
+        self.assertIn(status, (202, 409),
+                      "Should accept (202) or reject as concurrent (409)")
+        if status == 202:
+            self.assertIn("run_id", data)
+            self.assertEqual(data["frame_dataset_id"], self._dataset_id)
+            # Drain the concurrent slot so other tests can submit.
+            run_id = data["run_id"]
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                s2, d2 = self._get(f"/api/runs/{run_id}")
+                if d2.get("status") in _TERMINAL_STATUSES:
+                    break
+                time.sleep(0.2)
+
+    # ── test: frame indices subset is persisted ───────────────────────────────
+    def test_experiment_persists_frame_dataset_id_in_initial_record(self):
+        """202 response must include frame_dataset_id so the caller can verify."""
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "frame_indices": [0, 2],
+            "task_prompt": "Describe.",
+        })
+        if status == 202:
+            self.assertEqual(data.get("frame_dataset_id"), self._dataset_id)
+            self.assertEqual(data.get("frame_indices"), [0, 2])
+            run_id = data["run_id"]
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                s2, d2 = self._get(f"/api/runs/{run_id}")
+                if d2.get("status") in _TERMINAL_STATUSES:
+                    break
+                time.sleep(0.2)
+        else:
+            self.assertEqual(status, 409)
+
+    # ── test: profile API lists profiles ─────────────────────────────────────
+    def test_profiles_api_lists_integration_profile(self):
+        status, data = self._get("/api/profiles")
+        self.assertEqual(status, 200)
+        names = [p["name"] for p in data.get("profiles", [])]
+        self.assertIn("integration_profile", names)
+
+    # ── test: profile resolution in experiment ───────────────────────────────
+    def test_experiment_unknown_profile_returns_404(self):
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "profile_name": "nonexistent_profile",
+        })
+        self.assertEqual(status, 404)
+
+    def test_experiment_rejects_task_prompt_override_when_profile_selected(self):
+        """Providing task_prompt alongside profile_name must return 400 (provenance integrity)."""
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "profile_name": "integration_profile",
+            "task_prompt": "Override prompt that disagrees with profile.",
+        })
+        self.assertEqual(status, 400,
+                         f"Expected 400 when task_prompt overrides a profile, got {status}: {data}")
+        self.assertIn("error", data)
+
+    def test_experiment_rejects_system_instruction_override_when_profile_selected(self):
+        """Providing system_instruction alongside profile_name must return 400."""
+        status, data = self._post("/api/experiment/run", {
+            "frame_dataset_id": self._dataset_id,
+            "profile_name": "integration_profile",
+            "system_instruction": "Override instruction that disagrees with profile.",
+        })
+        self.assertEqual(status, 400,
+                         f"Expected 400 when system_instruction overrides a profile, got {status}: {data}")
+        self.assertIn("error", data)
+
+
+    def test_compare_aligns_by_source_provenance(self):
+        """Comparison must use (source_dataset_id, source_frame_index) as key."""
+        run_id1 = self._make_completed_run(frame_count=2)
+        run_id2 = self._make_completed_run(frame_count=2)
+        status, data = self._get(f"/api/compare?run_ids={run_id1},{run_id2}")
+        self.assertEqual(status, 200)
+        aligned = data["aligned_frames"]
+        # Both runs share the same dataset and frame indices 0,1 →
+        # should collapse to 2 aligned rows (not 4).
+        self.assertEqual(len(aligned), 2)
+        for row in aligned:
+            self.assertIn(run_id1, row)
+            self.assertIn(run_id2, row)
+        # Each row's frame_key should be an integer (source_frame_index)
+        # since both runs share the same dataset.
+        keys = [row["frame_key"] for row in aligned]
+        self.assertEqual(sorted(keys), [0, 1])
+
+    def test_compare_includes_profile_in_summaries(self):
+        """Compare summaries must expose profile_name/version/hash."""
+        run_id1 = self._make_completed_run(
+            profile_name="integration_profile",
+            profile_version="1",
+            profile_hash="abc123",
+        )
+        run_id2 = self._make_completed_run()
+        status, data = self._get(f"/api/compare?run_ids={run_id1},{run_id2}")
+        self.assertEqual(status, 200)
+        s1 = data["summaries"][run_id1]
+        self.assertEqual(s1["profile_name"], "integration_profile")
+        self.assertEqual(s1["profile_version"], "1")
+        self.assertEqual(s1["profile_hash"], "abc123")
+        self.assertIn("frame_dataset_id", s1)
+
+    def test_compare_different_datasets_uses_tuple_key(self):
+        """Runs on different datasets should use (ds_id, frame_index) keys."""
+        other_ds = str(uuid.uuid4())
+        run_id1 = self._make_completed_run(dataset_id=self._dataset_id, frame_count=1)
+        run_id2 = self._make_completed_run(dataset_id=other_ds, frame_count=1)
+        status, data = self._get(f"/api/compare?run_ids={run_id1},{run_id2}")
+        self.assertEqual(status, 200)
+        aligned = data["aligned_frames"]
+        # Two different dataset IDs → two rows (different keys, not merged).
+        self.assertEqual(len(aligned), 2)
+        # Keys should be tuples (serialized as lists in JSON).
+        for row in aligned:
+            key = row["frame_key"]
+            self.assertIsInstance(key, list, "Expected [dataset_id, frame_index] key")
+
+    # ── test: reviews require completed run ──────────────────────────────────
+    def test_review_for_nonexistent_run_returns_404(self):
+        status, data = self._post(f"/api/runs/{uuid.uuid4()}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        self.assertEqual(status, 404)
+
+    def test_review_for_running_run_returns_409(self):
+        run_id = RunStore.new_run_id()
+        self._run_store.save_run(run_id, {
+            "schema_version": 1, "run_id": run_id,
+            "kind": "experiment", "status": "running",
+            "created_at": "2025-01-01T00:00:00Z",
+        })
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        self.assertEqual(status, 409)
+
+    def test_review_for_invalid_frame_index_returns_400(self):
+        run_id = self._make_completed_run(frame_count=2)
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 999, "label": "acceptable",
+        })
+        self.assertEqual(status, 400)
+
+    def test_review_roundtrip_with_evidence_linked_run(self):
+        """Annotate a real result frame, then retrieve it."""
+        run_id = self._make_completed_run(frame_count=2)
+        status, data = self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 1, "label": "ambiguous", "note": "unclear context",
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(data["label"], "ambiguous")
+        self.assertEqual(data["frame_index"], 1)
+        # Verify retrieval.
+        s2, d2 = self._get(f"/api/runs/{run_id}/reviews")
+        self.assertEqual(s2, 200)
+        reviews = [r for r in d2["reviews"] if r["frame_index"] == 1]
+        self.assertTrue(any(r["label"] == "ambiguous" for r in reviews))
+
+    def test_review_preserves_created_at_on_update(self):
+        """Updating an existing review must keep the original created_at."""
+        run_id = self._make_completed_run(frame_count=2)
+        # First write.
+        self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "acceptable",
+        })
+        s1, d1 = self._get(f"/api/runs/{run_id}/reviews")
+        original_created_at = next(
+            r["created_at"] for r in d1["reviews"] if r["frame_index"] == 0
+        )
+        # Update with a different label.
+        time.sleep(0.05)
+        self._post(f"/api/runs/{run_id}/reviews", {
+            "frame_index": 0, "label": "ambiguous",
+        })
+        s2, d2 = self._get(f"/api/runs/{run_id}/reviews")
+        updated_review = next(
+            r for r in d2["reviews"] if r["frame_index"] == 0
+        )
+        self.assertEqual(updated_review["label"], "ambiguous")
+        self.assertEqual(updated_review["created_at"], original_created_at,
+                         "created_at must be preserved on update")
+
+    # ── test: extraction manifest has bag_key ────────────────────────────────
+    def test_extraction_manifest_includes_bag_key(self):
+        """The bag_key must be written into the extracted manifest (not left blank)."""
+        from web_console.frame_extractor import (
+            ExtractionParams, build_extraction_args,
+        )
+        params = ExtractionParams(
+            bag_key="integration-bag",
+            bag_path=str(pathlib.Path("/data/integration-bag")),
+            image_topic="/cam",
+            dataset_id=str(uuid.uuid4()),
+            output_dir=str(self._tmpdir / "ext_test"),
+            sample_interval=0.5,
+            max_frames=10,
+        )
+        args = build_extraction_args("/scripts/extract_bag_frames.py", params)
+        # --bag-key must appear with the correct value.
+        self.assertIn("--bag-key", args)
+        idx = args.index("--bag-key")
+        self.assertEqual(args[idx + 1], "integration-bag")
+
+    # ── test: experiment cancel route exists ─────────────────────────────────
+    def test_experiment_cancel_unknown_run_returns_404(self):
+        status, data = self._post(f"/api/experiment/{uuid.uuid4()}/cancel", {})
+        self.assertEqual(status, 404)
+
+    def test_experiment_cancel_completed_run_returns_409(self):
+        run_id = self._make_completed_run(frame_count=1)
+        status, data = self._post(f"/api/experiment/{run_id}/cancel", {})
+        self.assertEqual(status, 409)
 
 
 if __name__ == "__main__":
