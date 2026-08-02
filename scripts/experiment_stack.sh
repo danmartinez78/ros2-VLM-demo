@@ -523,6 +523,20 @@ cmd_start() {
     fi
   fi
 
+  # ── resolve installed binaries after loading ROS_WORKSPACE ────────────────
+
+  # edge_vlm_env.sh commonly defines ROS_WORKSPACE, but colcon-installed
+  # executables are not necessarily on PATH. Preserve explicit CLI options and
+  # environment overrides; only replace the bare default names.
+  if [[ "${SERVER_BIN}" == "edge_vlm_server" && -n "${ROS_WORKSPACE:-}" ]]; then
+    local installed_server="${ROS_WORKSPACE}/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_server"
+    [[ -x "${installed_server}" ]] && SERVER_BIN="${installed_server}"
+  fi
+  if [[ "${CLI_BIN}" == "edge_vlm_cli" && -n "${ROS_WORKSPACE:-}" ]]; then
+    local installed_cli="${ROS_WORKSPACE}/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_cli"
+    [[ -x "${installed_cli}" ]] && CLI_BIN="${installed_cli}"
+  fi
+
   # ── resolve model (if --model was given) ─────────────────────────────────
 
   _resolve_model "${SELECTED_MODEL:-}" || return 1
