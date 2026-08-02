@@ -71,6 +71,7 @@ _ALLOWED_ROS_PARAMS = frozenset(
         "playback_duration",
         "result_timeout",
         "instruction_delivery_mode",
+        "rosbag_path",
     }
 )
 
@@ -553,6 +554,26 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         if error:
             self._send_error(400, error)
             return
+
+        # Validate rosbag_path against the installed catalog (allowlist).
+        # Arbitrary filesystem paths are never accepted.
+        rosbag_path = params.get("rosbag_path", "")
+        if rosbag_path:
+            catalog = discover_datasets(
+                rosbag_root=cfg.get("rosbag_dir"),
+                image_root=cfg.get("image_dataset_dir"),
+                video_root=cfg.get("video_dataset_dir"),
+            )
+            allowed_paths = {
+                b["local_path"]
+                for b in catalog["rosbags"]
+                if b.get("installed") and b.get("local_path")
+            }
+            if rosbag_path not in allowed_paths:
+                self._send_error(
+                    400, "rosbag_path is not an installed catalog path"
+                )
+                return
 
         run_id = RunStore.new_run_id()
         run_store = self.server_instance.run_store
@@ -1132,6 +1153,7 @@ def _build_ros_env(
         "playback_duration": "PLAYBACK_DURATION_SECONDS",
         "result_timeout": "RESULT_TIMEOUT_SECONDS",
         "instruction_delivery_mode": "INSTRUCTION_DELIVERY_MODE",
+        "rosbag_path": "ROSBAG_PATH",
     }
     for param_key, env_key in _map.items():
         if param_key in params:
@@ -1400,6 +1422,7 @@ _INDEX_TEMPLATE = """\
       Active run: <span id="ros-active-id"></span>
       <button class="danger small" onclick="stopRosRun(document.getElementById('ros-active-id').textContent)">Stop</button>
     </div>
+    <div id="ros-selected-bag" class="selected-bag-status" style="display:none"></div>
     <fieldset>
       <legend>ROS Source &amp; Prompt</legend>
       <label>

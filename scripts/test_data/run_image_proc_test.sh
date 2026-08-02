@@ -14,11 +14,17 @@
 #   ARTIFACT_DIR               Preserve logs, timing JSONL, and run manifest here
 #   IMAGE_TOPIC                ROS image topic to subscribe to
 #                              (default: /hawk_0_left_rgb_image)
+#   ROSBAG_PATH                Optional path to a ROS 2 bag directory to play back
+#                              instead of the default image-proc asset. Must be a
+#                              directory containing a metadata.yaml file.
+#                              When omitted, the image-proc asset is used (and
+#                              auto-downloaded when absent).
 set -Eeuo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
-asset_root="${ROSBAG_DIR:-${repo_root}/test_data/rosbags}/image-proc"
+_default_asset_root="${ROSBAG_DIR:-${repo_root}/test_data/rosbags}/image-proc"
+rosbag_path_override="${ROSBAG_PATH:-}"
 env_file="${EDGE_VLM_ENV_FILE:-${repo_root}/scripts/edge_vlm_env.sh}"
 image_topic="${IMAGE_TOPIC:-/hawk_0_left_rgb_image}"
 result_topic="/vlm/result"
@@ -131,16 +137,29 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-if [[ ! -d "${asset_root}" ]]; then
-  bash "${script_dir}/download_rosbags.sh" download image-proc
+if [[ -n "${rosbag_path_override}" ]]; then
+  # Validate the caller-supplied bag path before using it.
+  if [[ ! -d "${rosbag_path_override}" ]]; then
+    echo "ROSBAG_PATH '${rosbag_path_override}' is not a directory." >&2
+    exit 2
+  fi
+  if [[ ! -f "${rosbag_path_override}/metadata.yaml" ]]; then
+    echo "ROSBAG_PATH '${rosbag_path_override}' is not a valid ROS 2 bag (no metadata.yaml found)." >&2
+    exit 2
+  fi
+  bag_path="${rosbag_path_override}"
+else
+  asset_root="${_default_asset_root}"
+  if [[ ! -d "${asset_root}" ]]; then
+    bash "${script_dir}/download_rosbags.sh" download image-proc
+  fi
+  metadata="$(find "${asset_root}" -name metadata.yaml -print -quit)"
+  if [[ -z "${metadata}" ]]; then
+    echo "No ROS 2 bag metadata found under ${asset_root}." >&2
+    exit 1
+  fi
+  bag_path="$(dirname -- "${metadata}")"
 fi
-
-metadata="$(find "${asset_root}" -name metadata.yaml -print -quit)"
-if [[ -z "${metadata}" ]]; then
-  echo "No ROS 2 bag metadata found under ${asset_root}." >&2
-  exit 1
-fi
-bag_path="$(dirname -- "${metadata}")"
 
 if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090

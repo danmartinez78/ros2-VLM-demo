@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 # Known downloadable rosbag assets registered in download_rosbags.sh.
 # This list mirrors the case statement in that script.
-_DOWNLOADABLE_BAGS: List[Dict[str, str]] = [
+_DOWNLOADABLE_BAGS: List[Dict[str, Any]] = [
     {
         "key": "image-proc",
         "name": "Isaac ROS image_proc quickstart",
@@ -32,6 +32,8 @@ _DOWNLOADABLE_BAGS: List[Dict[str, str]] = [
         ),
         "source": "NGC (nvidia/isaac/isaac_ros_image_proc_assets)",
         "content_types": "sensor_msgs/Image, sensor_msgs/CameraInfo",
+        "raw_image_compatible": True,
+        "compatibility_note": "",
     },
     {
         "key": "h264",
@@ -41,6 +43,8 @@ _DOWNLOADABLE_BAGS: List[Dict[str, str]] = [
         ),
         "source": "NGC (nvidia/isaac/isaac_ros_h264_decoder_assets)",
         "content_types": "sensor_msgs/CompressedImage",
+        "raw_image_compatible": False,
+        "compatibility_note": "Requires Isaac ROS H.264 decoder",
     },
 ]
 
@@ -85,6 +89,14 @@ class RosbagEntry:
     image_topics: List[str] = field(default_factory=list)
     content_types: str = ""
 
+    # Compatibility metadata
+    raw_image_compatible: bool = False
+    """True when the bag has at least one sensor_msgs/Image (raw) topic and can
+    be fed directly to the VLM image reasoner without a decoder."""
+    compatibility_note: str = ""
+    """Human-readable note explaining why the bag is not directly usable, e.g.
+    ``"Requires Isaac ROS H.264 decoder"``."""
+
     # Downloadable metadata
     downloadable: bool = True
     download_source: str = ""
@@ -106,6 +118,8 @@ class RosbagEntry:
             "message_counts": self.message_counts,
             "image_topics": self.image_topics,
             "content_types": self.content_types,
+            "raw_image_compatible": self.raw_image_compatible,
+            "compatibility_note": self.compatibility_note,
             "downloadable": self.downloadable,
             "download_source": self.download_source,
         }
@@ -247,6 +261,14 @@ def _scan_rosbags(rosbag_root: Path) -> Dict[str, RosbagEntry]:
         key = relative_parts[0]
         meta = _parse_bag_metadata(bag_dir / _ROSBAG_METADATA_FILENAME)
         dataset_root = rosbag_root / key
+        topic_types: Dict[str, str] = meta.get("topic_types", {})
+        # A bag is raw-image compatible when it contains at least one
+        # sensor_msgs/msg/Image (non-compressed) topic.
+        raw_compatible = any(
+            "Image" in typ and "Compressed" not in typ
+            for typ in topic_types.values()
+        )
+        note = "" if raw_compatible else "No raw sensor_msgs/Image topic found"
         entry = RosbagEntry(
             key=key,
             name=key,
@@ -257,9 +279,11 @@ def _scan_rosbags(rosbag_root: Path) -> Dict[str, RosbagEntry]:
             size_bytes=_dir_size_bytes(dataset_root),
             duration_seconds=meta.get("duration_seconds"),
             topics=meta.get("topics", []),
-            topic_types=meta.get("topic_types", {}),
+            topic_types=topic_types,
             message_counts=meta.get("message_counts", {}),
             image_topics=meta.get("image_topics", []),
+            raw_image_compatible=raw_compatible,
+            compatibility_note=note,
             downloadable=False,
         )
         # A catalog key currently represents one playable bag. Keep the first
@@ -397,6 +421,13 @@ def discover_datasets(
             entry.downloadable = True
             entry.download_source = dinfo["source"]
             entry.content_types = dinfo.get("content_types", "")
+            # Prefer the explicit downloadable-catalog compatibility metadata
+            # over the parsed-from-metadata.yaml value when available, so that
+            # known assets like h264 always carry the correct note even if the
+            # bag metadata was not parseable (e.g. first-time download).
+            if "raw_image_compatible" in dinfo:
+                entry.raw_image_compatible = bool(dinfo["raw_image_compatible"])
+                entry.compatibility_note = dinfo.get("compatibility_note", "")
         else:
             entry = RosbagEntry(
                 key=key,
@@ -407,6 +438,8 @@ def discover_datasets(
                 downloadable=True,
                 download_source=dinfo["source"],
                 content_types=dinfo.get("content_types", ""),
+                raw_image_compatible=bool(dinfo.get("raw_image_compatible", False)),
+                compatibility_note=dinfo.get("compatibility_note", ""),
             )
         rosbag_entries.append(entry.to_dict())
         seen_keys.add(key)

@@ -543,6 +543,24 @@ pre {
   margin-bottom: 0.5rem;
 }
 
+.selected-bag-status {
+  background: #e8f5e9;
+  border: 1px solid #4caf50;
+  border-radius: 4px;
+  padding: 0.4rem 0.9rem;
+  margin-bottom: 0.75rem;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  font-size: 0.88rem;
+  flex-wrap: wrap;
+}
+
+.selected-bag-info {
+  flex: 1;
+  word-break: break-all;
+}
+
 .run-detail-header {
   display: flex;
   align-items: center;

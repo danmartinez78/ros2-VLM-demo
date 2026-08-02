@@ -44,6 +44,8 @@ function _setClass(el, cls, on) {
 /* ── navigation ──────────────────────────────────────────────────────────── */
 
 var _currentView = "dashboard";
+/** Bag currently selected for the ROS experiment panel. */
+var _selectedBag = null;
 
 function navigate(viewId) {
   _currentView = viewId;
@@ -436,15 +438,17 @@ function _renderBagTile(bag) {
     actions.appendChild(dlBtn);
   }
   if (bag.installed) {
-    var useBtn = _el("button", "small secondary", "Use in Experiment");
-    useBtn.addEventListener("click", function() {
-      navigate("experiment");
-      setTimeout(function() {
-        var bagPathEl = document.getElementById("exp-bag-path");
-        if (bagPathEl) bagPathEl.value = bag.local_path;
-      }, 50);
-    });
-    actions.appendChild(useBtn);
+    if (bag.raw_image_compatible) {
+      var useBtn = _el("button", "small secondary", "Use in Experiment");
+      useBtn.addEventListener("click", function() { selectBagForExperiment(bag); });
+      actions.appendChild(useBtn);
+    } else {
+      var noteText = bag.compatibility_note || "Incompatible bag type";
+      var disabledBtn = _el("button", "small secondary", noteText);
+      disabledBtn.disabled = true;
+      disabledBtn.title = noteText;
+      actions.appendChild(disabledBtn);
+    }
   }
   tile.appendChild(actions);
   return tile;
@@ -494,6 +498,35 @@ async function _pollDownload(runId, btn) {
 /* ═══════════════════════════════════════════════════════════════════════════
    Experiment view
 ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * Select an installed compatible bag for the ROS experiment panel.
+ * Stores the bag, populates the selected-bag status widget, suggests the first
+ * raw image topic, and navigates to the Experiment view.
+ */
+function selectBagForExperiment(bag) {
+  _selectedBag = bag;
+  var statusEl = document.getElementById("ros-selected-bag");
+  if (statusEl) {
+    _empty(statusEl);
+    var infoSpan = _el("span", "selected-bag-info",
+      "Selected bag: " + bag.name + " (" + bag.local_path + ")");
+    var clrBtn = _el("button", "small secondary", "Clear");
+    clrBtn.addEventListener("click", function() {
+      _selectedBag = null;
+      statusEl.style.display = "none";
+    });
+    statusEl.appendChild(infoSpan);
+    statusEl.appendChild(clrBtn);
+    statusEl.style.display = "";
+  }
+  // Suggest the first raw image topic if the ROS topic field is at its default.
+  var topicEl = document.getElementById("ros-topic");
+  if (topicEl && bag.image_topics && bag.image_topics.length > 0) {
+    topicEl.value = bag.image_topics[0];
+  }
+  navigate("experiment");
+}
 
 // Standalone inference
 async function submitInfer() {
@@ -563,6 +596,10 @@ async function startRos() {
   };
   var prompt = document.getElementById("ros-prompt").value.trim();
   if (prompt) params.prompt = prompt;
+  // Include the selected bag path when a compatible bag has been chosen.
+  if (_selectedBag && _selectedBag.local_path) {
+    params.rosbag_path = _selectedBag.local_path;
+  }
 
   if (outEl) { outEl.textContent = "Starting…"; _show(outEl); }
   try {

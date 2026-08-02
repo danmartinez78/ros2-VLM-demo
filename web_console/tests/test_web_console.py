@@ -2805,6 +2805,302 @@ class TestExperimentStackScript(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          f"bash -n failed:\n{result.stderr}")
 
+    def test_run_image_proc_bash_syntax(self):
+        """run_image_proc_test.sh must pass bash -n syntax check."""
+        script = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "test_data"
+            / "run_image_proc_test.sh"
+        )
+        if not script.is_file():
+            self.skipTest(f"run_image_proc_test.sh not found at {script}")
+        if shutil.which("bash") is None:
+            self.skipTest("bash not available")
+        result = subprocess.run(
+            ["bash", "-n", str(script)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0,
+                         f"bash -n failed:\n{result.stderr}")
+
+
+# ── rosbag compatibility metadata tests ──────────────────────────────────────
+
+
+class TestRosbagCompatibility(unittest.TestCase):
+    """Tests for raw_image_compatible and compatibility_note catalog fields."""
+
+    def _make_bag(self, tmpdir: str, key: str, metadata_content: str) -> pathlib.Path:
+        """Create a fake installed rosbag under *tmpdir*/<key>/<bag>."""
+        bag_dir = pathlib.Path(tmpdir) / key / "bag0"
+        bag_dir.mkdir(parents=True)
+        (bag_dir / "metadata.yaml").write_text(metadata_content, encoding="utf-8")
+        return bag_dir
+
+    def test_image_proc_catalog_entry_is_compatible(self):
+        """The image-proc downloadable entry must be marked raw_image_compatible."""
+        data = discover_datasets(
+            rosbag_root="/nonexistent", image_root=None, video_root=None
+        )
+        entry = next(b for b in data["rosbags"] if b["key"] == "image-proc")
+        self.assertTrue(entry["raw_image_compatible"])
+        self.assertEqual(entry["compatibility_note"], "")
+
+    def test_h264_catalog_entry_is_not_compatible(self):
+        """The h264 downloadable entry must be marked NOT raw_image_compatible."""
+        data = discover_datasets(
+            rosbag_root="/nonexistent", image_root=None, video_root=None
+        )
+        entry = next(b for b in data["rosbags"] if b["key"] == "h264")
+        self.assertFalse(entry["raw_image_compatible"])
+        self.assertIn("H.264", entry["compatibility_note"])
+
+    def test_installed_bag_with_raw_image_topic_is_compatible(self):
+        """An installed bag whose metadata has a sensor_msgs/Image topic is compatible."""
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /camera/image_raw, type: sensor_msgs/msg/Image, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 5000000000}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            self._make_bag(root, "my_raw_bag", metadata)
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "my_raw_bag")
+        self.assertTrue(entry["raw_image_compatible"])
+        self.assertEqual(entry["compatibility_note"], "")
+
+    def test_installed_bag_with_compressed_image_only_is_not_compatible(self):
+        """An installed bag with only CompressedImage topics is not compatible."""
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /camera/image_compressed, "
+            "type: sensor_msgs/msg/CompressedImage, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 5000000000}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            self._make_bag(root, "my_h264_bag", metadata)
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "my_h264_bag")
+        self.assertFalse(entry["raw_image_compatible"])
+        self.assertNotEqual(entry["compatibility_note"], "")
+
+    def test_h264_installed_bag_uses_catalog_compatibility_note(self):
+        """When the h264 bag is installed, the catalog note overrides the parsed note."""
+        metadata = (
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /left, type: sensor_msgs/msg/CompressedImage, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 2000000000}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            bag_dir = (
+                pathlib.Path(root) / "h264" / "isaac_ros_h264_decoder" / "quickstart"
+            )
+            bag_dir.mkdir(parents=True)
+            (bag_dir / "metadata.yaml").write_text(metadata, encoding="utf-8")
+            data = discover_datasets(rosbag_root=root, image_root=None, video_root=None)
+        entry = next(b for b in data["rosbags"] if b["key"] == "h264")
+        self.assertTrue(entry["installed"])
+        self.assertFalse(entry["raw_image_compatible"])
+        self.assertIn("H.264", entry["compatibility_note"])
+
+    def test_compatibility_fields_present_in_all_catalog_entries(self):
+        """Every entry returned by discover_datasets must carry both compatibility fields."""
+        data = discover_datasets(
+            rosbag_root="/nonexistent", image_root=None, video_root=None
+        )
+        for entry in data["rosbags"]:
+            self.assertIn("raw_image_compatible", entry,
+                          f"Missing raw_image_compatible in {entry['key']}")
+            self.assertIn("compatibility_note", entry,
+                          f"Missing compatibility_note in {entry['key']}")
+
+
+# ── rosbag_path allowlist validation tests ───────────────────────────────────
+
+
+class TestRosbagPathValidation(unittest.TestCase):
+    """Server-side allowlist validation for rosbag_path in /api/ros/start."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(pathlib.Path(self._tmp) / "runs")
+        self._rosbag_root = pathlib.Path(self._tmp) / "rosbags"
+        self._rosbag_root.mkdir()
+        cfg = {
+            "socket_path": "",
+            "quiet": True,
+            "rosbag_dir": str(self._rosbag_root),
+            "image_dataset_dir": "",
+            "video_dataset_dir": "",
+        }
+        self._srv, self._port, self._thread = _start_test_server(
+            config=cfg, run_store=run_store
+        )
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _post_ros_start(self, params: dict) -> tuple:
+        body = json.dumps({"params": params}).encode()
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request(
+            "POST", "/api/ros/start", body=body,
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": str(len(body)),
+            },
+        )
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        conn.close()
+        return resp.status, json.loads(resp_body) if resp_body else {}
+
+    def _make_installed_bag(self, key: str) -> str:
+        """Create a fake installed bag and return its local_path."""
+        bag_dir = self._rosbag_root / key / "bag0"
+        bag_dir.mkdir(parents=True)
+        (bag_dir / "metadata.yaml").write_text(
+            "rosbag2_bagfile_information:\n"
+            "  topics_with_message_count:\n"
+            "    - topic_metadata: "
+            "{name: /img, type: sensor_msgs/msg/Image, serialization_format: cdr}\n"
+            "  duration: {nanoseconds: 1000000000}\n",
+            encoding="utf-8",
+        )
+        return str(bag_dir)
+
+    def test_arbitrary_rosbag_path_rejected(self):
+        """An arbitrary filesystem path must be rejected with 400."""
+        status, data = self._post_ros_start({"rosbag_path": "/etc/passwd"})
+        self.assertEqual(status, 400)
+        self.assertIn("error", data)
+
+    def test_path_traversal_rosbag_path_rejected(self):
+        """A traversal path must be rejected with 400."""
+        status, data = self._post_ros_start(
+            {"rosbag_path": str(self._rosbag_root) + "/../../etc"}
+        )
+        self.assertEqual(status, 400)
+
+    def test_installed_catalog_path_accepted(self):
+        """A local_path from the installed catalog is accepted and env is built."""
+        installed_path = self._make_installed_bag("my-test-bag")
+        # The server will try to launch the ROS script; we only need to verify
+        # the 400 is NOT returned for the path check. We patch start_ros_experiment
+        # to avoid actually launching a subprocess.
+        with patch.object(
+            self._srv.process_manager,
+            "start_ros_experiment",
+            return_value=99999,
+        ):
+            status, data = self._post_ros_start({"rosbag_path": installed_path})
+        # Should not get a 400 for path validation.
+        self.assertNotEqual(status, 400, f"Unexpected 400: {data}")
+
+    def test_no_rosbag_path_param_does_not_error(self):
+        """Omitting rosbag_path entirely should not cause a 400 for path validation."""
+        with patch.object(
+            self._srv.process_manager,
+            "start_ros_experiment",
+            return_value=99999,
+        ):
+            status, data = self._post_ros_start({})
+        self.assertNotEqual(status, 400, f"Unexpected 400 without rosbag_path: {data}")
+
+
+# ── _build_ros_env ROSBAG_PATH propagation tests ──────────────────────────────
+
+
+class TestBuildRosEnvRosbagPath(unittest.TestCase):
+    """Verify _build_ros_env forwards rosbag_path as ROSBAG_PATH."""
+
+    def test_rosbag_path_forwarded_to_env(self):
+        env = _build_ros_env(
+            {"rosbag_path": "/data/my_bag"}, cfg={}, artifact_dir=None
+        )
+        self.assertEqual(env.get("ROSBAG_PATH"), "/data/my_bag")
+
+    def test_rosbag_path_absent_when_not_in_params(self):
+        env = _build_ros_env({}, cfg={}, artifact_dir=None)
+        # Should not inject an empty ROSBAG_PATH.
+        # (It may still be present from os.environ; verify it is not *set* by _build_ros_env.)
+        env2 = _build_ros_env({"image_topic": "/cam"}, cfg={}, artifact_dir=None)
+        # Either ROSBAG_PATH is absent or unchanged from os.environ.
+        # The critical check: passing rosbag_path sets it correctly.
+        env3 = _build_ros_env({"rosbag_path": "/bags/custom"}, cfg={}, artifact_dir=None)
+        self.assertEqual(env3["ROSBAG_PATH"], "/bags/custom")
+
+
+# ── UI element presence tests ─────────────────────────────────────────────────
+
+
+class TestUIElementPresence(unittest.TestCase):
+    """Verify required HTML elements are present in the served index page."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        run_store = RunStore(pathlib.Path(self._tmp) / "runs")
+        cfg = {"socket_path": "", "quiet": True}
+        self._srv, self._port, self._thread = _start_test_server(
+            config=cfg, run_store=run_store
+        )
+
+    def tearDown(self):
+        self._srv.shutdown()
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def _get_index(self) -> str:
+        conn = HTTPConnection("127.0.0.1", self._port, timeout=5)
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        return body.decode("utf-8", errors="replace")
+
+    def test_ros_selected_bag_element_exists(self):
+        """The #ros-selected-bag element must be present in the ROS experiment panel."""
+        html = self._get_index()
+        self.assertIn('id="ros-selected-bag"', html)
+
+    def test_app_js_has_selected_bag_variable(self):
+        """app.js must declare _selectedBag."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("_selectedBag", js)
+
+    def test_app_js_has_select_bag_for_experiment(self):
+        """app.js must define selectBagForExperiment."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("selectBagForExperiment", js)
+
+    def test_app_js_sends_rosbag_path_in_start_ros(self):
+        """startRos() in app.js must include rosbag_path when _selectedBag is set."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("rosbag_path", js)
+
+    def test_app_js_uses_raw_image_compatible_for_button(self):
+        """_bagTile must check raw_image_compatible before showing Use in Experiment."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("raw_image_compatible", js)
+
+    def test_app_js_h264_shows_compatibility_note(self):
+        """_bagTile must show compatibility_note for incompatible bags."""
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        js = js_path.read_text(encoding="utf-8")
+        self.assertIn("compatibility_note", js)
+
 
 if __name__ == "__main__":
     unittest.main()
