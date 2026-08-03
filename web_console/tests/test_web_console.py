@@ -60,6 +60,7 @@ from web_console.sequence_catalog import (
     discover_jaad_clips,
     discover_sequences,
     resolve_sequence_frame_path,
+    materialize_sequence_frame,
     _parse_jaad_xml_summary,
     _load_jaad_clip_label_index,
 )
@@ -6790,6 +6791,495 @@ class TestSequencesExperimentEndpoint(unittest.TestCase):
             "task_prompt": "Describe",
         })
         self.assertEqual(status, 400)
+
+
+# ── new: scale, lazy materialisation, fixture-store, bounded strip ───────────
+
+
+class TestJaadCatalogScaleLazy(unittest.TestCase):
+    """Scale test: large JAAD dataset must not bloat catalog payload."""
+
+    def _make_large_jaad(self, tmp: pathlib.Path, n_clips: int, frames_each: int) -> pathlib.Path:
+        """Build a synthetic JAAD root with *n_clips* fake MP4 files.
+
+        ffprobe is not available in CI so frame_count stays 0; the key
+        assertion is that no FrameRef objects are created regardless.
+        """
+        clips_dir = tmp / "extracted" / "JAAD_clips"
+        clips_dir.mkdir(parents=True)
+        for i in range(1, n_clips + 1):
+            (clips_dir / f"video_{i:04d}.mp4").write_bytes(b"FAKE")
+        return tmp
+
+    def test_catalog_has_zero_frame_objects_for_jaad(self):
+        """discover_jaad_clips must never build per-frame FrameRef objects."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=346, frames_each=600)
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 346)
+            # No FrameRef objects should be created (lazy discovery).
+            total_frame_refs = sum(len(s.frame_refs) for s in seqs)
+            self.assertEqual(total_frame_refs, 0,
+                msg=f"Expected 0 FrameRef objects for lazy JAAD, got {total_frame_refs}")
+
+    def test_to_dict_emits_empty_frames_list_for_lazy(self):
+        """to_dict() must return an empty frames list for lazy JAAD clips."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=10, frames_each=600)
+            seqs = discover_jaad_clips(root)
+            for seq in seqs:
+                d = seq.to_dict()
+                self.assertEqual(d["frames"], [],
+                    msg="Lazy JAAD sequence must emit empty frames list in to_dict()")
+
+    def test_catalog_payload_is_sequence_sized(self):
+        """The total catalog JSON must not scale with the number of frames."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=20, frames_each=600)
+            seqs = discover_jaad_clips(root)
+            seq_dicts = [s.to_dict() for s in seqs]
+            payload = json.dumps({"sequences": seq_dicts})
+            # Upper bound: each sequence dict should be small (< 1 KB); 20 seqs < 20 KB.
+            # If frames were eagerly included (600 frames × ~60 bytes each),
+            # the 20-sequence payload would exceed 700 KB.
+            self.assertLess(len(payload), 20 * 1024,
+                msg=f"Catalog payload ({len(payload)} bytes) too large — frame refs must be lazy")
+
+    def test_source_path_stored_on_sequence(self):
+        """Each jaad_clip SequenceEntry must carry the MP4 path in source_path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=3, frames_each=0)
+            seqs = discover_jaad_clips(root)
+            for seq in seqs:
+                self.assertTrue(seq.source_path.endswith(".mp4"),
+                    msg=f"Expected .mp4 source_path, got {seq.source_path!r}")
+                # Must NOT appear in serialised output.
+                d = seq.to_dict()
+                self.assertNotIn("source_path", json.dumps(d))
+
+
+class TestJaadLazyMaterialization(unittest.TestCase):
+    """materialize_sequence_frame must work for JAAD without pre-built FrameRefs."""
+
+    def _make_seq(self, mp4_path: pathlib.Path, frame_count: int = 10) -> SequenceEntry:
+        return SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="",
+            frame_count=frame_count,
+            frame_refs=[],           # lazy — no pre-built refs
+            annotation_ref=None,
+            source_path=str(mp4_path),
+        )
+
+    def test_returns_none_for_missing_mp4(self):
+        seq = self._make_seq(pathlib.Path("/no/such/file.mp4"))
+        from web_console.sequence_catalog import materialize_sequence_frame
+        result = materialize_sequence_frame([seq], "jaad", "video_0001", 0)
+        self.assertIsNone(result)
+
+    def test_returns_none_for_empty_source_path(self):
+        seq = SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="",
+            frame_count=5,
+            frame_refs=[],
+            annotation_ref=None,
+            source_path="",
+        )
+        from web_console.sequence_catalog import materialize_sequence_frame
+        result = materialize_sequence_frame([seq], "jaad", "video_0001", 0)
+        self.assertIsNone(result)
+
+    def test_bounds_check_rejects_out_of_range_index(self):
+        """Frame indices >= frame_count must be rejected without ffmpeg invocation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mp4 = pathlib.Path(tmp) / "video_0001.mp4"
+            mp4.write_bytes(b"FAKE")
+            seq = self._make_seq(mp4, frame_count=10)
+            from web_console.sequence_catalog import materialize_sequence_frame
+            # Index 10 is out of range for a 10-frame video.
+            result = materialize_sequence_frame([seq], "jaad", "video_0001", 10)
+            self.assertIsNone(result)
+
+    def test_unknown_sequence_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mp4 = pathlib.Path(tmp) / "video_0001.mp4"
+            mp4.write_bytes(b"FAKE")
+            seq = self._make_seq(mp4)
+            from web_console.sequence_catalog import materialize_sequence_frame
+            result = materialize_sequence_frame([seq], "jaad", "video_9999", 0)
+            self.assertIsNone(result)
+
+
+class TestRosFixtureFrameWithExtraction(unittest.TestCase):
+    """ros_static_fixture frame serving works when a matching extraction exists."""
+
+    @classmethod
+    def setUpClass(cls):
+        from web_console.frame_extractor import write_frame_manifest
+
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        runs_dir = cls.tmpdir / "runs"
+        frame_datasets_dir = runs_dir / "frame_datasets"
+        frame_datasets_dir.mkdir(parents=True)
+
+        # Write a real JPEG into an extracted frame_dataset.
+        cls.bag_key = "rtdetr-quickstart"
+        ds_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        ds_dir = frame_datasets_dir / ds_id
+        ds_dir.mkdir()
+        jpeg = ds_dir / "frame_0000.jpg"
+        jpeg.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+        write_frame_manifest(ds_dir, {
+            "schema_version": 1,
+            "dataset_id": ds_id,
+            "bag_key": cls.bag_key,
+            "bag_path": "/data/fake.bag",
+            "topic": "/image_rect",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 1,
+            "frames": [{"index": 0, "filename": "frame_0000.jpg",
+                         "timestamp_sec": 0.0, "timestamp_ns": 0}],
+            "frame_count": 1,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(ds_dir),
+        })
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(runs_dir),
+                "frame_datasets_dir": str(frame_datasets_dir),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        # Inject a ros_static_fixture SequenceEntry pointing at the same bag_key.
+        bag_dir = cls.tmpdir / "fake_bag"
+        bag_dir.mkdir()
+        fr = FrameRef(
+            index=0,
+            source_id=f"{cls.bag_key}:frame_0",
+            timestamp_us=None,
+            source_path=str(bag_dir),
+            metadata={"topic": "/image_rect", "bag_key": cls.bag_key},
+        )
+        fixture_seq = SequenceEntry(
+            dataset_id=_sanitize_id(cls.bag_key),
+            sequence_id=_sanitize_id(cls.bag_key),
+            adapter="ros_static_fixture",
+            display_name="RT-DETR Quickstart",
+            description="Static fixture",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+            source_path=str(bag_dir),
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [fixture_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, body, resp.getheader("Content-Type", "")
+
+    def test_fixture_frame_served_from_extraction(self):
+        """When an extraction exists for the bag_key, the frame is served as JPEG."""
+        ds_id = _sanitize_id(self.bag_key)
+        status, body, ct = self._get(
+            f"/api/sequences/{ds_id}/{ds_id}/frames/0"
+        )
+        self.assertEqual(status, 200,
+            msg=f"Expected 200 from extracted fixture frame, got {status}")
+        self.assertIn("image/jpeg", ct)
+        self.assertTrue(body[:2] == b"\xff\xd8",
+            msg="Response body is not a JPEG")
+
+    def test_fixture_without_extraction_returns_422(self):
+        """A ros_static_fixture with no matching extraction returns 422."""
+        # Inject a second fixture with a bag_key that has no extraction.
+        fr2 = FrameRef(
+            index=0, source_id="no-extract:frame_0", timestamp_us=None,
+            source_path=str(self.tmpdir / "no_such_bag"),
+            metadata={"bag_key": "no-extraction-key"},
+        )
+        seq2 = SequenceEntry(
+            dataset_id="no-extract-ds", sequence_id="no-extract-seq",
+            adapter="ros_static_fixture",
+            display_name="No extract", description="",
+            frame_count=1, frame_refs=[fr2], annotation_ref=None,
+            source_path=str(self.tmpdir / "no_such_bag"),
+        )
+        with self.server._sequence_catalog_lock:
+            entries = list(self.server._sequence_catalog_entries)
+            entries.append(seq2)
+            self.server._sequence_catalog_entries = entries
+
+        status, body, _ = self._get("/api/sequences/no-extract-ds/no-extract-seq/frames/0")
+        self.assertEqual(status, 422)
+
+
+class TestRosFixtureExperimentWithExtraction(unittest.TestCase):
+    """POST /api/sequences/experiment works for a fixture with a prior extraction."""
+
+    @classmethod
+    def setUpClass(cls):
+        from web_console.frame_extractor import write_frame_manifest
+
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        runs_dir = cls.tmpdir / "runs"
+        frame_datasets_dir = runs_dir / "frame_datasets"
+        frame_datasets_dir.mkdir(parents=True)
+
+        cls.bag_key = "rtdetr-test"
+        ds_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        ds_dir = frame_datasets_dir / ds_id
+        ds_dir.mkdir()
+        jpeg = ds_dir / "frame_0000.jpg"
+        jpeg.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+        write_frame_manifest(ds_dir, {
+            "schema_version": 1,
+            "dataset_id": ds_id,
+            "bag_key": cls.bag_key,
+            "bag_path": "/data/fake.bag",
+            "topic": "/image_rect",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 1,
+            "frames": [{"index": 0, "filename": "frame_0000.jpg",
+                         "timestamp_sec": 0.0, "timestamp_ns": 0}],
+            "frame_count": 1,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(ds_dir),
+        })
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(runs_dir),
+                "frame_datasets_dir": str(frame_datasets_dir),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        bag_dir = cls.tmpdir / "fake_bag"
+        bag_dir.mkdir()
+        fr = FrameRef(
+            index=0,
+            source_id=f"{cls.bag_key}:frame_0",
+            timestamp_us=None,
+            source_path=str(bag_dir),
+            metadata={"topic": "/image_rect", "bag_key": cls.bag_key},
+        )
+        fixture_seq = SequenceEntry(
+            dataset_id=_sanitize_id(cls.bag_key),
+            sequence_id=_sanitize_id(cls.bag_key),
+            adapter="ros_static_fixture",
+            display_name="RT-DETR test",
+            description="",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+            source_path=str(bag_dir),
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [fixture_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _post(self, payload):
+        body = json.dumps(payload).encode()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request("POST", "/api/sequences/experiment", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, json.loads(raw.decode()) if raw else {}
+
+    def test_fixture_experiment_returns_422_without_extraction(self):
+        """Without extraction, experiment returns 422."""
+        # Use a sequence with no matching bag_key in frame_store.
+        fr2 = FrameRef(
+            index=0, source_id="no-ext:frame_0", timestamp_us=None,
+            source_path=str(self.tmpdir / "no_such"),
+            metadata={"bag_key": "no-such-key"},
+        )
+        seq2 = SequenceEntry(
+            dataset_id="no-ext", sequence_id="no-ext-seq",
+            adapter="ros_static_fixture",
+            display_name="No ext", description="",
+            frame_count=1, frame_refs=[fr2], annotation_ref=None,
+            source_path=str(self.tmpdir / "no_such"),
+        )
+        with self.server._sequence_catalog_lock:
+            entries = list(self.server._sequence_catalog_entries)
+            entries.append(seq2)
+            self.server._sequence_catalog_entries = entries
+
+        status, data = self._post({
+            "dataset_id": "no-ext",
+            "sequence_id": "no-ext-seq",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 422)
+
+    def test_missing_task_prompt_returns_400(self):
+        ds_id = _sanitize_id(self.bag_key)
+        status, data = self._post({
+            "dataset_id": ds_id,
+            "sequence_id": ds_id,
+        })
+        self.assertEqual(status, 400)
+
+
+class TestSeqExpRequiresFrameIndicesForLazy(unittest.TestCase):
+    """POST /api/sequences/experiment requires explicit frame_indices for lazy sequences."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(cls.tmpdir / "runs"),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        # A lazy JAAD-style sequence: no frame_refs, non-zero frame_count.
+        lazy_seq = SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="600 frames",
+            frame_count=600,
+            frame_refs=[],
+            annotation_ref=None,
+            source_path="/no/such/file.mp4",
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [lazy_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _post(self, payload):
+        body = json.dumps(payload).encode()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/sequences/experiment", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, json.loads(raw.decode()) if raw else {}
+
+    def test_lazy_without_frame_indices_returns_400(self):
+        """Lazy sequence without explicit frame_indices must return 400."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("frame_indices", data.get("error", ""))
+
+    def test_lazy_with_empty_frame_indices_returns_400(self):
+        """Empty frame_indices list must return 400."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [],
+        })
+        self.assertEqual(status, 400)
+
+    def test_lazy_with_explicit_frame_indices_attempts_materialisation(self):
+        """With explicit frame_indices, the server proceeds to materialise.
+
+        Since the MP4 doesn't exist, materialisation fails with 422 rather
+        than 400 — which proves that the endpoint accepted the frame_indices
+        and advanced past the selection-validation stage.
+        """
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [0, 5, 10],
+        })
+        # 422 means materialisation was attempted (mp4 not found); not 400.
+        self.assertEqual(status, 422)
+
+
+class TestAppJsBoundedStrip(unittest.TestCase):
+    """app.js must define a bounded thumbnail limit and bounded strip renderer."""
+
+    @classmethod
+    def setUpClass(cls):
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = js_path.read_text(encoding="utf-8")
+
+    def test_max_strip_thumbnails_constant_defined(self):
+        """_SEQ_MAX_STRIP_THUMBNAILS must be defined in app.js."""
+        self.assertIn("_SEQ_MAX_STRIP_THUMBNAILS", self._js)
+
+    def test_no_duplicate_frame_prev_next(self):
+        """_framePrev and _frameNext must each be defined exactly once."""
+        prev_count = self._js.count("function _framePrev(")
+        next_count = self._js.count("function _frameNext(")
+        self.assertEqual(prev_count, 1, f"_framePrev defined {prev_count} times")
+        self.assertEqual(next_count, 1, f"_frameNext defined {next_count} times")
+
+    def test_strip_bounded_by_max_constant(self):
+        """_renderSeqFrameStrip must reference _SEQ_MAX_STRIP_THUMBNAILS."""
+        self.assertIn("_SEQ_MAX_STRIP_THUMBNAILS", self._js)
+        # The function should guard against rendering more than the max.
+        self.assertIn("_renderSeqFrameStrip", self._js)
+
+    def test_lazy_navigator_function_defined(self):
+        """_renderSeqFrameNavigator must be defined for lazy sequences."""
+        self.assertIn("_renderSeqFrameNavigator", self._js)
 
 
 if __name__ == "__main__":

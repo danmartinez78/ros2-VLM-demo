@@ -49,6 +49,11 @@ _SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_.\-]{1,200}$")
 # Maximum number of scenes / clips to discover in one pass (safety bound).
 _MAX_SEQUENCES = 1000
 
+# Maximum thumbnail frame refs emitted in to_dict() for any sequence.
+# Sequences with more frames use lazy/on-demand delivery; the full frame_count
+# is still included so the UI can offer direct-index navigation.
+_MAX_CATALOG_FRAME_REFS = 20
+
 # nuScenes channel scope for this adapter version.
 _NUSCENES_CHANNEL = "CAM_FRONT"
 
@@ -146,11 +151,26 @@ class SequenceEntry:
     adapter_version: str = _ADAPTER_VERSION
     """Monotonically increasing version used as part of cache identities."""
 
+    source_path: str = ""
+    """Server-side path to the primary media asset for this sequence.
+
+    For ``jaad_clip``: absolute path to the MP4 file.
+    For ``ros_static_fixture``: absolute path to the bag directory.
+    For ``nuscenes_scene``: empty (frames carry individual ``source_path`` values).
+    **Never serialised to the browser.**
+    """
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialise for browser consumption.
 
-        Source paths from ``frame_refs`` are omitted.  ``annotation_ref`` is
-        also omitted (server-side only).
+        Source paths from ``frame_refs`` are omitted.  ``annotation_ref`` and
+        ``source_path`` are also omitted (server-side only).
+
+        Only the first ``_MAX_CATALOG_FRAME_REFS`` frame refs are included in
+        the ``frames`` list so that very large sequences (e.g. JAAD clips with
+        hundreds of frames) do not produce oversized catalog responses.
+        Sequences with ``frame_refs=[]`` (lazy/deferred) emit an empty list;
+        the ``frame_count`` field always reflects the true total.
         """
         return {
             "schema_version": _SCHEMA_VERSION,
@@ -160,7 +180,7 @@ class SequenceEntry:
             "display_name": self.display_name,
             "description": self.description,
             "frame_count": self.frame_count,
-            "frames": [fr.to_dict() for fr in self.frame_refs],
+            "frames": [fr.to_dict() for fr in self.frame_refs[:_MAX_CATALOG_FRAME_REFS]],
             "annotation_summary": self.annotation_summary,
             "provenance": self.provenance,
             "adapter_version": self.adapter_version,
@@ -287,6 +307,7 @@ def discover_ros_static_fixtures(
                 frame_count=1,
                 frame_refs=[frame_ref],
                 annotation_ref=None,
+                source_path=local_path,
                 provenance={
                     "source": "rosbag",
                     "bag_key": bag_key,
@@ -727,22 +748,11 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
         vid_meta = _probe_video_metadata(mp4_path)
         frame_count: int = vid_meta.get("frame_count") or 0
 
-        # Build FrameRefs lazily: one ref per frame index pointing at the MP4.
-        # We do NOT pre-extract frames; source_path is always the MP4 file.
-        # When frame_count is unknown we store zero refs and rely on on-demand
-        # probing during materialisation.
+        # JAAD clips are discovered lazily: frame_refs is always empty so the
+        # catalog response stays sequence-sized (no per-frame objects).
+        # The MP4 path is stored in source_path for on-demand materialisation.
+        # frame_count carries the total from ffprobe (0 when unknown).
         frame_refs: List[FrameRef] = []
-        if frame_count > 0:
-            for i in range(frame_count):
-                frame_refs.append(
-                    FrameRef(
-                        index=i,
-                        source_id=f"{stem}:frame_{i}",
-                        timestamp_us=None,  # computed during materialisation
-                        source_path=str(mp4_path),
-                        metadata={"video_stem": stem},
-                    )
-                )
 
         description_parts = []
         if vid_meta.get("width") and vid_meta.get("height"):
@@ -765,13 +775,14 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
                 adapter="jaad_clip",
                 display_name=stem,
                 description=", ".join(description_parts) if description_parts else stem,
-                frame_count=frame_count or len(frame_refs),
+                frame_count=frame_count,
                 frame_refs=frame_refs,
                 annotation_ref=(
                     str(primary_annotation_path)
                     if primary_annotation_path
                     else None
                 ),
+                source_path=str(mp4_path),
                 annotation_summary=annotation_summary,
                 provenance={
                     "source": "jaad",
@@ -903,26 +914,51 @@ def materialize_sequence_frame(
     for seq in sequences:
         if seq.dataset_id != dataset_id or seq.sequence_id != sequence_id:
             continue
+        # ── nuScenes: frame_refs carry individual image paths ─────────────
+        if seq.adapter == "nuscenes_scene":
+            for fr in seq.frame_refs:
+                if fr.index != frame_index:
+                    continue
+                sp = fr.source_path
+                if not sp:
+                    return None
+                p = Path(sp)
+                if not p.exists():
+                    return None
+                try:
+                    return p.read_bytes()
+                except OSError:
+                    return None
+            return None
+        # ── ros_static_fixture: handled by server layer (frame_store) ─────
+        if seq.adapter == "ros_static_fixture":
+            return None
+        # ── jaad_clip: lazy — use seq.source_path (MP4) directly ──────────
+        if seq.adapter == "jaad_clip":
+            mp4 = seq.source_path
+            if not mp4:
+                return None
+            p = Path(mp4)
+            if not p.exists():
+                return None
+            # Bounds-check using frame_count when known.
+            if seq.frame_count > 0 and not (0 <= frame_index < seq.frame_count):
+                return None
+            return _extract_mp4_frame_bytes(p, frame_index)
+        # Unknown adapter — fall back to frame_refs lookup.
         for fr in seq.frame_refs:
             if fr.index != frame_index:
                 continue
-            if seq.adapter == "ros_static_fixture":
-                return None
             sp = fr.source_path
             if not sp:
                 return None
             p = Path(sp)
             if not p.exists():
                 return None
-            if seq.adapter == "nuscenes_scene":
-                # source_path is already a JPEG/PNG image file.
-                try:
-                    return p.read_bytes()
-                except OSError:
-                    return None
-            if seq.adapter == "jaad_clip":
-                # source_path is the MP4; extract the specific frame.
-                return _extract_mp4_frame_bytes(p, frame_index)
+            try:
+                return p.read_bytes()
+            except OSError:
+                return None
         return None
     return None
 

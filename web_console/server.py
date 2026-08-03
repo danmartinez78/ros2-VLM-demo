@@ -1100,23 +1100,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         )
         if data is None:
             # Check if the sequence/frame exists at all to give a better error.
-            found_seq = any(
-                s.dataset_id == dataset_id and s.sequence_id == sequence_id
-                for s in entries
-            )
-            if not found_seq:
-                self._send_error(404, "Sequence not found")
-                return
-            found_adapter = next(
-                (s.adapter for s in entries
+            found_seq = next(
+                (s for s in entries
                  if s.dataset_id == dataset_id and s.sequence_id == sequence_id),
                 None,
             )
-            if found_adapter == "ros_static_fixture":
+            if found_seq is None:
+                self._send_error(404, "Sequence not found")
+                return
+            if found_seq.adapter == "ros_static_fixture":
+                # Try to serve from a previously extracted frame dataset.
+                srv = self.server_instance
+                bag_key = found_seq.frame_refs[0].metadata.get("bag_key") if found_seq.frame_refs else None
+                if bag_key:
+                    img = self._get_fixture_frame_from_store(bag_key, frame_index)
+                    if img is not None:
+                        self._send_response(200, img, "image/jpeg")
+                        return
                 self._send_error(
                     422,
-                    "Static-fixture bags cannot serve frames directly; "
-                    "use /api/extract to extract frames first.",
+                    "Static-fixture bag not yet extracted. "
+                    "Use /api/extract to extract frames first, then retry.",
                 )
                 return
             self._send_error(
@@ -1127,13 +1131,39 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         self._send_response(200, data, "image/jpeg")
 
+    def _get_fixture_frame_from_store(
+        self, bag_key: str, frame_index: int
+    ) -> Optional[bytes]:
+        """Return JPEG bytes for a static-fixture frame from an extracted dataset.
+
+        Searches the ``FrameDatasetStore`` for any dataset whose ``bag_key``
+        matches and returns the frame at *frame_index*.  Returns ``None`` when
+        no matching extraction is found or the frame cannot be read.
+        """
+        srv = self.server_instance
+        for ds in srv.frame_dataset_store.list_datasets():
+            if ds.get("bag_key") != bag_key:
+                continue
+            if ds.get("frame_count", 0) == 0:
+                continue
+            dataset_id = ds.get("dataset_id", "")
+            frame_path = srv.frame_dataset_store.get_frame_path(dataset_id, frame_index)
+            if frame_path is not None and frame_path.is_file():
+                try:
+                    return frame_path.read_bytes()
+                except OSError:
+                    continue
+        return None
+
     def _api_sequences_experiment(self) -> None:
         """Run a ROS-independent experiment from a sequence-catalog selection.
 
         Accepts a JSON body with keys:
           dataset_id             — sequence catalog dataset identifier (required)
           sequence_id            — sequence identifier within the dataset (required)
-          frame_indices          — list of int frame indices to run (default: all)
+          frame_indices          — list of int frame indices to run (required when
+                                   the sequence has no indexed frame_refs, e.g.
+                                   large JAAD clips)
           profile_name           — task profile name (optional)
           task_prompt            — task prompt (required if no profile)
           system_instruction     — optional system instruction (overrides profile)
@@ -1193,14 +1223,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(404, f"Sequence not found: {dataset_id!r}/{sequence_id!r}")
             return
 
-        if seq_entry.adapter == "ros_static_fixture":
-            self._send_error(
-                422,
-                "ros_static_fixture sequences cannot be used for sequence experiments; "
-                "use /api/extract to extract frames first, then /api/experiment/run.",
-            )
-            return
-
         # ── determine frame selection ─────────────────────────────────────────
         frame_indices_raw = body.get("frame_indices")
         if frame_indices_raw is not None:
@@ -1209,11 +1231,25 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 self._send_error(400, "frame_indices must be a list of integers")
                 return
-        else:
+        elif seq_entry.frame_refs:
+            # Default: all indexed frame refs (nuScenes keyframes etc.).
             frame_indices = [fr.index for fr in seq_entry.frame_refs]
+        elif seq_entry.adapter == "ros_static_fixture":
+            # Single-frame fixture — frame 0 is always available once extracted.
+            frame_indices = [0]
+        else:
+            # Lazy/large sequence (e.g. JAAD clip with no indexed refs):
+            # require the caller to supply an explicit bounded selection.
+            self._send_error(
+                400,
+                "frame_indices is required for this sequence "
+                "(no indexed frame refs — supply an explicit list of frame indices "
+                "to avoid materialising the entire clip)",
+            )
+            return
 
         if not frame_indices:
-            self._send_error(400, "No frames selected (sequence may have no indexed frames)")
+            self._send_error(400, "No frames selected")
             return
 
         # ── resolve profile ───────────────────────────────────────────────────
@@ -1256,7 +1292,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Build an index map for quick lookup.
+        # Build an index map for quick lookup (populated for nuScenes etc.).
         fr_by_index = {fr.index: fr for fr in seq_entry.frame_refs}
 
         # ── materialise frames into a temp directory ──────────────────────────
@@ -1270,14 +1306,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         source_frame_records: list = []
         frame_source_ids: list = []
         for fi in frame_indices:
-            frame_data = materialize_sequence_frame(entries, dataset_id, sequence_id, fi)
+            # For ros_static_fixture, try to serve from an extracted frame_store
+            # dataset; other adapters use the standard materialization path.
+            if seq_entry.adapter == "ros_static_fixture":
+                bag_key = seq_entry.frame_refs[0].metadata.get("bag_key") if seq_entry.frame_refs else None
+                frame_data = self._get_fixture_frame_from_store(bag_key or "", fi) if bag_key else None
+            else:
+                frame_data = materialize_sequence_frame(entries, dataset_id, sequence_id, fi)
             if frame_data is None:
                 _shutil.rmtree(tmp_dir, ignore_errors=True)
-                self._send_error(
-                    422,
-                    f"Frame {fi} could not be materialised from "
-                    f"{seq_entry.adapter!r} sequence. "
-                    "Ensure ffmpeg is installed for JAAD clips.",
+                if seq_entry.adapter == "ros_static_fixture":
+                    self._send_error(
+                        422,
+                        "ros_static_fixture frame not available. "
+                        "Use /api/extract to extract the bag first, then retry.",
+                    )
+                else:
+                    self._send_error(
+                        422,
+                        f"Frame {fi} could not be materialised from "
+                        f"{seq_entry.adapter!r} sequence. "
+                        "Ensure ffmpeg is installed for JAAD clips.",
                 )
                 return
             img_path = tmp_dir / f"frame_{fi:06d}.jpg"
@@ -2640,8 +2689,8 @@ _INDEX_TEMPLATE = """\
         </select>
       </label>
       <label>
-        <span class="label-text">Frame indices (comma-separated; leave blank = all)</span>
-        <input type="text" id="seqexp-frame-indices" size="70" placeholder="0,1,2,…  (leave blank for all frames)">
+        <span class="label-text">Frame indices (comma-separated; required for JAAD clips; blank = all indexed frames)</span>
+        <input type="text" id="seqexp-frame-indices" size="70" placeholder="e.g. 0,50,100,200  (required for JAAD clips — blank = all indexed frames only)">
       </label>
       <div id="seqexp-selection-info" style="font-size:0.85em;color:#666;margin-top:4px"></div>
     </fieldset>

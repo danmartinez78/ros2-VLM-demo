@@ -1580,18 +1580,6 @@ function _frameNext() {
   _showFrame(_frameExplorerDatasetId, next, _frameExplorerFrames[next]);
 }
 
-function _framePrev() {
-  if (!_frameExplorerDatasetId || _frameExplorerFrames.length === 0) return;
-  var next = Math.max(0, _frameExplorerSelected - 1);
-  _showFrame(_frameExplorerDatasetId, next, _frameExplorerFrames[next]);
-}
-
-function _frameNext() {
-  if (!_frameExplorerDatasetId || _frameExplorerFrames.length === 0) return;
-  var next = Math.min(_frameExplorerFrames.length - 1, _frameExplorerSelected + 1);
-  _showFrame(_frameExplorerDatasetId, next, _frameExplorerFrames[next]);
-}
-
 /* ── Sequence Catalog in Frame Explorer ──────────────────────────────────── */
 
 /** Currently open sequence catalog entry: {dataset_id, sequence_id, frames[]} */
@@ -1651,27 +1639,59 @@ async function _openSequence(seq) {
   if (viewerEl) _show(viewerEl);
   if (useBtn) {
     _show(useBtn);
-    // Only enable for non-fixture sequences that can materialise frames.
-    useBtn.disabled = (seq.adapter === "ros_static_fixture");
+    useBtn.disabled = false;
   }
   // Clear the rosbag-based explorer state so buttons don't conflict.
   _frameExplorerDatasetId = null;
   _frameExplorerFrames = [];
 
   var frames = seq.frames || [];
-  if (frames.length === 0) {
-    previewEl.appendChild(_el("p", "muted", "No indexed frames. Frame count: " + seq.frame_count));
+  var frameCount = seq.frame_count || 0;
+
+  if (frames.length === 0 && frameCount === 0) {
+    previewEl.appendChild(_el("p", "muted", "No frames available for this sequence."));
     return;
   }
-  _renderSeqFrameStrip(seq, frames);
-  _showSeqFrame(seq, 0, frames[0]);
+
+  if (frames.length > 0) {
+    // Bounded thumbnail strip (up to _SEQ_MAX_STRIP_THUMBNAILS evenly sampled).
+    _renderSeqFrameStrip(seq, frames, frameCount);
+    _showSeqFrame(seq, frames[0].index, frames[0]);
+  } else {
+    // Lazy sequence (e.g. JAAD clip): show a direct-index navigator instead.
+    _renderSeqFrameNavigator(seq, frameCount, previewEl, stripEl);
+  }
 }
 
-function _renderSeqFrameStrip(seq, frames) {
+/** Maximum number of thumbnails rendered in the sequence frame strip. */
+var _SEQ_MAX_STRIP_THUMBNAILS = 20;
+
+/**
+ * Render a bounded, evenly-sampled thumbnail strip.
+ *
+ * When the catalog returned all frame refs (≤ _SEQ_MAX_STRIP_THUMBNAILS),
+ * every frame gets a thumbnail.  For longer sequences the strip is sub-sampled
+ * to exactly _SEQ_MAX_STRIP_THUMBNAILS thumbnails using integer stride.
+ */
+function _renderSeqFrameStrip(seq, frames, totalCount) {
   var stripEl = document.getElementById("frame-thumbnail-strip");
   if (!stripEl) return;
   _empty(stripEl);
-  frames.forEach(function(frame) {
+  // Sub-sample if needed.
+  var sampled = frames;
+  if (frames.length > _SEQ_MAX_STRIP_THUMBNAILS) {
+    sampled = [];
+    var stride = Math.floor(frames.length / _SEQ_MAX_STRIP_THUMBNAILS);
+    for (var i = 0; i < frames.length; i += stride) {
+      sampled.push(frames[i]);
+      if (sampled.length >= _SEQ_MAX_STRIP_THUMBNAILS) break;
+    }
+  }
+  if (totalCount > frames.length) {
+    stripEl.appendChild(_el("span", "muted",
+      "Showing " + sampled.length + " of " + totalCount + " frames. "));
+  }
+  sampled.forEach(function(frame) {
     var idx = frame.index;
     var thumb = document.createElement("img");
     thumb.className = "frame-thumb" + (idx === 0 ? " selected" : "");
@@ -1681,6 +1701,64 @@ function _renderSeqFrameStrip(seq, frames) {
     thumb.addEventListener("click", function() { _showSeqFrame(seq, idx, frame); });
     stripEl.appendChild(thumb);
   });
+}
+
+/**
+ * Render a direct-index navigator for lazy sequences (no pre-indexed frames).
+ *
+ * Shows a bounded sample of evenly-spaced thumbnail indices and a text input
+ * for direct frame-index access.  This is used for JAAD clips where frame_refs
+ * is empty but frame_count is known.
+ */
+function _renderSeqFrameNavigator(seq, frameCount, previewEl, stripEl) {
+  // Offer evenly-spaced sample thumbnails (bounded to _SEQ_MAX_STRIP_THUMBNAILS).
+  var sampleCount = Math.min(frameCount, _SEQ_MAX_STRIP_THUMBNAILS);
+  var step = frameCount > 1 ? Math.floor((frameCount - 1) / (sampleCount - 1 || 1)) : 1;
+  var sampleIndices = [];
+  for (var i = 0; i < frameCount && sampleIndices.length < sampleCount; i += step) {
+    sampleIndices.push(i);
+  }
+
+  var note = _el("span", "muted",
+    "Showing " + sampleCount + " sampled thumbnails of " + frameCount + " frames. Use the input below to navigate to any frame.");
+  stripEl.appendChild(note);
+
+  sampleIndices.forEach(function(idx) {
+    var thumb = document.createElement("img");
+    thumb.className = "frame-thumb";
+    thumb.src = "/api/sequences/" + seq.dataset_id + "/" + seq.sequence_id + "/frames/" + idx;
+    thumb.alt = "Frame " + idx;
+    thumb.title = "Frame " + idx;
+    thumb.addEventListener("click", function() { _showSeqFrame(seq, idx, null); });
+    stripEl.appendChild(thumb);
+  });
+
+  // Direct-index input.
+  var navDiv = _el("div", "seq-frame-nav");
+  var label = document.createElement("label");
+  label.textContent = "Frame index (0–" + (frameCount - 1) + "): ";
+  var input = document.createElement("input");
+  input.type = "number";
+  input.min = "0";
+  input.max = String(frameCount - 1);
+  input.value = "0";
+  input.style.width = "80px";
+  var goBtn = _el("button", null, "Go");
+  goBtn.addEventListener("click", function() {
+    var v = parseInt(input.value, 10);
+    if (!isNaN(v) && v >= 0 && v < frameCount) {
+      _showSeqFrame(seq, v, null);
+    }
+  });
+  navDiv.appendChild(label);
+  navDiv.appendChild(input);
+  navDiv.appendChild(goBtn);
+  previewEl.appendChild(navDiv);
+
+  // Show first sampled frame by default.
+  if (sampleIndices.length > 0) {
+    _showSeqFrame(seq, sampleIndices[0], null);
+  }
 }
 
 function _showSeqFrame(seq, idx, frame) {
