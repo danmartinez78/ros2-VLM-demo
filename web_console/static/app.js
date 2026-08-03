@@ -1589,6 +1589,19 @@ var _seqExplorerSelectedFrame = 0;
 /** All discovered sequences, grouped by dataset_id (populated by _loadSequenceCatalog). */
 var _seqCatalog = {};
 
+/** Flat filtered list currently visible in the catalog list panel. */
+var _seqCatalogFiltered = [];
+
+/** Pagination state for the catalog list. */
+var _seqCatalogPage = 0;
+var _SEQ_CATALOG_PAGE_SIZE = 20;
+
+/** Currently selected dataset filter. */
+var _seqCatalogDataset = "";
+
+/** Current search text. */
+var _seqCatalogSearchText = "";
+
 async function _loadSequenceCatalog() {
   var listEl = document.getElementById("sequence-catalog-list");
   if (!listEl) return;
@@ -1596,32 +1609,133 @@ async function _loadSequenceCatalog() {
   listEl.appendChild(_el("p", "muted", "Loading sequences…"));
   try {
     var data = await _apiGet("/api/sequences");
-    _empty(listEl);
     _seqCatalog = data.by_dataset || {};
     var seqs = data.sequences || [];
+
+    // Surface decoder capability warning when no backend is available.
+    var cap = data.decoder_capability || {};
+    if (cap.frame_extraction === "none") {
+      var warn = _el("div", "alert error", cap.actionable_error || "No media decoder available.");
+      listEl.insertBefore ? listEl.insertBefore(warn, listEl.firstChild) : listEl.appendChild(warn);
+    }
+
     if (seqs.length === 0) {
+      _empty(listEl);
       listEl.appendChild(_el("p", "muted", "No sequences found. Configure NUSCENES_DIR or JAAD_DIR to discover sequences."));
       return;
     }
-    // Group by dataset_id.
-    var byDs = data.by_dataset || {};
-    Object.keys(byDs).sort().forEach(function(dsId) {
-      var group = _el("div", "seq-dataset-group");
-      group.appendChild(_el("div", "seq-dataset-label", dsId + " (" + byDs[dsId].length + " sequences)"));
-      byDs[dsId].forEach(function(seq) {
-        var btn = _el("button", "dataset-btn");
-        btn.appendChild(_el("span", "ds-id", seq.sequence_id));
-        btn.appendChild(_el("span", "ds-meta", " · " + seq.adapter + " · " + seq.frame_count + " frames"));
-        if (seq.description) btn.appendChild(_el("span", "ds-meta", " · " + seq.description));
-        btn.addEventListener("click", function() { _openSequence(seq); });
-        group.appendChild(btn);
+
+    // Populate dataset selector.
+    var ctrlEl = document.getElementById("seq-catalog-controls");
+    var dsSel = document.getElementById("seq-catalog-dataset-sel");
+    if (dsSel) {
+      _empty(dsSel);
+      var allOpt = document.createElement("option");
+      allOpt.value = ""; allOpt.textContent = "— all datasets (" + seqs.length + ") —";
+      dsSel.appendChild(allOpt);
+      Object.keys(_seqCatalog).sort().forEach(function(dsId) {
+        var opt = document.createElement("option");
+        opt.value = dsId;
+        opt.textContent = dsId + " (" + _seqCatalog[dsId].length + ")";
+        dsSel.appendChild(opt);
       });
-      listEl.appendChild(group);
-    });
+    }
+    if (ctrlEl) ctrlEl.style.display = "";
+
+    _seqCatalogDataset = "";
+    _seqCatalogSearchText = "";
+    _seqCatalogPage = 0;
+    var searchEl = document.getElementById("seq-catalog-search");
+    if (searchEl) searchEl.value = "";
+    _seqCatalogApplyFilter(seqs);
+    _seqCatalogRenderPage();
   } catch (e) {
     _empty(listEl);
     listEl.appendChild(_el("p", "error-msg", "Failed to load sequences: " + e.message));
   }
+}
+
+function _onSeqCatalogDatasetChange() {
+  var dsSel = document.getElementById("seq-catalog-dataset-sel");
+  _seqCatalogDataset = dsSel ? dsSel.value : "";
+  _seqCatalogPage = 0;
+  _seqCatalogApplyFilter(_getAllCatalogSeqs());
+  _seqCatalogRenderPage();
+}
+
+function _onSeqCatalogSearch() {
+  var searchEl = document.getElementById("seq-catalog-search");
+  _seqCatalogSearchText = searchEl ? searchEl.value.toLowerCase() : "";
+  _seqCatalogPage = 0;
+  _seqCatalogApplyFilter(_getAllCatalogSeqs());
+  _seqCatalogRenderPage();
+}
+
+function _getAllCatalogSeqs() {
+  var all = [];
+  Object.keys(_seqCatalog).forEach(function(k) { all = all.concat(_seqCatalog[k]); });
+  return all;
+}
+
+function _seqCatalogApplyFilter(all) {
+  _seqCatalogFiltered = all.filter(function(seq) {
+    if (_seqCatalogDataset && seq.dataset_id !== _seqCatalogDataset) return false;
+    if (_seqCatalogSearchText) {
+      var hay = (seq.sequence_id + " " + seq.description + " " + seq.adapter).toLowerCase();
+      if (hay.indexOf(_seqCatalogSearchText) === -1) return false;
+    }
+    return true;
+  });
+}
+
+function _seqCatalogRenderPage() {
+  var listEl = document.getElementById("sequence-catalog-list");
+  var pageEl = document.getElementById("seq-catalog-pagination");
+  var infoEl = document.getElementById("seq-catalog-page-info");
+  if (!listEl) return;
+  _empty(listEl);
+
+  var total = _seqCatalogFiltered.length;
+  if (total === 0) {
+    listEl.appendChild(_el("p", "muted", "No sequences match."));
+    if (pageEl) pageEl.style.display = "none";
+    return;
+  }
+
+  var pages = Math.ceil(total / _SEQ_CATALOG_PAGE_SIZE);
+  if (_seqCatalogPage >= pages) _seqCatalogPage = pages - 1;
+  var start = _seqCatalogPage * _SEQ_CATALOG_PAGE_SIZE;
+  var slice = _seqCatalogFiltered.slice(start, start + _SEQ_CATALOG_PAGE_SIZE);
+
+  slice.forEach(function(seq) {
+    var btn = _el("button", "dataset-btn seq-catalog-row");
+    btn.appendChild(_el("span", "ds-id", seq.sequence_id));
+    btn.appendChild(_el("span", "ds-meta", " · " + seq.adapter + " · " + seq.frame_count + " frames"));
+    if (seq.description) btn.appendChild(_el("span", "ds-meta", " · " + seq.description));
+    btn.addEventListener("click", function() { _openSequence(seq); });
+    listEl.appendChild(btn);
+  });
+
+  // Pagination controls.
+  if (pages > 1) {
+    if (pageEl) pageEl.style.display = "";
+    if (infoEl) infoEl.textContent = "Page " + (_seqCatalogPage + 1) + " / " + pages + " (" + total + " sequences)";
+    var prevBtn = document.getElementById("seq-catalog-prev-btn");
+    var nextBtn = document.getElementById("seq-catalog-next-btn");
+    if (prevBtn) prevBtn.disabled = _seqCatalogPage === 0;
+    if (nextBtn) nextBtn.disabled = _seqCatalogPage >= pages - 1;
+  } else {
+    if (pageEl) pageEl.style.display = "none";
+  }
+}
+
+function _seqCatalogPrevPage() {
+  if (_seqCatalogPage > 0) { _seqCatalogPage--; _seqCatalogRenderPage(); }
+}
+
+function _seqCatalogNextPage() {
+  var pages = Math.ceil(_seqCatalogFiltered.length / _SEQ_CATALOG_PAGE_SIZE);
+  if (_seqCatalogPage < pages - 1) { _seqCatalogPage++; _seqCatalogRenderPage(); }
 }
 
 async function _openSequence(seq) {
@@ -1630,15 +1744,30 @@ async function _openSequence(seq) {
   var previewEl = document.getElementById("frame-preview-area");
   var stripEl = document.getElementById("frame-thumbnail-strip");
   var metaEl = document.getElementById("frame-metadata");
-  var viewerEl = document.getElementById("frame-explorer-viewer");
+  var detailEl = document.getElementById("seq-catalog-detail");
+  var titleEl = document.getElementById("seq-catalog-detail-title");
+  var detailMetaEl = document.getElementById("seq-catalog-detail-meta");
   var useBtn = document.getElementById("seq-use-in-exp-btn");
+
   if (!previewEl || !stripEl) return;
   _empty(previewEl);
   _empty(stripEl);
   if (metaEl) _empty(metaEl);
-  if (viewerEl) _show(viewerEl);
+  if (detailMetaEl) {
+    _empty(detailMetaEl);
+    // Show annotation summary if available.
+    var ann = seq.annotation_summary || {};
+    var parts = [];
+    if (seq.frame_count) parts.push(seq.frame_count + " frames");
+    if (ann.track_count) parts.push(ann.track_count + " tracks");
+    if (ann.crossing_count) parts.push(ann.crossing_count + " crossing");
+    if (ann.walking_count) parts.push(ann.walking_count + " walking");
+    if (parts.length) detailMetaEl.appendChild(_el("span", "meta-item", parts.join(" · ")));
+  }
+  if (titleEl) titleEl.textContent = seq.dataset_id + " / " + seq.sequence_id;
+  if (detailEl) detailEl.style.display = "";
   if (useBtn) {
-    _show(useBtn);
+    useBtn.style.display = "";
     useBtn.disabled = false;
   }
   // Clear the rosbag-based explorer state so buttons don't conflict.
@@ -1775,10 +1904,10 @@ function _showSeqFrame(seq, idx, frame) {
   if (metaEl) {
     _empty(metaEl);
     metaEl.appendChild(_el("span", "meta-item", "Frame: " + idx));
-    if (frame.timestamp_us) {
+    if (frame && frame.timestamp_us) {
       metaEl.appendChild(_el("span", "meta-item", " · " + (frame.timestamp_us / 1e6).toFixed(3) + "s"));
     }
-    if (frame.source_id) metaEl.appendChild(_el("span", "meta-item", " · ID: " + frame.source_id));
+    if (frame && frame.source_id) metaEl.appendChild(_el("span", "meta-item", " · ID: " + frame.source_id));
     metaEl.appendChild(_el("span", "meta-item", " · " + seq.adapter));
   }
   document.querySelectorAll(".frame-thumb").forEach(function(t, i) {

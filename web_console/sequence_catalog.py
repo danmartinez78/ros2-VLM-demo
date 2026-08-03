@@ -478,12 +478,50 @@ def discover_nuscenes_scenes(
 # ── jaad_clip adapter ─────────────────────────────────────────────────────────
 
 
-def _probe_video_metadata(video_path: Path) -> Dict[str, Any]:
-    """Probe basic video metadata without importing a heavy media framework.
+def _probe_video_metadata_opencv(video_path: Path) -> Dict[str, Any]:
+    """Probe video metadata using OpenCV (cv2.VideoCapture).
 
-    Uses ``ffprobe`` (preferred) if available, otherwise returns an empty dict.
+    Used as a fallback when ``ffprobe`` is unavailable.  Never raises; returns
+    an empty dict on any error (including when OpenCV itself is absent).
+    """
+    result: Dict[str, Any] = {}
+    try:
+        import cv2  # type: ignore
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            return result
+        try:
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps_raw = cap.get(cv2.CAP_PROP_FPS)
+            fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if w > 0:
+                result["width"] = w
+            if h > 0:
+                result["height"] = h
+            if fps_raw and fps_raw > 0:
+                result["fps"] = round(float(fps_raw), 4)
+                if fc > 0:
+                    result["duration_sec"] = round(fc / fps_raw, 3)
+            if fc > 0:
+                result["frame_count"] = fc
+        finally:
+            cap.release()
+    except Exception:
+        pass
+    return result
+
+
+def _probe_video_metadata(video_path: Path) -> Dict[str, Any]:
+    """Probe basic video metadata.
+
+    Tries ``ffprobe`` first (preferred for accuracy); falls back to
+    ``cv2.VideoCapture`` (OpenCV) when ``ffprobe`` is unavailable.
+    Returns ``{"_backend": "ffprobe"|"opencv"|"none"}`` alongside the
+    extracted fields so callers can surface decoder capability.
     Never raises; always returns a (possibly empty) dict.
     """
+    # ── Try ffprobe ────────────────────────────────────────────────────────
     result: Dict[str, Any] = {}
     try:
         import subprocess
@@ -522,9 +560,20 @@ def _probe_video_metadata(video_path: Path) -> Dict[str, Any]:
                         except ValueError:
                             pass
                     break
+            if result:
+                result["_backend"] = "ffprobe"
+                return result
     except Exception:
         pass
-    return result
+
+    # ── Fall back to OpenCV ────────────────────────────────────────────────
+    result = _probe_video_metadata_opencv(video_path)
+    if result:
+        result["_backend"] = "opencv"
+        return result
+
+    # ── Neither backend available ──────────────────────────────────────────
+    return {"_backend": "none"}
 
 
 def _parse_jaad_xml_summary(xml_path: Path) -> Dict[str, Any]:
@@ -744,14 +793,21 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
             xml_summary = _parse_jaad_xml_summary(primary_annotation_path)
             annotation_summary.update(xml_summary)
 
-        # Probe video metadata (non-blocking; empty dict if ffprobe absent).
+        # Probe video metadata (non-blocking; falls back to OpenCV, then "none").
         vid_meta = _probe_video_metadata(mp4_path)
         frame_count: int = vid_meta.get("frame_count") or 0
+
+        # Last-resort frame count hint: use stop_frame from annotation summary
+        # when neither ffprobe nor OpenCV provided a frame count.
+        if frame_count == 0:
+            stop_frame = annotation_summary.get("stop_frame")
+            if isinstance(stop_frame, int) and stop_frame >= 0:
+                frame_count = stop_frame + 1
 
         # JAAD clips are discovered lazily: frame_refs is always empty so the
         # catalog response stays sequence-sized (no per-frame objects).
         # The MP4 path is stored in source_path for on-demand materialisation.
-        # frame_count carries the total from ffprobe (0 when unknown).
+        # frame_count carries the total from metadata probing (0 when unknown).
         frame_refs: List[FrameRef] = []
 
         description_parts = []
@@ -767,6 +823,9 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
             )
         if annotation_availability.get("annotations"):
             description_parts.append("annotated")
+
+        # Strip internal backend key from provenance (not useful in browser context).
+        meta_public = {k: v for k, v in vid_meta.items() if k != "_backend"}
 
         sequences.append(
             SequenceEntry(
@@ -787,7 +846,7 @@ def discover_jaad_clips(jaad_root: Path) -> List[SequenceEntry]:
                 provenance={
                     "source": "jaad",
                     "video_stem": stem,
-                    "video_metadata": vid_meta,
+                    "video_metadata": meta_public,
                 },
             )
         )
@@ -849,13 +908,43 @@ def resolve_sequence_frame_path(
     return None
 
 
-def _extract_mp4_frame_bytes(mp4_path: Path, frame_index: int) -> Optional[bytes]:
-    """Extract a single frame from an MP4 as JPEG bytes using ffmpeg.
+def _extract_mp4_frame_bytes_opencv(mp4_path: Path, frame_index: int) -> Optional[bytes]:
+    """Extract a single frame from an MP4 as JPEG bytes using OpenCV.
 
-    Uses ``ffmpeg``'s ``select`` filter to pick the exact zero-based frame.
-    Returns ``None`` if ``ffmpeg`` is unavailable or the extraction fails.
+    Seeks to *frame_index*, reads one frame, and JPEG-encodes it.
+    Returns ``None`` if OpenCV is unavailable or the extraction fails.
     Never raises.
     """
+    try:
+        import cv2  # type: ignore
+        import numpy as _np  # type: ignore  # noqa: F401 (imported for cv2 encode)
+        cap = cv2.VideoCapture(str(mp4_path))
+        if not cap.isOpened():
+            return None
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, float(frame_index))
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                return None
+            ok, buf = cv2.imencode(".jpg", frame)
+            if ok and buf is not None:
+                return buf.tobytes()
+        finally:
+            cap.release()
+    except Exception:
+        pass
+    return None
+
+
+def _extract_mp4_frame_bytes(mp4_path: Path, frame_index: int) -> Optional[bytes]:
+    """Extract a single frame from an MP4 as JPEG bytes.
+
+    Tries ``ffmpeg`` first (preferred); falls back to ``cv2.VideoCapture``
+    (OpenCV) when ``ffmpeg`` is unavailable.
+    Returns ``None`` if neither backend can extract the frame.
+    Never raises.
+    """
+    # ── Try ffmpeg ─────────────────────────────────────────────────────────
     try:
         import subprocess as _sp
         proc = _sp.run(
@@ -876,7 +965,9 @@ def _extract_mp4_frame_bytes(mp4_path: Path, frame_index: int) -> Optional[bytes
             return proc.stdout
     except Exception:
         pass
-    return None
+
+    # ── Fall back to OpenCV ────────────────────────────────────────────────
+    return _extract_mp4_frame_bytes_opencv(mp4_path, frame_index)
 
 
 def materialize_sequence_frame(
@@ -892,8 +983,9 @@ def materialize_sequence_frame(
     ``nuscenes_scene``
         Reads the existing JPEG directly from ``source_path``.
     ``jaad_clip``
-        Calls ``ffmpeg`` to extract frame *frame_index* from the MP4.
-        Returns ``None`` when ``ffmpeg`` is unavailable.
+        Extracts frame *frame_index* from the MP4 using ``ffmpeg``
+        (preferred) or ``cv2.VideoCapture`` (OpenCV fallback).
+        Returns ``None`` when neither backend is available.
     ``ros_static_fixture``
         Always returns ``None`` — use the rosbag extraction pipeline instead.
 
@@ -1072,5 +1164,57 @@ def discover_sequences(
         "by_dataset": by_dataset,
         "adapter_counts": adapter_counts,
         "errors": errors,
+        "decoder_capability": get_decoder_capability(),
+    }
+
+
+def get_decoder_capability() -> Dict[str, Any]:
+    """Return information about available media decoder backends.
+
+    Probes whether ``ffprobe``/``ffmpeg`` and ``cv2`` (OpenCV) are available
+    on the current host.  The returned dict is safe to include in diagnostics
+    responses and ``/api/sequences`` payloads.
+
+    Returns
+    -------
+    dict with:
+        ``ffprobe``  — bool, True when ``ffprobe`` CLI is found on PATH
+        ``ffmpeg``   — bool, True when ``ffmpeg`` CLI is found on PATH
+        ``opencv``   — bool, True when ``cv2`` can be imported
+        ``frame_extraction`` — ``"ffmpeg"``, ``"opencv"``, or ``"none"``
+        ``metadata_probe``   — ``"ffprobe"``, ``"opencv"``, or ``"none"``
+        ``actionable_error`` — human-readable string when *no* backend is
+                               available; ``None`` otherwise
+    """
+    import shutil
+
+    has_ffprobe = shutil.which("ffprobe") is not None
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+
+    has_opencv = False
+    try:
+        import cv2  # type: ignore  # noqa: F401
+        has_opencv = True
+    except Exception:
+        pass
+
+    frame_extraction = "ffmpeg" if has_ffmpeg else ("opencv" if has_opencv else "none")
+    metadata_probe = "ffprobe" if has_ffprobe else ("opencv" if has_opencv else "none")
+
+    actionable_error: Optional[str] = None
+    if frame_extraction == "none":
+        actionable_error = (
+            "No media decoder is available for JAAD frame extraction. "
+            "Install ffmpeg (e.g. 'apt-get install ffmpeg') or opencv-python "
+            "('pip install opencv-python-headless') to enable frame viewing."
+        )
+
+    return {
+        "ffprobe": has_ffprobe,
+        "ffmpeg": has_ffmpeg,
+        "opencv": has_opencv,
+        "frame_extraction": frame_extraction,
+        "metadata_probe": metadata_probe,
+        "actionable_error": actionable_error,
     }
 

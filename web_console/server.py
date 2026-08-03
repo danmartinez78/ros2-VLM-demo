@@ -1126,7 +1126,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self._send_error(
                 422,
                 "Frame could not be materialised. "
-                "Ensure ffmpeg is installed for JAAD clips.",
+                "Ensure ffmpeg or opencv-python is installed for JAAD clips.",
             )
             return
         self._send_response(200, data, "image/jpeg")
@@ -2917,18 +2917,36 @@ _INDEX_TEMPLATE = """\
     <div class="panel-title">Sequence Catalog (nuScenes / JAAD / ROS fixtures)
       <button class="secondary small" onclick="_loadSequenceCatalog()" style="margin-left:auto">Refresh</button>
     </div>
-    <div id="sequence-catalog-list"><span class="muted">Loading…</span></div>
-  </div>
-  <div class="panel" id="frame-explorer-viewer" style="display:none">
-    <div class="panel-title">Frame Viewer
-      <button class="secondary small" onclick="_framePrev()">&#8592; Prev</button>
-      <button class="secondary small" onclick="_frameNext()">Next &#8594;</button>
-      <button class="small" id="seq-use-in-exp-btn" style="display:none;margin-left:auto" onclick="_seqUseInExperiment()">Use in Experiment &#8594;</button>
+    <!-- Dataset selector -->
+    <div class="form-row" id="seq-catalog-controls" style="display:none">
+      <label class="label-text">Dataset
+        <select id="seq-catalog-dataset-sel" onchange="_onSeqCatalogDatasetChange()">
+          <option value="">— select a dataset —</option>
+        </select>
+      </label>
+      <label class="label-text" style="margin-left:1rem;flex:1">Search
+        <input id="seq-catalog-search" type="search" placeholder="Filter sequences…" oninput="_onSeqCatalogSearch()" style="width:100%">
+      </label>
     </div>
-    <div id="frame-preview-area"></div>
-    <div id="frame-metadata" class="frame-meta"></div>
-    <div id="frame-thumbnail-strip" class="thumb-strip"></div>
-    <div id="frame-review-ui" class="review-panel"></div>
+    <!-- Sequence list: max ~20 rows visible, paginated -->
+    <div id="sequence-catalog-list"><span class="muted">Loading…</span></div>
+    <div id="seq-catalog-pagination" class="form-row" style="display:none;margin-top:0.4rem">
+      <button class="secondary small" id="seq-catalog-prev-btn" onclick="_seqCatalogPrevPage()">&#8592; Prev</button>
+      <span id="seq-catalog-page-info" class="muted" style="margin:0 0.5rem"></span>
+      <button class="secondary small" id="seq-catalog-next-btn" onclick="_seqCatalogNextPage()">Next &#8594;</button>
+    </div>
+    <!-- Selected sequence details panel (shown when a sequence is selected) -->
+    <div id="seq-catalog-detail" style="display:none;margin-top:0.75rem;border-top:1px solid var(--border,#ddd);padding-top:0.5rem">
+      <div class="panel-title" style="margin:0 0 0.4rem">
+        <span id="seq-catalog-detail-title"></span>
+        <button class="small" id="seq-use-in-exp-btn" style="display:none;margin-left:auto" onclick="_seqUseInExperiment()">Use in Experiment &#8594;</button>
+      </div>
+      <div id="seq-catalog-detail-meta" class="frame-meta" style="margin-bottom:0.4rem"></div>
+      <div id="frame-thumbnail-strip" class="thumb-strip"></div>
+      <div id="frame-preview-area"></div>
+      <div id="frame-metadata" class="frame-meta"></div>
+      <div id="frame-review-ui" class="review-panel"></div>
+    </div>
   </div>
 </div>
 

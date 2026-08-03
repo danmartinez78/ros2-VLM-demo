@@ -63,6 +63,11 @@ from web_console.sequence_catalog import (
     materialize_sequence_frame,
     _parse_jaad_xml_summary,
     _load_jaad_clip_label_index,
+    _probe_video_metadata,
+    _probe_video_metadata_opencv,
+    _extract_mp4_frame_bytes,
+    _extract_mp4_frame_bytes_opencv,
+    get_decoder_capability,
 )
 
 
@@ -7280,6 +7285,211 @@ class TestAppJsBoundedStrip(unittest.TestCase):
     def test_lazy_navigator_function_defined(self):
         """_renderSeqFrameNavigator must be defined for lazy sequences."""
         self.assertIn("_renderSeqFrameNavigator", self._js)
+
+
+class TestAppJsCompactCatalogUI(unittest.TestCase):
+    """app.js must implement the compact dataset-selector + paginated sequence list UI."""
+
+    @classmethod
+    def setUpClass(cls):
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = js_path.read_text(encoding="utf-8")
+
+    def test_dataset_selector_change_handler_defined(self):
+        """_onSeqCatalogDatasetChange must be defined for dataset filtering."""
+        self.assertIn("_onSeqCatalogDatasetChange", self._js)
+
+    def test_search_handler_defined(self):
+        """_onSeqCatalogSearch must be defined for text-search filtering."""
+        self.assertIn("_onSeqCatalogSearch", self._js)
+
+    def test_pagination_functions_defined(self):
+        """_seqCatalogPrevPage and _seqCatalogNextPage must be defined."""
+        self.assertIn("_seqCatalogPrevPage", self._js)
+        self.assertIn("_seqCatalogNextPage", self._js)
+
+    def test_page_size_constant_defined(self):
+        """_SEQ_CATALOG_PAGE_SIZE must be defined and reference 20."""
+        self.assertIn("_SEQ_CATALOG_PAGE_SIZE", self._js)
+        self.assertIn("= 20", self._js)
+
+    def test_render_page_function_defined(self):
+        """_seqCatalogRenderPage must be the central rendering function."""
+        self.assertIn("_seqCatalogRenderPage", self._js)
+
+    def test_apply_filter_function_defined(self):
+        """_seqCatalogApplyFilter must filter sequences."""
+        self.assertIn("_seqCatalogApplyFilter", self._js)
+
+    def test_346_sequences_never_produce_346_buttons_in_one_page(self):
+        """The page-size guard must prevent 346 buttons from rendering at once.
+
+        This is a static code assertion: _seqCatalogRenderPage must slice
+        _seqCatalogFiltered using _SEQ_CATALOG_PAGE_SIZE before appending rows.
+        """
+        # Find the _seqCatalogRenderPage function body.
+        start = self._js.find("function _seqCatalogRenderPage(")
+        self.assertGreater(start, 0, "_seqCatalogRenderPage not found")
+        # The function must reference _SEQ_CATALOG_PAGE_SIZE for slicing.
+        func_body = self._js[start:start + 2000]
+        self.assertIn("_SEQ_CATALOG_PAGE_SIZE", func_body,
+            "_seqCatalogRenderPage must use _SEQ_CATALOG_PAGE_SIZE to limit visible rows")
+        self.assertIn("slice(", func_body,
+            "_seqCatalogRenderPage must slice _seqCatalogFiltered")
+
+    def test_decoder_capability_warning_handled(self):
+        """App must surface decoder capability warning when no backend is available."""
+        self.assertIn("decoder_capability", self._js)
+        self.assertIn("frame_extraction", self._js)
+        self.assertIn("actionable_error", self._js)
+
+    def test_use_in_experiment_transfers_sequence(self):
+        """_seqUseInExperiment must reference seqexp-dataset-id and seqexp-sequence-id."""
+        self.assertIn("seqexp-dataset-id", self._js)
+        self.assertIn("seqexp-sequence-id", self._js)
+        self.assertIn("_seqUseInExperiment", self._js)
+
+    def test_detail_panel_populated(self):
+        """_openSequence must populate the seq-catalog-detail panel."""
+        start = self._js.find("async function _openSequence(")
+        self.assertGreater(start, 0, "_openSequence not found")
+        func_body = self._js[start:start + 3000]
+        self.assertIn("seq-catalog-detail", func_body,
+            "_openSequence must show the seq-catalog-detail panel")
+
+
+class TestVideoBackendFallback(unittest.TestCase):
+    """_probe_video_metadata and _extract_mp4_frame_bytes must fall back to OpenCV."""
+
+    def test_probe_metadata_ffprobe_unavailable_returns_none_backend(self):
+        """When ffprobe subprocess raises, _probe_video_metadata falls back to opencv or none."""
+        with patch("subprocess.run", side_effect=FileNotFoundError("ffprobe not found")):
+            # OpenCV is also unavailable in CI; expect _backend == "none" or "opencv".
+            with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+                result = _probe_video_metadata(pathlib.Path(f.name))
+        self.assertIn("_backend", result)
+        self.assertIn(result["_backend"], {"opencv", "none"})
+
+    def test_probe_metadata_backend_key_always_present(self):
+        """_probe_video_metadata must always include the _backend key."""
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            fname = f.name
+        try:
+            result = _probe_video_metadata(pathlib.Path(fname))
+            self.assertIn("_backend", result)
+            self.assertIn(result["_backend"], {"ffprobe", "opencv", "none"})
+        finally:
+            os.unlink(fname)
+
+    def test_probe_metadata_backend_not_leaked_in_provenance(self):
+        """The _backend key must be stripped from JAAD sequence provenance."""
+        with tempfile.TemporaryDirectory() as tmp:
+            clips_dir = pathlib.Path(tmp) / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            seqs = discover_jaad_clips(pathlib.Path(tmp))
+            self.assertEqual(len(seqs), 1)
+            prov = seqs[0].provenance
+            meta = prov.get("video_metadata", {})
+            self.assertNotIn("_backend", meta,
+                "_backend must not appear in serialised provenance")
+
+    def test_probe_opencv_nonexistent_path_returns_empty(self):
+        """_probe_video_metadata_opencv must return {} for nonexistent paths."""
+        result = _probe_video_metadata_opencv(pathlib.Path("/nonexistent/video.mp4"))
+        self.assertIsInstance(result, dict)
+        self.assertNotIn("frame_count", result)
+
+    def test_extract_frame_bytes_ffmpeg_unavailable_tries_opencv(self):
+        """When ffmpeg is unavailable, _extract_mp4_frame_bytes must try OpenCV."""
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(b"FAKE")
+            fname = f.name
+        try:
+            with patch("subprocess.run", side_effect=FileNotFoundError("ffmpeg not found")):
+                # OpenCV will also fail on a fake file but must be tried.
+                result = _extract_mp4_frame_bytes(pathlib.Path(fname), 0)
+            # Result may be None (no real video) but must not raise.
+            self.assertIsNone(result)
+        finally:
+            os.unlink(fname)
+
+    def test_extract_frame_bytes_opencv_nonexistent_returns_none(self):
+        """_extract_mp4_frame_bytes_opencv must return None for nonexistent files."""
+        result = _extract_mp4_frame_bytes_opencv(pathlib.Path("/nonexistent/video.mp4"), 0)
+        self.assertIsNone(result)
+
+    def test_get_decoder_capability_structure(self):
+        """get_decoder_capability must return required keys."""
+        cap = get_decoder_capability()
+        self.assertIn("ffprobe", cap)
+        self.assertIn("ffmpeg", cap)
+        self.assertIn("opencv", cap)
+        self.assertIn("frame_extraction", cap)
+        self.assertIn("metadata_probe", cap)
+        self.assertIn("actionable_error", cap)
+        self.assertIn(cap["frame_extraction"], {"ffmpeg", "opencv", "none"})
+        self.assertIn(cap["metadata_probe"], {"ffprobe", "opencv", "none"})
+
+    def test_get_decoder_capability_actionable_error_when_none(self):
+        """actionable_error must be a string when no backend is available."""
+        with patch("shutil.which", return_value=None):
+            with patch.dict("sys.modules", {"cv2": None}):
+                cap = get_decoder_capability()
+        if cap["frame_extraction"] == "none":
+            self.assertIsNotNone(cap["actionable_error"])
+            self.assertIsInstance(cap["actionable_error"], str)
+            self.assertGreater(len(cap["actionable_error"]), 10)
+
+    def test_get_decoder_capability_no_error_when_opencv_available(self):
+        """actionable_error must be None when OpenCV is available."""
+        mock_cv2 = MagicMock()
+        with patch("shutil.which", return_value=None):
+            with patch.dict("sys.modules", {"cv2": mock_cv2}):
+                cap = get_decoder_capability()
+        # If the mock makes opencv appear available, frame_extraction == "opencv"
+        # and actionable_error should be None.
+        if cap["frame_extraction"] in {"ffmpeg", "opencv"}:
+            self.assertIsNone(cap["actionable_error"])
+
+    def test_discover_sequences_includes_decoder_capability(self):
+        """discover_sequences must include decoder_capability in its result."""
+        result = discover_sequences()
+        self.assertIn("decoder_capability", result)
+        cap = result["decoder_capability"]
+        self.assertIn("frame_extraction", cap)
+        self.assertIn("metadata_probe", cap)
+
+    def test_jaad_frame_count_from_annotation_stop_frame(self):
+        """When both ffprobe and OpenCV are unavailable, use stop_frame+1 from annotation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            clips_dir = root / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            # Create an annotation XML with stop_frame = 599 → frame_count should be 600.
+            # Use the JAAD annotation format: stop_frame lives in <meta><task>.
+            ann_dir = root / "annotations"
+            ann_dir.mkdir()
+            xml = ann_dir / "video_0001.xml"
+            xml.write_text(
+                '<?xml version="1.0"?>'
+                '<JAAD_annotations>'
+                '<meta><task><start_frame>0</start_frame><stop_frame>599</stop_frame></task></meta>'
+                '<track id="0" label="pedestrian" start_frame="0" stop_frame="599">'
+                '<box frame="0"/></track>'
+                '</JAAD_annotations>',
+                encoding="utf-8",
+            )
+            # Patch _probe_video_metadata to return no frame_count.
+            with patch(
+                "web_console.sequence_catalog._probe_video_metadata",
+                return_value={"_backend": "none"},
+            ):
+                seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 1)
+            self.assertEqual(seqs[0].frame_count, 600,
+                f"Expected frame_count=600 from annotation, got {seqs[0].frame_count}")
 
 
 if __name__ == "__main__":
