@@ -6409,6 +6409,19 @@ class TestSequencesApiEndpoint(unittest.TestCase):
             self.assertNotIn(prefix, serialised,
                              msg=f"Server path prefix {prefix!r} found in response")
 
+    def test_get_sequences_includes_decoder_capability(self):
+        """GET /api/sequences must include a decoder_capability dict."""
+        status, data = self._get("/api/sequences")
+        self.assertEqual(status, 200)
+        self.assertIn("decoder_capability", data)
+        cap = data["decoder_capability"]
+        for key in ("ffprobe", "ffmpeg", "opencv", "frame_extraction",
+                    "metadata_probe"):
+            self.assertIn(key, cap, msg=f"decoder_capability missing key {key!r}")
+        # frame_extraction and metadata_probe must be one of the known values.
+        self.assertIn(cap["frame_extraction"], ("ffmpeg", "opencv", "none"))
+        self.assertIn(cap["metadata_probe"], ("ffprobe", "opencv", "none"))
+
 
 class TestJaadLabelIndexSchema(unittest.TestCase):
     """Tests for the canonical {"clips": [...]} label index schema."""

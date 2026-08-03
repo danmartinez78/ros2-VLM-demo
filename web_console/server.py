@@ -54,6 +54,7 @@ from .sequence_catalog import (
     SequenceEntry,
     _build_sequence_list,
     discover_sequences,
+    get_decoder_capability,
     materialize_sequence_frame,
 )
 from .experiment_engine import (
@@ -1042,6 +1043,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             "by_dataset": by_dataset,
             "adapter_counts": adapter_counts,
             "errors": errors,
+            "decoder_capability": get_decoder_capability(),
         })
 
     def _get_sequence_entries(self) -> list:
