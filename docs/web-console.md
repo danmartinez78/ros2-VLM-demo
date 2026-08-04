@@ -159,6 +159,81 @@ All run manifests are stored under `--runs-dir`. Click a run in the history
 table to inspect its full configuration, result text, latency, and error
 information.
 
+### Sequence Catalog (Frame Explorer)
+
+The **Sequence Catalog** panel in Frame Explorer provides access to locally
+installed datasets without a live ROS graph.  Three adapter types are
+supported:
+
+| Adapter | Dataset | Source |
+|---|---|---|
+| `ros_static_fixture` | RT-DETR quickstart rosbag | A rosbag with exactly one raw image message |
+| `nuscenes_scene` | nuScenes mini | `CAM_FRONT` keyframes from the `scene → sample` linked list |
+| `jaad_clip` | JAAD | Individual `video_XXXX.mp4` clips with annotation summaries |
+
+**Browsing is lazy and bounded.**  The catalog response is sequence-level only
+— frame references are not pre-loaded for JAAD clips at discovery time.  The
+UI shows a compact dataset/source selector, a searchable sequence list with
+paginated results (20 visible rows), and a selected-sequence detail panel.
+A ≤ 20-thumbnail strip is rendered for sequences that have pre-indexed frame
+refs (nuScenes, static fixtures); JAAD clips show a sampled navigator with a
+direct frame-index input.
+
+**Frame serving and media backends.**  On-demand frame extraction uses two
+backends with automatic fallback:
+
+1. **ffmpeg / ffprobe** — preferred when available on `PATH`.
+2. **OpenCV (`cv2`)** — used automatically when ffmpeg/ffprobe are absent
+   (e.g. on a fresh Thor without media tools).  Install with
+   `pip install opencv-python-headless`.
+
+`GET /api/sequences` includes a `decoder_capability` object that reports which
+backends are active and surfaces an actionable error when neither is available:
+
+```json
+{
+  "ffprobe": false,
+  "ffmpeg": false,
+  "opencv": true,
+  "metadata_probe": "opencv",
+  "frame_extraction": "opencv",
+  "actionable_error": null
+}
+```
+
+Install at least one backend before using JAAD frame viewing:
+
+```bash
+# Option A — ffmpeg (also covers ffprobe):
+sudo apt-get install ffmpeg
+
+# Option B — OpenCV headless (no display required):
+pip install opencv-python-headless
+```
+
+**RT-DETR static fixture prerequisite.**  The `ros_static_fixture` adapter
+lists the RT-DETR quickstart bag as a selectable sequence, but frame serving
+requires the bag to have been previously extracted through the normal Frame
+Explorer extraction flow.  The "Use in Experiment" button and frame viewer are
+enabled only after an extraction has populated the frame dataset store.  Use
+the existing **Extract Frames** panel to extract the bag first.
+
+**Sequence experiments.**  Clicking **Use in Experiment** in the sequence
+detail panel transfers the selected `dataset_id`, `sequence_id`, and optional
+frame indices to the Experiment form.  `POST /api/sequences/experiment` runs
+`ExperimentDefinition` on the materialized frames and records
+`adapter`/`dataset_id`/`sequence_id`/`frame_source_ids` in the run manifest.
+Lazy JAAD sequences require explicit `frame_indices` in the request body.
+
+Configure dataset roots via server config keys or environment variables:
+
+| Config key | Env variable | Default |
+|---|---|---|
+| `nuscenes_dir` | `NUSCENES_DIR` | `test_data/datasets/nuscenes-mini` |
+| `jaad_dir` | `JAAD_DIR` | `test_data/datasets/jaad` |
+
+
+
 ## Artifact locations and retention
 
 Each run is stored under `~/.web_console/runs/<run_id>/` (configurable with

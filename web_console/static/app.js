@@ -60,10 +60,10 @@ function navigate(viewId) {
   else if (viewId === "datasets") { _loadDatasets(); _loadExtractionBags(); }
   else if (viewId === "runs") { _loadRuns(); }
   else if (viewId === "diagnostics") { _loadDiagnostics(); }
-  else if (viewId === "frame-explorer") { _loadFrameExplorer(); _loadExtractionBags(); }
+  else if (viewId === "frame-explorer") { _loadFrameExplorer(); _loadSequenceCatalog(); _loadExtractionBags(); }
   else if (viewId === "profiles") { _loadProfiles(); }
   else if (viewId === "compare") { _loadCompare(); }
-  else if (viewId === "experiment") { _loadExpDatasets(); _loadExpProfiles(); }
+  else if (viewId === "experiment") { _loadExpDatasets(); _loadExpProfiles(); _loadSeqExpDatasets(); }
 }
 
 document.addEventListener("DOMContentLoaded", function() {
@@ -1578,6 +1578,609 @@ function _frameNext() {
   if (!_frameExplorerDatasetId || _frameExplorerFrames.length === 0) return;
   var next = Math.min(_frameExplorerFrames.length - 1, _frameExplorerSelected + 1);
   _showFrame(_frameExplorerDatasetId, next, _frameExplorerFrames[next]);
+}
+
+/* ── Sequence Catalog in Frame Explorer ──────────────────────────────────── */
+
+/** Currently open sequence catalog entry: {dataset_id, sequence_id, frames[]} */
+var _seqExplorerEntry = null;
+var _seqExplorerSelectedFrame = 0;
+
+/** All discovered sequences, grouped by dataset_id (populated by _loadSequenceCatalog). */
+var _seqCatalog = {};
+
+/** Flat filtered list currently visible in the catalog list panel. */
+var _seqCatalogFiltered = [];
+
+/** Pagination state for the catalog list. */
+var _seqCatalogPage = 0;
+var _SEQ_CATALOG_PAGE_SIZE = 20;
+
+/** Maximum number of frames allowed in a single sequence experiment selection. */
+var _SEQ_MAX_FRAME_SELECTION = 100;
+
+/** Currently selected dataset filter. */
+var _seqCatalogDataset = "";
+
+/** Current search text. */
+var _seqCatalogSearchText = "";
+
+async function _loadSequenceCatalog() {
+  var listEl = document.getElementById("sequence-catalog-list");
+  if (!listEl) return;
+  _empty(listEl);
+  listEl.appendChild(_el("p", "muted", "Loading sequences…"));
+  try {
+    var data = await _apiGet("/api/sequences");
+    _seqCatalog = data.by_dataset || {};
+    var seqs = data.sequences || [];
+
+    // Surface decoder capability warning when no backend is available.
+    var cap = data.decoder_capability || {};
+    if (cap.frame_extraction === "none") {
+      var warn = _el("div", "alert error", cap.actionable_error || "No media decoder available.");
+      listEl.insertBefore ? listEl.insertBefore(warn, listEl.firstChild) : listEl.appendChild(warn);
+    }
+
+    if (seqs.length === 0) {
+      _empty(listEl);
+      listEl.appendChild(_el("p", "muted", "No sequences found. Configure NUSCENES_DIR or JAAD_DIR to discover sequences."));
+      return;
+    }
+
+    // Populate dataset selector.
+    var ctrlEl = document.getElementById("seq-catalog-controls");
+    var dsSel = document.getElementById("seq-catalog-dataset-sel");
+    if (dsSel) {
+      _empty(dsSel);
+      var allOpt = document.createElement("option");
+      allOpt.value = ""; allOpt.textContent = "— all datasets (" + seqs.length + ") —";
+      dsSel.appendChild(allOpt);
+      Object.keys(_seqCatalog).sort().forEach(function(dsId) {
+        var opt = document.createElement("option");
+        opt.value = dsId;
+        opt.textContent = dsId + " (" + _seqCatalog[dsId].length + ")";
+        dsSel.appendChild(opt);
+      });
+    }
+    if (ctrlEl) ctrlEl.style.display = "";
+
+    _seqCatalogDataset = "";
+    _seqCatalogSearchText = "";
+    _seqCatalogPage = 0;
+    var searchEl = document.getElementById("seq-catalog-search");
+    if (searchEl) searchEl.value = "";
+    _seqCatalogApplyFilter(seqs);
+    _seqCatalogRenderPage();
+  } catch (e) {
+    _empty(listEl);
+    listEl.appendChild(_el("p", "error-msg", "Failed to load sequences: " + e.message));
+  }
+}
+
+function _onSeqCatalogDatasetChange() {
+  var dsSel = document.getElementById("seq-catalog-dataset-sel");
+  _seqCatalogDataset = dsSel ? dsSel.value : "";
+  _seqCatalogPage = 0;
+  _seqCatalogApplyFilter(_getAllCatalogSeqs());
+  _seqCatalogRenderPage();
+}
+
+function _onSeqCatalogSearch() {
+  var searchEl = document.getElementById("seq-catalog-search");
+  _seqCatalogSearchText = searchEl ? searchEl.value.toLowerCase() : "";
+  _seqCatalogPage = 0;
+  _seqCatalogApplyFilter(_getAllCatalogSeqs());
+  _seqCatalogRenderPage();
+}
+
+function _getAllCatalogSeqs() {
+  var all = [];
+  Object.keys(_seqCatalog).forEach(function(k) { all = all.concat(_seqCatalog[k]); });
+  return all;
+}
+
+function _seqCatalogApplyFilter(all) {
+  _seqCatalogFiltered = all.filter(function(seq) {
+    if (_seqCatalogDataset && seq.dataset_id !== _seqCatalogDataset) return false;
+    if (_seqCatalogSearchText) {
+      var hay = (seq.sequence_id + " " + seq.description + " " + seq.adapter).toLowerCase();
+      if (hay.indexOf(_seqCatalogSearchText) === -1) return false;
+    }
+    return true;
+  });
+}
+
+function _seqCatalogRenderPage() {
+  var listEl = document.getElementById("sequence-catalog-list");
+  var pageEl = document.getElementById("seq-catalog-pagination");
+  var infoEl = document.getElementById("seq-catalog-page-info");
+  if (!listEl) return;
+  _empty(listEl);
+
+  var total = _seqCatalogFiltered.length;
+  if (total === 0) {
+    listEl.appendChild(_el("p", "muted", "No sequences match."));
+    if (pageEl) pageEl.style.display = "none";
+    return;
+  }
+
+  var pages = Math.ceil(total / _SEQ_CATALOG_PAGE_SIZE);
+  if (_seqCatalogPage >= pages) _seqCatalogPage = pages - 1;
+  var start = _seqCatalogPage * _SEQ_CATALOG_PAGE_SIZE;
+  var slice = _seqCatalogFiltered.slice(start, start + _SEQ_CATALOG_PAGE_SIZE);
+
+  slice.forEach(function(seq) {
+    var btn = _el("button", "dataset-btn seq-catalog-row");
+    btn.appendChild(_el("span", "ds-id", seq.sequence_id));
+    btn.appendChild(_el("span", "ds-meta", " · " + seq.adapter + " · " + seq.frame_count + " frames"));
+    if (seq.description) btn.appendChild(_el("span", "ds-meta", " · " + seq.description));
+    btn.addEventListener("click", function() { _openSequence(seq); });
+    listEl.appendChild(btn);
+  });
+
+  // Pagination controls.
+  if (pages > 1) {
+    if (pageEl) pageEl.style.display = "";
+    if (infoEl) infoEl.textContent = "Page " + (_seqCatalogPage + 1) + " / " + pages + " (" + total + " sequences)";
+    var prevBtn = document.getElementById("seq-catalog-prev-btn");
+    var nextBtn = document.getElementById("seq-catalog-next-btn");
+    if (prevBtn) prevBtn.disabled = _seqCatalogPage === 0;
+    if (nextBtn) nextBtn.disabled = _seqCatalogPage >= pages - 1;
+  } else {
+    if (pageEl) pageEl.style.display = "none";
+  }
+}
+
+function _seqCatalogPrevPage() {
+  if (_seqCatalogPage > 0) { _seqCatalogPage--; _seqCatalogRenderPage(); }
+}
+
+function _seqCatalogNextPage() {
+  var pages = Math.ceil(_seqCatalogFiltered.length / _SEQ_CATALOG_PAGE_SIZE);
+  if (_seqCatalogPage < pages - 1) { _seqCatalogPage++; _seqCatalogRenderPage(); }
+}
+
+async function _openSequence(seq) {
+  _seqExplorerEntry = seq;
+  _seqExplorerSelectedFrame = 0;
+  var previewEl = document.getElementById("frame-preview-area");
+  var stripEl = document.getElementById("frame-thumbnail-strip");
+  var metaEl = document.getElementById("frame-metadata");
+  var detailEl = document.getElementById("seq-catalog-detail");
+  var titleEl = document.getElementById("seq-catalog-detail-title");
+  var detailMetaEl = document.getElementById("seq-catalog-detail-meta");
+  var useBtn = document.getElementById("seq-use-in-exp-btn");
+
+  if (!previewEl || !stripEl) return;
+  _empty(previewEl);
+  _empty(stripEl);
+  if (metaEl) _empty(metaEl);
+  if (detailMetaEl) {
+    _empty(detailMetaEl);
+    // Show annotation summary if available.
+    var ann = seq.annotation_summary || {};
+    var parts = [];
+    if (seq.frame_count) parts.push(seq.frame_count + " frames");
+    if (ann.track_count) parts.push(ann.track_count + " tracks");
+    if (ann.crossing_count) parts.push(ann.crossing_count + " crossing");
+    if (ann.walking_count) parts.push(ann.walking_count + " walking");
+    if (parts.length) detailMetaEl.appendChild(_el("span", "meta-item", parts.join(" · ")));
+  }
+  if (titleEl) titleEl.textContent = seq.dataset_id + " / " + seq.sequence_id;
+  if (detailEl) detailEl.style.display = "";
+
+  // Static fixture: show Extract action; disable Use in Experiment until extracted.
+  var extractNoteEl = document.getElementById("seq-fixture-extract-note");
+  if (seq.adapter === "ros_static_fixture") {
+    if (useBtn) {
+      useBtn.style.display = "";
+      useBtn.disabled = true;
+      useBtn.title = "Extract the bag first to enable Use in Experiment";
+    }
+    if (extractNoteEl) {
+      extractNoteEl.style.display = "";
+      var bagKey = (seq.provenance && seq.provenance.bag_key) || seq.sequence_id;
+      extractNoteEl.innerHTML = "";
+      var noteMsg = _el("span", "muted", "This is a static-fixture bag. Extract it first to view frames and run experiments. ");
+      var extractBtn = _el("button", "small", "Extract Frames");
+      extractBtn.addEventListener("click", function() { _seqFixtureExtract(bagKey, extractBtn, useBtn, seq); });
+      extractNoteEl.appendChild(noteMsg);
+      extractNoteEl.appendChild(extractBtn);
+    }
+    previewEl.appendChild(_el("p", "muted", "Frames available after extraction."));
+    return;
+  }
+
+  if (extractNoteEl) extractNoteEl.style.display = "none";
+  if (useBtn) {
+    useBtn.style.display = "";
+    useBtn.disabled = false;
+  }
+  // Clear the rosbag-based explorer state so buttons don't conflict.
+  _frameExplorerDatasetId = null;
+  _frameExplorerFrames = [];
+
+  var frames = seq.frames || [];
+  var frameCount = seq.frame_count || 0;
+
+  if (frames.length === 0 && frameCount === 0) {
+    previewEl.appendChild(_el("p", "muted", "No frames available for this sequence."));
+    return;
+  }
+
+  if (frames.length > 0) {
+    // Bounded thumbnail strip (up to _SEQ_MAX_STRIP_THUMBNAILS evenly sampled).
+    _renderSeqFrameStrip(seq, frames, frameCount);
+    _showSeqFrame(seq, frames[0].index, frames[0]);
+  } else {
+    // Lazy sequence (e.g. JAAD clip): show a direct-index navigator instead.
+    _renderSeqFrameNavigator(seq, frameCount, previewEl, stripEl);
+  }
+}
+
+/** Trigger frame extraction for a static-fixture bag from the catalog detail panel. */
+/** Interval (ms) between polling requests while waiting for extraction to finish. */
+var _SEQ_EXTRACT_POLL_INTERVAL_MS = 2000;
+
+async function _seqFixtureExtract(bagKey, extractBtn, useBtn, seq) {
+  extractBtn.disabled = true;
+  extractBtn.textContent = "Extracting…";
+  try {
+    var resp = await _apiPost("/api/extract", { bag_key: bagKey });
+    if (resp.status !== 202) {
+      extractBtn.textContent = "Error: " + ((resp.body && resp.body.error) || resp.status);
+      extractBtn.disabled = false;
+      return;
+    }
+    var runId = resp.body && resp.body.run_id;
+    if (!runId) {
+      extractBtn.textContent = "Error: no run_id in response";
+      extractBtn.disabled = false;
+      return;
+    }
+    // Poll run status until terminal.
+    extractBtn.textContent = "Extracting… (polling)";
+    var terminalStatuses = ["completed", "failed", "stopped"];
+    while (true) {
+      await new Promise(function(resolve) { setTimeout(resolve, _SEQ_EXTRACT_POLL_INTERVAL_MS); });
+      var statusResp = await fetch("/api/runs/" + runId);
+      if (statusResp.status !== 200) {
+        extractBtn.textContent = "Error: failed to poll run status";
+        extractBtn.disabled = false;
+        return;
+      }
+      var run = await statusResp.json();
+      if (terminalStatuses.indexOf(run.status) !== -1) {
+        if (run.status === "completed") {
+          extractBtn.textContent = "Extraction complete";
+          if (useBtn) {
+            useBtn.disabled = false;
+            useBtn.title = "";
+          }
+          // Refresh the sequence viewer so the extracted frame appears.
+          if (seq) { _openSequence(seq); }
+        } else {
+          extractBtn.textContent = "Extraction " + run.status;
+          extractBtn.disabled = false;
+        }
+        return;
+      }
+    }
+  } catch (e) {
+    extractBtn.textContent = "Error";
+    extractBtn.disabled = false;
+  }
+}
+
+/** Maximum number of thumbnails rendered in the sequence frame strip. */
+var _SEQ_MAX_STRIP_THUMBNAILS = 20;
+
+/**
+ * Render a bounded, evenly-sampled thumbnail strip.
+ *
+ * When the catalog returned all frame refs (≤ _SEQ_MAX_STRIP_THUMBNAILS),
+ * every frame gets a thumbnail.  For longer sequences the strip is sub-sampled
+ * to exactly _SEQ_MAX_STRIP_THUMBNAILS thumbnails using integer stride.
+ */
+function _renderSeqFrameStrip(seq, frames, totalCount) {
+  var stripEl = document.getElementById("frame-thumbnail-strip");
+  if (!stripEl) return;
+  _empty(stripEl);
+  // Sub-sample if needed.
+  var sampled = frames;
+  if (frames.length > _SEQ_MAX_STRIP_THUMBNAILS) {
+    sampled = [];
+    var stride = Math.floor(frames.length / _SEQ_MAX_STRIP_THUMBNAILS);
+    for (var i = 0; i < frames.length; i += stride) {
+      sampled.push(frames[i]);
+      if (sampled.length >= _SEQ_MAX_STRIP_THUMBNAILS) break;
+    }
+  }
+  if (totalCount > frames.length) {
+    stripEl.appendChild(_el("span", "muted",
+      "Showing " + sampled.length + " of " + totalCount + " frames. "));
+  }
+  sampled.forEach(function(frame) {
+    var idx = frame.index;
+    var thumb = document.createElement("img");
+    thumb.className = "frame-thumb" + (idx === 0 ? " selected" : "");
+    thumb.dataset.frameIndex = String(idx);
+    thumb.src = "/api/sequences/" + seq.dataset_id + "/" + seq.sequence_id + "/frames/" + idx;
+    thumb.alt = "Frame " + idx;
+    thumb.title = "Frame " + idx + (frame.timestamp_us ? " @ " + (frame.timestamp_us / 1e6).toFixed(3) + "s" : "");
+    thumb.addEventListener("click", function() { _showSeqFrame(seq, idx, frame); });
+    stripEl.appendChild(thumb);
+  });
+}
+
+/**
+ * Render a direct-index navigator for lazy sequences (no pre-indexed frames).
+ *
+ * Shows a bounded sample of evenly-spaced thumbnail indices and a text input
+ * for direct frame-index access.  This is used for JAAD clips where frame_refs
+ * is empty but frame_count is known.
+ */
+function _renderSeqFrameNavigator(seq, frameCount, previewEl, stripEl) {
+  // Offer evenly-spaced sample thumbnails (bounded to _SEQ_MAX_STRIP_THUMBNAILS).
+  var sampleCount = Math.min(frameCount, _SEQ_MAX_STRIP_THUMBNAILS);
+  var step = frameCount > 1 ? Math.floor((frameCount - 1) / (sampleCount - 1 || 1)) : 1;
+  var sampleIndices = [];
+  for (var i = 0; i < frameCount && sampleIndices.length < sampleCount; i += step) {
+    sampleIndices.push(i);
+  }
+
+  var note = _el("span", "muted",
+    "Showing " + sampleCount + " sampled thumbnails of " + frameCount + " frames. Use the input below to navigate to any frame.");
+  stripEl.appendChild(note);
+
+  sampleIndices.forEach(function(idx) {
+    var thumb = document.createElement("img");
+    thumb.className = "frame-thumb";
+    thumb.dataset.frameIndex = String(idx);
+    thumb.src = "/api/sequences/" + seq.dataset_id + "/" + seq.sequence_id + "/frames/" + idx;
+    thumb.alt = "Frame " + idx;
+    thumb.title = "Frame " + idx;
+    thumb.addEventListener("click", function() { _showSeqFrame(seq, idx, null); });
+    stripEl.appendChild(thumb);
+  });
+
+  // Direct-index input.
+  var navDiv = _el("div", "seq-frame-nav");
+  var label = document.createElement("label");
+  label.textContent = "Frame index (0–" + (frameCount - 1) + "): ";
+  var input = document.createElement("input");
+  input.type = "number";
+  input.min = "0";
+  input.max = String(frameCount - 1);
+  input.value = "0";
+  input.style.width = "80px";
+  var goBtn = _el("button", null, "Go");
+  goBtn.addEventListener("click", function() {
+    var v = parseInt(input.value, 10);
+    if (!isNaN(v) && v >= 0 && v < frameCount) {
+      _showSeqFrame(seq, v, null);
+    }
+  });
+  navDiv.appendChild(label);
+  navDiv.appendChild(input);
+  navDiv.appendChild(goBtn);
+  previewEl.appendChild(navDiv);
+
+  // Show first sampled frame by default.
+  if (sampleIndices.length > 0) {
+    _showSeqFrame(seq, sampleIndices[0], null);
+  }
+}
+
+function _showSeqFrame(seq, idx, frame) {
+  _seqExplorerSelectedFrame = idx;
+  var previewEl = document.getElementById("frame-preview-area");
+  var metaEl = document.getElementById("frame-metadata");
+  if (!previewEl) return;
+  _empty(previewEl);
+  var img = document.createElement("img");
+  img.className = "frame-preview-img";
+  img.src = "/api/sequences/" + seq.dataset_id + "/" + seq.sequence_id + "/frames/" + idx;
+  img.alt = "Frame " + idx;
+  previewEl.appendChild(img);
+  if (metaEl) {
+    _empty(metaEl);
+    metaEl.appendChild(_el("span", "meta-item", "Frame: " + idx));
+    if (frame && frame.timestamp_us) {
+      metaEl.appendChild(_el("span", "meta-item", " · " + (frame.timestamp_us / 1e6).toFixed(3) + "s"));
+    }
+    if (frame && frame.source_id) metaEl.appendChild(_el("span", "meta-item", " · ID: " + frame.source_id));
+    metaEl.appendChild(_el("span", "meta-item", " · " + seq.adapter));
+  }
+  document.querySelectorAll(".frame-thumb").forEach(function(t) {
+    _setClass(t, "selected", t.dataset.frameIndex === String(idx));
+  });
+}
+
+/** Transfer current sequence selection to the Sequence Experiment form and navigate there. */
+function _seqUseInExperiment() {
+  if (!_seqExplorerEntry) return;
+  var seq = _seqExplorerEntry;
+  navigate("experiment");
+  setTimeout(function() {
+    // Set dataset and sequence selectors in the Sequence Experiment panel.
+    var dsSel = document.getElementById("seqexp-dataset-id");
+    var seqSel = document.getElementById("seqexp-sequence-id");
+    var infoEl = document.getElementById("seqexp-selection-info");
+    if (dsSel) {
+      // Trigger a change to populate sequence list, then select.
+      // Find or create the option.
+      var opt = Array.prototype.find.call(dsSel.options, function(o) { return o.value === seq.dataset_id; });
+      if (!opt) {
+        opt = document.createElement("option");
+        opt.value = seq.dataset_id;
+        opt.textContent = seq.dataset_id;
+        dsSel.appendChild(opt);
+      }
+      dsSel.value = seq.dataset_id;
+      _onSeqExpDatasetChange();
+    }
+    // After dataset change populates the sequence list, select the sequence.
+    setTimeout(function() {
+      if (seqSel) {
+        var sopt = Array.prototype.find.call(seqSel.options, function(o) { return o.value === seq.sequence_id; });
+        if (!sopt) {
+          sopt = document.createElement("option");
+          sopt.value = seq.sequence_id;
+          sopt.textContent = seq.sequence_id;
+          seqSel.appendChild(sopt);
+        }
+        seqSel.value = seq.sequence_id;
+      }
+      if (infoEl) infoEl.textContent = "Transferred from Frame Explorer: " + seq.dataset_id + " / " + seq.sequence_id + " (" + seq.frame_count + " frames)";
+    }, 50);
+  }, 50);
+}
+
+/* ── Sequence Catalog Experiment ─────────────────────────────────────────── */
+
+/** All sequences grouped by dataset for the experiment form selectors. */
+var _seqExpCatalog = {};
+var _activeSeqExperimentRunId = null;
+
+async function _loadSeqExpDatasets() {
+  var dsSel = document.getElementById("seqexp-dataset-id");
+  if (!dsSel) return;
+  try {
+    var data = await _apiGet("/api/sequences");
+    _seqExpCatalog = data.by_dataset || {};
+    _empty(dsSel);
+    var blank = document.createElement("option");
+    blank.value = ""; blank.textContent = "— select a dataset —";
+    dsSel.appendChild(blank);
+    Object.keys(_seqExpCatalog).sort().forEach(function(dsId) {
+      var opt = document.createElement("option");
+      opt.value = dsId;
+      opt.textContent = dsId + " (" + _seqExpCatalog[dsId].length + " sequences)";
+      dsSel.appendChild(opt);
+    });
+    // Also populate the profile selector.
+    var pSel = document.getElementById("seqexp-profile-name");
+    if (pSel) {
+      _empty(pSel);
+      var pb = document.createElement("option"); pb.value = ""; pb.textContent = "— none (use fields below) —";
+      pSel.appendChild(pb);
+      try {
+        var pd = await _apiGet("/api/profiles");
+        (pd.profiles || []).forEach(function(p) {
+          var po = document.createElement("option"); po.value = p.name;
+          po.textContent = p.name + (p.version ? " v" + p.version : "");
+          pSel.appendChild(po);
+        });
+      } catch (e) { /* leave profiles empty */ }
+    }
+  } catch (e) { /* leave empty */ }
+}
+
+function _onSeqExpDatasetChange() {
+  var dsSel = document.getElementById("seqexp-dataset-id");
+  var seqSel = document.getElementById("seqexp-sequence-id");
+  if (!dsSel || !seqSel) return;
+  var dsId = dsSel.value;
+  _empty(seqSel);
+  var blank = document.createElement("option");
+  blank.value = ""; blank.textContent = "— select a sequence —";
+  seqSel.appendChild(blank);
+  var seqs = _seqExpCatalog[dsId] || [];
+  seqs.forEach(function(seq) {
+    var opt = document.createElement("option");
+    opt.value = seq.sequence_id;
+    opt.textContent = seq.sequence_id + " (" + seq.frame_count + " frames)";
+    seqSel.appendChild(opt);
+  });
+}
+
+async function submitSeqExperiment() {
+  var btn = document.getElementById("seqexp-submit-btn");
+  var cancelBtn = document.getElementById("seqexp-cancel-btn");
+  var resultEl = document.getElementById("seqexp-result");
+  if (btn) btn.disabled = true;
+  if (cancelBtn) cancelBtn.style.display = "";
+  _empty(resultEl);
+
+  var datasetId = ((document.getElementById("seqexp-dataset-id") || {}).value || "").trim();
+  var sequenceId = ((document.getElementById("seqexp-sequence-id") || {}).value || "").trim();
+  if (!datasetId || !sequenceId) {
+    _append(resultEl, _el("div", "alert error", "Please select a dataset and sequence."));
+    if (btn) btn.disabled = false;
+    if (cancelBtn) cancelBtn.style.display = "none";
+    return;
+  }
+
+  var indicesRaw = ((document.getElementById("seqexp-frame-indices") || {}).value || "").trim();
+  var frameIndices = null;
+  if (indicesRaw) {
+    frameIndices = indicesRaw.split(",")
+      .map(function(s) { return parseInt(s.trim(), 10); })
+      .filter(function(n) { return !isNaN(n); });
+    // Deduplicate while preserving order.
+    var seenIdx = {};
+    frameIndices = frameIndices.filter(function(n) {
+      if (seenIdx[n]) return false;
+      seenIdx[n] = true;
+      return true;
+    });
+    if (frameIndices.length > _SEQ_MAX_FRAME_SELECTION) {
+      _append(resultEl, _el("div", "alert error",
+        "Too many frames selected (" + frameIndices.length + "). Maximum is " + _SEQ_MAX_FRAME_SELECTION + "."));
+      if (btn) btn.disabled = false;
+      if (cancelBtn) cancelBtn.style.display = "none";
+      return;
+    }
+  }
+
+  var profileName = ((document.getElementById("seqexp-profile-name") || {}).value || "").trim() || null;
+
+  var params = {
+    dataset_id: datasetId,
+    sequence_id: sequenceId,
+    max_generate_length: parseInt((document.getElementById("seqexp-max-gen") || {}).value || "96", 10),
+    temperature: parseFloat((document.getElementById("seqexp-temperature") || {}).value || "0.2"),
+    timeout_seconds: parseInt((document.getElementById("seqexp-timeout") || {}).value || "120", 10),
+    notes: ((document.getElementById("seqexp-notes") || {}).value || "").trim()
+  };
+  if (frameIndices !== null) params.frame_indices = frameIndices;
+  if (profileName) {
+    params.profile_name = profileName;
+  } else {
+    params.task_prompt = ((document.getElementById("seqexp-prompt") || {}).value || "").trim();
+    params.system_instruction = ((document.getElementById("seqexp-system") || {}).value || "").trim();
+  }
+
+  try {
+    var result = await _apiPost("/api/sequences/experiment", params);
+    if (result.status >= 400) {
+      _append(resultEl, _el("div", "alert error", "Error: " + (result.body.error || result.status)));
+      if (cancelBtn) cancelBtn.style.display = "none";
+    } else {
+      var runId = result.body.run_id;
+      _activeSeqExperimentRunId = runId;
+      _append(resultEl, _el("div", "alert success",
+        "Sequence experiment started (run_id: " + runId + ").\n" +
+        "Results will appear in the Runs view when complete."));
+    }
+  } catch (e) {
+    _append(resultEl, _el("div", "alert error", "Error: " + e.message));
+    if (cancelBtn) cancelBtn.style.display = "none";
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function cancelSeqExperiment() {
+  var runId = _activeSeqExperimentRunId;
+  if (!runId) return;
+  try {
+    await _apiPost("/api/experiment/" + runId + "/cancel", {});
+  } catch (e) { /* ignore */ }
+  var cancelBtn = document.getElementById("seqexp-cancel-btn");
+  if (cancelBtn) cancelBtn.style.display = "none";
 }
 
 /* ── Profiles view ───────────────────────────────────────────────────────── */

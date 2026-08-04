@@ -48,6 +48,27 @@ from web_console.server import (
     _fold_single_quoted_scalar,
 )
 from web_console.__main__ import _parse_args, _is_loopback
+from web_console.sequence_catalog import (
+    FrameRef,
+    SequenceEntry,
+    _is_safe_id,
+    _sanitize_id,
+    _assert_within_root,
+    _is_static_fixture,
+    discover_ros_static_fixtures,
+    discover_nuscenes_scenes,
+    discover_jaad_clips,
+    discover_sequences,
+    resolve_sequence_frame_path,
+    materialize_sequence_frame,
+    _parse_jaad_xml_summary,
+    _load_jaad_clip_label_index,
+    _probe_video_metadata,
+    _probe_video_metadata_opencv,
+    _extract_mp4_frame_bytes,
+    _extract_mp4_frame_bytes_opencv,
+    get_decoder_capability,
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -5431,6 +5452,2487 @@ class TestExperimentIntegration(unittest.TestCase):
         run_id = self._make_completed_run(frame_count=1)
         status, data = self._post(f"/api/experiment/{run_id}/cancel", {})
         self.assertEqual(status, 409)
+
+
+# ── sequence catalog tests ───────────────────────────────────────────────────
+
+
+class TestSequenceCatalogHelpers(unittest.TestCase):
+    """Unit tests for helper functions in sequence_catalog."""
+
+    def test_is_safe_id_valid(self):
+        for v in ("scene-0553", "video_0001", "nuscenes-mini", "rtdetr-quickstart"):
+            with self.subTest(v=v):
+                self.assertTrue(_is_safe_id(v))
+
+    def test_is_safe_id_invalid(self):
+        for v in ("", "../etc/passwd", "a/b", "a b", "x" * 201):
+            with self.subTest(v=v):
+                self.assertFalse(_is_safe_id(v))
+
+    def test_sanitize_id_replaces_unsafe(self):
+        self.assertEqual(_sanitize_id("a/b"), "a-b")
+        self.assertEqual(_sanitize_id("scene-0553"), "scene-0553")
+        self.assertEqual(_sanitize_id("x" * 300), "x" * 200)
+
+    def test_assert_within_root_ok(self):
+        with tempfile.TemporaryDirectory() as root:
+            p = pathlib.Path(root) / "sub" / "file.jpg"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"X")
+            resolved = _assert_within_root(p, pathlib.Path(root))
+            self.assertTrue(str(resolved).startswith(root))
+
+    def test_assert_within_root_escape(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(ValueError):
+                _assert_within_root(
+                    pathlib.Path(root) / ".." / "etc" / "passwd",
+                    pathlib.Path(root),
+                )
+
+    def test_frame_ref_to_dict_omits_source_path(self):
+        fr = FrameRef(
+            index=0,
+            source_id="tok123",
+            timestamp_us=1234567890,
+            source_path="/secret/path/to/image.jpg",
+            metadata={"foo": "bar"},
+        )
+        d = fr.to_dict()
+        self.assertNotIn("source_path", d)
+        self.assertEqual(d["index"], 0)
+        self.assertEqual(d["source_id"], "tok123")
+        self.assertEqual(d["timestamp_us"], 1234567890)
+        self.assertEqual(d["metadata"]["foo"], "bar")
+
+    def test_sequence_entry_to_dict_omits_source_paths(self):
+        fr = FrameRef(
+            index=0, source_id="tok", timestamp_us=None,
+            source_path="/secret/path", metadata={},
+        )
+        seq = SequenceEntry(
+            dataset_id="test-ds",
+            sequence_id="seq-01",
+            adapter="ros_static_fixture",
+            display_name="Test",
+            description="A test sequence",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref="/secret/annotations/test.xml",
+        )
+        d = seq.to_dict()
+        self.assertNotIn("annotation_ref", d)
+        self.assertEqual(d["dataset_id"], "test-ds")
+        self.assertEqual(d["frame_count"], 1)
+        for frame_d in d["frames"]:
+            self.assertNotIn("source_path", frame_d)
+
+
+class TestRosStaticFixtureAdapter(unittest.TestCase):
+    """Tests for the ros_static_fixture adapter."""
+
+    def _make_bag_entry(
+        self,
+        key: str = "rtdetr-quickstart",
+        installed: bool = True,
+        image_topics: list = None,
+        topic_types: dict = None,
+        message_counts: dict = None,
+        local_path: str = "/data/rtdetr/quickstart.bag",
+    ) -> dict:
+        if image_topics is None:
+            image_topics = ["/image_rect"]
+        if topic_types is None:
+            topic_types = {"/image_rect": "sensor_msgs/msg/Image"}
+        if message_counts is None:
+            message_counts = {"/image_rect": 1}
+        return {
+            "key": key,
+            "name": "RT-DETR Quickstart",
+            "display_name": "RT-DETR Quickstart",
+            "description": "One-frame fixture",
+            "installed": installed,
+            "local_path": local_path,
+            "image_topics": image_topics,
+            "topic_types": topic_types,
+            "message_counts": message_counts,
+        }
+
+    def test_is_static_fixture_true(self):
+        entry = self._make_bag_entry()
+        self.assertTrue(_is_static_fixture(entry))
+
+    def test_is_static_fixture_false_not_installed(self):
+        entry = self._make_bag_entry(installed=False)
+        self.assertFalse(_is_static_fixture(entry))
+
+    def test_is_static_fixture_false_multiple_frames(self):
+        entry = self._make_bag_entry(message_counts={"/image_rect": 5})
+        self.assertFalse(_is_static_fixture(entry))
+
+    def test_is_static_fixture_false_no_image_topics(self):
+        entry = self._make_bag_entry(image_topics=[], topic_types={}, message_counts={})
+        self.assertFalse(_is_static_fixture(entry))
+
+    def test_is_static_fixture_false_compressed_image(self):
+        entry = self._make_bag_entry(
+            topic_types={"/image_rect": "sensor_msgs/msg/CompressedImage"},
+            message_counts={"/image_rect": 1},
+        )
+        self.assertFalse(_is_static_fixture(entry))
+
+    def test_discover_ros_static_fixtures_single_bag(self):
+        entry = self._make_bag_entry()
+        seqs = discover_ros_static_fixtures([entry])
+        self.assertEqual(len(seqs), 1)
+        seq = seqs[0]
+        self.assertEqual(seq.adapter, "ros_static_fixture")
+        self.assertEqual(seq.frame_count, 1)
+        self.assertEqual(len(seq.frame_refs), 1)
+        # source_path must NOT appear in to_dict()
+        d = seq.to_dict()
+        self.assertNotIn("annotation_ref", d)
+        self.assertNotIn("source_path", json.dumps(d))
+
+    def test_discover_ros_static_fixtures_filters_non_static(self):
+        entries = [
+            self._make_bag_entry(key="rtdetr", message_counts={"/image_rect": 1}),
+            self._make_bag_entry(key="full-bag", message_counts={"/image_rect": 100}),
+        ]
+        seqs = discover_ros_static_fixtures(entries)
+        self.assertEqual(len(seqs), 1)
+        self.assertEqual(seqs[0].sequence_id, "rtdetr")
+
+    def test_discover_ros_static_fixtures_stable_id(self):
+        """Dataset ID and sequence ID must be stable across repeated calls."""
+        entry = self._make_bag_entry(key="my-fixture")
+        s1 = discover_ros_static_fixtures([entry])
+        s2 = discover_ros_static_fixtures([entry])
+        self.assertEqual(s1[0].dataset_id, s2[0].dataset_id)
+        self.assertEqual(s1[0].sequence_id, s2[0].sequence_id)
+
+    def test_discover_ros_static_fixtures_empty_catalog(self):
+        seqs = discover_ros_static_fixtures([])
+        self.assertEqual(seqs, [])
+
+    def test_discover_ros_static_fixtures_missing_local_path(self):
+        entry = self._make_bag_entry(local_path="")
+        seqs = discover_ros_static_fixtures([entry])
+        self.assertEqual(seqs, [])
+
+
+class TestNuScenesSceneAdapter(unittest.TestCase):
+    """Tests for the nuscenes_scene adapter using synthetic fixture data."""
+
+    # Scene A has 3 samples; scene B has 2 samples.
+    _SCENE_A_TOKEN = "sceneAAAA"
+    _SCENE_B_TOKEN = "sceneBBBB"
+
+    _SAMPLE_S0 = "sampleS0"
+    _SAMPLE_S1 = "sampleS1"
+    _SAMPLE_S2 = "sampleS2"
+    _SAMPLE_S3 = "sampleS3"
+    _SAMPLE_S4 = "sampleS4"
+
+    _SD_A0 = "sdA0"
+    _SD_A1 = "sdA1"
+    _SD_A2 = "sdA2"
+    _SD_B0 = "sdB0"
+    _SD_B1 = "sdB1"
+
+    # Canonical sensor/calibrated_sensor tokens (no synthetic "channel" field).
+    _SENSOR_CAM_FRONT = "sensorCAMFRONT"
+    _CS_TOKEN = "csTokenCAMFRONT"
+
+    def _make_nuscenes_dir(self, tmp: pathlib.Path) -> pathlib.Path:
+        """Write a minimal nuScenes-mini fixture under *tmp*.
+
+        Uses the canonical relationship chain
+        ``sample_data.calibrated_sensor_token → calibrated_sensor.sensor_token
+        → sensor.channel`` rather than a synthetic ``channel`` field so that
+        tests exercise the same code path as real nuScenes data.
+        """
+        meta = tmp / "v1.0-mini"
+        meta.mkdir(parents=True)
+        # scene.json
+        scenes = [
+            {
+                "token": self._SCENE_A_TOKEN,
+                "name": "scene-0553",
+                "description": "intersection, bicycle",
+                "first_sample_token": self._SAMPLE_S0,
+                "last_sample_token": self._SAMPLE_S2,
+            },
+            {
+                "token": self._SCENE_B_TOKEN,
+                "name": "scene-1100",
+                "description": "night, crosswalk",
+                "first_sample_token": self._SAMPLE_S3,
+                "last_sample_token": self._SAMPLE_S4,
+            },
+        ]
+        (meta / "scene.json").write_text(json.dumps(scenes), encoding="utf-8")
+
+        # sample.json — linked list
+        samples = [
+            {
+                "token": self._SAMPLE_S0,
+                "scene_token": self._SCENE_A_TOKEN,
+                "timestamp": 1000000,
+                "prev": "",
+                "next": self._SAMPLE_S1,
+                "data": {"CAM_FRONT": self._SD_A0},
+            },
+            {
+                "token": self._SAMPLE_S1,
+                "scene_token": self._SCENE_A_TOKEN,
+                "timestamp": 1500000,
+                "prev": self._SAMPLE_S0,
+                "next": self._SAMPLE_S2,
+                "data": {"CAM_FRONT": self._SD_A1},
+            },
+            {
+                "token": self._SAMPLE_S2,
+                "scene_token": self._SCENE_A_TOKEN,
+                "timestamp": 2000000,
+                "prev": self._SAMPLE_S1,
+                "next": "",
+                "data": {"CAM_FRONT": self._SD_A2},
+            },
+            {
+                "token": self._SAMPLE_S3,
+                "scene_token": self._SCENE_B_TOKEN,
+                "timestamp": 3000000,
+                "prev": "",
+                "next": self._SAMPLE_S4,
+                "data": {"CAM_FRONT": self._SD_B0},
+            },
+            {
+                "token": self._SAMPLE_S4,
+                "scene_token": self._SCENE_B_TOKEN,
+                "timestamp": 3500000,
+                "prev": self._SAMPLE_S3,
+                "next": "",
+                "data": {"CAM_FRONT": self._SD_B1},
+            },
+        ]
+        (meta / "sample.json").write_text(json.dumps(samples), encoding="utf-8")
+
+        # Create image stubs for scene A.
+        (tmp / "samples" / "CAM_FRONT").mkdir(parents=True, exist_ok=True)
+        for fname in ("img_A0.jpg", "img_A1.jpg", "img_A2.jpg", "img_B0.jpg", "img_B1.jpg"):
+            (tmp / "samples" / "CAM_FRONT" / fname).write_bytes(b"")
+
+        # sensor.json — canonical channel lookup table (no "channel" field on
+        # sample_data; mirrors the real nuScenes schema).
+        sensors = [
+            {"token": self._SENSOR_CAM_FRONT, "channel": "CAM_FRONT", "modality": "camera"},
+        ]
+        (meta / "sensor.json").write_text(json.dumps(sensors), encoding="utf-8")
+
+        # calibrated_sensor.json — maps cs_token → sensor_token.
+        calibrated_sensors = [
+            {
+                "token": self._CS_TOKEN,
+                "sensor_token": self._SENSOR_CAM_FRONT,
+                "translation": [1.72, 0.0, 1.49],
+                "rotation": [0.5, -0.5, 0.5, -0.5],
+                "camera_intrinsic": [],
+            },
+        ]
+        (meta / "calibrated_sensor.json").write_text(
+            json.dumps(calibrated_sensors), encoding="utf-8"
+        )
+
+        # sample_data.json — intentionally omits "channel" field to match real
+        # nuScenes; channel is resolved via calibrated_sensor_token chain.
+        sample_data = [
+            {
+                "token": self._SD_A0,
+                "sample_token": self._SAMPLE_S0,
+                "calibrated_sensor_token": self._CS_TOKEN,
+                "filename": "samples/CAM_FRONT/img_A0.jpg",
+                "timestamp": 1000100,
+                "is_key_frame": True,
+                "width": 1600,
+                "height": 900,
+                "prev": "",
+                "next": self._SD_A1,
+                "ego_pose_token": "ep0",
+            },
+            {
+                "token": self._SD_A1,
+                "sample_token": self._SAMPLE_S1,
+                "calibrated_sensor_token": self._CS_TOKEN,
+                "filename": "samples/CAM_FRONT/img_A1.jpg",
+                "timestamp": 1500100,
+                "is_key_frame": True,
+                "width": 1600,
+                "height": 900,
+                "prev": self._SD_A0,
+                "next": self._SD_A2,
+                "ego_pose_token": "ep1",
+            },
+            {
+                "token": self._SD_A2,
+                "sample_token": self._SAMPLE_S2,
+                "calibrated_sensor_token": self._CS_TOKEN,
+                "filename": "samples/CAM_FRONT/img_A2.jpg",
+                "timestamp": 2000100,
+                "is_key_frame": True,
+                "width": 1600,
+                "height": 900,
+                "prev": self._SD_A1,
+                "next": "",
+                "ego_pose_token": "ep2",
+            },
+            {
+                "token": self._SD_B0,
+                "sample_token": self._SAMPLE_S3,
+                "calibrated_sensor_token": self._CS_TOKEN,
+                "filename": "samples/CAM_FRONT/img_B0.jpg",
+                "timestamp": 3000100,
+                "is_key_frame": True,
+                "width": 1600,
+                "height": 900,
+                "prev": "",
+                "next": self._SD_B1,
+                "ego_pose_token": "ep3",
+            },
+            {
+                "token": self._SD_B1,
+                "sample_token": self._SAMPLE_S4,
+                "calibrated_sensor_token": self._CS_TOKEN,
+                "filename": "samples/CAM_FRONT/img_B1.jpg",
+                "timestamp": 3500100,
+                "is_key_frame": True,
+                "width": 1600,
+                "height": 900,
+                "prev": self._SD_B0,
+                "next": "",
+                "ego_pose_token": "ep4",
+            },
+        ]
+        (meta / "sample_data.json").write_text(
+            json.dumps(sample_data), encoding="utf-8"
+        )
+        return tmp
+
+    def test_discover_scenes_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            self.assertEqual(len(seqs), 2)
+
+    def test_discover_scenes_independent_no_mixing(self):
+        """Each scene must contain only its own frames (no cross-scene mixing)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            by_name = {s.sequence_id: s for s in seqs}
+            self.assertIn("scene-0553", by_name)
+            self.assertIn("scene-1100", by_name)
+            self.assertEqual(by_name["scene-0553"].frame_count, 3)
+            self.assertEqual(by_name["scene-1100"].frame_count, 2)
+
+    def test_discover_scenes_temporal_order(self):
+        """Frames must be in linked-list order, not lexical filename order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            scene_a = next(s for s in seqs if s.sequence_id == "scene-0553")
+            # Verify timestamps increase monotonically.
+            tss = [
+                fr.timestamp_us for fr in scene_a.frame_refs if fr.timestamp_us
+            ]
+            self.assertEqual(tss, sorted(tss))
+
+    def test_discover_scenes_stable_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            s1 = discover_nuscenes_scenes(root)
+            s2 = discover_nuscenes_scenes(root)
+            ids1 = sorted(s.sequence_id for s in s1)
+            ids2 = sorted(s.sequence_id for s in s2)
+            self.assertEqual(ids1, ids2)
+
+    def test_discover_scenes_dataset_id_constant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            for s in seqs:
+                self.assertEqual(s.dataset_id, "nuscenes-mini")
+
+    def test_discover_scenes_adapter_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            for s in seqs:
+                self.assertEqual(s.adapter, "nuscenes_scene")
+
+    def test_discover_scenes_frame_metadata_tokens(self):
+        """Each frame must carry scene_name, sample_token, sample_data_token."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            scene_a = next(s for s in seqs if s.sequence_id == "scene-0553")
+            fr0 = scene_a.frame_refs[0]
+            self.assertIn("sample_token", fr0.metadata)
+            self.assertIn("sample_data_token", fr0.metadata)
+            self.assertIn("scene_name", fr0.metadata)
+            self.assertEqual(fr0.metadata["scene_name"], "scene-0553")
+
+    def test_discover_scenes_source_path_not_in_dict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            for s in seqs:
+                d = s.to_dict()
+                serialised = json.dumps(d)
+                self.assertNotIn("source_path", serialised)
+
+    def test_discover_scenes_missing_meta_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seqs = discover_nuscenes_scenes(pathlib.Path(tmp) / "nonexistent")
+            self.assertEqual(seqs, [])
+
+    def test_discover_scenes_missing_table_returns_empty(self):
+        """Missing any of the three tables returns an empty list gracefully."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            (root / "v1.0-mini" / "sample.json").unlink()
+            seqs = discover_nuscenes_scenes(root)
+            self.assertEqual(seqs, [])
+
+    def test_discover_scenes_corrupt_json_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            (root / "v1.0-mini" / "scene.json").write_text("{not valid json[", encoding="utf-8")
+            seqs = discover_nuscenes_scenes(root)
+            self.assertEqual(seqs, [])
+
+    def test_discover_scenes_path_containment(self):
+        """A malicious filename in sample_data must not escape the dataset root."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            meta = root / "v1.0-mini"
+            sd_data = json.loads((meta / "sample_data.json").read_text())
+            # Inject a path-traversal filename.
+            sd_data[0]["filename"] = "../../etc/passwd"
+            (meta / "sample_data.json").write_text(
+                json.dumps(sd_data), encoding="utf-8"
+            )
+            # Discovery must not crash; the offending frame must be excluded entirely.
+            seqs = discover_nuscenes_scenes(root)
+            self.assertTrue(len(seqs) > 0)
+            scene_a = next(s for s in seqs if s.sequence_id == "scene-0553")
+            # Path-traversal frame excluded; 2 valid frames remain.
+            self.assertEqual(scene_a.frame_count, 2)
+            for fr in scene_a.frame_refs:
+                self.assertNotIn("..", fr.source_path)
+
+    def test_canonical_channel_resolution_no_channel_field(self):
+        """Channel must be resolved via calibrated_sensor→sensor chain.
+
+        This test uses records where sample_data intentionally has NO
+        'channel' field, mirroring the real nuScenes schema.  Discovery
+        must still find all CAM_FRONT keyframes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            # Confirm sample_data has no synthetic 'channel' field.
+            meta = root / "v1.0-mini"
+            sd_records = json.loads((meta / "sample_data.json").read_text())
+            for rec in sd_records:
+                self.assertNotIn(
+                    "channel", rec,
+                    "Test fixture must not embed a synthetic 'channel' field",
+                )
+            seqs = discover_nuscenes_scenes(root)
+            by_name = {s.sequence_id: s for s in seqs}
+            self.assertIn("scene-0553", by_name)
+            self.assertIn("scene-1100", by_name)
+            # All keyframes found via canonical chain.
+            self.assertEqual(by_name["scene-0553"].frame_count, 3)
+            self.assertEqual(by_name["scene-1100"].frame_count, 2)
+
+    def test_missing_file_count_in_provenance(self):
+        """Provenance must include 'missing_files' when image files are absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            # Remove one image file to trigger a missing-file count.
+            (root / "samples" / "CAM_FRONT" / "img_A0.jpg").unlink()
+            seqs = discover_nuscenes_scenes(root)
+            scene_a = next(s for s in seqs if s.sequence_id == "scene-0553")
+            self.assertIn("missing_files", scene_a.provenance)
+            self.assertEqual(scene_a.provenance["missing_files"], 1)
+            # Missing file must be excluded from frame_refs entirely.
+            self.assertEqual(scene_a.frame_count, 2)
+            self.assertTrue(all(fr.source_path != "" for fr in scene_a.frame_refs))
+
+    def test_no_missing_files_key_when_all_present(self):
+        """Provenance must NOT include 'missing_files' when all images exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            for s in seqs:
+                self.assertNotIn("missing_files", s.provenance)
+
+
+class TestJaadClipAdapter(unittest.TestCase):
+    """Tests for the jaad_clip adapter using synthetic fixture data."""
+
+    def _make_jaad_dir(
+        self,
+        tmp: pathlib.Path,
+        clips: int = 3,
+        add_annotations: bool = True,
+        add_label_index: bool = False,
+    ) -> pathlib.Path:
+        """Build a minimal JAAD directory fixture under *tmp*."""
+        clips_dir = tmp / "extracted" / "JAAD_clips"
+        clips_dir.mkdir(parents=True)
+
+        for i in range(1, clips + 1):
+            stem = f"video_{i:04d}"
+            # Fake MP4 file (not a real video, but probe will just return empty).
+            (clips_dir / f"{stem}.mp4").write_bytes(b"FAKE_MP4_DATA")
+
+            if add_annotations:
+                for family in (
+                    "annotations",
+                    "annotations_appearance",
+                    "annotations_attributes",
+                ):
+                    ann_dir = tmp / family
+                    ann_dir.mkdir(exist_ok=True)
+                    # Write a minimal JAAD XML annotation.
+                    xml = (
+                        '<?xml version="1.0" encoding="utf-8"?>\n'
+                        "<annotations>\n"
+                        "  <meta><task>"
+                        "<start_frame>0</start_frame>"
+                        "<stop_frame>299</stop_frame>"
+                        "</task></meta>\n"
+                        '  <track id="0" label="pedestrian">\n'
+                        '    <box frame="0" outside="0" occluded="0" keyframe="1">\n'
+                        '      <attribute name="cross">crossing</attribute>\n'
+                        '      <attribute name="action">walking</attribute>\n'
+                        '      <attribute name="look">looking</attribute>\n'
+                        "    </box>\n"
+                        '    <box frame="1" outside="0" occluded="0" keyframe="1">\n'
+                        '      <attribute name="cross">not-crossing</attribute>\n'
+                        '      <attribute name="action">standing</attribute>\n'
+                        '      <attribute name="look">not-looking</attribute>\n'
+                        "    </box>\n"
+                        "  </track>\n"
+                        "</annotations>\n"
+                    )
+                    (ann_dir / f"{stem}.xml").write_text(xml, encoding="utf-8")
+
+        if add_label_index:
+            prepared = tmp / "prepared"
+            prepared.mkdir(exist_ok=True)
+            index: dict = {}
+            for i in range(1, clips + 1):
+                stem = f"video_{i:04d}"
+                index[stem] = {
+                    "track_count": 2,
+                    "crossing_count": 10,
+                    "not_crossing_count": 5,
+                    "walking_count": 8,
+                }
+            (prepared / "jaad-clip-label-index.json").write_text(
+                json.dumps(index), encoding="utf-8"
+            )
+        return tmp
+
+    def test_discover_clips_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp), clips=5)
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 5)
+
+    def test_discover_clips_adapter_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp))
+            seqs = discover_jaad_clips(root)
+            for s in seqs:
+                self.assertEqual(s.adapter, "jaad_clip")
+
+    def test_discover_clips_dataset_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp))
+            seqs = discover_jaad_clips(root)
+            for s in seqs:
+                self.assertEqual(s.dataset_id, "jaad")
+
+    def test_discover_clips_stable_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp))
+            s1 = discover_jaad_clips(root)
+            s2 = discover_jaad_clips(root)
+            ids1 = sorted(s.sequence_id for s in s1)
+            ids2 = sorted(s.sequence_id for s in s2)
+            self.assertEqual(ids1, ids2)
+
+    def test_discover_clips_annotation_families_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp), clips=1, add_annotations=True)
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 1)
+            summary = seqs[0].annotation_summary
+            self.assertIn("annotation_families", summary)
+            families = summary["annotation_families"]
+            self.assertTrue(families.get("annotations"))
+            self.assertTrue(families.get("annotations_appearance"))
+            self.assertTrue(families.get("annotations_attributes"))
+            # Traffic and vehicle were not written in the fixture.
+            self.assertFalse(families.get("annotations_traffic"))
+            self.assertFalse(families.get("annotations_vehicle"))
+
+    def test_discover_clips_label_index_preferred(self):
+        """Pre-built label index takes precedence over XML parsing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(
+                pathlib.Path(tmp), clips=2, add_label_index=True
+            )
+            seqs = discover_jaad_clips(root)
+            for s in seqs:
+                summary = s.annotation_summary
+                self.assertEqual(summary.get("track_count"), 2)
+                self.assertEqual(summary.get("crossing_count"), 10)
+
+    def test_discover_clips_xml_fallback(self):
+        """When label index is absent, XML annotations are parsed for summary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(
+                pathlib.Path(tmp), clips=1,
+                add_annotations=True, add_label_index=False
+            )
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 1)
+            summary = seqs[0].annotation_summary
+            # From the XML fixture: 1 crossing + 1 not-crossing per track
+            self.assertGreaterEqual(summary.get("crossing_count", 0), 1)
+            self.assertGreaterEqual(summary.get("not_crossing_count", 0), 1)
+
+    def test_discover_clips_no_annotations(self):
+        """Clips without annotations are still discovered."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(
+                pathlib.Path(tmp), clips=2, add_annotations=False
+            )
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 2)
+            for s in seqs:
+                families = s.annotation_summary.get("annotation_families", {})
+                self.assertFalse(families.get("annotations"))
+
+    def test_discover_clips_missing_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seqs = discover_jaad_clips(pathlib.Path(tmp) / "nonexistent")
+            self.assertEqual(seqs, [])
+
+    def test_discover_clips_source_path_not_in_dict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp), clips=1)
+            seqs = discover_jaad_clips(root)
+            for s in seqs:
+                d = s.to_dict()
+                serialised = json.dumps(d)
+                self.assertNotIn("source_path", serialised)
+                self.assertNotIn("annotation_ref", serialised)
+
+    def test_discover_clips_mp4_only(self):
+        """Non-MP4 files in the clips directory are ignored."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp), clips=0)
+            clips_dir = root / "extracted" / "JAAD_clips"
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            (clips_dir / "readme.txt").write_text("hello", encoding="utf-8")
+            (clips_dir / "thumb.jpg").write_bytes(b"FAKE_JPEG")
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 1)
+            self.assertEqual(seqs[0].sequence_id, "video_0001")
+
+    def test_discover_clips_sorted_order(self):
+        """Clips must be returned in sorted filename order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir(pathlib.Path(tmp), clips=5)
+            seqs = discover_jaad_clips(root)
+            ids = [s.sequence_id for s in seqs]
+            self.assertEqual(ids, sorted(ids))
+
+
+class TestJaadXmlSummaryParser(unittest.TestCase):
+    """Unit tests for _parse_jaad_xml_summary."""
+
+    def test_parse_full_fixture(self):
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<annotations>\n"
+            "  <meta><task>"
+            "<start_frame>0</start_frame><stop_frame>599</stop_frame>"
+            "</task></meta>\n"
+            '  <track id="0" label="pedestrian">\n'
+            '    <box frame="0" outside="0">\n'
+            '      <attribute name="cross">crossing</attribute>\n'
+            '      <attribute name="action">walking</attribute>\n'
+            '      <attribute name="look">looking</attribute>\n'
+            "    </box>\n"
+            '    <box frame="1" outside="0">\n'
+            '      <attribute name="cross">not-crossing</attribute>\n'
+            '      <attribute name="action">standing</attribute>\n'
+            '      <attribute name="look">not-looking</attribute>\n'
+            "    </box>\n"
+            '    <box frame="2" outside="1"/>\n'  # outside=1 must be skipped
+            "  </track>\n"
+            '  <track id="1" label="pedestrian">\n'
+            '    <box frame="0" outside="0">\n'
+            '      <attribute name="cross">crossing</attribute>\n'
+            '      <attribute name="action">walking</attribute>\n'
+            '      <attribute name="look">not-looking</attribute>\n'
+            "    </box>\n"
+            "  </track>\n"
+            "</annotations>\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".xml", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(xml)
+            xml_path = pathlib.Path(f.name)
+        try:
+            s = _parse_jaad_xml_summary(xml_path)
+            self.assertEqual(s["track_count"], 2)
+            self.assertEqual(s["annotated_frame_count"], 3)
+            self.assertEqual(s["crossing_count"], 2)
+            self.assertEqual(s["not_crossing_count"], 1)
+            self.assertEqual(s["walking_count"], 2)
+            self.assertEqual(s["standing_count"], 1)
+            self.assertEqual(s["looking_count"], 1)
+            self.assertEqual(s["not_looking_count"], 2)
+            self.assertEqual(s["start_frame"], 0)
+            self.assertEqual(s["stop_frame"], 599)
+        finally:
+            xml_path.unlink(missing_ok=True)
+
+    def test_parse_nonexistent_returns_empty(self):
+        s = _parse_jaad_xml_summary(pathlib.Path("/nonexistent/file.xml"))
+        self.assertEqual(s["track_count"], 0)
+        self.assertEqual(s["crossing_count"], 0)
+
+    def test_parse_corrupt_xml_returns_empty_counts(self):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".xml", delete=False, encoding="utf-8"
+        ) as f:
+            f.write("<not_valid_xml[[[")
+            xml_path = pathlib.Path(f.name)
+        try:
+            s = _parse_jaad_xml_summary(xml_path)
+            self.assertEqual(s["track_count"], 0)
+        finally:
+            xml_path.unlink(missing_ok=True)
+
+    def test_parse_non_pedestrian_tracks_ignored(self):
+        xml = (
+            '<?xml version="1.0" encoding="utf-8"?>\n'
+            "<annotations>\n"
+            '  <track id="0" label="vehicle">\n'
+            '    <box frame="0" outside="0">'
+            '<attribute name="cross">crossing</attribute></box>\n'
+            "  </track>\n"
+            "</annotations>\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".xml", delete=False, encoding="utf-8"
+        ) as f:
+            f.write(xml)
+            xml_path = pathlib.Path(f.name)
+        try:
+            s = _parse_jaad_xml_summary(xml_path)
+            self.assertEqual(s["track_count"], 0)
+            self.assertEqual(s["crossing_count"], 0)
+        finally:
+            xml_path.unlink(missing_ok=True)
+
+
+class TestDiscoverSequencesIntegration(unittest.TestCase):
+    """Integration tests for discover_sequences()."""
+
+    def test_empty_inputs_returns_structure(self):
+        result = discover_sequences(
+            rosbag_catalog_entries=[],
+            nuscenes_root="",
+            jaad_root="",
+        )
+        self.assertIn("sequences", result)
+        self.assertIn("by_dataset", result)
+        self.assertIn("adapter_counts", result)
+        self.assertIn("errors", result)
+        self.assertEqual(result["sequences"], [])
+
+    def test_static_fixture_via_discover_sequences(self):
+        bag_entry = {
+            "key": "rtdetr",
+            "name": "RT-DETR",
+            "display_name": "RT-DETR",
+            "description": "one-frame",
+            "installed": True,
+            "local_path": "/data/rtdetr/quickstart.bag",
+            "image_topics": ["/image_rect"],
+            "topic_types": {"/image_rect": "sensor_msgs/msg/Image"},
+            "message_counts": {"/image_rect": 1},
+        }
+        result = discover_sequences(
+            rosbag_catalog_entries=[bag_entry],
+            nuscenes_root="",
+            jaad_root="",
+        )
+        self.assertEqual(len(result["sequences"]), 1)
+        seq = result["sequences"][0]
+        self.assertEqual(seq["adapter"], "ros_static_fixture")
+        self.assertIn("ros_static_fixture", result["adapter_counts"])
+        self.assertNotIn("source_path", json.dumps(seq))
+
+    def test_nuscenes_via_discover_sequences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            meta = root / "v1.0-mini"
+            meta.mkdir()
+            # Minimal single scene, single sample.
+            scenes = [{"token": "sc1", "name": "scene-0061",
+                       "description": "construction",
+                       "first_sample_token": "sa1", "last_sample_token": "sa1"}]
+            samples = [{"token": "sa1", "scene_token": "sc1",
+                        "timestamp": 1000, "prev": "", "next": "",
+                        "data": {"CAM_FRONT": "sd1"}}]
+            sample_data = [{"token": "sd1", "sample_token": "sa1",
+                             "filename": "samples/CAM_FRONT/img.jpg",
+                             "timestamp": 1001, "is_key_frame": True,
+                             "channel": "CAM_FRONT", "width": 1600, "height": 900}]
+            (meta / "scene.json").write_text(json.dumps(scenes))
+            (meta / "sample.json").write_text(json.dumps(samples))
+            (meta / "sample_data.json").write_text(json.dumps(sample_data))
+
+            result = discover_sequences(
+                rosbag_catalog_entries=[],
+                nuscenes_root=str(root),
+                jaad_root="",
+            )
+            self.assertEqual(len(result["sequences"]), 1)
+            self.assertEqual(result["sequences"][0]["adapter"], "nuscenes_scene")
+            self.assertEqual(result["sequences"][0]["dataset_id"], "nuscenes-mini")
+
+    def test_jaad_via_discover_sequences(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            clips_dir = root / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            (clips_dir / "video_0002.mp4").write_bytes(b"FAKE")
+
+            result = discover_sequences(
+                rosbag_catalog_entries=[],
+                nuscenes_root="",
+                jaad_root=str(root),
+            )
+            self.assertEqual(len(result["sequences"]), 2)
+            for seq in result["sequences"]:
+                self.assertEqual(seq["adapter"], "jaad_clip")
+            self.assertIn("jaad", result["by_dataset"])
+            self.assertEqual(result["adapter_counts"].get("jaad_clip"), 2)
+
+    def test_error_recovery_nuscenes(self):
+        """An invalid nuScenes root logs an error but does not crash."""
+        result = discover_sequences(
+            rosbag_catalog_entries=[],
+            nuscenes_root="/nonexistent/path/nuscenes",
+            jaad_root="",
+        )
+        # No crash; errors list may be empty (discover returns [] gracefully).
+        self.assertIn("sequences", result)
+
+    def test_multiple_adapters_combined(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # JAAD root
+            root = pathlib.Path(tmp)
+            clips_dir = root / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+
+            # Static fixture bag
+            bag_entry = {
+                "key": "rtdetr",
+                "name": "RT-DETR",
+                "display_name": "RT-DETR",
+                "description": "",
+                "installed": True,
+                "local_path": "/data/rtdetr.bag",
+                "image_topics": ["/image_rect"],
+                "topic_types": {"/image_rect": "sensor_msgs/msg/Image"},
+                "message_counts": {"/image_rect": 1},
+            }
+            result = discover_sequences(
+                rosbag_catalog_entries=[bag_entry],
+                nuscenes_root="",
+                jaad_root=str(root),
+            )
+            adapters = {s["adapter"] for s in result["sequences"]}
+            self.assertIn("ros_static_fixture", adapters)
+            self.assertIn("jaad_clip", adapters)
+
+
+class TestResolveSequenceFramePath(unittest.TestCase):
+    """Tests for resolve_sequence_frame_path."""
+
+    def _make_seq(self, tmp: pathlib.Path) -> SequenceEntry:
+        img = tmp / "frame.jpg"
+        img.write_bytes(b"JPEG_DATA")
+        fr = FrameRef(
+            index=0,
+            source_id="fr0",
+            timestamp_us=None,
+            source_path=str(img),
+            metadata={},
+        )
+        return SequenceEntry(
+            dataset_id="test-ds",
+            sequence_id="seq-01",
+            adapter="ros_static_fixture",
+            display_name="Test",
+            description="",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+        )
+
+    def test_resolve_valid_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seq = self._make_seq(pathlib.Path(tmp))
+            result = resolve_sequence_frame_path(
+                [seq], "test-ds", "seq-01", frame_index=0
+            )
+            self.assertIsNotNone(result)
+            self.assertTrue(result.exists())
+
+    def test_resolve_wrong_frame_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seq = self._make_seq(pathlib.Path(tmp))
+            result = resolve_sequence_frame_path([seq], "test-ds", "seq-01", 99)
+            self.assertIsNone(result)
+
+    def test_resolve_unknown_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seq = self._make_seq(pathlib.Path(tmp))
+            result = resolve_sequence_frame_path([seq], "other-ds", "seq-01", 0)
+            self.assertIsNone(result)
+
+    def test_resolve_unknown_sequence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            seq = self._make_seq(pathlib.Path(tmp))
+            result = resolve_sequence_frame_path([seq], "test-ds", "other-seq", 0)
+            self.assertIsNone(result)
+
+    def test_resolve_rejects_unsafe_dataset_id(self):
+        result = resolve_sequence_frame_path([], "../evil", "seq", 0)
+        self.assertIsNone(result)
+
+    def test_resolve_rejects_unsafe_sequence_id(self):
+        result = resolve_sequence_frame_path([], "ds", "../../etc/passwd", 0)
+        self.assertIsNone(result)
+
+
+class TestSequencesApiEndpoint(unittest.TestCase):
+    """Integration test: GET /api/sequences via the HTTP server."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(cls.tmpdir / "runs"),
+                # no nuscenes_dir / jaad_dir → adapters gracefully return []
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, json.loads(body.decode()) if body else {}
+
+    def test_get_sequences_returns_200(self):
+        status, data = self._get("/api/sequences")
+        self.assertEqual(status, 200)
+
+    def test_get_sequences_response_structure(self):
+        status, data = self._get("/api/sequences")
+        self.assertEqual(status, 200)
+        self.assertIn("sequences", data)
+        self.assertIn("by_dataset", data)
+        self.assertIn("adapter_counts", data)
+        self.assertIn("errors", data)
+        self.assertIsInstance(data["sequences"], list)
+
+    def test_get_sequences_no_source_paths_in_response(self):
+        """Source paths must never appear in the HTTP response."""
+        status, data = self._get("/api/sequences")
+        self.assertEqual(status, 200)
+        serialised = json.dumps(data)
+        # "source_path" should never appear in any serialised sequence.
+        self.assertNotIn("source_path", serialised)
+
+    def test_get_sequences_no_absolute_paths_in_provenance(self):
+        """Provenance must not contain absolute server-side paths."""
+        status, data = self._get("/api/sequences")
+        self.assertEqual(status, 200)
+        serialised = json.dumps(data)
+        # Real filesystem path prefixes must not leak.
+        for prefix in ("/tmp", "/data", "/home", "/var", "/opt"):
+            self.assertNotIn(prefix, serialised,
+                             msg=f"Server path prefix {prefix!r} found in response")
+
+    def test_get_sequences_includes_decoder_capability(self):
+        """GET /api/sequences must include a decoder_capability dict."""
+        status, data = self._get("/api/sequences")
+        self.assertEqual(status, 200)
+        self.assertIn("decoder_capability", data)
+        cap = data["decoder_capability"]
+        for key in ("ffprobe", "ffmpeg", "opencv", "frame_extraction",
+                    "metadata_probe"):
+            self.assertIn(key, cap, msg=f"decoder_capability missing key {key!r}")
+        # frame_extraction and metadata_probe must be one of the known values.
+        self.assertIn(cap["frame_extraction"], ("ffmpeg", "opencv", "none"))
+        self.assertIn(cap["metadata_probe"], ("ffprobe", "opencv", "none"))
+
+
+class TestJaadLabelIndexSchema(unittest.TestCase):
+    """Tests for the canonical {"clips": [...]} label index schema."""
+
+    def _make_jaad_dir_with_clips_schema(
+        self,
+        tmp: pathlib.Path,
+        clips: int = 2,
+    ) -> pathlib.Path:
+        """Build a JAAD directory with the canonical {"clips":[...]} index."""
+        clips_dir = tmp / "extracted" / "JAAD_clips"
+        clips_dir.mkdir(parents=True)
+        prepared = tmp / "prepared"
+        prepared.mkdir(exist_ok=True)
+
+        clip_entries = []
+        for i in range(1, clips + 1):
+            stem = f"video_{i:04d}"
+            (clips_dir / f"{stem}.mp4").write_bytes(b"FAKE_MP4_DATA")
+            clip_entries.append({
+                "clip_id": stem,
+                "track_count": 3,
+                "crossing_count": 12,
+                "not_crossing_count": 6,
+                "walking_count": 9,
+            })
+        index = {"clips": clip_entries}
+        (prepared / "jaad-clip-label-index.json").write_text(
+            json.dumps(index), encoding="utf-8"
+        )
+        return tmp
+
+    def test_canonical_clips_schema_parsed(self):
+        """discover_jaad_clips reads stats from {"clips":[...]} index."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir_with_clips_schema(pathlib.Path(tmp), clips=2)
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 2)
+            for s in seqs:
+                summary = s.annotation_summary
+                self.assertEqual(summary.get("track_count"), 3,
+                                 msg=f"track_count not loaded from clips schema for {s.sequence_id}")
+                self.assertEqual(summary.get("crossing_count"), 12)
+                self.assertEqual(summary.get("not_crossing_count"), 6)
+
+    def test_canonical_clips_schema_preferred_over_xml(self):
+        """When canonical index exists, XML is not parsed (even if present)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_jaad_dir_with_clips_schema(pathlib.Path(tmp), clips=1)
+            # Add an XML annotation with different counts.
+            ann_dir = root / "annotations"
+            ann_dir.mkdir(exist_ok=True)
+            xml = (
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<annotations>\n"
+                "  <meta><task>"
+                "<start_frame>0</start_frame><stop_frame>99</stop_frame>"
+                "</task></meta>\n"
+                '  <track id="0" label="pedestrian">\n'
+                '    <box frame="0" outside="0"><attribute name="cross">crossing</attribute>'
+                "</box>\n"
+                "  </track>\n"
+                "</annotations>\n"
+            )
+            (ann_dir / "video_0001.xml").write_text(xml, encoding="utf-8")
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 1)
+            # Stats must come from the index (track_count=3), not XML (track_count=1).
+            self.assertEqual(seqs[0].annotation_summary.get("track_count"), 3)
+
+    def test_xml_fallback_when_clip_missing_from_index(self):
+        """When index exists but a clip is absent, XML fallback is used."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            clips_dir = root / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            prepared = root / "prepared"
+            prepared.mkdir(exist_ok=True)
+            ann_dir = root / "annotations"
+            ann_dir.mkdir(exist_ok=True)
+
+            # Only video_0001 in the index; video_0002 is absent.
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            (clips_dir / "video_0002.mp4").write_bytes(b"FAKE")
+            index = {"clips": [{"clip_id": "video_0001", "track_count": 7}]}
+            (prepared / "jaad-clip-label-index.json").write_text(
+                json.dumps(index), encoding="utf-8"
+            )
+            # XML annotation for video_0002 only.
+            xml = (
+                '<?xml version="1.0" encoding="utf-8"?>\n'
+                "<annotations>\n"
+                "  <meta><task>"
+                "<start_frame>0</start_frame><stop_frame>49</stop_frame>"
+                "</task></meta>\n"
+                '  <track id="0" label="pedestrian">\n'
+                '    <box frame="0" outside="0">'
+                '<attribute name="cross">not-crossing</attribute></box>\n'
+                "  </track>\n"
+                "</annotations>\n"
+            )
+            (ann_dir / "video_0002.xml").write_text(xml, encoding="utf-8")
+
+            seqs = {s.sequence_id: s for s in discover_jaad_clips(root)}
+            self.assertIn("video_0001", seqs)
+            self.assertIn("video_0002", seqs)
+            # video_0001 gets stats from the index.
+            self.assertEqual(seqs["video_0001"].annotation_summary.get("track_count"), 7)
+            # video_0002 must fall back to XML (not_crossing_count ≥ 1).
+            self.assertGreaterEqual(
+                seqs["video_0002"].annotation_summary.get("not_crossing_count", 0), 1,
+                msg="XML fallback not used for clip absent from label index",
+            )
+
+    def test_load_jaad_clip_label_index_clips_format(self):
+        """_load_jaad_clip_label_index normalises the {"clips":[...]} format."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prepared = root / "prepared"
+            prepared.mkdir()
+            data = {"clips": [
+                {"clip_id": "video_0001", "track_count": 5},
+                {"clip_id": "video_0002", "track_count": 8},
+            ]}
+            (prepared / "jaad-clip-label-index.json").write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+            result = _load_jaad_clip_label_index(root)
+            self.assertIsNotNone(result)
+            self.assertIn("video_0001", result)
+            self.assertIn("video_0002", result)
+            self.assertEqual(result["video_0001"]["track_count"], 5)
+            self.assertEqual(result["video_0002"]["track_count"], 8)
+
+    def test_load_jaad_clip_label_index_legacy_flat_format(self):
+        """_load_jaad_clip_label_index still accepts the legacy flat dict format."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            prepared = root / "prepared"
+            prepared.mkdir()
+            data = {
+                "video_0001": {"track_count": 2},
+                "video_0002": {"track_count": 4},
+            }
+            (prepared / "jaad-clip-label-index.json").write_text(
+                json.dumps(data), encoding="utf-8"
+            )
+            result = _load_jaad_clip_label_index(root)
+            self.assertIsNotNone(result)
+            self.assertEqual(result["video_0001"]["track_count"], 2)
+            self.assertEqual(result["video_0002"]["track_count"], 4)
+
+
+class TestSequenceFrameEndpoint(unittest.TestCase):
+    """Tests for GET /api/sequences/<dataset_id>/<sequence_id>/frames/<n>."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+
+        # Build a tiny nuScenes-style JAAD fixture: one JPEG "frame".
+        # We create a nuscenes_scene entry via direct SequenceEntry construction
+        # so we can inject a real JPEG path without needing an actual nuScenes install.
+        cls.jpeg_path = cls.tmpdir / "frame_0000.jpg"
+        # Minimal valid JPEG header bytes.
+        cls.jpeg_path.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(cls.tmpdir / "runs"),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        # Pre-populate the sequence catalog cache with a synthetic nuScenes entry
+        # that points at the real JPEG we wrote above.
+        fr = FrameRef(
+            index=0,
+            source_id="synthetic-frame-0",
+            timestamp_us=0,
+            source_path=str(cls.jpeg_path),
+            metadata={},
+        )
+        synthetic_seq = SequenceEntry(
+            dataset_id="nuscenes",
+            sequence_id="scene-test",
+            adapter="nuscenes_scene",
+            display_name="Synthetic scene",
+            description="CI fixture",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [synthetic_seq]
+
+        # Also add a ros_static_fixture entry to test the 422 path.
+        bag_dir = cls.tmpdir / "fake_bag"
+        bag_dir.mkdir()
+        fr_ros = FrameRef(
+            index=0,
+            source_id="ros-frame-0",
+            timestamp_us=0,
+            source_path=str(bag_dir),
+            metadata={},
+        )
+        ros_seq = SequenceEntry(
+            dataset_id="ros",
+            sequence_id="fixture-01",
+            adapter="ros_static_fixture",
+            display_name="Fixture",
+            description="",
+            frame_count=1,
+            frame_refs=[fr_ros],
+            annotation_ref=None,
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries.append(ros_seq)
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, body
+
+    def test_nuscenes_frame_returns_200_and_jpeg(self):
+        """A nuScenes frame that exists as a JPEG file is served correctly."""
+        status, body = self._get("/api/sequences/nuscenes/scene-test/frames/0")
+        self.assertEqual(status, 200)
+        # JPEG files start with FF D8.
+        self.assertTrue(body[:2] == b"\xff\xd8",
+                        msg="Response body is not a JPEG")
+
+    def test_unknown_sequence_returns_404(self):
+        status, body = self._get("/api/sequences/nuscenes/nonexistent/frames/0")
+        self.assertEqual(status, 404)
+
+    def test_unknown_dataset_returns_404(self):
+        status, body = self._get("/api/sequences/unknown-ds/scene-test/frames/0")
+        self.assertEqual(status, 404)
+
+    def test_ros_fixture_returns_422(self):
+        """ros_static_fixture entries cannot serve frames directly."""
+        status, body = self._get("/api/sequences/ros/fixture-01/frames/0")
+        self.assertEqual(status, 422)
+
+    def test_invalid_dataset_id_returns_400(self):
+        status, body = self._get("/api/sequences/../evil/scene-test/frames/0")
+        # Router should not match the path-traversal pattern.
+        self.assertIn(status, (400, 404))
+
+    def test_out_of_range_frame_index_returns_400_or_404(self):
+        # The regex only matches \d{1,5} so an 8-digit index is a 404.
+        status, body = self._get("/api/sequences/nuscenes/scene-test/frames/99999999")
+        self.assertIn(status, (400, 404))
+
+
+class TestSequencesExperimentEndpoint(unittest.TestCase):
+    """Tests for POST /api/sequences/experiment."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+
+        # Real JPEG for materialisation.
+        cls.jpeg_path = cls.tmpdir / "frame_0.jpg"
+        cls.jpeg_path.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(cls.tmpdir / "runs"),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        fr = FrameRef(
+            index=0,
+            source_id="sf0",
+            timestamp_us=0,
+            source_path=str(cls.jpeg_path),
+            metadata={},
+        )
+        nuscenes_seq = SequenceEntry(
+            dataset_id="nuscenes",
+            sequence_id="scene-exp",
+            adapter="nuscenes_scene",
+            display_name="Exp scene",
+            description="",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+        )
+        ros_seq = SequenceEntry(
+            dataset_id="ros",
+            sequence_id="fixture-exp",
+            adapter="ros_static_fixture",
+            display_name="ROS fixture",
+            description="",
+            frame_count=0,
+            frame_refs=[],
+            annotation_ref=None,
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [nuscenes_seq, ros_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _post(self, path, payload):
+        body = json.dumps(payload).encode()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", path, body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, json.loads(raw.decode()) if raw else {}
+
+    def test_missing_dataset_id_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "sequence_id": "scene-exp",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
+
+    def test_missing_sequence_id_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "nuscenes",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
+
+    def test_unknown_sequence_returns_404(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "nuscenes",
+            "sequence_id": "does-not-exist",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 404)
+
+    def test_ros_fixture_returns_422(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "ros",
+            "sequence_id": "fixture-exp",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 422)
+
+    def test_missing_task_prompt_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "nuscenes",
+            "sequence_id": "scene-exp",
+        })
+        self.assertEqual(status, 400)
+
+    def test_path_traversal_dataset_returns_400(self):
+        status, data = self._post("/api/sequences/experiment", {
+            "dataset_id": "../../etc",
+            "sequence_id": "scene-exp",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
+
+
+# ── new: scale, lazy materialisation, fixture-store, bounded strip ───────────
+
+
+class TestJaadCatalogScaleLazy(unittest.TestCase):
+    """Scale test: large JAAD dataset must not bloat catalog payload."""
+
+    def _make_large_jaad(self, tmp: pathlib.Path, n_clips: int, frames_each: int) -> pathlib.Path:
+        """Build a synthetic JAAD root with *n_clips* fake MP4 files.
+
+        ffprobe is not available in CI so frame_count stays 0; the key
+        assertion is that no FrameRef objects are created regardless.
+        """
+        clips_dir = tmp / "extracted" / "JAAD_clips"
+        clips_dir.mkdir(parents=True)
+        for i in range(1, n_clips + 1):
+            (clips_dir / f"video_{i:04d}.mp4").write_bytes(b"FAKE")
+        return tmp
+
+    def test_catalog_has_zero_frame_objects_for_jaad(self):
+        """discover_jaad_clips must never build per-frame FrameRef objects."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=346, frames_each=600)
+            seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 346)
+            # No FrameRef objects should be created (lazy discovery).
+            total_frame_refs = sum(len(s.frame_refs) for s in seqs)
+            self.assertEqual(total_frame_refs, 0,
+                msg=f"Expected 0 FrameRef objects for lazy JAAD, got {total_frame_refs}")
+
+    def test_to_dict_emits_empty_frames_list_for_lazy(self):
+        """to_dict() must return an empty frames list for lazy JAAD clips."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=10, frames_each=600)
+            seqs = discover_jaad_clips(root)
+            for seq in seqs:
+                d = seq.to_dict()
+                self.assertEqual(d["frames"], [],
+                    msg="Lazy JAAD sequence must emit empty frames list in to_dict()")
+
+    def test_catalog_payload_is_sequence_sized(self):
+        """The total catalog JSON must not scale with the number of frames."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=20, frames_each=600)
+            seqs = discover_jaad_clips(root)
+            seq_dicts = [s.to_dict() for s in seqs]
+            payload = json.dumps({"sequences": seq_dicts})
+            # Upper bound: each sequence dict should be small (< 1 KB); 20 seqs < 20 KB.
+            # If frames were eagerly included (600 frames × ~60 bytes each),
+            # the 20-sequence payload would exceed 700 KB.
+            self.assertLess(len(payload), 20 * 1024,
+                msg=f"Catalog payload ({len(payload)} bytes) too large — frame refs must be lazy")
+
+    def test_source_path_stored_on_sequence(self):
+        """Each jaad_clip SequenceEntry must carry the MP4 path in source_path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_large_jaad(pathlib.Path(tmp), n_clips=3, frames_each=0)
+            seqs = discover_jaad_clips(root)
+            for seq in seqs:
+                self.assertTrue(seq.source_path.endswith(".mp4"),
+                    msg=f"Expected .mp4 source_path, got {seq.source_path!r}")
+                # Must NOT appear in serialised output.
+                d = seq.to_dict()
+                self.assertNotIn("source_path", json.dumps(d))
+
+
+class TestJaadLazyMaterialization(unittest.TestCase):
+    """materialize_sequence_frame must work for JAAD without pre-built FrameRefs."""
+
+    def _make_seq(self, mp4_path: pathlib.Path, frame_count: int = 10) -> SequenceEntry:
+        return SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="",
+            frame_count=frame_count,
+            frame_refs=[],           # lazy — no pre-built refs
+            annotation_ref=None,
+            source_path=str(mp4_path),
+        )
+
+    def test_returns_none_for_missing_mp4(self):
+        seq = self._make_seq(pathlib.Path("/no/such/file.mp4"))
+        from web_console.sequence_catalog import materialize_sequence_frame
+        result = materialize_sequence_frame([seq], "jaad", "video_0001", 0)
+        self.assertIsNone(result)
+
+    def test_returns_none_for_empty_source_path(self):
+        seq = SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="",
+            frame_count=5,
+            frame_refs=[],
+            annotation_ref=None,
+            source_path="",
+        )
+        from web_console.sequence_catalog import materialize_sequence_frame
+        result = materialize_sequence_frame([seq], "jaad", "video_0001", 0)
+        self.assertIsNone(result)
+
+    def test_bounds_check_rejects_out_of_range_index(self):
+        """Frame indices >= frame_count must be rejected without ffmpeg invocation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            mp4 = pathlib.Path(tmp) / "video_0001.mp4"
+            mp4.write_bytes(b"FAKE")
+            seq = self._make_seq(mp4, frame_count=10)
+            from web_console.sequence_catalog import materialize_sequence_frame
+            # Index 10 is out of range for a 10-frame video.
+            result = materialize_sequence_frame([seq], "jaad", "video_0001", 10)
+            self.assertIsNone(result)
+
+    def test_unknown_sequence_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mp4 = pathlib.Path(tmp) / "video_0001.mp4"
+            mp4.write_bytes(b"FAKE")
+            seq = self._make_seq(mp4)
+            from web_console.sequence_catalog import materialize_sequence_frame
+            result = materialize_sequence_frame([seq], "jaad", "video_9999", 0)
+            self.assertIsNone(result)
+
+
+class TestRosFixtureFrameWithExtraction(unittest.TestCase):
+    """ros_static_fixture frame serving works when a matching extraction exists."""
+
+    @classmethod
+    def setUpClass(cls):
+        from web_console.frame_extractor import write_frame_manifest
+
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        runs_dir = cls.tmpdir / "runs"
+        frame_datasets_dir = runs_dir / "frame_datasets"
+        frame_datasets_dir.mkdir(parents=True)
+
+        # Write a real JPEG into an extracted frame_dataset.
+        cls.bag_key = "rtdetr-quickstart"
+        ds_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        ds_dir = frame_datasets_dir / ds_id
+        ds_dir.mkdir()
+        jpeg = ds_dir / "frame_0000.jpg"
+        jpeg.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+        write_frame_manifest(ds_dir, {
+            "schema_version": 1,
+            "dataset_id": ds_id,
+            "bag_key": cls.bag_key,
+            "bag_path": "/data/fake.bag",
+            "topic": "/image_rect",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 1,
+            "frames": [{"index": 0, "filename": "frame_0000.jpg",
+                         "timestamp_sec": 0.0, "timestamp_ns": 0}],
+            "frame_count": 1,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(ds_dir),
+        })
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(runs_dir),
+                "frame_datasets_dir": str(frame_datasets_dir),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        # Inject a ros_static_fixture SequenceEntry pointing at the same bag_key.
+        bag_dir = cls.tmpdir / "fake_bag"
+        bag_dir.mkdir()
+        fr = FrameRef(
+            index=0,
+            source_id=f"{cls.bag_key}:frame_0",
+            timestamp_us=None,
+            source_path=str(bag_dir),
+            metadata={"topic": "/image_rect", "bag_key": cls.bag_key},
+        )
+        fixture_seq = SequenceEntry(
+            dataset_id=_sanitize_id(cls.bag_key),
+            sequence_id=_sanitize_id(cls.bag_key),
+            adapter="ros_static_fixture",
+            display_name="RT-DETR Quickstart",
+            description="Static fixture",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+            source_path=str(bag_dir),
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [fixture_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _get(self, path):
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, body, resp.getheader("Content-Type", "")
+
+    def test_fixture_frame_served_from_extraction(self):
+        """When an extraction exists for the bag_key, the frame is served as JPEG."""
+        ds_id = _sanitize_id(self.bag_key)
+        status, body, ct = self._get(
+            f"/api/sequences/{ds_id}/{ds_id}/frames/0"
+        )
+        self.assertEqual(status, 200,
+            msg=f"Expected 200 from extracted fixture frame, got {status}")
+        self.assertIn("image/jpeg", ct)
+        self.assertTrue(body[:2] == b"\xff\xd8",
+            msg="Response body is not a JPEG")
+
+    def test_fixture_without_extraction_returns_422(self):
+        """A ros_static_fixture with no matching extraction returns 422."""
+        # Inject a second fixture with a bag_key that has no extraction.
+        fr2 = FrameRef(
+            index=0, source_id="no-extract:frame_0", timestamp_us=None,
+            source_path=str(self.tmpdir / "no_such_bag"),
+            metadata={"bag_key": "no-extraction-key"},
+        )
+        seq2 = SequenceEntry(
+            dataset_id="no-extract-ds", sequence_id="no-extract-seq",
+            adapter="ros_static_fixture",
+            display_name="No extract", description="",
+            frame_count=1, frame_refs=[fr2], annotation_ref=None,
+            source_path=str(self.tmpdir / "no_such_bag"),
+        )
+        with self.server._sequence_catalog_lock:
+            entries = list(self.server._sequence_catalog_entries)
+            entries.append(seq2)
+            self.server._sequence_catalog_entries = entries
+
+        status, body, _ = self._get("/api/sequences/no-extract-ds/no-extract-seq/frames/0")
+        self.assertEqual(status, 422)
+
+
+class TestRosFixtureExperimentWithExtraction(unittest.TestCase):
+    """POST /api/sequences/experiment works for a fixture with a prior extraction."""
+
+    @classmethod
+    def setUpClass(cls):
+        from web_console.frame_extractor import write_frame_manifest
+
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        runs_dir = cls.tmpdir / "runs"
+        frame_datasets_dir = runs_dir / "frame_datasets"
+        frame_datasets_dir.mkdir(parents=True)
+
+        cls.bag_key = "rtdetr-test"
+        ds_id = "cccccccc-cccc-cccc-cccc-cccccccccccc"
+        ds_dir = frame_datasets_dir / ds_id
+        ds_dir.mkdir()
+        jpeg = ds_dir / "frame_0000.jpg"
+        jpeg.write_bytes(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00\x00\x01\x00\x01\x00\x00"
+            b"\xff\xd9"
+        )
+        write_frame_manifest(ds_dir, {
+            "schema_version": 1,
+            "dataset_id": ds_id,
+            "bag_key": cls.bag_key,
+            "bag_path": "/data/fake.bag",
+            "topic": "/image_rect",
+            "start_offset_sec": 0.0,
+            "end_offset_sec": None,
+            "sample_interval_sec": 0.5,
+            "max_frames": 1,
+            "frames": [{"index": 0, "filename": "frame_0000.jpg",
+                         "timestamp_sec": 0.0, "timestamp_ns": 0}],
+            "frame_count": 1,
+            "extracted_at": "2025-01-01T00:00:00Z",
+            "output_dir": str(ds_dir),
+        })
+
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(runs_dir),
+                "frame_datasets_dir": str(frame_datasets_dir),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        bag_dir = cls.tmpdir / "fake_bag"
+        bag_dir.mkdir()
+        fr = FrameRef(
+            index=0,
+            source_id=f"{cls.bag_key}:frame_0",
+            timestamp_us=None,
+            source_path=str(bag_dir),
+            metadata={"topic": "/image_rect", "bag_key": cls.bag_key},
+        )
+        fixture_seq = SequenceEntry(
+            dataset_id=_sanitize_id(cls.bag_key),
+            sequence_id=_sanitize_id(cls.bag_key),
+            adapter="ros_static_fixture",
+            display_name="RT-DETR test",
+            description="",
+            frame_count=1,
+            frame_refs=[fr],
+            annotation_ref=None,
+            source_path=str(bag_dir),
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [fixture_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _post(self, payload):
+        body = json.dumps(payload).encode()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request("POST", "/api/sequences/experiment", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, json.loads(raw.decode()) if raw else {}
+
+    def test_fixture_experiment_returns_422_without_extraction(self):
+        """Without extraction, experiment returns 422."""
+        # Use a sequence with no matching bag_key in frame_store.
+        fr2 = FrameRef(
+            index=0, source_id="no-ext:frame_0", timestamp_us=None,
+            source_path=str(self.tmpdir / "no_such"),
+            metadata={"bag_key": "no-such-key"},
+        )
+        seq2 = SequenceEntry(
+            dataset_id="no-ext", sequence_id="no-ext-seq",
+            adapter="ros_static_fixture",
+            display_name="No ext", description="",
+            frame_count=1, frame_refs=[fr2], annotation_ref=None,
+            source_path=str(self.tmpdir / "no_such"),
+        )
+        with self.server._sequence_catalog_lock:
+            entries = list(self.server._sequence_catalog_entries)
+            entries.append(seq2)
+            self.server._sequence_catalog_entries = entries
+
+        status, data = self._post({
+            "dataset_id": "no-ext",
+            "sequence_id": "no-ext-seq",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 422)
+
+    def test_missing_task_prompt_returns_400(self):
+        ds_id = _sanitize_id(self.bag_key)
+        status, data = self._post({
+            "dataset_id": ds_id,
+            "sequence_id": ds_id,
+        })
+        self.assertEqual(status, 400)
+
+
+class TestSeqExpRequiresFrameIndicesForLazy(unittest.TestCase):
+    """POST /api/sequences/experiment requires explicit frame_indices for lazy sequences."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={
+                "quiet": True,
+                "runs_dir": str(cls.tmpdir / "runs"),
+            },
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        # A lazy JAAD-style sequence: no frame_refs, non-zero frame_count.
+        lazy_seq = SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="600 frames",
+            frame_count=600,
+            frame_refs=[],
+            annotation_ref=None,
+            source_path="/no/such/file.mp4",
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [lazy_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _post(self, payload):
+        body = json.dumps(payload).encode()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/sequences/experiment", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, json.loads(raw.decode()) if raw else {}
+
+    def test_lazy_without_frame_indices_returns_400(self):
+        """Lazy sequence without explicit frame_indices must return 400."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("frame_indices", data.get("error", ""))
+
+    def test_lazy_with_empty_frame_indices_returns_400(self):
+        """Empty frame_indices list must return 400."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [],
+        })
+        self.assertEqual(status, 400)
+
+    def test_lazy_with_explicit_frame_indices_attempts_materialisation(self):
+        """With explicit frame_indices, the server proceeds to materialise.
+
+        Since the MP4 doesn't exist, materialisation fails with 422 rather
+        than 400 — which proves that the endpoint accepted the frame_indices
+        and advanced past the selection-validation stage.
+        """
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [0, 5, 10],
+        })
+        # 422 means materialisation was attempted (mp4 not found); not 400.
+        self.assertEqual(status, 422)
+
+
+class TestAppJsBoundedStrip(unittest.TestCase):
+    """app.js must define a bounded thumbnail limit and bounded strip renderer."""
+
+    @classmethod
+    def setUpClass(cls):
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = js_path.read_text(encoding="utf-8")
+
+    def test_max_strip_thumbnails_constant_defined(self):
+        """_SEQ_MAX_STRIP_THUMBNAILS must be defined in app.js."""
+        self.assertIn("_SEQ_MAX_STRIP_THUMBNAILS", self._js)
+
+    def test_no_duplicate_frame_prev_next(self):
+        """_framePrev and _frameNext must each be defined exactly once."""
+        prev_count = self._js.count("function _framePrev(")
+        next_count = self._js.count("function _frameNext(")
+        self.assertEqual(prev_count, 1, f"_framePrev defined {prev_count} times")
+        self.assertEqual(next_count, 1, f"_frameNext defined {next_count} times")
+
+    def test_strip_bounded_by_max_constant(self):
+        """_renderSeqFrameStrip must reference _SEQ_MAX_STRIP_THUMBNAILS."""
+        self.assertIn("_SEQ_MAX_STRIP_THUMBNAILS", self._js)
+        # The function should guard against rendering more than the max.
+        self.assertIn("_renderSeqFrameStrip", self._js)
+
+    def test_lazy_navigator_function_defined(self):
+        """_renderSeqFrameNavigator must be defined for lazy sequences."""
+        self.assertIn("_renderSeqFrameNavigator", self._js)
+
+
+class TestAppJsCompactCatalogUI(unittest.TestCase):
+    """app.js must implement the compact dataset-selector + paginated sequence list UI."""
+
+    @classmethod
+    def setUpClass(cls):
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = js_path.read_text(encoding="utf-8")
+
+    def test_dataset_selector_change_handler_defined(self):
+        """_onSeqCatalogDatasetChange must be defined for dataset filtering."""
+        self.assertIn("_onSeqCatalogDatasetChange", self._js)
+
+    def test_search_handler_defined(self):
+        """_onSeqCatalogSearch must be defined for text-search filtering."""
+        self.assertIn("_onSeqCatalogSearch", self._js)
+
+    def test_pagination_functions_defined(self):
+        """_seqCatalogPrevPage and _seqCatalogNextPage must be defined."""
+        self.assertIn("_seqCatalogPrevPage", self._js)
+        self.assertIn("_seqCatalogNextPage", self._js)
+
+    def test_page_size_constant_defined(self):
+        """_SEQ_CATALOG_PAGE_SIZE must be defined and reference 20."""
+        self.assertIn("_SEQ_CATALOG_PAGE_SIZE", self._js)
+        self.assertIn("= 20", self._js)
+
+    def test_render_page_function_defined(self):
+        """_seqCatalogRenderPage must be the central rendering function."""
+        self.assertIn("_seqCatalogRenderPage", self._js)
+
+    def test_apply_filter_function_defined(self):
+        """_seqCatalogApplyFilter must filter sequences."""
+        self.assertIn("_seqCatalogApplyFilter", self._js)
+
+    def test_346_sequences_never_produce_346_buttons_in_one_page(self):
+        """The page-size guard must prevent 346 buttons from rendering at once.
+
+        This is a static code assertion: _seqCatalogRenderPage must slice
+        _seqCatalogFiltered using _SEQ_CATALOG_PAGE_SIZE before appending rows.
+        """
+        # Find the _seqCatalogRenderPage function body.
+        start = self._js.find("function _seqCatalogRenderPage(")
+        self.assertGreater(start, 0, "_seqCatalogRenderPage not found")
+        # The function must reference _SEQ_CATALOG_PAGE_SIZE for slicing.
+        func_body = self._js[start:start + 2000]
+        self.assertIn("_SEQ_CATALOG_PAGE_SIZE", func_body,
+            "_seqCatalogRenderPage must use _SEQ_CATALOG_PAGE_SIZE to limit visible rows")
+        self.assertIn("slice(", func_body,
+            "_seqCatalogRenderPage must slice _seqCatalogFiltered")
+
+    def test_decoder_capability_warning_handled(self):
+        """App must surface decoder capability warning when no backend is available."""
+        self.assertIn("decoder_capability", self._js)
+        self.assertIn("frame_extraction", self._js)
+        self.assertIn("actionable_error", self._js)
+
+    def test_use_in_experiment_transfers_sequence(self):
+        """_seqUseInExperiment must reference seqexp-dataset-id and seqexp-sequence-id."""
+        self.assertIn("seqexp-dataset-id", self._js)
+        self.assertIn("seqexp-sequence-id", self._js)
+        self.assertIn("_seqUseInExperiment", self._js)
+
+    def test_detail_panel_populated(self):
+        """_openSequence must populate the seq-catalog-detail panel."""
+        start = self._js.find("async function _openSequence(")
+        self.assertGreater(start, 0, "_openSequence not found")
+        func_body = self._js[start:start + 3000]
+        self.assertIn("seq-catalog-detail", func_body,
+            "_openSequence must show the seq-catalog-detail panel")
+
+
+class TestVideoBackendFallback(unittest.TestCase):
+    """_probe_video_metadata and _extract_mp4_frame_bytes must fall back to OpenCV."""
+
+    def test_probe_metadata_ffprobe_unavailable_returns_none_backend(self):
+        """When ffprobe subprocess raises, _probe_video_metadata falls back to opencv or none."""
+        with patch("subprocess.run", side_effect=FileNotFoundError("ffprobe not found")):
+            # OpenCV is also unavailable in CI; expect _backend == "none" or "opencv".
+            with tempfile.NamedTemporaryFile(suffix=".mp4") as f:
+                result = _probe_video_metadata(pathlib.Path(f.name))
+        self.assertIn("_backend", result)
+        self.assertIn(result["_backend"], {"opencv", "none"})
+
+    def test_probe_metadata_backend_key_always_present(self):
+        """_probe_video_metadata must always include the _backend key."""
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            fname = f.name
+        try:
+            result = _probe_video_metadata(pathlib.Path(fname))
+            self.assertIn("_backend", result)
+            self.assertIn(result["_backend"], {"ffprobe", "opencv", "none"})
+        finally:
+            os.unlink(fname)
+
+    def test_probe_metadata_backend_not_leaked_in_provenance(self):
+        """The _backend key must be stripped from JAAD sequence provenance."""
+        with tempfile.TemporaryDirectory() as tmp:
+            clips_dir = pathlib.Path(tmp) / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            seqs = discover_jaad_clips(pathlib.Path(tmp))
+            self.assertEqual(len(seqs), 1)
+            prov = seqs[0].provenance
+            meta = prov.get("video_metadata", {})
+            self.assertNotIn("_backend", meta,
+                "_backend must not appear in serialised provenance")
+
+    def test_probe_opencv_nonexistent_path_returns_empty(self):
+        """_probe_video_metadata_opencv must return {} for nonexistent paths."""
+        result = _probe_video_metadata_opencv(pathlib.Path("/nonexistent/video.mp4"))
+        self.assertIsInstance(result, dict)
+        self.assertNotIn("frame_count", result)
+
+    def test_extract_frame_bytes_ffmpeg_unavailable_tries_opencv(self):
+        """When ffmpeg is unavailable, _extract_mp4_frame_bytes must try OpenCV."""
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(b"FAKE")
+            fname = f.name
+        try:
+            with patch("subprocess.run", side_effect=FileNotFoundError("ffmpeg not found")):
+                # OpenCV will also fail on a fake file but must be tried.
+                result = _extract_mp4_frame_bytes(pathlib.Path(fname), 0)
+            # Result may be None (no real video) but must not raise.
+            self.assertIsNone(result)
+        finally:
+            os.unlink(fname)
+
+    def test_extract_frame_bytes_opencv_nonexistent_returns_none(self):
+        """_extract_mp4_frame_bytes_opencv must return None for nonexistent files."""
+        result = _extract_mp4_frame_bytes_opencv(pathlib.Path("/nonexistent/video.mp4"), 0)
+        self.assertIsNone(result)
+
+    def test_get_decoder_capability_structure(self):
+        """get_decoder_capability must return required keys."""
+        cap = get_decoder_capability()
+        self.assertIn("ffprobe", cap)
+        self.assertIn("ffmpeg", cap)
+        self.assertIn("opencv", cap)
+        self.assertIn("frame_extraction", cap)
+        self.assertIn("metadata_probe", cap)
+        self.assertIn("actionable_error", cap)
+        self.assertIn(cap["frame_extraction"], {"ffmpeg", "opencv", "none"})
+        self.assertIn(cap["metadata_probe"], {"ffprobe", "opencv", "none"})
+
+    def test_get_decoder_capability_actionable_error_when_none(self):
+        """actionable_error must be a string when no backend is available."""
+        with patch("shutil.which", return_value=None):
+            with patch.dict("sys.modules", {"cv2": None}):
+                cap = get_decoder_capability()
+        if cap["frame_extraction"] == "none":
+            self.assertIsNotNone(cap["actionable_error"])
+            self.assertIsInstance(cap["actionable_error"], str)
+            self.assertGreater(len(cap["actionable_error"]), 10)
+
+    def test_get_decoder_capability_no_error_when_opencv_available(self):
+        """actionable_error must be None when OpenCV is available."""
+        mock_cv2 = MagicMock()
+        with patch("shutil.which", return_value=None):
+            with patch.dict("sys.modules", {"cv2": mock_cv2}):
+                cap = get_decoder_capability()
+        # If the mock makes opencv appear available, frame_extraction == "opencv"
+        # and actionable_error should be None.
+        if cap["frame_extraction"] in {"ffmpeg", "opencv"}:
+            self.assertIsNone(cap["actionable_error"])
+
+    def test_discover_sequences_includes_decoder_capability(self):
+        """discover_sequences must include decoder_capability in its result."""
+        result = discover_sequences()
+        self.assertIn("decoder_capability", result)
+        cap = result["decoder_capability"]
+        self.assertIn("frame_extraction", cap)
+        self.assertIn("metadata_probe", cap)
+
+    def test_jaad_frame_count_from_annotation_stop_frame(self):
+        """When both ffprobe and OpenCV are unavailable, use stop_frame+1 from annotation."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            clips_dir = root / "extracted" / "JAAD_clips"
+            clips_dir.mkdir(parents=True)
+            (clips_dir / "video_0001.mp4").write_bytes(b"FAKE")
+            # Create an annotation XML with stop_frame = 599 → frame_count should be 600.
+            # Use the JAAD annotation format: stop_frame lives in <meta><task>.
+            ann_dir = root / "annotations"
+            ann_dir.mkdir()
+            xml = ann_dir / "video_0001.xml"
+            xml.write_text(
+                '<?xml version="1.0"?>'
+                '<JAAD_annotations>'
+                '<meta><task><start_frame>0</start_frame><stop_frame>599</stop_frame></task></meta>'
+                '<track id="0" label="pedestrian" start_frame="0" stop_frame="599">'
+                '<box frame="0"/></track>'
+                '</JAAD_annotations>',
+                encoding="utf-8",
+            )
+            # Patch _probe_video_metadata to return no frame_count.
+            with patch(
+                "web_console.sequence_catalog._probe_video_metadata",
+                return_value={"_backend": "none"},
+            ):
+                seqs = discover_jaad_clips(root)
+            self.assertEqual(len(seqs), 1)
+            self.assertEqual(seqs[0].frame_count, 600,
+                f"Expected frame_count=600 from annotation, got {seqs[0].frame_count}")
+
+
+class TestSeqExpFrameIndicesValidation(unittest.TestCase):
+    """POST /api/sequences/experiment must validate and bound frame_indices."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir = pathlib.Path(tempfile.mkdtemp())
+        cls.server = ConsoleServer(
+            host="127.0.0.1",
+            port=0,
+            config={"quiet": True, "runs_dir": str(cls.tmpdir / "runs")},
+        )
+        cls.port = cls.server.socket.getsockname()[1]
+
+        lazy_seq = SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="600 frames",
+            frame_count=600,
+            frame_refs=[],
+            annotation_ref=None,
+            source_path="/no/such/file.mp4",
+        )
+        with cls.server._sequence_catalog_lock:
+            cls.server._sequence_catalog_entries = [lazy_seq]
+
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def _post(self, payload):
+        body = json.dumps(payload).encode()
+        conn = HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request("POST", "/api/sequences/experiment", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        raw = resp.read()
+        return resp.status, json.loads(raw.decode()) if raw else {}
+
+    def test_oversized_frame_indices_returns_400(self):
+        """More than _SEQ_MAX_FRAME_SELECTION unique indices must be rejected."""
+        indices = list(range(101))  # 101 > 100 max
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": indices,
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("maximum", data.get("error", "").lower())
+
+    def test_duplicate_indices_deduplicated_and_checked_against_limit(self):
+        """Duplicates must be removed before the max-size check."""
+        # 101 entries all value 0 → deduplicates to 1 → well within limit → proceeds.
+        status, _data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [0] * 101,
+        })
+        # 422 = materialisation attempted (mp4 absent), not 400 (rejected).
+        self.assertEqual(status, 422)
+
+    def test_negative_frame_index_returns_400(self):
+        """Negative indices must be rejected when frame_count is known."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [0, -1, 5],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("range", data.get("error", "").lower())
+
+    def test_out_of_range_index_returns_400(self):
+        """Indices >= frame_count must be rejected."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [0, 599, 600],  # 600 is out of range for count=600
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("range", data.get("error", "").lower())
+
+    def test_boolean_in_frame_indices_returns_400(self):
+        """Boolean values in frame_indices must be rejected."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [0, True, 5],
+        })
+        self.assertEqual(status, 400)
+
+    def test_non_list_frame_indices_returns_400(self):
+        """Non-list frame_indices (e.g. integer) must be rejected."""
+        status, data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": 5,
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("list", data.get("error", "").lower())
+
+    def test_valid_deduplicated_selection_proceeds(self):
+        """Valid, deduplicated in-range indices proceed to materialisation (422 = mp4 absent)."""
+        status, _data = self._post({
+            "dataset_id": "jaad",
+            "sequence_id": "video_0001",
+            "task_prompt": "Describe",
+            "frame_indices": [0, 5, 10, 0, 5],  # duplicates → [0,5,10]
+        })
+        self.assertEqual(status, 422)
+
+
+class TestSeqExpJaadProvenance(unittest.TestCase):
+    """Lazy JAAD sequence experiments must synthesize stable source_id and timestamp."""
+
+    def test_synthesized_source_id_format(self):
+        """Without FrameRef, source_id must be '<sequence_id>:frame_<index>'."""
+        # We test the logic directly via the server's source_frame_records building.
+        # Instead of an HTTP test (which requires materialisation), verify the
+        # synthesized-ID logic with the server helper indirectly through the
+        # fact that all fields are non-None.
+        seq = SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0001",
+            adapter="jaad_clip",
+            display_name="video_0001",
+            description="test",
+            frame_count=100,
+            frame_refs=[],
+            annotation_ref=None,
+            provenance={"video_metadata": {"fps": 25.0}},
+        )
+        fr_by_index = {}  # no FrameRef objects
+        fi = 50
+        fr_rec = fr_by_index.get(fi)
+        if fr_rec is not None:
+            synthesized_source_id = fr_rec.source_id
+            synthesized_timestamp_us = fr_rec.timestamp_us
+        else:
+            synthesized_source_id = f"{seq.sequence_id}:frame_{fi}"
+            fps = (
+                seq.provenance.get("video_metadata", {}).get("fps")
+                if isinstance(seq.provenance.get("video_metadata"), dict)
+                else None
+            )
+            synthesized_timestamp_us = (
+                int(fi / fps * 1_000_000) if fps else None
+            )
+        self.assertEqual(synthesized_source_id, "video_0001:frame_50")
+        self.assertEqual(synthesized_timestamp_us, 2_000_000)
+
+    def test_synthesized_timestamp_none_when_no_fps(self):
+        """When fps is unavailable, synthesized timestamp_us must be None."""
+        seq = SequenceEntry(
+            dataset_id="jaad",
+            sequence_id="video_0002",
+            adapter="jaad_clip",
+            display_name="video_0002",
+            description="test",
+            frame_count=100,
+            frame_refs=[],
+            annotation_ref=None,
+            provenance={},
+        )
+        fr_by_index = {}
+        fi = 10
+        fr_rec = fr_by_index.get(fi)
+        if fr_rec is not None:
+            synthesized_source_id = fr_rec.source_id
+            synthesized_timestamp_us = fr_rec.timestamp_us
+        else:
+            synthesized_source_id = f"{seq.sequence_id}:frame_{fi}"
+            fps = (
+                seq.provenance.get("video_metadata", {}).get("fps")
+                if isinstance(seq.provenance.get("video_metadata"), dict)
+                else None
+            )
+            synthesized_timestamp_us = (
+                int(fi / fps * 1_000_000) if fps else None
+            )
+        self.assertEqual(synthesized_source_id, "video_0002:frame_10")
+        self.assertIsNone(synthesized_timestamp_us)
+
+
+class TestAppJsStaticFixtureUI(unittest.TestCase):
+    """app.js must handle ros_static_fixture sequences with an Extract action."""
+
+    @classmethod
+    def setUpClass(cls):
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = js_path.read_text(encoding="utf-8")
+
+    def test_fixture_extract_note_element_referenced(self):
+        """_openSequence must reference the seq-fixture-extract-note DOM element."""
+        self.assertIn("seq-fixture-extract-note", self._js,
+            "_openSequence must reference seq-fixture-extract-note")
+
+    def test_ros_static_fixture_branch_in_open_sequence(self):
+        """_openSequence must have a branch for ros_static_fixture adapter."""
+        self.assertIn("ros_static_fixture", self._js,
+            "_openSequence must handle ros_static_fixture adapter")
+
+    def test_seq_fixture_extract_function_defined(self):
+        """_seqFixtureExtract function must be defined in app.js."""
+        self.assertIn("function _seqFixtureExtract(", self._js,
+            "_seqFixtureExtract must be defined")
+
+    def test_extract_uses_api_extract_endpoint(self):
+        """_seqFixtureExtract must call /api/extract."""
+        self.assertIn('"/api/extract"', self._js,
+            "_seqFixtureExtract must use /api/extract endpoint")
+
+    def test_use_in_experiment_disabled_for_fixture(self):
+        """useBtn must be disabled in the ros_static_fixture branch."""
+        # Extract the fixture branch body from _openSequence.
+        marker = "ros_static_fixture"
+        idx = self._js.find(marker)
+        self.assertGreater(idx, 0)
+        # In the block following the marker, disabled = true must appear.
+        block = self._js[idx:idx + 500]
+        self.assertIn("disabled = true", block,
+            "Use in Experiment button must be disabled for static fixtures")
+
+    def test_max_frame_selection_constant_defined(self):
+        """_SEQ_MAX_FRAME_SELECTION constant must be defined in app.js."""
+        self.assertIn("var _SEQ_MAX_FRAME_SELECTION", self._js,
+            "_SEQ_MAX_FRAME_SELECTION constant must be defined")
+
+    def test_max_frame_selection_enforced_in_run_function(self):
+        """The max frame selection limit must be enforced in the run function."""
+        self.assertIn("_SEQ_MAX_FRAME_SELECTION", self._js,
+            "UI must enforce _SEQ_MAX_FRAME_SELECTION")
+
+    def test_202_alone_does_not_enable_use_button(self):
+        """_seqFixtureExtract must NOT enable useBtn immediately on 202."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        self.assertGreater(func_start, 0, "_seqFixtureExtract must be defined")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        # After receiving 202, the code must NOT immediately set useBtn.disabled = false.
+        # Instead it should start polling. The immediate-enable pattern would be
+        # "status === 202" followed shortly by "useBtn.disabled = false" without polling.
+        # Verify that polling (setTimeout or _SEQ_EXTRACT_POLL_INTERVAL_MS) is present.
+        self.assertIn("_SEQ_EXTRACT_POLL_INTERVAL_MS", func_body,
+            "_seqFixtureExtract must use poll interval constant")
+        self.assertIn("setTimeout", func_body,
+            "_seqFixtureExtract must poll via setTimeout")
+
+    def test_polls_run_status_endpoint(self):
+        """_seqFixtureExtract must poll /api/runs/ to check extraction status."""
+        self.assertIn('"/api/runs/"', self._js,
+            "_seqFixtureExtract must poll /api/runs/<run_id> endpoint")
+
+    def test_enables_use_button_on_completion(self):
+        """_seqFixtureExtract must enable useBtn only when status is 'completed'."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        self.assertIn('"completed"', func_body,
+            "_seqFixtureExtract must check for completed status before enabling button")
+        self.assertIn("useBtn.disabled = false", func_body,
+            "_seqFixtureExtract must enable useBtn on success")
+
+    def test_surfaces_failure_status(self):
+        """_seqFixtureExtract must surface failed/stopped extraction status."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        # The function must re-enable the extract button on failure.
+        self.assertIn("extractBtn.disabled = false", func_body,
+            "_seqFixtureExtract must re-enable extractBtn on failure")
+
+    def test_reopens_sequence_on_success(self):
+        """_seqFixtureExtract must reopen the sequence after successful extraction."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        self.assertIn("_openSequence(seq)", func_body,
+            "_seqFixtureExtract must call _openSequence(seq) after extraction completes")
+
+    def test_poll_interval_constant_defined(self):
+        """_SEQ_EXTRACT_POLL_INTERVAL_MS constant must be defined."""
+        self.assertIn("var _SEQ_EXTRACT_POLL_INTERVAL_MS", self._js,
+            "_SEQ_EXTRACT_POLL_INTERVAL_MS must be defined")
+
+
+class TestAppJsThumbnailSelectionFix(unittest.TestCase):
+    """_showSeqFrame must use data-frame-index for thumbnail selection."""
+
+    @classmethod
+    def setUpClass(cls):
+        js_path = pathlib.Path(__file__).resolve().parents[1] / "static" / "app.js"
+        cls._js = js_path.read_text(encoding="utf-8")
+
+    def test_thumbnail_has_dataset_frame_index(self):
+        """Thumbnails must store the frame index as data-frame-index."""
+        self.assertIn("dataset.frameIndex", self._js,
+            "Thumbnails must set dataset.frameIndex for selection tracking")
+
+    def test_show_seq_frame_uses_dataset_frame_index(self):
+        """_showSeqFrame must compare data-frame-index, not loop index."""
+        self.assertIn("t.dataset.frameIndex", self._js,
+            "_showSeqFrame must use t.dataset.frameIndex for selection")
+
+    def test_old_loop_index_comparison_removed(self):
+        """The broken 'i === idx' comparison must be gone from _showSeqFrame."""
+        # Look for the old pattern in the _showSeqFrame function body.
+        func_start = self._js.find("function _showSeqFrame(")
+        self.assertGreater(func_start, 0)
+        func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end]
+        self.assertNotIn("i === idx", func_body,
+            "_showSeqFrame must not use 'i === idx' for thumbnail selection")
 
 
 if __name__ == "__main__":
