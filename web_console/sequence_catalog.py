@@ -378,17 +378,43 @@ def discover_nuscenes_scenes(
     if not scene_table or not sample_table or not sample_data_table:
         return sequences
 
+    # Load calibrated_sensor and sensor tables to resolve channel names.
+    # These are optional — fall back to the synthetic "channel" field if absent
+    # (supports legacy test fixtures that embed channel directly).
+    calibrated_sensor_table = _load_nuscenes_table(meta_dir, "calibrated_sensor")
+    sensor_table = _load_nuscenes_table(meta_dir, "sensor")
+
+    # Build calibrated_sensor_token -> channel mapping via the canonical chain:
+    #   sample_data.calibrated_sensor_token
+    #   -> calibrated_sensor.sensor_token
+    #   -> sensor.channel
+    cs_token_to_channel: Dict[str, str] = {}
+    if calibrated_sensor_table and sensor_table:
+        sensor_index = _build_token_index(sensor_table)
+        for cs in calibrated_sensor_table:
+            cs_tok = str(cs.get("token", ""))
+            sensor_tok = str(cs.get("sensor_token", ""))
+            sensor_rec = sensor_index.get(sensor_tok)
+            if cs_tok and sensor_rec:
+                cs_token_to_channel[cs_tok] = str(sensor_rec.get("channel", ""))
+
     # Build indices.
     sample_index = _build_token_index(sample_table)
     sample_data_index = _build_token_index(sample_data_table)
 
     # Build per-sample → CAM_FRONT keyframe sample_data token mapping.
+    # Channel resolution priority:
+    #   1. Canonical: calibrated_sensor_token -> sensor.channel (real nuScenes)
+    #   2. Legacy fallback: sample_data["channel"] (synthetic fixtures only)
     cam_front_by_sample: Dict[str, str] = {}
     for sd in sample_data_table:
-        if (
-            sd.get("channel") == channel
-            and sd.get("is_key_frame")
-        ):
+        cs_tok = str(sd.get("calibrated_sensor_token", ""))
+        if cs_tok and cs_token_to_channel:
+            resolved_channel = cs_token_to_channel.get(cs_tok, "")
+        else:
+            # Legacy synthetic fixture: channel embedded directly on record.
+            resolved_channel = str(sd.get("channel", ""))
+        if resolved_channel == channel and sd.get("is_key_frame"):
             stok = str(sd.get("sample_token", ""))
             if stok:
                 cam_front_by_sample[stok] = str(sd.get("token", ""))
@@ -405,6 +431,7 @@ def discover_nuscenes_scenes(
 
         description = str(scene_rec.get("description", ""))
         frame_refs: List[FrameRef] = []
+        missing_files = 0
 
         # Walk the sample linked list starting from first_sample_token.
         current_token = str(scene_rec.get("first_sample_token", ""))
@@ -422,16 +449,19 @@ def discover_nuscenes_scenes(
                 if sd_rec:
                     filename = str(sd_rec.get("filename", ""))
                     # Resolve and validate source path.
+                    src = None
                     if filename:
                         try:
-                            src = _assert_within_root(
+                            candidate = _assert_within_root(
                                 nuscenes_root / filename,
                                 nuscenes_root,
                             )
+                            if candidate.exists():
+                                src = candidate
+                            else:
+                                missing_files += 1
                         except ValueError:
                             src = None
-                    else:
-                        src = None
                     frame_refs.append(
                         FrameRef(
                             index=len(frame_refs),
@@ -453,6 +483,15 @@ def discover_nuscenes_scenes(
 
             current_token = str(sample_rec.get("next", ""))
 
+        provenance: Dict[str, Any] = {
+            "source": "nuscenes-mini",
+            "scene_token": str(scene_rec.get("token", "")),
+            "scene_name": scene_name,
+            "channel": channel,
+        }
+        if missing_files:
+            provenance["missing_files"] = missing_files
+
         sequences.append(
             SequenceEntry(
                 dataset_id=dataset_id,
@@ -463,12 +502,7 @@ def discover_nuscenes_scenes(
                 frame_count=len(frame_refs),
                 frame_refs=frame_refs,
                 annotation_ref=None,
-                provenance={
-                    "source": "nuscenes-mini",
-                    "scene_token": str(scene_rec.get("token", "")),
-                    "scene_name": scene_name,
-                    "channel": channel,
-                },
+                provenance=provenance,
             )
         )
 

@@ -5641,8 +5641,18 @@ class TestNuScenesSceneAdapter(unittest.TestCase):
     _SD_B0 = "sdB0"
     _SD_B1 = "sdB1"
 
+    # Canonical sensor/calibrated_sensor tokens (no synthetic "channel" field).
+    _SENSOR_CAM_FRONT = "sensorCAMFRONT"
+    _CS_TOKEN = "csTokenCAMFRONT"
+
     def _make_nuscenes_dir(self, tmp: pathlib.Path) -> pathlib.Path:
-        """Write a minimal nuScenes-mini fixture under *tmp*."""
+        """Write a minimal nuScenes-mini fixture under *tmp*.
+
+        Uses the canonical relationship chain
+        ``sample_data.calibrated_sensor_token → calibrated_sensor.sensor_token
+        → sensor.channel`` rather than a synthetic ``channel`` field so that
+        tests exercise the same code path as real nuScenes data.
+        """
         meta = tmp / "v1.0-mini"
         meta.mkdir(parents=True)
         # scene.json
@@ -5711,58 +5721,97 @@ class TestNuScenesSceneAdapter(unittest.TestCase):
 
         # Create image stubs for scene A.
         (tmp / "samples" / "CAM_FRONT").mkdir(parents=True, exist_ok=True)
+        for fname in ("img_A0.jpg", "img_A1.jpg", "img_A2.jpg", "img_B0.jpg", "img_B1.jpg"):
+            (tmp / "samples" / "CAM_FRONT" / fname).write_bytes(b"")
 
-        # sample_data.json
+        # sensor.json — canonical channel lookup table (no "channel" field on
+        # sample_data; mirrors the real nuScenes schema).
+        sensors = [
+            {"token": self._SENSOR_CAM_FRONT, "channel": "CAM_FRONT", "modality": "camera"},
+        ]
+        (meta / "sensor.json").write_text(json.dumps(sensors), encoding="utf-8")
+
+        # calibrated_sensor.json — maps cs_token → sensor_token.
+        calibrated_sensors = [
+            {
+                "token": self._CS_TOKEN,
+                "sensor_token": self._SENSOR_CAM_FRONT,
+                "translation": [1.72, 0.0, 1.49],
+                "rotation": [0.5, -0.5, 0.5, -0.5],
+                "camera_intrinsic": [],
+            },
+        ]
+        (meta / "calibrated_sensor.json").write_text(
+            json.dumps(calibrated_sensors), encoding="utf-8"
+        )
+
+        # sample_data.json — intentionally omits "channel" field to match real
+        # nuScenes; channel is resolved via calibrated_sensor_token chain.
         sample_data = [
             {
                 "token": self._SD_A0,
                 "sample_token": self._SAMPLE_S0,
+                "calibrated_sensor_token": self._CS_TOKEN,
                 "filename": "samples/CAM_FRONT/img_A0.jpg",
                 "timestamp": 1000100,
                 "is_key_frame": True,
-                "channel": "CAM_FRONT",
                 "width": 1600,
                 "height": 900,
+                "prev": "",
+                "next": self._SD_A1,
+                "ego_pose_token": "ep0",
             },
             {
                 "token": self._SD_A1,
                 "sample_token": self._SAMPLE_S1,
+                "calibrated_sensor_token": self._CS_TOKEN,
                 "filename": "samples/CAM_FRONT/img_A1.jpg",
                 "timestamp": 1500100,
                 "is_key_frame": True,
-                "channel": "CAM_FRONT",
                 "width": 1600,
                 "height": 900,
+                "prev": self._SD_A0,
+                "next": self._SD_A2,
+                "ego_pose_token": "ep1",
             },
             {
                 "token": self._SD_A2,
                 "sample_token": self._SAMPLE_S2,
+                "calibrated_sensor_token": self._CS_TOKEN,
                 "filename": "samples/CAM_FRONT/img_A2.jpg",
                 "timestamp": 2000100,
                 "is_key_frame": True,
-                "channel": "CAM_FRONT",
                 "width": 1600,
                 "height": 900,
+                "prev": self._SD_A1,
+                "next": "",
+                "ego_pose_token": "ep2",
             },
             {
                 "token": self._SD_B0,
                 "sample_token": self._SAMPLE_S3,
+                "calibrated_sensor_token": self._CS_TOKEN,
                 "filename": "samples/CAM_FRONT/img_B0.jpg",
                 "timestamp": 3000100,
                 "is_key_frame": True,
-                "channel": "CAM_FRONT",
                 "width": 1600,
                 "height": 900,
+                "prev": "",
+                "next": self._SD_B1,
+                "ego_pose_token": "ep3",
             },
             {
                 "token": self._SD_B1,
                 "sample_token": self._SAMPLE_S4,
+                "calibrated_sensor_token": self._CS_TOKEN,
                 "filename": "samples/CAM_FRONT/img_B1.jpg",
                 "timestamp": 3500100,
                 "is_key_frame": True,
-                "channel": "CAM_FRONT",
                 "width": 1600,
                 "height": 900,
+                "prev": self._SD_B0,
+                "next": "",
+                "ego_pose_token": "ep4",
             },
         ]
         (meta / "sample_data.json").write_text(
@@ -5881,6 +5930,52 @@ class TestNuScenesSceneAdapter(unittest.TestCase):
             fr0 = scene_a.frame_refs[0]
             # source_path must be empty (traversal was rejected).
             self.assertEqual(fr0.source_path, "")
+
+    def test_canonical_channel_resolution_no_channel_field(self):
+        """Channel must be resolved via calibrated_sensor→sensor chain.
+
+        This test uses records where sample_data intentionally has NO
+        'channel' field, mirroring the real nuScenes schema.  Discovery
+        must still find all CAM_FRONT keyframes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            # Confirm sample_data has no synthetic 'channel' field.
+            meta = root / "v1.0-mini"
+            sd_records = json.loads((meta / "sample_data.json").read_text())
+            for rec in sd_records:
+                self.assertNotIn(
+                    "channel", rec,
+                    "Test fixture must not embed a synthetic 'channel' field",
+                )
+            seqs = discover_nuscenes_scenes(root)
+            by_name = {s.sequence_id: s for s in seqs}
+            self.assertIn("scene-0553", by_name)
+            self.assertIn("scene-1100", by_name)
+            # All keyframes found via canonical chain.
+            self.assertEqual(by_name["scene-0553"].frame_count, 3)
+            self.assertEqual(by_name["scene-1100"].frame_count, 2)
+
+    def test_missing_file_count_in_provenance(self):
+        """Provenance must include 'missing_files' when image files are absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            # Remove one image file to trigger a missing-file count.
+            (root / "samples" / "CAM_FRONT" / "img_A0.jpg").unlink()
+            seqs = discover_nuscenes_scenes(root)
+            scene_a = next(s for s in seqs if s.sequence_id == "scene-0553")
+            self.assertIn("missing_files", scene_a.provenance)
+            self.assertEqual(scene_a.provenance["missing_files"], 1)
+            # Frame is still added, but source_path is empty.
+            self.assertEqual(scene_a.frame_refs[0].source_path, "")
+
+    def test_no_missing_files_key_when_all_present(self):
+        """Provenance must NOT include 'missing_files' when all images exist."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._make_nuscenes_dir(pathlib.Path(tmp))
+            seqs = discover_nuscenes_scenes(root)
+            for s in seqs:
+                self.assertNotIn("missing_files", s.provenance)
 
 
 class TestJaadClipAdapter(unittest.TestCase):
