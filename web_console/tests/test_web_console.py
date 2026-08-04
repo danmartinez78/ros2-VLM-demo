@@ -7748,6 +7748,66 @@ class TestAppJsStaticFixtureUI(unittest.TestCase):
         self.assertIn("_SEQ_MAX_FRAME_SELECTION", self._js,
             "UI must enforce _SEQ_MAX_FRAME_SELECTION")
 
+    def test_202_alone_does_not_enable_use_button(self):
+        """_seqFixtureExtract must NOT enable useBtn immediately on 202."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        self.assertGreater(func_start, 0, "_seqFixtureExtract must be defined")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        # After receiving 202, the code must NOT immediately set useBtn.disabled = false.
+        # Instead it should start polling. The immediate-enable pattern would be
+        # "status === 202" followed shortly by "useBtn.disabled = false" without polling.
+        # Verify that polling (setTimeout or _SEQ_EXTRACT_POLL_INTERVAL_MS) is present.
+        self.assertIn("_SEQ_EXTRACT_POLL_INTERVAL_MS", func_body,
+            "_seqFixtureExtract must use poll interval constant")
+        self.assertIn("setTimeout", func_body,
+            "_seqFixtureExtract must poll via setTimeout")
+
+    def test_polls_run_status_endpoint(self):
+        """_seqFixtureExtract must poll /api/runs/ to check extraction status."""
+        self.assertIn('"/api/runs/"', self._js,
+            "_seqFixtureExtract must poll /api/runs/<run_id> endpoint")
+
+    def test_enables_use_button_on_completion(self):
+        """_seqFixtureExtract must enable useBtn only when status is 'completed'."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        self.assertIn('"completed"', func_body,
+            "_seqFixtureExtract must check for completed status before enabling button")
+        self.assertIn("useBtn.disabled = false", func_body,
+            "_seqFixtureExtract must enable useBtn on success")
+
+    def test_surfaces_failure_status(self):
+        """_seqFixtureExtract must surface failed/stopped extraction status."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        # The function must re-enable the extract button on failure.
+        self.assertIn("extractBtn.disabled = false", func_body,
+            "_seqFixtureExtract must re-enable extractBtn on failure")
+
+    def test_reopens_sequence_on_success(self):
+        """_seqFixtureExtract must reopen the sequence after successful extraction."""
+        func_start = self._js.find("async function _seqFixtureExtract(")
+        func_end = self._js.find("\nasync function ", func_start + 1)
+        if func_end == -1:
+            func_end = self._js.find("\nfunction ", func_start + 1)
+        func_body = self._js[func_start:func_end] if func_end != -1 else self._js[func_start:]
+        self.assertIn("_openSequence(seq)", func_body,
+            "_seqFixtureExtract must call _openSequence(seq) after extraction completes")
+
+    def test_poll_interval_constant_defined(self):
+        """_SEQ_EXTRACT_POLL_INTERVAL_MS constant must be defined."""
+        self.assertIn("var _SEQ_EXTRACT_POLL_INTERVAL_MS", self._js,
+            "_SEQ_EXTRACT_POLL_INTERVAL_MS must be defined")
+
 
 class TestAppJsThumbnailSelectionFix(unittest.TestCase):
     """_showSeqFrame must use data-frame-index for thumbnail selection."""

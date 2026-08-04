@@ -1784,7 +1784,7 @@ async function _openSequence(seq) {
       extractNoteEl.innerHTML = "";
       var noteMsg = _el("span", "muted", "This is a static-fixture bag. Extract it first to view frames and run experiments. ");
       var extractBtn = _el("button", "small", "Extract Frames");
-      extractBtn.addEventListener("click", function() { _seqFixtureExtract(bagKey, extractBtn, useBtn); });
+      extractBtn.addEventListener("click", function() { _seqFixtureExtract(bagKey, extractBtn, useBtn, seq); });
       extractNoteEl.appendChild(noteMsg);
       extractNoteEl.appendChild(extractBtn);
     }
@@ -1820,20 +1820,52 @@ async function _openSequence(seq) {
 }
 
 /** Trigger frame extraction for a static-fixture bag from the catalog detail panel. */
-async function _seqFixtureExtract(bagKey, extractBtn, useBtn) {
+/** Interval (ms) between polling requests while waiting for extraction to finish. */
+var _SEQ_EXTRACT_POLL_INTERVAL_MS = 2000;
+
+async function _seqFixtureExtract(bagKey, extractBtn, useBtn, seq) {
   extractBtn.disabled = true;
   extractBtn.textContent = "Extracting…";
   try {
     var resp = await _apiPost("/api/extract", { bag_key: bagKey });
-    if (resp.status === 202) {
-      extractBtn.textContent = "Extraction started";
-      if (useBtn) {
-        useBtn.disabled = false;
-        useBtn.title = "";
-      }
-    } else {
+    if (resp.status !== 202) {
       extractBtn.textContent = "Error: " + ((resp.body && resp.body.error) || resp.status);
       extractBtn.disabled = false;
+      return;
+    }
+    var runId = resp.body && resp.body.run_id;
+    if (!runId) {
+      extractBtn.textContent = "Error: no run_id in response";
+      extractBtn.disabled = false;
+      return;
+    }
+    // Poll run status until terminal.
+    extractBtn.textContent = "Extracting… (polling)";
+    var terminalStatuses = ["completed", "failed", "stopped"];
+    while (true) {
+      await new Promise(function(resolve) { setTimeout(resolve, _SEQ_EXTRACT_POLL_INTERVAL_MS); });
+      var statusResp = await fetch("/api/runs/" + runId);
+      if (statusResp.status !== 200) {
+        extractBtn.textContent = "Error: failed to poll run status";
+        extractBtn.disabled = false;
+        return;
+      }
+      var run = await statusResp.json();
+      if (terminalStatuses.indexOf(run.status) !== -1) {
+        if (run.status === "completed") {
+          extractBtn.textContent = "Extraction complete";
+          if (useBtn) {
+            useBtn.disabled = false;
+            useBtn.title = "";
+          }
+          // Refresh the sequence viewer so the extracted frame appears.
+          if (seq) { _openSequence(seq); }
+        } else {
+          extractBtn.textContent = "Extraction " + run.status;
+          extractBtn.disabled = false;
+        }
+        return;
+      }
     }
   } catch (e) {
     extractBtn.textContent = "Error";
