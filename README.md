@@ -134,6 +134,46 @@ rviz2 -d "$HOME/ros2-VLM-demo/rviz/vision_reasoning_results.rviz"
 
 Paths supplied to ROS must be absolute; `~` is not expanded.
 
+## Thor tracked-observation one-command bring-up
+
+Terminal 1:
+
+```bash
+cd "$HOME/ros2-VLM-demo"
+source scripts/edge_vlm_env.sh
+source "$ROS_WORKSPACE/install/setup.bash"
+
+ros2 launch edge_vlm_ros thor_tracked_observation.launch.py \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
+  edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH"
+```
+
+This single command starts the existing Edge-LLM worker + ROS VLM node, the
+tracked-observation adapter, the repository-owned Isaac ROS RT-DETR launch, and
+RViz2. By default it uses `use_sim_time:=true`, subscribes to
+`/camera0/color/image_raw`, publishes detections on `/detections`, tracked
+observations on `/tracked_observation`, and reasoning output on `/vlm/result`.
+
+Terminal 2 (separate rosbag playback):
+
+```bash
+source /opt/ros/jazzy/setup.bash
+ros2 bag play \
+  /home/daniel/ros2-VLM-demo/test_data/rosbags/nvblox/isaac_ros_nvblox/galileo_people_3_2 \
+  --clock --loop
+```
+
+Optional overrides:
+- `image_topic:=...`
+- `detections_topic:=...`
+- `tracked_observation_topic:=...`
+- `enable_rviz:=false`
+- `use_sim_time:=false`
+
+The launch fails early with a clear error if Isaac ROS RT-DETR, RViz2, the RViz
+config, or any required engine/plugin path is missing.
+
 ## NVIDIA test data
 
 Download or inspect the supported NVIDIA quickstart assets:
