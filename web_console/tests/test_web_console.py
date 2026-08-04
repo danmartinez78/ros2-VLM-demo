@@ -5923,13 +5923,14 @@ class TestNuScenesSceneAdapter(unittest.TestCase):
             (meta / "sample_data.json").write_text(
                 json.dumps(sd_data), encoding="utf-8"
             )
-            # Discovery must not crash; the offending frame gets an empty source_path.
+            # Discovery must not crash; the offending frame must be excluded entirely.
             seqs = discover_nuscenes_scenes(root)
             self.assertTrue(len(seqs) > 0)
             scene_a = next(s for s in seqs if s.sequence_id == "scene-0553")
-            fr0 = scene_a.frame_refs[0]
-            # source_path must be empty (traversal was rejected).
-            self.assertEqual(fr0.source_path, "")
+            # Path-traversal frame excluded; 2 valid frames remain.
+            self.assertEqual(scene_a.frame_count, 2)
+            for fr in scene_a.frame_refs:
+                self.assertNotIn("..", fr.source_path)
 
     def test_canonical_channel_resolution_no_channel_field(self):
         """Channel must be resolved via calibrated_sensor→sensor chain.
@@ -5966,8 +5967,9 @@ class TestNuScenesSceneAdapter(unittest.TestCase):
             scene_a = next(s for s in seqs if s.sequence_id == "scene-0553")
             self.assertIn("missing_files", scene_a.provenance)
             self.assertEqual(scene_a.provenance["missing_files"], 1)
-            # Frame is still added, but source_path is empty.
-            self.assertEqual(scene_a.frame_refs[0].source_path, "")
+            # Missing file must be excluded from frame_refs entirely.
+            self.assertEqual(scene_a.frame_count, 2)
+            self.assertTrue(all(fr.source_path != "" for fr in scene_a.frame_refs))
 
     def test_no_missing_files_key_when_all_present(self):
         """Provenance must NOT include 'missing_files' when all images exist."""

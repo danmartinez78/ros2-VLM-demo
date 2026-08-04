@@ -461,25 +461,26 @@ def discover_nuscenes_scenes(
                             else:
                                 missing_files += 1
                         except ValueError:
-                            src = None
-                    frame_refs.append(
-                        FrameRef(
-                            index=len(frame_refs),
-                            source_id=sd_token,
-                            timestamp_us=int(sd_rec.get("timestamp", 0)) or None,
-                            source_path=str(src) if src else "",
-                            metadata={
-                                "sample_token": current_token,
-                                "sample_data_token": sd_token,
-                                "channel": channel,
-                                "filename": filename,
-                                "width": sd_rec.get("width"),
-                                "height": sd_rec.get("height"),
-                                "scene_token": str(scene_rec.get("token", "")),
-                                "scene_name": scene_name,
-                            },
+                            pass
+                    if src is not None:
+                        frame_refs.append(
+                            FrameRef(
+                                index=len(frame_refs),
+                                source_id=sd_token,
+                                timestamp_us=int(sd_rec.get("timestamp", 0)) or None,
+                                source_path=str(src),
+                                metadata={
+                                    "sample_token": current_token,
+                                    "sample_data_token": sd_token,
+                                    "channel": channel,
+                                    "filename": filename,
+                                    "width": sd_rec.get("width"),
+                                    "height": sd_rec.get("height"),
+                                    "scene_token": str(scene_rec.get("token", "")),
+                                    "scene_name": scene_name,
+                                },
+                            )
                         )
-                    )
 
             current_token = str(sample_rec.get("next", ""))
 
