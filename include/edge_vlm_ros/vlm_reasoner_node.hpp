@@ -98,8 +98,13 @@ private:
     const std_msgs::msg::Header & header,
     uint64_t frame_seq,
     const InferenceResponse & resp,
+    const std::string & effective_prompt);
+  void publish_result(
+    const std_msgs::msg::Header & header,
+    uint64_t frame_seq,
+    const InferenceResponse & resp,
     const std::string & effective_prompt,
-    const ResultMetadata & metadata = {});
+    const ResultMetadata & metadata);
 
   // ── Prompt/history configuration helpers ─────────────────────────────────
   std::string render_effective_prompt(

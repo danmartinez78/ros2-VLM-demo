@@ -55,7 +55,8 @@ public:
     bool class_aware{true};
   };
 
-  explicit IouTracker(Options options = {})
+  IouTracker() = default;
+  explicit IouTracker(Options options)
   : options_(options) {}
 
   std::vector<TrackState> update(const std::vector<TrackedBox> & detections)

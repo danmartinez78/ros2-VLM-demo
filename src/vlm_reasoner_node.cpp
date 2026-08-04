@@ -1206,6 +1206,15 @@ void VlmReasonerNode::publish_result(
   const std_msgs::msg::Header & header,
   uint64_t frame_seq,
   const InferenceResponse & resp,
+  const std::string & effective_prompt)
+{
+  publish_result(header, frame_seq, resp, effective_prompt, ResultMetadata{});
+}
+
+void VlmReasonerNode::publish_result(
+  const std_msgs::msg::Header & header,
+  uint64_t frame_seq,
+  const InferenceResponse & resp,
   const std::string & effective_prompt,
   const ResultMetadata & metadata)
 {
