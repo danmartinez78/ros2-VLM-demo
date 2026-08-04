@@ -25,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <thread>
 #include <unordered_map>
 #include <utility>
@@ -125,6 +126,8 @@ private:
   double min_vlm_interval_seconds_{0.0};
   bool have_last_time_{false};
   bool have_last_vlm_time_{false};
+  bool worker_has_active_frame_{false};
+  uint64_t active_source_sequence_{0};
 
   // ── Parameters (cached after validate_parameters) ───────────────────────
   std::string source_topic_;
@@ -155,6 +158,7 @@ private:
   std::string tracked_observation_topic_;
   uint64_t last_completed_source_sequence_{0};
   bool have_last_completed_source_sequence_{false};
+  std::unordered_set<uint64_t> accepted_source_sequences_;
 
   // ── Worker thread and synchronisation ───────────────────────────────────
   std::thread worker_thread_;

@@ -909,9 +909,27 @@ void VlmReasonerNode::worker_loop()
         break;
       }
       dropped_before_this_frame = stats_.dropped;
+      if (min_vlm_interval_seconds_ > 0.0 && have_last_vlm_time_) {
+        const double elapsed = (this->now() - last_vlm_time_).seconds();
+        if (elapsed >= 0.0 && elapsed < min_vlm_interval_seconds_) {
+          const auto wait_for = std::chrono::duration<double>(min_vlm_interval_seconds_ - elapsed);
+          queue_cv_.wait_for(lock, wait_for, [this] {
+            return !worker_running_;
+          });
+          continue;
+        }
+      }
+
       frame = *pending_frame_;
       pending_frame_.reset();
+      if (frame.metadata.source_sequence != 0) {
+        worker_has_active_frame_ = true;
+        active_source_sequence_ = frame.metadata.source_sequence;
+      }
     }
+
+    last_vlm_time_ = this->now();
+    have_last_vlm_time_ = true;
 
     // ── record dequeue wall time ──────────────────────────────────────────
     const int64_t dequeue_wall_ns = benchmark_out_ ?
@@ -937,6 +955,12 @@ void VlmReasonerNode::worker_loop()
       const std::string effective_prompt = render_effective_prompt(frame.seq, structured);
       update_observation_history_after_response(resp, effective_prompt);
       publish_result(frame.result_header, frame.seq, resp, effective_prompt, frame.metadata);
+      if (frame.metadata.source_sequence != 0) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        worker_has_active_frame_ = false;
+        active_source_sequence_ = 0;
+        accepted_source_sequences_.erase(frame.metadata.source_sequence);
+      }
       continue;
     }
 
@@ -1007,6 +1031,10 @@ void VlmReasonerNode::worker_loop()
     update_observation_history_after_response(resp, effective_prompt);
     publish_result(frame.result_header, frame.seq, resp, effective_prompt, frame.metadata);
     if (frame.metadata.source_sequence != 0) {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      worker_has_active_frame_ = false;
+      active_source_sequence_ = 0;
+      accepted_source_sequences_.erase(frame.metadata.source_sequence);
       have_last_completed_source_sequence_ = true;
       last_completed_source_sequence_ = frame.metadata.source_sequence;
     }
@@ -1105,13 +1133,6 @@ void VlmReasonerNode::tracked_observation_callback(
 {
   ++stats_.received;
 
-  if (
-    have_last_completed_source_sequence_ &&
-    msg->source_sequence <= last_completed_source_sequence_)
-  {
-    return;
-  }
-
   const rclcpp::Time msg_time(msg->source_stamp, RCL_ROS_TIME);
   if (sample_period_seconds_ > 0.0 && have_last_time_) {
     const double elapsed = (msg_time - last_sampled_time_).seconds();
@@ -1123,18 +1144,9 @@ void VlmReasonerNode::tracked_observation_callback(
   }
 
   const rclcpp::Time now = this->now();
-  if (min_vlm_interval_seconds_ > 0.0 && have_last_vlm_time_) {
-    const double elapsed = (now - last_vlm_time_).seconds();
-    if (elapsed < min_vlm_interval_seconds_) {
-      return;
-    }
-  }
 
   last_sampled_time_ = msg_time;
   have_last_time_ = true;
-  last_vlm_time_ = now;
-  have_last_vlm_time_ = true;
-  ++stats_.sampled;
 
   const int64_t subscribe_wall_ns = benchmark_out_ ?
     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1149,9 +1161,23 @@ void VlmReasonerNode::tracked_observation_callback(
   metadata.observation_age_seconds =
     std::max(0.0, (now - rclcpp::Time(msg->source_stamp, RCL_ROS_TIME)).seconds());
 
+  bool accepted = false;
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (
+      msg->source_sequence != 0 &&
+      ((have_last_completed_source_sequence_ &&
+      msg->source_sequence <= last_completed_source_sequence_) ||
+      accepted_source_sequences_.count(msg->source_sequence) > 0 ||
+      (worker_has_active_frame_ && msg->source_sequence == active_source_sequence_)))
+    {
+      return;
+    }
+
     if (pending_frame_.has_value() && drop_old_frames_) {
+      if (pending_frame_->metadata.source_sequence != 0) {
+        accepted_source_sequences_.erase(pending_frame_->metadata.source_sequence);
+      }
       ++stats_.dropped;
     }
     PendingFrame frame;
@@ -1161,8 +1187,15 @@ void VlmReasonerNode::tracked_observation_callback(
     frame.subscribe_wall_ns = subscribe_wall_ns;
     frame.metadata = std::move(metadata);
     pending_frame_ = std::move(frame);
+    if (msg->source_sequence != 0) {
+      accepted_source_sequences_.insert(msg->source_sequence);
+    }
+    accepted = true;
   }
-  queue_cv_.notify_one();
+  if (accepted) {
+    ++stats_.sampled;
+    queue_cv_.notify_one();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -167,7 +167,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             'sample_period_seconds',
-            default_value='0.0',
+            default_value='2.0',
             description='Seconds between sampled frames (uses message timestamp)',
         ),
         DeclareLaunchArgument(
