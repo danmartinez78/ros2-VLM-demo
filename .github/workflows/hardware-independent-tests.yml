@@ -92,7 +92,7 @@ jobs:
       - name: Install package rosdep dependencies
         timeout-minutes: 3
         run: |
-          rosdep update --rosdistro "${ROS_DISTRO}" --quiet
+          rosdep update --rosdistro "${ROS_DISTRO}"
           rosdep install \
             --from-paths . \
             --ignore-src \
