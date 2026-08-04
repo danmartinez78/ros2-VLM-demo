@@ -22,8 +22,10 @@ find_package(Qt5 QUIET COMPONENTS Core Gui Widgets)
 
 # ── Custom message ────────────────────────────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/TrackedObject.msg"
+  "msg/TrackedObservation.msg"
   "msg/VlmResult.msg"
-  DEPENDENCIES std_msgs builtin_interfaces
+  DEPENDENCIES std_msgs builtin_interfaces sensor_msgs
 )
 
 # ── TensorRT Edge-LLM integration ─────────────────────────────────────────────
@@ -520,6 +522,20 @@ if(BUILD_TESTING)
     test/test_inference_watchdog.cpp
   )
   target_include_directories(test_inference_watchdog PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  ament_add_gtest(test_latest_value_stage
+    test/test_latest_value_stage.cpp
+  )
+  target_include_directories(test_latest_value_stage PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  ament_add_gtest(test_iou_tracker
+    test/test_iou_tracker.cpp
+  )
+  target_include_directories(test_iou_tracker PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
 

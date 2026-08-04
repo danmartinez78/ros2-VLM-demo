@@ -1,5 +1,7 @@
 std_msgs/Header header
 string source_topic
+string detector_id
+string tracker_id
 string task_profile
 string prompt_version
 string prompt_config_hash
@@ -7,5 +9,9 @@ string prompt
 string response
 float64 inference_seconds
 uint64 frame_sequence
+float64 observation_age_seconds
+string tracker_context
+uint32 tracked_object_count
+uint64 source_sequence
 bool success
 string error

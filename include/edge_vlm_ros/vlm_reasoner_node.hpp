@@ -27,10 +27,12 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 
 #include <sensor_msgs/msg/image.hpp>
 #include <std_msgs/msg/header.hpp>
 
+#include "edge_vlm_ros/msg/tracked_observation.hpp"
 #include "edge_vlm_ros/msg/vlm_result.hpp"
 
 namespace edge_vlm_ros
@@ -77,13 +79,26 @@ private:
 
   // ── Subscription callback (fast; must not block) ────────────────────────
   void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & msg);
+  void tracked_observation_callback(
+    const msg::TrackedObservation::ConstSharedPtr & msg);
 
   // ── Result publication ───────────────────────────────────────────────────
+  struct ResultMetadata
+  {
+    std::string detector_id;
+    std::string tracker_id;
+    double observation_age_seconds{0.0};
+    std::string tracker_context;
+    uint32_t tracked_object_count{0};
+    uint64_t source_sequence{0};
+  };
+
   void publish_result(
     const std_msgs::msg::Header & header,
     uint64_t frame_seq,
     const InferenceResponse & resp,
-    const std::string & effective_prompt);
+    const std::string & effective_prompt,
+    const ResultMetadata & metadata = {});
 
   // ── Prompt/history configuration helpers ─────────────────────────────────
   std::string render_effective_prompt(
@@ -100,12 +115,16 @@ private:
 
   // ── ROS interfaces ──────────────────────────────────────────────────────
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<msg::TrackedObservation>::SharedPtr tracked_observation_sub_;
   rclcpp::Publisher<msg::VlmResult>::SharedPtr result_pub_;
 
   // ── Sampling state ──────────────────────────────────────────────────────
   rclcpp::Time last_sampled_time_{0, 0, RCL_ROS_TIME};
+  rclcpp::Time last_vlm_time_{0, 0, RCL_ROS_TIME};
   double sample_period_seconds_{2.0};
+  double min_vlm_interval_seconds_{0.0};
   bool have_last_time_{false};
+  bool have_last_vlm_time_{false};
 
   // ── Parameters (cached after validate_parameters) ───────────────────────
   std::string source_topic_;
@@ -131,6 +150,11 @@ private:
   bool drop_old_frames_{true};
   bool publish_results_{true};
   bool enable_system_prompt_cache_{false};
+  bool enable_tracked_observation_input_{false};
+  bool use_tracked_observations_{false};
+  std::string tracked_observation_topic_;
+  uint64_t last_completed_source_sequence_{0};
+  bool have_last_completed_source_sequence_{false};
 
   // ── Worker thread and synchronisation ───────────────────────────────────
   std::thread worker_thread_;
@@ -141,9 +165,11 @@ private:
 
   struct PendingFrame
   {
-    sensor_msgs::msg::Image::ConstSharedPtr msg;
+    sensor_msgs::msg::Image source_image;
+    std_msgs::msg::Header result_header;
     uint64_t seq{0};
     int64_t subscribe_wall_ns{0};  // wall time when frame was accepted in image_callback
+    ResultMetadata metadata;
   };
 
   mutable std::mutex queue_mutex_;

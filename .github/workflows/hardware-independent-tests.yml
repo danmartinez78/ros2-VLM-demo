@@ -63,7 +63,7 @@ jobs:
           source install/setup.bash
           colcon test --packages-select edge_vlm_ros \
             --ctest-args \
-              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|worker_recovery_helpers)" \
+              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|latest_value_stage|iou_tracker|worker_recovery_helpers)" \
               --output-on-failure
 
       - name: Publish test results

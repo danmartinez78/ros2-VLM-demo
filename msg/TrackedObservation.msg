@@ -1,0 +1,12 @@
+std_msgs/Header header
+sensor_msgs/Image source_image
+edge_vlm_ros/TrackedObject[] tracked_objects
+builtin_interfaces/Time source_stamp
+builtin_interfaces/Time detector_completed_at
+builtin_interfaces/Time tracker_completed_at
+string source_topic
+string detector_id
+string tracker_id
+uint64 source_sequence
+uint64 detector_superseded_count
+uint64 tracker_superseded_count

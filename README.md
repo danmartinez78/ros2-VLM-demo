@@ -304,6 +304,8 @@ Results are published as
 `/vlm/result` by default. Each result includes:
 
 - source image header and topic;
+- optional tracked-observation provenance (`detector_id`, `tracker_id`, `source_sequence`,
+  tracked-object count, observation age, serialized tracker context) when enabled;
 - effective prompt, selected task profile, prompt-version label, and prompt-configuration hash;
 - generated response;
 - inference duration;
@@ -318,6 +320,11 @@ Example console output:
 
 The observed 1.5-second results used a 64-token output limit. Longer responses
 increase end-to-end latency.
+
+Tracked-observation mode is optional at runtime. Set
+`enable_tracked_observation_input:=true` and publish
+`edge_vlm_ros/msg/TrackedObservation` messages to bypass the raw-image subscriber
+while preserving continuous latest-only delivery semantics.
 
 ## RViz2 visualization panel (optional)
 
