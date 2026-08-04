@@ -98,8 +98,7 @@ jobs:
             --ignore-src \
             --rosdistro "${ROS_DISTRO}" \
             -y \
-            --skip-keys "libopencv-dev qtbase5-dev pluginlib rviz_common message_filters vision_msgs" \
-            || true
+            --skip-keys "libopencv-dev qtbase5-dev image_transport pluginlib rviz_common message_filters vision_msgs"
           rm -rf /var/lib/apt/lists/*
 
       # Full Thor-representative build: all production and test targets.

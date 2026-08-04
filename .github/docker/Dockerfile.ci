@@ -24,6 +24,7 @@ RUN apt-get update && \
       python3-colcon-common-extensions \
       python3-rosdep \
       qtbase5-dev \
+      ros-jazzy-image-transport \
       ros-jazzy-message-filters \
       ros-jazzy-pluginlib \
       ros-jazzy-rviz-common \
