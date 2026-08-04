@@ -1,5 +1,16 @@
 name: hardware-independent-tests
 
+# Approval note: GitHub requires a maintainer to approve the first workflow run
+# for pull requests from forks and for any PR that modifies workflow files
+# (including those authored by bots such as Copilot).  This is a platform
+# security policy ("action_required") that cannot be disabled.  Normal
+# same-repository PRs that do not touch workflow files run automatically.
+#
+# CI image: ghcr.io/<owner>/ros2-vlm-demo-ci:jazzy
+# Rebuilt by build-ci-image.yml when .github/docker/Dockerfile.ci changes.
+# The image pre-installs all stable apt dependencies so PR jobs skip
+# costly apt/rosdep setup and complete in a few minutes.
+
 on:
   pull_request:
   push:
@@ -11,13 +22,18 @@ concurrency:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   ipc-and-node-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     container:
-      image: ros:jazzy-ros-base-noble
+      image: ghcr.io/${{ github.repository_owner }}/ros2-vlm-demo-ci:jazzy
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
 
     defaults:
       run:
@@ -29,33 +45,36 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
-      - name: Install package dependencies
+      # Install only the package's own rosdep keys (not the stable apt deps,
+      # which are already baked into the CI image).  Bounded to 3 minutes so a
+      # mirror stall does not silently consume the job timeout.
+      - name: Install package rosdep dependencies
+        timeout-minutes: 3
         run: |
-          apt-get update
-          apt-get install --no-install-recommends --yes \
-            libopencv-dev \
-            python3-colcon-common-extensions \
-            python3-rosdep \
-            qtbase5-dev \
-            ros-jazzy-pluginlib \
-            ros-jazzy-rviz-common
-          rosdep update --rosdistro "${ROS_DISTRO}"
+          rosdep update --rosdistro "${ROS_DISTRO}" --quiet
           rosdep install \
             --from-paths . \
             --ignore-src \
             --rosdistro "${ROS_DISTRO}" \
-            -y
+            -y \
+            --skip-keys "libopencv-dev qtbase5-dev pluginlib rviz_common message_filters vision_msgs" \
+            || true
           rm -rf /var/lib/apt/lists/*
 
-      - name: Build package
+      # Full Thor-representative build: all production and test targets.
+      # --symlink-install matches the Jetson Thor build procedure.
+      - name: Build package (colcon)
         run: |
           source "/opt/ros/${ROS_DISTRO}/setup.bash"
           colcon build \
             --packages-select edge_vlm_ros \
+            --symlink-install \
             --cmake-args -DBUILD_TESTING=ON
-          test -f build/edge_vlm_ros/libedge_vlm_rviz_panel.so
+
+      - name: Verify RViz plugin library
+        run: test -f build/edge_vlm_ros/libedge_vlm_rviz_panel.so
 
       - name: Run hardware-independent tests
         run: |
@@ -63,7 +82,7 @@ jobs:
           source install/setup.bash
           colcon test --packages-select edge_vlm_ros \
             --ctest-args \
-              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|worker_recovery_helpers)" \
+              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|latest_value_stage|iou_tracker|tracked_obs_adapter|worker_recovery_helpers)" \
               --output-on-failure
 
       - name: Publish test results
@@ -89,7 +108,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Run benchmark parser and schema tests (CPU-only, no hardware required)
         run: |
@@ -109,7 +128,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Run web console tests (CPU-only, no hardware required)
         run: python3 web_console/tests/test_web_console.py -v
@@ -124,7 +143,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Reject obsolete generic infrastructure identifiers
         run: bash scripts/check_obsolete_identifiers.sh

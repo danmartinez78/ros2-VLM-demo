@@ -1,0 +1,36 @@
+# CI image for edge_vlm_ros hardware-independent builds.
+#
+# Base: ros:jazzy-ros-base-noble
+# Pre-installs all stable build and test dependencies so that PR jobs do not
+# need to run apt-get or rosdep during normal runs.
+#
+# Rebuild and push when dependencies change:
+#   docker build -f .github/docker/Dockerfile.ci -t ghcr.io/<owner>/ros2-vlm-demo-ci:jazzy .
+#   docker push ghcr.io/<owner>/ros2-vlm-demo-ci:jazzy
+#
+# The image-build workflow (.github/workflows/build-ci-image.yml) automates
+# this for the main branch.
+
+FROM ros:jazzy-ros-base-noble
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG ROS_DISTRO=jazzy
+
+# Install stable build and test dependencies.
+# These change rarely; rebuilding the image is the only cost when they do.
+RUN apt-get update && \
+    apt-get install --no-install-recommends --yes \
+      libopencv-dev \
+      python3-colcon-common-extensions \
+      python3-rosdep \
+      qtbase5-dev \
+      ros-jazzy-message-filters \
+      ros-jazzy-pluginlib \
+      ros-jazzy-rviz-common \
+      ros-jazzy-vision-msgs && \
+    rosdep init || true && \
+    rosdep update --rosdistro "${ROS_DISTRO}" && \
+    rm -rf /var/lib/apt/lists/*
+
+# Default shell for ROS environment sourcing.
+SHELL ["/bin/bash", "-c"]
