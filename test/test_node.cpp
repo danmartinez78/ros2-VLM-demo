@@ -428,8 +428,9 @@ TEST_F(NodeTest, TrackedObservationDuplicateSequenceIsSuppressedWhilePending)
   auto pub = helper->create_publisher<edge_vlm_ros::msg::TrackedObservation>(
     "/tracked_observation", qos);
 
-  std::this_thread::sleep_for(100ms);
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return pub->get_subscription_count() > 0;}, 2s));
   pub->publish(*make_tracked_observation(rclcpp::Time(800, 0, RCL_ROS_TIME), 123));
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return received.load() >= 1;}, 4s));
   pub->publish(*make_tracked_observation(rclcpp::Time(801, 0, RCL_ROS_TIME), 123));
   pub->publish(*make_tracked_observation(rclcpp::Time(802, 0, RCL_ROS_TIME), 124));
 
