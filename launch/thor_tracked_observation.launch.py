@@ -28,7 +28,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('tracker_id', default_value='iou_tracker'),
         DeclareLaunchArgument(
             'rosbag_path',
-            default_value='/mnt/data/bags/thor/galileo',
+            default_value='/home/daniel/ros2-VLM-demo/test_data/rosbags/nvblox/isaac_ros_nvblox/galileo_people_3_2',
         ),
         DeclareLaunchArgument(
             'play_rosbag',
@@ -49,7 +49,7 @@ def generate_launch_description() -> LaunchDescription:
                 'enable_tracked_observation_input': 'true',
                 'tracked_observation_topic': tracked_observation_topic,
                 'image_topic': image_topic,
-                'sample_period_seconds': '2.0',
+                'sample_period_seconds': '0.0',
                 'min_vlm_interval_seconds': '0.0',
             }.items(),
         ),

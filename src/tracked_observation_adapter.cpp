@@ -25,7 +25,6 @@ namespace edge_vlm_ros
 namespace
 {
 
-const rmw_qos_profile_t kSensorQos = rmw_qos_profile_sensor_data;
 
 TrackedBox detection_to_tracked_box(const vision_msgs::msg::Detection2D & detection)
 {
@@ -63,6 +62,11 @@ msg::TrackedObject track_state_to_msg(
   return out;
 }
 
+bool same_stamp(const builtin_interfaces::msg::Time & lhs, const builtin_interfaces::msg::Time & rhs)
+{
+  return lhs.sec == rhs.sec && lhs.nanosec == rhs.nanosec;
+}
+
 }  // namespace
 
 TrackedObservationAdapter::TrackedObservationAdapter(const rclcpp::NodeOptions & options)
@@ -79,14 +83,16 @@ TrackedObservationAdapter::TrackedObservationAdapter(const rclcpp::NodeOptions &
   tracked_observation_pub_ = this->create_publisher<msg::TrackedObservation>(
     tracked_observation_topic_, rclcpp::SystemDefaultsQoS());
 
-  image_sub_.subscribe(this, image_topic_, kSensorQos);
-  detections_sub_.subscribe(this, detections_topic_, kSensorQos);
-
-  synchronizer_ = std::make_shared<message_filters::Synchronizer<SyncPolicy>>(
-    SyncPolicy(sync_queue_size_), image_sub_, detections_sub_);
-  synchronizer_->registerCallback(std::bind(
-      &TrackedObservationAdapter::handle_synced_messages, this,
-      std::placeholders::_1, std::placeholders::_2));
+  image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+    image_topic_, rclcpp::SensorDataQoS(),
+    [this](const sensor_msgs::msg::Image::ConstSharedPtr msg) {
+      image_callback(msg);
+    });
+  detections_sub_ = this->create_subscription<DetectionArray>(
+    detections_topic_, rclcpp::SensorDataQoS(),
+    [this](const DetectionArray::ConstSharedPtr msg) {
+      detections_callback(msg);
+    });
 }
 
 void TrackedObservationAdapter::declare_parameters()
@@ -113,9 +119,6 @@ void TrackedObservationAdapter::declare_parameters()
     "tracker_id", "iou_tracker",
     desc("Tracker identity stamped into tracked observations"));
   this->declare_parameter(
-    "sync_queue_size", 10,
-    desc("ApproximateTime synchronizer queue size"));
-  this->declare_parameter(
     "tracker_min_iou", 0.3,
     desc("Minimum IOU for associating a detection to an existing track"));
   this->declare_parameter(
@@ -133,16 +136,12 @@ void TrackedObservationAdapter::validate_parameters()
   tracked_observation_topic_ = this->get_parameter("tracked_observation_topic").as_string();
   detector_id_ = this->get_parameter("detector_id").as_string();
   tracker_id_ = this->get_parameter("tracker_id").as_string();
-  sync_queue_size_ = this->get_parameter("sync_queue_size").as_int();
   tracker_min_iou_ = static_cast<float>(this->get_parameter("tracker_min_iou").as_double());
   tracker_max_coast_age_ = this->get_parameter("tracker_max_coast_age").as_int();
   tracker_class_aware_ = this->get_parameter("tracker_class_aware").as_bool();
 
   if (image_topic_.empty() || detections_topic_.empty() || tracked_observation_topic_.empty()) {
     throw std::runtime_error("TrackedObservationAdapter topics must be non-empty");
-  }
-  if (sync_queue_size_ <= 0) {
-    throw std::runtime_error("sync_queue_size must be > 0");
   }
   if (tracker_min_iou_ < 0.0f || tracker_min_iou_ > 1.0f) {
     throw std::runtime_error("tracker_min_iou must be in [0, 1]");
@@ -152,14 +151,48 @@ void TrackedObservationAdapter::validate_parameters()
   }
 }
 
-void TrackedObservationAdapter::handle_synced_messages(
-  const sensor_msgs::msg::Image::ConstSharedPtr & image_msg,
-  const DetectionArray::ConstSharedPtr & detections_msg)
+void TrackedObservationAdapter::image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & image_msg)
 {
+  if (latest_image_.has_value()) {
+    ++stale_drop_count_;
+  }
+  latest_image_ = *image_msg;
+  try_publish_latest_match();
+}
+
+void TrackedObservationAdapter::detections_callback(const DetectionArray::ConstSharedPtr & detections_msg)
+{
+  if (latest_detections_.has_value()) {
+    ++stale_drop_count_;
+  }
+  latest_detections_ = *detections_msg;
+  try_publish_latest_match();
+}
+
+void TrackedObservationAdapter::try_publish_latest_match()
+{
+  if (!latest_image_.has_value() || !latest_detections_.has_value()) {
+    return;
+  }
+
+  const auto & image = *latest_image_;
+  const auto & detections = *latest_detections_;
+  if (!same_stamp(image.header.stamp, detections.header.stamp)) {
+    if (rclcpp::Time(image.header.stamp, RCL_ROS_TIME) < rclcpp::Time(detections.header.stamp, RCL_ROS_TIME)) {
+      latest_image_.reset();
+    } else {
+      latest_detections_.reset();
+    }
+    ++mismatch_drop_count_;
+    return;
+  }
+
   const rclcpp::Time completed_at = this->now();
-  auto observation = build_observation(*image_msg, *detections_msg, completed_at);
+  auto observation = build_observation(image, detections, completed_at);
   tracked_observation_pub_->publish(observation);
   ++published_count_;
+  latest_image_.reset();
+  latest_detections_.reset();
 }
 
 msg::TrackedObservation TrackedObservationAdapter::build_observation(

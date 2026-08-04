@@ -15,11 +15,9 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
-#include <message_filters/subscriber.hpp>
-#include <message_filters/sync_policies/approximate_time.hpp>
-#include <message_filters/synchronizer.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <vision_msgs/msg/detection2_d_array.hpp>
@@ -37,14 +35,12 @@ public:
 
 private:
   using DetectionArray = vision_msgs::msg::Detection2DArray;
-  using SyncPolicy = message_filters::sync_policies::ApproximateTime<
-    sensor_msgs::msg::Image, DetectionArray>;
 
   void declare_parameters();
   void validate_parameters();
-  void handle_synced_messages(
-    const sensor_msgs::msg::Image::ConstSharedPtr & image_msg,
-    const DetectionArray::ConstSharedPtr & detections_msg);
+  void image_callback(const sensor_msgs::msg::Image::ConstSharedPtr & image_msg);
+  void detections_callback(const DetectionArray::ConstSharedPtr & detections_msg);
+  void try_publish_latest_match();
   msg::TrackedObservation build_observation(
     const sensor_msgs::msg::Image & image_msg,
     const DetectionArray & detections_msg,
@@ -55,7 +51,8 @@ private:
   std::string tracked_observation_topic_;
   std::string detector_id_;
   std::string tracker_id_;
-  int sync_queue_size_{10};
+  uint64_t mismatch_drop_count_{0};
+  uint64_t stale_drop_count_{0};
   float tracker_min_iou_{0.3f};
   int tracker_max_coast_age_{1};
   bool tracker_class_aware_{true};
@@ -64,9 +61,10 @@ private:
   uint64_t next_source_sequence_{1};
   uint64_t published_count_{0};
 
-  message_filters::Subscriber<sensor_msgs::msg::Image> image_sub_;
-  message_filters::Subscriber<DetectionArray> detections_sub_;
-  std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> synchronizer_;
+  std::optional<sensor_msgs::msg::Image> latest_image_;
+  std::optional<DetectionArray> latest_detections_;
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+  rclcpp::Subscription<DetectionArray>::SharedPtr detections_sub_;
   rclcpp::Publisher<msg::TrackedObservation>::SharedPtr tracked_observation_pub_;
 };
 

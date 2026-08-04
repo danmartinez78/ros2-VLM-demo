@@ -110,6 +110,43 @@ TEST(TrackedObservationAdapter, PublishesExactImageDetectionPairing)
   EXPECT_EQ(observed.source_sequence, 1u);
 }
 
+
+TEST(TrackedObservationAdapter, DoesNotPairMismatchedTimestamps)
+{
+  rclcpp::NodeOptions opts;
+  opts.append_parameter_override("image_topic", "/camera/image_raw");
+  opts.append_parameter_override("detections_topic", "/detections");
+  opts.append_parameter_override("tracked_observation_topic", "/tracked_observation");
+  auto adapter = std::make_shared<edge_vlm_ros::TrackedObservationAdapter>(opts);
+  auto helper = std::make_shared<rclcpp::Node>("tracked_observation_adapter_mismatch_test_helper");
+
+  std::vector<edge_vlm_ros::msg::TrackedObservation> observations;
+  auto sub = helper->create_subscription<edge_vlm_ros::msg::TrackedObservation>(
+    "/tracked_observation", rclcpp::SystemDefaultsQoS(),
+    [&](edge_vlm_ros::msg::TrackedObservation::SharedPtr msg) {
+      observations.push_back(*msg);
+    });
+
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto image_pub = helper->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
+  auto detections_pub = helper->create_publisher<vision_msgs::msg::Detection2DArray>("/detections", qos);
+
+  std::this_thread::sleep_for(100ms);
+  image_pub->publish(make_image(10, 10));
+  detections_pub->publish(make_detections(11, 9.0, "person"));
+  std::this_thread::sleep_for(200ms);
+  rclcpp::spin_some(adapter);
+  rclcpp::spin_some(helper);
+  EXPECT_TRUE(observations.empty());
+
+  image_pub->publish(make_image(11, 11));
+  ASSERT_TRUE(spin_until(adapter, helper, [&] {return observations.size() >= 1u;}));
+  ASSERT_EQ(observations.size(), 1u);
+  EXPECT_EQ(observations.front().source_image.header.stamp.sec, 11);
+  EXPECT_EQ(observations.front().tracked_objects.front().class_label, "person");
+}
+
 TEST(TrackedObservationAdapter, PreservesTrackIdsAcrossSynchronizedUpdates)
 {
   rclcpp::NodeOptions opts;
