@@ -1596,6 +1596,9 @@ var _seqCatalogFiltered = [];
 var _seqCatalogPage = 0;
 var _SEQ_CATALOG_PAGE_SIZE = 20;
 
+/** Maximum number of frames allowed in a single sequence experiment selection. */
+var _SEQ_MAX_FRAME_SELECTION = 100;
+
 /** Currently selected dataset filter. */
 var _seqCatalogDataset = "";
 
@@ -1766,6 +1769,30 @@ async function _openSequence(seq) {
   }
   if (titleEl) titleEl.textContent = seq.dataset_id + " / " + seq.sequence_id;
   if (detailEl) detailEl.style.display = "";
+
+  // Static fixture: show Extract action; disable Use in Experiment until extracted.
+  var extractNoteEl = document.getElementById("seq-fixture-extract-note");
+  if (seq.adapter === "ros_static_fixture") {
+    if (useBtn) {
+      useBtn.style.display = "";
+      useBtn.disabled = true;
+      useBtn.title = "Extract the bag first to enable Use in Experiment";
+    }
+    if (extractNoteEl) {
+      extractNoteEl.style.display = "";
+      var bagKey = (seq.provenance && seq.provenance.bag_key) || seq.sequence_id;
+      extractNoteEl.innerHTML = "";
+      var noteMsg = _el("span", "muted", "This is a static-fixture bag. Extract it first to view frames and run experiments. ");
+      var extractBtn = _el("button", "small", "Extract Frames");
+      extractBtn.addEventListener("click", function() { _seqFixtureExtract(bagKey, extractBtn, useBtn); });
+      extractNoteEl.appendChild(noteMsg);
+      extractNoteEl.appendChild(extractBtn);
+    }
+    previewEl.appendChild(_el("p", "muted", "Frames available after extraction."));
+    return;
+  }
+
+  if (extractNoteEl) extractNoteEl.style.display = "none";
   if (useBtn) {
     useBtn.style.display = "";
     useBtn.disabled = false;
@@ -1789,6 +1816,28 @@ async function _openSequence(seq) {
   } else {
     // Lazy sequence (e.g. JAAD clip): show a direct-index navigator instead.
     _renderSeqFrameNavigator(seq, frameCount, previewEl, stripEl);
+  }
+}
+
+/** Trigger frame extraction for a static-fixture bag from the catalog detail panel. */
+async function _seqFixtureExtract(bagKey, extractBtn, useBtn) {
+  extractBtn.disabled = true;
+  extractBtn.textContent = "Extracting…";
+  try {
+    var resp = await _apiPost("/api/extract", { bag_key: bagKey });
+    if (resp.status === 202) {
+      extractBtn.textContent = "Extraction started";
+      if (useBtn) {
+        useBtn.disabled = false;
+        useBtn.title = "";
+      }
+    } else {
+      extractBtn.textContent = "Error: " + ((resp.body && resp.body.error) || resp.status);
+      extractBtn.disabled = false;
+    }
+  } catch (e) {
+    extractBtn.textContent = "Error";
+    extractBtn.disabled = false;
   }
 }
 
@@ -1824,6 +1873,7 @@ function _renderSeqFrameStrip(seq, frames, totalCount) {
     var idx = frame.index;
     var thumb = document.createElement("img");
     thumb.className = "frame-thumb" + (idx === 0 ? " selected" : "");
+    thumb.dataset.frameIndex = String(idx);
     thumb.src = "/api/sequences/" + seq.dataset_id + "/" + seq.sequence_id + "/frames/" + idx;
     thumb.alt = "Frame " + idx;
     thumb.title = "Frame " + idx + (frame.timestamp_us ? " @ " + (frame.timestamp_us / 1e6).toFixed(3) + "s" : "");
@@ -1855,6 +1905,7 @@ function _renderSeqFrameNavigator(seq, frameCount, previewEl, stripEl) {
   sampleIndices.forEach(function(idx) {
     var thumb = document.createElement("img");
     thumb.className = "frame-thumb";
+    thumb.dataset.frameIndex = String(idx);
     thumb.src = "/api/sequences/" + seq.dataset_id + "/" + seq.sequence_id + "/frames/" + idx;
     thumb.alt = "Frame " + idx;
     thumb.title = "Frame " + idx;
@@ -1910,8 +1961,8 @@ function _showSeqFrame(seq, idx, frame) {
     if (frame && frame.source_id) metaEl.appendChild(_el("span", "meta-item", " · ID: " + frame.source_id));
     metaEl.appendChild(_el("span", "meta-item", " · " + seq.adapter));
   }
-  document.querySelectorAll(".frame-thumb").forEach(function(t, i) {
-    _setClass(t, "selected", i === idx);
+  document.querySelectorAll(".frame-thumb").forEach(function(t) {
+    _setClass(t, "selected", t.dataset.frameIndex === String(idx));
   });
 }
 
@@ -2036,6 +2087,20 @@ async function submitSeqExperiment() {
     frameIndices = indicesRaw.split(",")
       .map(function(s) { return parseInt(s.trim(), 10); })
       .filter(function(n) { return !isNaN(n); });
+    // Deduplicate while preserving order.
+    var seenIdx = {};
+    frameIndices = frameIndices.filter(function(n) {
+      if (seenIdx[n]) return false;
+      seenIdx[n] = true;
+      return true;
+    });
+    if (frameIndices.length > _SEQ_MAX_FRAME_SELECTION) {
+      _append(resultEl, _el("div", "alert error",
+        "Too many frames selected (" + frameIndices.length + "). Maximum is " + _SEQ_MAX_FRAME_SELECTION + "."));
+      if (btn) btn.disabled = false;
+      if (cancelBtn) cancelBtn.style.display = "none";
+      return;
+    }
   }
 
   var profileName = ((document.getElementById("seqexp-profile-name") || {}).value || "").trim() || null;

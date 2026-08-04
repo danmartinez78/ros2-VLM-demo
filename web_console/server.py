@@ -121,6 +121,10 @@ _ROS_ARTIFACT_ALLOWLIST = ("manifest.json", "benchmark.jsonl", "launch.log", "re
 # Maximum frame index that can be requested via the image-serving route.
 _MAX_FRAME_INDEX = 9999
 
+# Maximum number of frames that may be submitted in a single sequence experiment.
+# This prevents runaway ffmpeg/OpenCV decodes from arbitrarily large lists.
+_SEQ_MAX_FRAME_SELECTION = 100
+
 _STATIC_DIR = pathlib.Path(__file__).parent / "static"
 _CONTENT_TYPES: Dict[str, str] = {
     ".css": "text/css; charset=utf-8",
@@ -1228,11 +1232,47 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         # ── determine frame selection ─────────────────────────────────────────
         frame_indices_raw = body.get("frame_indices")
         if frame_indices_raw is not None:
-            try:
-                frame_indices = [int(i) for i in frame_indices_raw]
-            except (TypeError, ValueError):
+            # Reject booleans and non-list inputs before iteration.
+            if not isinstance(frame_indices_raw, list):
                 self._send_error(400, "frame_indices must be a list of integers")
                 return
+            try:
+                frame_indices_parsed = []
+                for item in frame_indices_raw:
+                    if isinstance(item, bool):
+                        raise ValueError("boolean values are not permitted in frame_indices")
+                    frame_indices_parsed.append(int(item))
+            except (TypeError, ValueError) as exc:
+                self._send_error(400, f"frame_indices must be a list of integers: {exc}")
+                return
+            # Validate range when frame_count is known.
+            fc = seq_entry.frame_count
+            if fc > 0:
+                bad = [i for i in frame_indices_parsed if not (0 <= i < fc)]
+                if bad:
+                    self._send_error(
+                        400,
+                        f"frame_indices out of range [0, {fc}): {bad[:5]}"
+                        + (" …" if len(bad) > 5 else ""),
+                    )
+                    return
+            # Deduplicate while preserving order.
+            seen: set = set()
+            frame_indices_deduped = []
+            for i in frame_indices_parsed:
+                if i not in seen:
+                    seen.add(i)
+                    frame_indices_deduped.append(i)
+            # Enforce maximum selection size.
+            if len(frame_indices_deduped) > _SEQ_MAX_FRAME_SELECTION:
+                self._send_error(
+                    400,
+                    f"frame_indices exceeds maximum selection size of "
+                    f"{_SEQ_MAX_FRAME_SELECTION} (got {len(frame_indices_deduped)} "
+                    "after deduplication)",
+                )
+                return
+            frame_indices = frame_indices_deduped
         elif seq_entry.frame_refs:
             # Default: all indexed frame refs (nuScenes keyframes etc.).
             frame_indices = [fr.index for fr in seq_entry.frame_refs]
@@ -1340,13 +1380,27 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return
             image_paths.append(str(img_path))
             fr_rec = fr_by_index.get(fi)
+            # For lazy sequences (e.g. JAAD clips) there are no FrameRef objects.
+            # Synthesize a stable source_id and derive a timestamp from FPS.
+            if fr_rec is not None:
+                synthesized_source_id = fr_rec.source_id
+                synthesized_timestamp_us = fr_rec.timestamp_us
+            else:
+                synthesized_source_id = f"{sequence_id}:frame_{fi}"
+                fps = (
+                    seq_entry.provenance.get("video_metadata", {}).get("fps")
+                    if isinstance(seq_entry.provenance.get("video_metadata"), dict)
+                    else None
+                )
+                synthesized_timestamp_us = (
+                    int(fi / fps * 1_000_000) if fps else None
+                )
             source_frame_records.append({
                 "frame_index": fi,
-                "source_id": fr_rec.source_id if fr_rec else None,
-                "timestamp_us": fr_rec.timestamp_us if fr_rec else None,
+                "source_id": synthesized_source_id,
+                "timestamp_us": synthesized_timestamp_us,
             })
-            if fr_rec:
-                frame_source_ids.append(fr_rec.source_id)
+            frame_source_ids.append(synthesized_source_id)
 
         # ── build ExperimentDefinition ────────────────────────────────────────
         try:
@@ -2944,6 +2998,7 @@ _INDEX_TEMPLATE = """\
         <button class="small" id="seq-use-in-exp-btn" style="display:none;margin-left:auto" onclick="_seqUseInExperiment()">Use in Experiment &#8594;</button>
       </div>
       <div id="seq-catalog-detail-meta" class="frame-meta" style="margin-bottom:0.4rem"></div>
+      <div id="seq-fixture-extract-note" style="display:none;margin-bottom:0.5rem"></div>
       <div id="frame-thumbnail-strip" class="thumb-strip"></div>
       <div id="frame-preview-area"></div>
       <div id="frame-metadata" class="frame-meta"></div>
