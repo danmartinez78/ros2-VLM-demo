@@ -7,9 +7,11 @@ name: hardware-independent-tests
 # same-repository PRs that do not touch workflow files run automatically.
 #
 # CI image: ghcr.io/<owner>/ros2-vlm-demo-ci:jazzy
-# Rebuilt by build-ci-image.yml when .github/docker/Dockerfile.ci changes.
-# The image pre-installs all stable apt dependencies so PR jobs skip
-# costly apt/rosdep setup and complete in a few minutes.
+# Built by the ensure-ci-image job below before ipc-and-node-tests runs.
+# The image pre-installs all stable apt dependencies so the build step
+# does not repeat expensive apt/rosdep setup on every PR.
+# On the first run (or after Dockerfile changes) the image is built from
+# scratch using GitHub Actions layer cache; subsequent PRs reuse the cache.
 
 on:
   pull_request:
@@ -22,14 +24,51 @@ concurrency:
 
 permissions:
   contents: read
-  packages: read
+  packages: write
 
 jobs:
+  # Build and push the CI image whenever the Dockerfile changes; all other runs
+  # hit the GitHub Actions layer cache and complete in seconds.
+  ensure-ci-image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      image: ${{ steps.image-ref.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push CI image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/docker/Dockerfile.ci
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/ros2-vlm-demo-ci:jazzy
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Output image ref
+        id: image-ref
+        run: echo "image=ghcr.io/${{ github.repository_owner }}/ros2-vlm-demo-ci:jazzy" >> "$GITHUB_OUTPUT"
+
   ipc-and-node-tests:
     runs-on: ubuntu-24.04
+    needs: ensure-ci-image
     timeout-minutes: 15
     container:
-      image: ghcr.io/${{ github.repository_owner }}/ros2-vlm-demo-ci:jazzy
+      image: ${{ needs.ensure-ci-image.outputs.image }}
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
