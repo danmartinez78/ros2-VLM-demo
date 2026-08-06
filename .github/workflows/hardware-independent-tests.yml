@@ -181,19 +181,12 @@ jobs:
             --skip-keys "libopencv-dev qtbase5-dev image_transport pluginlib rviz_common message_filters vision_msgs"
           rm -rf /var/lib/apt/lists/*
 
-      - name: Build yolo_msgs
-        run: |
-          source "/opt/ros/${ROS_DISTRO}/setup.bash"
-          colcon build \
-            --packages-select yolo_msgs \
-            --symlink-install
-
       - name: Build YOLO adapter path (colcon)
         run: |
           source "/opt/ros/${ROS_DISTRO}/setup.bash"
-          source install/setup.bash
           colcon build \
-            --packages-select edge_vlm_ros \
+            --base-paths . external/yolo_ros/yolo_msgs \
+            --packages-select yolo_msgs edge_vlm_ros \
             --symlink-install \
             --cmake-args -DBUILD_TESTING=ON
 
