@@ -14,7 +14,9 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(image_transport REQUIRED)
+find_package(message_filters REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(vision_msgs REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(pluginlib QUIET)
 find_package(rviz_common QUIET)
@@ -22,8 +24,10 @@ find_package(Qt5 QUIET COMPONENTS Core Gui Widgets)
 
 # ── Custom message ────────────────────────────────────────────────────────────
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/TrackedObject.msg"
+  "msg/TrackedObservation.msg"
   "msg/VlmResult.msg"
-  DEPENDENCIES std_msgs builtin_interfaces
+  DEPENDENCIES std_msgs builtin_interfaces sensor_msgs
 )
 
 # ── TensorRT Edge-LLM integration ─────────────────────────────────────────────
@@ -274,6 +278,29 @@ target_link_libraries(edge_vlm_ros_node
   vlm_reasoner_node)
 ament_target_dependencies(edge_vlm_ros_node rclcpp)
 
+add_library(tracked_observation_adapter SHARED
+  src/tracked_observation_adapter.cpp
+)
+target_include_directories(tracked_observation_adapter PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>
+)
+ament_target_dependencies(tracked_observation_adapter
+  message_filters
+  rclcpp
+  sensor_msgs
+  std_msgs
+  vision_msgs
+)
+target_link_libraries(tracked_observation_adapter "${cpp_typesupport_target}")
+
+add_executable(edge_vlm_tracked_observation_adapter src/tracked_observation_adapter_main.cpp)
+target_include_directories(edge_vlm_tracked_observation_adapter PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(edge_vlm_tracked_observation_adapter
+  tracked_observation_adapter)
+ament_target_dependencies(edge_vlm_tracked_observation_adapter rclcpp)
+
 add_executable(edge_vlm_cli src/reasoning_cli.cpp)
 target_include_directories(edge_vlm_cli PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -411,7 +438,7 @@ else()
 endif()
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install(TARGETS edge_vlm_ros_node edge_vlm_cli edge_vlm_ipc_client
+install(TARGETS edge_vlm_ros_node edge_vlm_tracked_observation_adapter edge_vlm_cli edge_vlm_ipc_client
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -419,6 +446,12 @@ install(TARGETS edge_vlm_ros_node edge_vlm_cli edge_vlm_ipc_client
 
 install(TARGETS vlm_reasoner_node
   EXPORT vlm_reasoner_nodeTargets
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+install(TARGETS tracked_observation_adapter
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION lib/${PROJECT_NAME}
@@ -523,6 +556,37 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/include
   )
 
+  ament_add_gtest(test_latest_value_stage
+    test/test_latest_value_stage.cpp
+  )
+  target_include_directories(test_latest_value_stage PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  ament_add_gtest(test_iou_tracker
+    test/test_iou_tracker.cpp
+  )
+  target_include_directories(test_iou_tracker PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+
+  ament_add_gtest(test_tracked_observation_adapter
+    test/test_tracked_observation_adapter.cpp
+  )
+  target_include_directories(test_tracked_observation_adapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+  )
+  target_link_libraries(test_tracked_observation_adapter
+    tracked_observation_adapter
+    "${cpp_typesupport_target}"
+  )
+  ament_target_dependencies(test_tracked_observation_adapter
+    message_filters
+    rclcpp
+    sensor_msgs
+    vision_msgs
+  )
+
   # Shell-level unit tests for the PID-match helpers and PGID isolation safety
   # checks used in the worker-recovery hardware validation script.
   # Runs without ROS, hardware, or network access.
@@ -537,5 +601,5 @@ endif()
 
 ament_export_targets(vlm_reasoner_nodeTargets HAS_LIBRARY_TARGET)
 ament_export_dependencies(
-  rclcpp rcl_interfaces sensor_msgs std_msgs builtin_interfaces image_transport)
+  rclcpp rcl_interfaces sensor_msgs std_msgs builtin_interfaces image_transport message_filters vision_msgs)
 ament_package()

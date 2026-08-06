@@ -84,6 +84,9 @@ edge_vlm_ros_node:
     # Time between frames sent for inference (uses ROS message timestamp,
     # so bag replay at any speed remains deterministic).
     sample_period_seconds: 2.0
+    enable_tracked_observation_input: false
+    tracked_observation_topic: /tracked_observation
+    min_vlm_interval_seconds: 0.0
 
     # ── Inference parameters ──────────────────────────────────────────────────
     max_generate_length: 256

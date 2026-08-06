@@ -28,6 +28,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 
+#include "edge_vlm_ros/msg/tracked_observation.hpp"
 #include "edge_vlm_ros/vlm_reasoner_node.hpp"
 #include "edge_vlm_ros/msg/vlm_result.hpp"
 #include "fake_inference_backend.hpp"
@@ -54,6 +55,33 @@ static sensor_msgs::msg::Image::SharedPtr make_image(rclcpp::Time stamp)
   img->step = 4 * 3;
   img->data.assign(4 * 4 * 3, 200u);
   return img;
+}
+
+static edge_vlm_ros::msg::TrackedObservation::SharedPtr make_tracked_observation(
+  rclcpp::Time stamp, uint64_t source_sequence = 1)
+{
+  auto observation = std::make_shared<edge_vlm_ros::msg::TrackedObservation>();
+  observation->header.stamp = stamp;
+  observation->source_stamp = stamp;
+  observation->source_topic = "/camera/image_raw";
+  observation->detector_id = "detector";
+  observation->tracker_id = "tracker";
+  observation->source_sequence = source_sequence;
+  observation->source_image = *make_image(stamp);
+
+  edge_vlm_ros::msg::TrackedObject tracked;
+  tracked.header.stamp = stamp;
+  tracked.track_id = 7;
+  tracked.class_label = "person";
+  tracked.confidence = 0.9f;
+  tracked.center_x = 10.0f;
+  tracked.center_y = 12.0f;
+  tracked.width = 4.0f;
+  tracked.height = 5.0f;
+  tracked.age = 2;
+  tracked.coast_age = 0;
+  observation->tracked_objects.push_back(tracked);
+  return observation;
 }
 
 static rclcpp::NodeOptions make_options(bool publish = true)
@@ -273,6 +301,16 @@ TEST_F(NodeTest, InvalidSamplePeriodRejected)
     std::exception);
 }
 
+TEST_F(NodeTest, ZeroSamplePeriodIsAllowed)
+{
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("sample_period_seconds", 0.0);
+
+  EXPECT_NO_THROW(
+    node_ = std::make_shared<VlmReasonerNode>(
+      std::make_unique<FakeInferenceBackend>(), opts));
+}
+
 /// Invalid temperature is rejected during construction.
 TEST_F(NodeTest, InvalidTemperatureRejected)
 {
@@ -322,6 +360,134 @@ TEST_F(NodeTest, PublishesProfileAndPromptVersionMetadata)
   EXPECT_EQ(last_msg.prompt_version, "hazard-v2");
   EXPECT_FALSE(last_msg.prompt_config_hash.empty());
   EXPECT_NE(last_msg.prompt.find("Detect hazards in this camera frame"), std::string::npos);
+}
+
+TEST_F(NodeTest, TrackedObservationModePublishesTrackedMetadata)
+{
+  std::atomic<bool> received{false};
+  ResultMsg last_msg;
+
+  auto helper = std::make_shared<rclcpp::Node>("_test_helper_tracked");
+  auto sub = helper->create_subscription<ResultMsg>(
+    "/vlm/result", rclcpp::SystemDefaultsQoS(),
+    [&](ResultMsg::SharedPtr msg) {
+      last_msg = *msg;
+      received = true;
+    });
+
+  rclcpp::NodeOptions opts = make_options(true);
+  opts.append_parameter_override("enable_tracked_observation_input", true);
+  opts.append_parameter_override("tracked_observation_topic", "/tracked_observation");
+  opts.append_parameter_override("sample_period_seconds", 0.0);
+  node_ = std::make_shared<VlmReasonerNode>(
+    std::make_unique<FakeInferenceBackend>(),
+    opts);
+
+  std::this_thread::sleep_for(100ms);
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = helper->create_publisher<edge_vlm_ros::msg::TrackedObservation>(
+    "/tracked_observation", qos);
+
+  std::this_thread::sleep_for(50ms);
+  pub->publish(*make_tracked_observation(rclcpp::Time(700, 0, RCL_ROS_TIME), 99));
+
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return received.load();}));
+  EXPECT_TRUE(last_msg.success);
+  EXPECT_EQ(last_msg.detector_id, "detector");
+  EXPECT_EQ(last_msg.tracker_id, "tracker");
+  EXPECT_EQ(last_msg.tracked_object_count, 1u);
+  EXPECT_EQ(last_msg.source_sequence, 99u);
+  EXPECT_NE(last_msg.tracker_context.find("Tracked objects:"), std::string::npos);
+}
+
+TEST_F(NodeTest, TrackedObservationDuplicateSequenceIsSuppressedWhilePending)
+{
+  auto helper = std::make_shared<rclcpp::Node>("_test_helper_tracked_duplicates");
+  std::vector<uint64_t> sequences;
+  std::mutex seq_mutex;
+  std::atomic<int> received{0};
+  auto sub = helper->create_subscription<ResultMsg>(
+    "/vlm/result", rclcpp::SystemDefaultsQoS(),
+    [&](ResultMsg::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(seq_mutex);
+      sequences.push_back(msg->source_sequence);
+      ++received;
+    });
+
+  rclcpp::NodeOptions opts = make_options(false);
+  opts.append_parameter_override("enable_tracked_observation_input", true);
+  opts.append_parameter_override("tracked_observation_topic", "/tracked_observation");
+  opts.append_parameter_override("sample_period_seconds", 0.0);
+  opts.append_parameter_override("publish_results", true);
+  node_ = std::make_shared<VlmReasonerNode>(
+    std::make_unique<SlowFakeInferenceBackend>(150ms), opts);
+
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = helper->create_publisher<edge_vlm_ros::msg::TrackedObservation>(
+    "/tracked_observation", qos);
+
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return pub->get_subscription_count() > 0;}, 2s));
+  pub->publish(*make_tracked_observation(rclcpp::Time(800, 0, RCL_ROS_TIME), 123));
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return received.load() >= 1;}, 4s));
+  pub->publish(*make_tracked_observation(rclcpp::Time(801, 0, RCL_ROS_TIME), 123));
+  pub->publish(*make_tracked_observation(rclcpp::Time(802, 0, RCL_ROS_TIME), 124));
+
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return received.load() >= 2;}, 4s));
+  std::lock_guard<std::mutex> lock(seq_mutex);
+  ASSERT_EQ(sequences.size(), 2u);
+  EXPECT_EQ(sequences[0], 123u);
+  EXPECT_EQ(sequences[1], 124u);
+}
+
+TEST_F(NodeTest, TrackedObservationMinIntervalKeepsNewestPendingObservation)
+{
+  std::mutex seq_mutex;
+  std::vector<uint64_t> sequences;
+  auto backend = std::make_unique<FakeInferenceBackend>(
+    [&](const InferenceRequest &) {
+      InferenceResponse resp;
+      resp.success = true;
+      resp.text = "ok";
+      resp.inference_seconds = 0.001;
+      return resp;
+    });
+
+  std::atomic<int> received{0};
+  auto helper = std::make_shared<rclcpp::Node>("_test_helper_tracked_interval");
+  auto sub = helper->create_subscription<ResultMsg>(
+    "/vlm/result", rclcpp::SystemDefaultsQoS(),
+    [&](ResultMsg::SharedPtr msg) {
+      std::lock_guard<std::mutex> lock(seq_mutex);
+      sequences.push_back(msg->source_sequence);
+      ++received;
+    });
+
+  rclcpp::NodeOptions opts = make_options(true);
+  opts.append_parameter_override("enable_tracked_observation_input", true);
+  opts.append_parameter_override("tracked_observation_topic", "/tracked_observation");
+  opts.append_parameter_override("sample_period_seconds", 0.0);
+  opts.append_parameter_override("min_vlm_interval_seconds", 0.2);
+  node_ = std::make_shared<VlmReasonerNode>(std::move(backend), opts);
+
+  rclcpp::QoS qos{rclcpp::KeepLast(10)};
+  qos.best_effort();
+  auto pub = helper->create_publisher<edge_vlm_ros::msg::TrackedObservation>(
+    "/tracked_observation", qos);
+
+  std::this_thread::sleep_for(100ms);
+  pub->publish(*make_tracked_observation(rclcpp::Time(900, 0, RCL_ROS_TIME), 200));
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return received.load() >= 1;}));
+
+  pub->publish(*make_tracked_observation(rclcpp::Time(901, 0, RCL_ROS_TIME), 201));
+  pub->publish(*make_tracked_observation(rclcpp::Time(902, 0, RCL_ROS_TIME), 202));
+
+  ASSERT_TRUE(spin_until(node_, helper, [&] {return received.load() >= 2;}, 4s));
+  std::lock_guard<std::mutex> lock(seq_mutex);
+  ASSERT_EQ(sequences.size(), 2u);
+  EXPECT_EQ(sequences[0], 200u);
+  EXPECT_EQ(sequences[1], 202u);
 }
 
 /// Unknown variables in prompt templates fail validation during startup.

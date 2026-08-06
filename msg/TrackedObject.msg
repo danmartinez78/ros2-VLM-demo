@@ -1,0 +1,12 @@
+std_msgs/Header header
+uint64 track_id
+string class_label
+float32 confidence
+float32 center_x
+float32 center_y
+float32 width
+float32 height
+float32 velocity_x
+float32 velocity_y
+uint32 age
+uint32 coast_age

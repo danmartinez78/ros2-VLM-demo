@@ -156,9 +156,24 @@ def generate_launch_description() -> LaunchDescription:
             description='Reset interval used when policy is every_n_requests',
         ),
         DeclareLaunchArgument(
+            'enable_tracked_observation_input',
+            default_value='false',
+            description='Consume edge_vlm_ros/msg/TrackedObservation instead of raw images',
+        ),
+        DeclareLaunchArgument(
+            'tracked_observation_topic',
+            default_value='/tracked_observation',
+            description='Input tracked-observation topic',
+        ),
+        DeclareLaunchArgument(
             'sample_period_seconds',
             default_value='2.0',
             description='Seconds between sampled frames (uses message timestamp)',
+        ),
+        DeclareLaunchArgument(
+            'min_vlm_interval_seconds',
+            default_value='0.0',
+            description='Minimum seconds between VLM requests after dequeue',
         ),
         DeclareLaunchArgument(
             'max_generate_length',
@@ -221,7 +236,10 @@ def generate_launch_description() -> LaunchDescription:
                 'observation_history_reset_policy': LaunchConfiguration('observation_history_reset_policy'),
                 'observation_history_reset_interval_requests': LaunchConfiguration(
                     'observation_history_reset_interval_requests'),
+                'enable_tracked_observation_input': LaunchConfiguration('enable_tracked_observation_input'),
+                'tracked_observation_topic': LaunchConfiguration('tracked_observation_topic'),
                 'sample_period_seconds': LaunchConfiguration('sample_period_seconds'),
+                'min_vlm_interval_seconds': LaunchConfiguration('min_vlm_interval_seconds'),
                 'max_generate_length': LaunchConfiguration('max_generate_length'),
                 'temperature': LaunchConfiguration('temperature'),
                 'jpeg_quality': LaunchConfiguration('jpeg_quality'),

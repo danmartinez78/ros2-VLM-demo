@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -202,6 +203,27 @@ std::string fnv1a64_hex(const std::string & input)
   return oss.str();
 }
 
+std::string render_tracker_context(
+  const edge_vlm_ros::msg::TrackedObservation & observation)
+{
+  if (observation.tracked_objects.empty()) {
+    return "";
+  }
+
+  std::ostringstream out;
+  out << "Tracked objects:";
+  for (const auto & tracked : observation.tracked_objects) {
+    out << "\n- id=" << tracked.track_id
+        << " class=" << tracked.class_label
+        << " conf=" << std::fixed << std::setprecision(3) << tracked.confidence
+        << " center=(" << tracked.center_x << "," << tracked.center_y << ")"
+        << " size=(" << tracked.width << "x" << tracked.height << ")"
+        << " age=" << tracked.age
+        << " coast_age=" << tracked.coast_age;
+  }
+  return out.str();
+}
+
 }  // namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -238,17 +260,27 @@ VlmReasonerNode::VlmReasonerNode(
     // ── image subscriber (QoS: best effort, depth 1)
     rclcpp::QoS sub_qos{rclcpp::KeepLast(1)};
     sub_qos.best_effort();
-    image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-      source_topic_, sub_qos,
-      [this](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
-        image_callback(msg);
-      });
+    if (use_tracked_observations_) {
+      tracked_observation_sub_ = this->create_subscription<msg::TrackedObservation>(
+        tracked_observation_topic_, sub_qos,
+        [this](const msg::TrackedObservation::ConstSharedPtr & msg) {
+          tracked_observation_callback(msg);
+        });
+    } else {
+      image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+        source_topic_, sub_qos,
+        [this](const sensor_msgs::msg::Image::ConstSharedPtr & msg) {
+          image_callback(msg);
+        });
+    }
   } catch (...) {
     stop_worker();
     throw;
   }
 
-  RCLCPP_INFO(this->get_logger(), "Subscribed to %s", source_topic_.c_str());
+  RCLCPP_INFO(
+    this->get_logger(), "Subscribed to %s",
+    (use_tracked_observations_ ? tracked_observation_topic_ : source_topic_).c_str());
   RCLCPP_INFO(this->get_logger(), "Publishing results to %s", result_topic.c_str());
   RCLCPP_INFO(
     this->get_logger(),
@@ -323,6 +355,14 @@ void VlmReasonerNode::declare_parameters()
   this->declare_parameter(
     "image_topic", "/camera/image_raw",
     desc("Input image topic (sensor_msgs/msg/Image)"));
+
+  this->declare_parameter(
+    "tracked_observation_topic", "/tracked_observation",
+    desc("Input tracked observation topic (edge_vlm_ros/msg/TrackedObservation)"));
+
+  this->declare_parameter(
+    "enable_tracked_observation_input", false,
+    desc("Consume edge_vlm_ros/msg/TrackedObservation instead of raw sensor_msgs/msg/Image"));
 
   this->declare_parameter(
     "result_topic", "/vlm/result",
@@ -421,6 +461,10 @@ void VlmReasonerNode::declare_parameters()
     desc("Minimum time between frames sent for inference (uses message timestamp)"));
 
   this->declare_parameter(
+    "min_vlm_interval_seconds", 0.0,
+    desc("Minimum time between VLM requests after dequeue (0 disables throttling)"));
+
+  this->declare_parameter(
     "max_generate_length", 256,
     desc("Maximum number of tokens to generate per frame"));
 
@@ -478,8 +522,13 @@ void VlmReasonerNode::declare_parameters()
 void VlmReasonerNode::validate_parameters()
 {
   sample_period_seconds_ = this->get_parameter("sample_period_seconds").as_double();
-  if (sample_period_seconds_ <= 0.0) {
-    throw std::runtime_error("sample_period_seconds must be > 0");
+  if (sample_period_seconds_ < 0.0) {
+    throw std::runtime_error("sample_period_seconds must be >= 0");
+  }
+
+  min_vlm_interval_seconds_ = this->get_parameter("min_vlm_interval_seconds").as_double();
+  if (min_vlm_interval_seconds_ < 0.0) {
+    throw std::runtime_error("min_vlm_interval_seconds must be >= 0");
   }
 
   max_generate_length_ = this->get_parameter("max_generate_length").as_int();
@@ -641,6 +690,11 @@ void VlmReasonerNode::validate_parameters()
 
   drop_old_frames_ = this->get_parameter("drop_old_frames").as_bool();
   publish_results_ = this->get_parameter("publish_results").as_bool();
+  enable_tracked_observation_input_ =
+    this->get_parameter("enable_tracked_observation_input").as_bool();
+  tracked_observation_topic_ = this->get_parameter("tracked_observation_topic").as_string();
+  use_tracked_observations_ =
+    enable_tracked_observation_input_ && !tracked_observation_topic_.empty();
 
   benchmark_output_file_ = this->get_parameter("benchmark_output_file").as_string();
   if (!benchmark_output_file_.empty()) {
@@ -855,9 +909,27 @@ void VlmReasonerNode::worker_loop()
         break;
       }
       dropped_before_this_frame = stats_.dropped;
+      if (min_vlm_interval_seconds_ > 0.0 && have_last_vlm_time_) {
+        const double elapsed = (this->now() - last_vlm_time_).seconds();
+        if (elapsed >= 0.0 && elapsed < min_vlm_interval_seconds_) {
+          const auto wait_for = std::chrono::duration<double>(min_vlm_interval_seconds_ - elapsed);
+          queue_cv_.wait_for(lock, wait_for, [this] {
+            return !worker_running_;
+          });
+          continue;
+        }
+      }
+
       frame = *pending_frame_;
       pending_frame_.reset();
+      if (frame.metadata.source_sequence != 0) {
+        worker_has_active_frame_ = true;
+        active_source_sequence_ = frame.metadata.source_sequence;
+      }
     }
+
+    last_vlm_time_ = this->now();
+    have_last_vlm_time_ = true;
 
     // ── record dequeue wall time ──────────────────────────────────────────
     const int64_t dequeue_wall_ns = benchmark_out_ ?
@@ -871,7 +943,7 @@ void VlmReasonerNode::worker_loop()
     // ── convert image ─────────────────────────────────────────────────────
     cv::Mat bgr;
     try {
-      bgr = ros_image_to_bgr(*frame.msg);
+      bgr = ros_image_to_bgr(frame.source_image);
     } catch (const std::exception & e) {
       RCLCPP_ERROR(this->get_logger(), "image conversion failed: %s", e.what());
       ++stats_.failure;
@@ -882,7 +954,13 @@ void VlmReasonerNode::worker_loop()
       const bool structured = instruction_delivery_mode_ == "structured";
       const std::string effective_prompt = render_effective_prompt(frame.seq, structured);
       update_observation_history_after_response(resp, effective_prompt);
-      publish_result(frame.msg->header, frame.seq, resp, effective_prompt);
+      publish_result(frame.result_header, frame.seq, resp, effective_prompt, frame.metadata);
+      if (frame.metadata.source_sequence != 0) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        worker_has_active_frame_ = false;
+        active_source_sequence_ = 0;
+        accepted_source_sequences_.erase(frame.metadata.source_sequence);
+      }
       continue;
     }
 
@@ -951,15 +1029,23 @@ void VlmReasonerNode::worker_loop()
     }
 
     update_observation_history_after_response(resp, effective_prompt);
-    publish_result(frame.msg->header, frame.seq, resp, effective_prompt);
+    publish_result(frame.result_header, frame.seq, resp, effective_prompt, frame.metadata);
+    if (frame.metadata.source_sequence != 0) {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      worker_has_active_frame_ = false;
+      active_source_sequence_ = 0;
+      accepted_source_sequences_.erase(frame.metadata.source_sequence);
+      have_last_completed_source_sequence_ = true;
+      last_completed_source_sequence_ = frame.metadata.source_sequence;
+    }
 
     // ── record publish-done wall time and write benchmark record ─────────
     if (benchmark_out_) {
       const int64_t publish_done_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
       const int64_t image_stamp_ns =
-        static_cast<int64_t>(frame.msg->header.stamp.sec) * 1000000000LL +
-        frame.msg->header.stamp.nanosec;
+        static_cast<int64_t>(frame.result_header.stamp.sec) * 1000000000LL +
+        frame.result_header.stamp.nanosec;
 
       // Escape error string: replace backslash and double-quote characters
       std::string escaped_error;
@@ -1032,9 +1118,84 @@ void VlmReasonerNode::image_callback(
     if (pending_frame_.has_value() && drop_old_frames_) {
       ++stats_.dropped;
     }
-    pending_frame_ = PendingFrame{msg, stats_.sampled, subscribe_wall_ns};
+    PendingFrame frame;
+    frame.source_image = *msg;
+    frame.result_header = msg->header;
+    frame.seq = stats_.sampled;
+    frame.subscribe_wall_ns = subscribe_wall_ns;
+    pending_frame_ = std::move(frame);
   }
   queue_cv_.notify_one();
+}
+
+void VlmReasonerNode::tracked_observation_callback(
+  const msg::TrackedObservation::ConstSharedPtr & msg)
+{
+  ++stats_.received;
+
+  const rclcpp::Time msg_time(msg->source_stamp, RCL_ROS_TIME);
+  if (sample_period_seconds_ > 0.0 && have_last_time_) {
+    const double elapsed = (msg_time - last_sampled_time_).seconds();
+    if (elapsed < 0.0) {
+      have_last_time_ = false;
+    } else if (elapsed < sample_period_seconds_) {
+      return;
+    }
+  }
+
+  const rclcpp::Time now = this->now();
+
+  last_sampled_time_ = msg_time;
+  have_last_time_ = true;
+
+  const int64_t subscribe_wall_ns = benchmark_out_ ?
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+
+  ResultMetadata metadata;
+  metadata.detector_id = msg->detector_id;
+  metadata.tracker_id = msg->tracker_id;
+  metadata.tracked_object_count = static_cast<uint32_t>(msg->tracked_objects.size());
+  metadata.source_sequence = msg->source_sequence;
+  metadata.tracker_context = render_tracker_context(*msg);
+  metadata.observation_age_seconds =
+    std::max(0.0, (now - rclcpp::Time(msg->source_stamp, RCL_ROS_TIME)).seconds());
+
+  bool accepted = false;
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    if (
+      msg->source_sequence != 0 &&
+      ((have_last_completed_source_sequence_ &&
+      msg->source_sequence <= last_completed_source_sequence_) ||
+      accepted_source_sequences_.count(msg->source_sequence) > 0 ||
+      (worker_has_active_frame_ && msg->source_sequence == active_source_sequence_)))
+    {
+      return;
+    }
+
+    if (pending_frame_.has_value() && drop_old_frames_) {
+      if (pending_frame_->metadata.source_sequence != 0) {
+        accepted_source_sequences_.erase(pending_frame_->metadata.source_sequence);
+      }
+      ++stats_.dropped;
+    }
+    PendingFrame frame;
+    frame.source_image = msg->source_image;
+    frame.result_header = msg->header;
+    frame.seq = stats_.sampled;
+    frame.subscribe_wall_ns = subscribe_wall_ns;
+    frame.metadata = std::move(metadata);
+    pending_frame_ = std::move(frame);
+    if (msg->source_sequence != 0) {
+      accepted_source_sequences_.insert(msg->source_sequence);
+    }
+    accepted = true;
+  }
+  if (accepted) {
+    ++stats_.sampled;
+    queue_cv_.notify_one();
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1047,6 +1208,16 @@ void VlmReasonerNode::publish_result(
   const InferenceResponse & resp,
   const std::string & effective_prompt)
 {
+  publish_result(header, frame_seq, resp, effective_prompt, ResultMetadata{});
+}
+
+void VlmReasonerNode::publish_result(
+  const std_msgs::msg::Header & header,
+  uint64_t frame_seq,
+  const InferenceResponse & resp,
+  const std::string & effective_prompt,
+  const ResultMetadata & metadata)
+{
   if (!publish_results_ || !result_pub_) {
     return;
   }
@@ -1054,6 +1225,8 @@ void VlmReasonerNode::publish_result(
   msg::VlmResult out;
   out.header = header;
   out.source_topic = source_topic_;
+  out.detector_id = metadata.detector_id;
+  out.tracker_id = metadata.tracker_id;
   out.task_profile = task_profile_;
   out.prompt_version = prompt_version_;
   out.prompt_config_hash = prompt_config_hash_;
@@ -1061,6 +1234,10 @@ void VlmReasonerNode::publish_result(
   out.response = resp.text;
   out.inference_seconds = resp.inference_seconds;
   out.frame_sequence = frame_seq;
+  out.observation_age_seconds = metadata.observation_age_seconds;
+  out.tracker_context = metadata.tracker_context;
+  out.tracked_object_count = metadata.tracked_object_count;
+  out.source_sequence = metadata.source_sequence;
   out.success = resp.success;
   out.error = resp.error;
 
