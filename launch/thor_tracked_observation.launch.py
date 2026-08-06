@@ -19,7 +19,7 @@ import os
 
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetLaunchConfiguration
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -110,6 +110,22 @@ def _validate_thor_launch(context, *args, **kwargs):
     return []
 
 
+def _configure_detector_provenance(context, *args, **kwargs):
+    detector_id = LaunchConfiguration('detector_id').perform(context).strip()
+    if detector_id:
+        return [SetLaunchConfiguration('detector_id', detector_id)]
+
+    detector_backend = LaunchConfiguration('detector_backend').perform(context)
+    start_rtdetr = _truthy(LaunchConfiguration('start_rtdetr').perform(context))
+    if detector_backend == 'ultralytics_yolo':
+        detector_id = 'ultralytics_yolo'
+    elif detector_backend == 'isaac_ros_rtdetr' or (detector_backend == 'none' and start_rtdetr):
+        detector_id = 'isaac_ros_rtdetr'
+    else:
+        detector_id = 'detector_external'
+    return [SetLaunchConfiguration('detector_id', detector_id)]
+
+
 def generate_launch_description() -> LaunchDescription:
     base_launch = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'launch', 'edge_vlm.launch.py'
@@ -125,7 +141,7 @@ def generate_launch_description() -> LaunchDescription:
     enable_rviz = LaunchConfiguration('enable_rviz')
     start_rtdetr = LaunchConfiguration('start_rtdetr')
     detector_backend = LaunchConfiguration('detector_backend')
-    yolo_detections_topic = LaunchConfiguration('yolo_detections_topic')
+    yolo_namespace = LaunchConfiguration('yolo_namespace')
     yolo_model = LaunchConfiguration('yolo_model')
     rviz_config = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'rviz', 'vision_reasoning_results.rviz'
@@ -144,7 +160,7 @@ def generate_launch_description() -> LaunchDescription:
                     launch_arguments={
                         'image_topic': image_topic,
                         'detections_topic': detections_topic,
-                        'yolo_detections_topic': yolo_detections_topic,
+                        'yolo_namespace': yolo_namespace,
                         'yolo_model': yolo_model,
                     }.items(),
                 )
@@ -180,17 +196,18 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('detector_backend', default_value='none'),
         DeclareLaunchArgument(
             'detector_id',
-            default_value='detector_external',
-            description='Detector identity stamped into tracked observations. Override to values such as ultralytics_yolo or isaac_ros_rtdetr when launching a managed backend.',
+            default_value='',
+            description='Optional detector identity stamped into tracked observations. Defaults to the selected managed backend, or detector_external when no backend is launched here.',
         ),
         DeclareLaunchArgument('tracker_id', default_value='iou_tracker'),
-        DeclareLaunchArgument('yolo_detections_topic', default_value='/yolo/detections'),
+        DeclareLaunchArgument('yolo_namespace', default_value='yolo'),
         DeclareLaunchArgument('yolo_model', default_value='yolov8m.pt'),
         DeclareLaunchArgument('enable_rviz', default_value='true'),
         DeclareLaunchArgument('llm_engine_dir', default_value=''),
         DeclareLaunchArgument('multimodal_engine_dir', default_value=''),
         DeclareLaunchArgument('edge_llm_plugin_path', default_value=''),
         OpaqueFunction(function=_validate_thor_launch),
+        OpaqueFunction(function=_configure_detector_provenance),
         OpaqueFunction(function=launch_selected_detector),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(base_launch),

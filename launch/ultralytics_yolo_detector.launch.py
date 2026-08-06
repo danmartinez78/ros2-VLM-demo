@@ -52,14 +52,22 @@ def _validate_launch(context, *args, **kwargs):
     return []
 
 
+def _namespaced_topic(namespace: str, topic_name: str) -> str:
+    cleaned_namespace = namespace.strip().strip('/')
+    if not cleaned_namespace:
+        return f'/{topic_name}'
+    return f'/{cleaned_namespace}/{topic_name}'
+
+
 def _launch_yolo_backend(context, *args, **kwargs):
     global _YOLO_LAUNCH_PATH
     if _YOLO_LAUNCH_PATH is None:
         raise RuntimeError('YOLO launch path was not validated before backend startup.')
     image_topic = LaunchConfiguration('image_topic')
     detections_topic = LaunchConfiguration('detections_topic')
-    yolo_detections_topic = LaunchConfiguration('yolo_detections_topic')
+    yolo_namespace = LaunchConfiguration('yolo_namespace')
     yolo_model = LaunchConfiguration('yolo_model')
+    yolo_detections_topic = _namespaced_topic(yolo_namespace.perform(context), 'detections')
     return [
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(_YOLO_LAUNCH_PATH),
@@ -67,7 +75,7 @@ def _launch_yolo_backend(context, *args, **kwargs):
                 'input_image_topic': image_topic,
                 'image_reliability': '2',
                 'model': yolo_model,
-                'detections_topic': yolo_detections_topic,
+                'namespace': yolo_namespace,
             }.items(),
         ),
         Node(
@@ -87,7 +95,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         DeclareLaunchArgument('image_topic', default_value='/camera0/color/image_raw'),
         DeclareLaunchArgument('detections_topic', default_value='/detections'),
-        DeclareLaunchArgument('yolo_detections_topic', default_value='/yolo/detections'),
+        DeclareLaunchArgument('yolo_namespace', default_value='yolo'),
         DeclareLaunchArgument('yolo_model', default_value='yolov8m.pt'),
         OpaqueFunction(function=_validate_launch),
         OpaqueFunction(function=_launch_yolo_backend),

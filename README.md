@@ -171,9 +171,10 @@ Optional overrides:
 - `detections_topic:=...`
 - `tracked_observation_topic:=...`
 - `detector_backend:=none|ultralytics_yolo|isaac_ros_rtdetr`
+- `detector_id:=...` (optional override; otherwise managed backends stamp their own ID)
 - `start_rtdetr:=true`
 - `yolo_model:=yolov8m.pt`
-- `yolo_detections_topic:=/yolo/detections`
+- `yolo_namespace:=yolo`
 - `enable_rviz:=false`
 - `use_sim_time:=false`
 
@@ -189,7 +190,6 @@ Example:
 ```bash
 ros2 launch edge_vlm_ros thor_tracked_observation.launch.py \
   detector_backend:=ultralytics_yolo \
-  detector_id:=ultralytics_yolo \
   yolo_model:=yolov8m.pt \
   llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
   multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
@@ -211,13 +211,24 @@ is available.
 
 ### Installing the recommended Ultralytics YOLO backend
 
-On Jetson AGX Thor / JetPack 7.2, install a ROS 2 Jazzy-compatible checkout of
-[`mgonzs13/yolo_ros`](https://github.com/mgonzs13/yolo_ros) in the same
-workspace, then rebuild:
+Tested upstream revision: [`mgonzs13/yolo_ros` tag `4.6.1`](https://github.com/mgonzs13/yolo_ros/releases/tag/4.6.1)
+(`e712bdee9c5fcffb5e42a17b28792de004224964`).
+
+On Jetson AGX Thor / JetPack 7.2, install that exact ROS 2 Jazzy-compatible
+checkout in the same workspace, make sure `uv` is installed on the target, and
+then rebuild:
 
 ```bash
 cd "$ROS_WORKSPACE/src"
+rm -rf yolo_ros
 git clone https://github.com/mgonzs13/yolo_ros.git
+cd yolo_ros
+git checkout e712bdee9c5fcffb5e42a17b28792de004224964
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+uv sync
+
 cd "$ROS_WORKSPACE"
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select yolo_msgs yolo_ros yolo_bringup edge_vlm_ros --symlink-install
@@ -227,6 +238,13 @@ That package publishes `yolo_msgs/msg/DetectionArray`; this repository converts
 it to `vision_msgs/msg/Detection2DArray` on `/detections` without requiring any
 manual topic relay. The tracked-observation adapter then preserves the exact
 source image stamp when publishing `/tracked_observation`.
+
+Upstream `yolo_bringup/launch/yolo.launch.py` currently runs `uv sync` again at
+launch time, so `uv` must remain installed and available on `PATH` on the Thor
+system. If you override `yolo_namespace:=...`, the repo-owned adapter
+automatically follows the upstream detections topic at `/<namespace>/detections`
+and still republishes detector-neutral `vision_msgs/msg/Detection2DArray` on
+your selected `detections_topic`.
 
 ## NVIDIA test data
 

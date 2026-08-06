@@ -136,6 +136,92 @@ jobs:
             echo "No build directory; test results are unavailable."
           fi
 
+  yolo-adapter-tests:
+    runs-on: ubuntu-24.04
+    needs: ensure-ci-image
+    timeout-minutes: 15
+    container:
+      image: ${{ needs.ensure-ci-image.outputs.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --user root
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      ROS_DISTRO: jazzy
+      YOLO_ROS_SHA: e712bdee9c5fcffb5e42a17b28792de004224964
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout pinned yolo_msgs sources
+        uses: actions/checkout@v4
+        with:
+          repository: mgonzs13/yolo_ros
+          ref: ${{ env.YOLO_ROS_SHA }}
+          path: external/yolo_ros
+          sparse-checkout: |
+            yolo_msgs
+
+      - name: Install package rosdep dependencies
+        timeout-minutes: 3
+        run: |
+          rosdep update --rosdistro "${ROS_DISTRO}"
+          rosdep install \
+            --from-paths . external/yolo_ros/yolo_msgs \
+            --ignore-src \
+            --rosdistro "${ROS_DISTRO}" \
+            -y \
+            --skip-keys "libopencv-dev qtbase5-dev image_transport pluginlib rviz_common message_filters vision_msgs"
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Build yolo_msgs
+        run: |
+          source "/opt/ros/${ROS_DISTRO}/setup.bash"
+          colcon build \
+            --packages-select yolo_msgs \
+            --symlink-install
+
+      - name: Build YOLO adapter path (colcon)
+        run: |
+          source "/opt/ros/${ROS_DISTRO}/setup.bash"
+          source install/setup.bash
+          colcon build \
+            --packages-select edge_vlm_ros \
+            --symlink-install \
+            --cmake-args -DBUILD_TESTING=ON
+
+      - name: Verify YOLO adapter executable
+        run: test -f install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_yolo_detection2d_adapter
+
+      - name: Run YOLO adapter test
+        run: |
+          source "/opt/ros/${ROS_DISTRO}/setup.bash"
+          source install/setup.bash
+          colcon test --packages-select edge_vlm_ros \
+            --ctest-args \
+              -R "test_yolo_detection2d_adapter" \
+              --output-on-failure
+
+      - name: Publish test results
+        if: always()
+        run: |
+          source "/opt/ros/${ROS_DISTRO}/setup.bash"
+          if [[ -f install/setup.bash ]]; then
+            source install/setup.bash
+          fi
+          if [[ -d build ]]; then
+            colcon test-result --verbose
+          else
+            echo "No build directory; test results are unavailable."
+          fi
+
   benchmark-parser-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
