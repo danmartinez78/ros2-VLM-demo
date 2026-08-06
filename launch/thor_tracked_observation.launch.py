@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Thor tracked-observation bring-up with RT-DETR, adapter, VLM, and RViz2."""
+"""Thor tracked-observation bring-up with optional RT-DETR, adapter, VLM, and RViz2."""
 
 import os
 
@@ -83,7 +83,8 @@ def _validate_thor_launch(context, *args, **kwargs):
         if not os.path.exists(rviz_executable):
             raise RuntimeError(f'rviz2 executable not found: {rviz_executable}')
 
-    _resolve_isaac_rtdetr_launch()
+    if _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
+        _resolve_isaac_rtdetr_launch()
     return []
 
 
@@ -100,6 +101,7 @@ def generate_launch_description() -> LaunchDescription:
     multimodal_engine_dir = LaunchConfiguration('multimodal_engine_dir')
     edge_llm_plugin_path = LaunchConfiguration('edge_llm_plugin_path')
     enable_rviz = LaunchConfiguration('enable_rviz')
+    start_rtdetr = LaunchConfiguration('start_rtdetr')
 
     rviz_config = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'rviz', 'vision_reasoning_results.rviz'
@@ -111,6 +113,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('detections_topic', default_value='/detections'),
         DeclareLaunchArgument('tracked_observation_topic', default_value='/tracked_observation'),
         DeclareLaunchArgument('result_topic', default_value='/vlm/result'),
+        DeclareLaunchArgument('start_rtdetr', default_value='false'),
         DeclareLaunchArgument('detector_id', default_value='isaac_ros_rtdetr'),
         DeclareLaunchArgument('tracker_id', default_value='iou_tracker'),
         DeclareLaunchArgument('enable_rviz', default_value='true'),
@@ -144,6 +147,7 @@ def generate_launch_description() -> LaunchDescription:
                 'output_detections_topic': detections_topic,
                 'detection2_d_array_topic': detections_topic,
             }.items(),
+            condition=IfCondition(start_rtdetr),
         ),
         Node(
             package='edge_vlm_ros',

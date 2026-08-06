@@ -150,10 +150,12 @@ ros2 launch edge_vlm_ros thor_tracked_observation.launch.py \
 ```
 
 This single command starts the existing Edge-LLM worker + ROS VLM node, the
-tracked-observation adapter, the repository-owned Isaac ROS RT-DETR launch, and
-RViz2. By default it uses `use_sim_time:=true`, subscribes to
-`/camera0/color/image_raw`, publishes detections on `/detections`, tracked
-observations on `/tracked_observation`, and reasoning output on `/vlm/result`.
+tracked-observation adapter, and RViz2. By default it uses `use_sim_time:=true`,
+subscribes to `/camera0/color/image_raw`, accepts detector-neutral
+`vision_msgs/msg/Detection2DArray` input on `/detections`, publishes tracked
+observations on `/tracked_observation`, and publishes reasoning output on
+`/vlm/result`. Rosbag playback remains separate, and a detector can publish to
+`/detections` externally.
 
 Terminal 2 (separate rosbag playback):
 
@@ -168,11 +170,19 @@ Optional overrides:
 - `image_topic:=...`
 - `detections_topic:=...`
 - `tracked_observation_topic:=...`
+- `start_rtdetr:=true`
 - `enable_rviz:=false`
 - `use_sim_time:=false`
 
-The launch fails early with a clear error if Isaac ROS RT-DETR, RViz2, the RViz
-config, or any required engine/plugin path is missing.
+Set `start_rtdetr:=true` to launch the repository-owned Isaac ROS RT-DETR
+backend directly from this entrypoint. When enabled, the launch wires
+`/camera0/color/image_raw` (or your `image_topic`) into RT-DETR and remaps its
+`vision_msgs/msg/Detection2DArray` output to `/detections`.
+
+The launch fails early with a clear error if RViz2, the RViz config, or any
+required engine/plugin path is missing. When `start_rtdetr:=true`, it also
+fails early if the supported Isaac ROS RT-DETR packages or launch files are not
+installed.
 
 ## NVIDIA test data
 
