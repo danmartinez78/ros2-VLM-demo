@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Thor tracked-observation bring-up with optional RT-DETR, adapter, VLM, and RViz2."""
+"""Thor tracked-observation bring-up with optional detector backends, adapter, VLM, and RViz2."""
 
 import os
 
@@ -22,7 +22,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -62,6 +62,14 @@ def _resolve_isaac_rtdetr_launch() -> str:
         f'and ensure one of these launch files exists: {joined}')
 
 
+def _resolve_repo_yolo_include() -> str:
+    share_dir = get_package_share_directory('edge_vlm_ros')
+    launch_path = os.path.join(share_dir, 'launch', 'ultralytics_yolo_detector.launch.py')
+    if not os.path.exists(launch_path):
+        raise RuntimeError(f'Repo-owned YOLO detector include not found: {launch_path}')
+    return launch_path
+
+
 def _validate_thor_launch(context, *args, **kwargs):
     share_dir = get_package_share_directory('edge_vlm_ros')
     rviz_config = os.path.join(share_dir, 'rviz', 'vision_reasoning_results.rviz')
@@ -83,8 +91,20 @@ def _validate_thor_launch(context, *args, **kwargs):
         if not os.path.exists(rviz_executable):
             raise RuntimeError(f'rviz2 executable not found: {rviz_executable}')
 
-    if _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
+    detector_backend = LaunchConfiguration('detector_backend').perform(context)
+    start_rtdetr = _truthy(LaunchConfiguration('start_rtdetr').perform(context))
+
+    if detector_backend == 'none' and start_rtdetr:
+        detector_backend = 'isaac_ros_rtdetr'
+
+    if detector_backend == 'isaac_ros_rtdetr':
         _resolve_isaac_rtdetr_launch()
+    elif detector_backend == 'ultralytics_yolo':
+        _resolve_repo_yolo_include()
+    elif detector_backend != 'none':
+        raise RuntimeError(
+            f'Unsupported detector_backend: {detector_backend}. '
+            'Supported values: none, isaac_ros_rtdetr, ultralytics_yolo')
     return []
 
 
@@ -102,6 +122,14 @@ def generate_launch_description() -> LaunchDescription:
     edge_llm_plugin_path = LaunchConfiguration('edge_llm_plugin_path')
     enable_rviz = LaunchConfiguration('enable_rviz')
     start_rtdetr = LaunchConfiguration('start_rtdetr')
+    detector_backend = LaunchConfiguration('detector_backend')
+    yolo_detections_topic = LaunchConfiguration('yolo_detections_topic')
+    yolo_model = LaunchConfiguration('yolo_model')
+    use_rtdetr = PythonExpression([
+        '"', detector_backend, '" == "isaac_ros_rtdetr" or ("', detector_backend,
+        '" == "none" and "', start_rtdetr, '" in ["true", "True", "1", "yes", "on"])'
+    ])
+    use_yolo = PythonExpression(['"', detector_backend, '" == "ultralytics_yolo"'])
 
     rviz_config = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'rviz', 'vision_reasoning_results.rviz'
@@ -114,8 +142,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('tracked_observation_topic', default_value='/tracked_observation'),
         DeclareLaunchArgument('result_topic', default_value='/vlm/result'),
         DeclareLaunchArgument('start_rtdetr', default_value='false'),
-        DeclareLaunchArgument('detector_id', default_value='isaac_ros_rtdetr'),
+        DeclareLaunchArgument('detector_backend', default_value='none'),
+        DeclareLaunchArgument('detector_id', default_value='detector_external'),
         DeclareLaunchArgument('tracker_id', default_value='iou_tracker'),
+        DeclareLaunchArgument('yolo_detections_topic', default_value='/yolo/detections'),
+        DeclareLaunchArgument('yolo_model', default_value='yolov8m.pt'),
         DeclareLaunchArgument('enable_rviz', default_value='true'),
         DeclareLaunchArgument('llm_engine_dir', default_value=''),
         DeclareLaunchArgument('multimodal_engine_dir', default_value=''),
@@ -147,7 +178,17 @@ def generate_launch_description() -> LaunchDescription:
                 'output_detections_topic': detections_topic,
                 'detection2_d_array_topic': detections_topic,
             }.items(),
-            condition=IfCondition(start_rtdetr),
+            condition=IfCondition(use_rtdetr),
+        ),
+        IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(_resolve_repo_yolo_include()),
+            launch_arguments={
+                'image_topic': image_topic,
+                'detections_topic': detections_topic,
+                'yolo_detections_topic': yolo_detections_topic,
+                'yolo_model': yolo_model,
+            }.items(),
+            condition=IfCondition(use_yolo),
         ),
         Node(
             package='edge_vlm_ros',

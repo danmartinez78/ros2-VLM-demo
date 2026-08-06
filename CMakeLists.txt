@@ -17,6 +17,7 @@ find_package(image_transport REQUIRED)
 find_package(message_filters REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(vision_msgs REQUIRED)
+find_package(yolo_msgs QUIET)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs)
 find_package(pluginlib QUIET)
 find_package(rviz_common QUIET)
@@ -301,6 +302,33 @@ target_link_libraries(edge_vlm_tracked_observation_adapter
   tracked_observation_adapter)
 ament_target_dependencies(edge_vlm_tracked_observation_adapter rclcpp)
 
+set(BUILD_YOLO_ADAPTER FALSE)
+if(yolo_msgs_FOUND)
+  set(BUILD_YOLO_ADAPTER TRUE)
+  add_library(yolo_detection2d_adapter SHARED
+    src/yolo_detection2d_adapter.cpp
+  )
+  target_include_directories(yolo_detection2d_adapter PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+  )
+  ament_target_dependencies(yolo_detection2d_adapter
+    rcl_interfaces
+    rclcpp
+    vision_msgs
+    yolo_msgs
+  )
+
+  add_executable(edge_vlm_yolo_detection2d_adapter src/yolo_detection2d_adapter_main.cpp)
+  target_include_directories(edge_vlm_yolo_detection2d_adapter PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(edge_vlm_yolo_detection2d_adapter
+    yolo_detection2d_adapter)
+  ament_target_dependencies(edge_vlm_yolo_detection2d_adapter rclcpp)
+else()
+  message(STATUS "yolo_msgs not found. YOLO Detection2D adapter will not be built.")
+endif()
+
 add_executable(edge_vlm_cli src/reasoning_cli.cpp)
 target_include_directories(edge_vlm_cli PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -444,6 +472,14 @@ install(TARGETS edge_vlm_ros_node edge_vlm_tracked_observation_adapter edge_vlm_
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
+if(BUILD_YOLO_ADAPTER)
+  install(TARGETS edge_vlm_yolo_detection2d_adapter yolo_detection2d_adapter
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+
 install(TARGETS vlm_reasoner_node
   EXPORT vlm_reasoner_nodeTargets
   ARCHIVE DESTINATION lib
@@ -586,6 +622,23 @@ if(BUILD_TESTING)
     sensor_msgs
     vision_msgs
   )
+
+  if(BUILD_YOLO_ADAPTER)
+    ament_add_gtest(test_yolo_detection2d_adapter
+      test/test_yolo_detection2d_adapter.cpp
+    )
+    target_include_directories(test_yolo_detection2d_adapter PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_yolo_detection2d_adapter
+      yolo_detection2d_adapter
+    )
+    ament_target_dependencies(test_yolo_detection2d_adapter
+      rclcpp
+      vision_msgs
+      yolo_msgs
+    )
+  endif()
 
   # Shell-level unit tests for the PID-match helpers and PGID isolation safety
   # checks used in the worker-recovery hardware validation script.

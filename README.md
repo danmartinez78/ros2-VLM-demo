@@ -170,19 +170,63 @@ Optional overrides:
 - `image_topic:=...`
 - `detections_topic:=...`
 - `tracked_observation_topic:=...`
+- `detector_backend:=none|ultralytics_yolo|isaac_ros_rtdetr`
 - `start_rtdetr:=true`
+- `yolo_model:=yolov8m.pt`
+- `yolo_detections_topic:=/yolo/detections`
 - `enable_rviz:=false`
 - `use_sim_time:=false`
 
-Set `start_rtdetr:=true` to launch the repository-owned Isaac ROS RT-DETR
-backend directly from this entrypoint. When enabled, the launch wires
+Recommended Thor backend: `detector_backend:=ultralytics_yolo`. This uses the
+externally installed ROS 2 Jazzy `yolo_ros` / `yolo_bringup` package plus the
+repo-owned `edge_vlm_yolo_detection2d_adapter` bridge so the rest of this
+repository still receives detector-neutral
+`vision_msgs/msg/Detection2DArray` on `/detections` with the exact detector
+header stamp preserved.
+
+Example:
+
+```bash
+ros2 launch edge_vlm_ros thor_tracked_observation.launch.py \
+  detector_backend:=ultralytics_yolo \
+  detector_id:=ultralytics_yolo \
+  yolo_model:=yolov8m.pt \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
+  edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH"
+```
+
+Set `detector_backend:=isaac_ros_rtdetr` (or the backward-compatible
+`start_rtdetr:=true`) to launch the optional Isaac ROS RT-DETR backend directly
+from this entrypoint. When enabled, the launch wires
 `/camera0/color/image_raw` (or your `image_topic`) into RT-DETR and remaps its
 `vision_msgs/msg/Detection2DArray` output to `/detections`.
 
 The launch fails early with a clear error if RViz2, the RViz config, or any
-required engine/plugin path is missing. When `start_rtdetr:=true`, it also
-fails early if the supported Isaac ROS RT-DETR packages or launch files are not
-installed.
+required engine/plugin path is missing. When a detector backend is selected, it
+also fails early if the required external launch package is not installed. For
+`detector_backend:=ultralytics_yolo`, `edge_vlm_ros` must also be rebuilt in an
+environment where `yolo_msgs` is installed so the repo-owned bridge executable
+is available.
+
+### Installing the recommended Ultralytics YOLO backend
+
+On Jetson AGX Thor / JetPack 7.2, install a ROS 2 Jazzy-compatible checkout of
+[`mgonzs13/yolo_ros`](https://github.com/mgonzs13/yolo_ros) in the same
+workspace, then rebuild:
+
+```bash
+cd "$ROS_WORKSPACE/src"
+git clone https://github.com/mgonzs13/yolo_ros.git
+cd "$ROS_WORKSPACE"
+rosdep install --from-paths src --ignore-src -r -y
+colcon build --packages-select yolo_msgs yolo_ros yolo_bringup edge_vlm_ros --symlink-install
+```
+
+That package publishes `yolo_msgs/msg/DetectionArray`; this repository converts
+it to `vision_msgs/msg/Detection2DArray` on `/detections` without requiring any
+manual topic relay. The tracked-observation adapter then preserves the exact
+source image stamp when publishing `/tracked_observation`.
 
 ## NVIDIA test data
 
