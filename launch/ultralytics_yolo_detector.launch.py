@@ -15,6 +15,8 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+_YOLO_LAUNCH_PATH = None
+
 
 def _resolve_yolo_launch() -> str:
     candidates = [
@@ -39,30 +41,28 @@ def _resolve_yolo_launch() -> str:
 
 
 def _validate_launch(context, *args, **kwargs):
+    global _YOLO_LAUNCH_PATH
     prefix = get_package_prefix('edge_vlm_ros')
     adapter_executable = os.path.join(prefix, 'lib', 'edge_vlm_ros', 'edge_vlm_yolo_detection2d_adapter')
     if not os.path.exists(adapter_executable):
         raise RuntimeError(
             'The YOLO Detection2D adapter executable is not installed. Rebuild edge_vlm_ros '
             'in an environment where yolo_msgs is available before using this launch include.')
-    _resolve_yolo_launch()
+    _YOLO_LAUNCH_PATH = _resolve_yolo_launch()
     return []
 
 
-def generate_launch_description() -> LaunchDescription:
+def _launch_yolo_backend(context, *args, **kwargs):
+    global _YOLO_LAUNCH_PATH
+    if _YOLO_LAUNCH_PATH is None:
+        raise RuntimeError('YOLO launch path was not validated before backend startup.')
     image_topic = LaunchConfiguration('image_topic')
     detections_topic = LaunchConfiguration('detections_topic')
     yolo_detections_topic = LaunchConfiguration('yolo_detections_topic')
     yolo_model = LaunchConfiguration('yolo_model')
-
-    return LaunchDescription([
-        DeclareLaunchArgument('image_topic', default_value='/camera0/color/image_raw'),
-        DeclareLaunchArgument('detections_topic', default_value='/detections'),
-        DeclareLaunchArgument('yolo_detections_topic', default_value='/yolo/detections'),
-        DeclareLaunchArgument('yolo_model', default_value='yolov8m.pt'),
-        OpaqueFunction(function=_validate_launch),
+    return [
         IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(_resolve_yolo_launch()),
+            PythonLaunchDescriptionSource(_YOLO_LAUNCH_PATH),
             launch_arguments={
                 'input_image_topic': image_topic,
                 'image_reliability': '2',
@@ -80,4 +80,15 @@ def generate_launch_description() -> LaunchDescription:
                 'output_topic': detections_topic,
             }],
         ),
+    ]
+
+
+def generate_launch_description() -> LaunchDescription:
+    return LaunchDescription([
+        DeclareLaunchArgument('image_topic', default_value='/camera0/color/image_raw'),
+        DeclareLaunchArgument('detections_topic', default_value='/detections'),
+        DeclareLaunchArgument('yolo_detections_topic', default_value='/yolo/detections'),
+        DeclareLaunchArgument('yolo_model', default_value='yolov8m.pt'),
+        OpaqueFunction(function=_validate_launch),
+        OpaqueFunction(function=_launch_yolo_backend),
     ])

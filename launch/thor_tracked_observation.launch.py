@@ -22,9 +22,12 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+
+_REPO_YOLO_INCLUDE_PATH = None
+_RTDETR_LAUNCH_PATH = None
 
 
 def _truthy(value: str) -> bool:
@@ -71,6 +74,8 @@ def _resolve_repo_yolo_include() -> str:
 
 
 def _validate_thor_launch(context, *args, **kwargs):
+    global _REPO_YOLO_INCLUDE_PATH
+    global _RTDETR_LAUNCH_PATH
     share_dir = get_package_share_directory('edge_vlm_ros')
     rviz_config = os.path.join(share_dir, 'rviz', 'vision_reasoning_results.rviz')
     _require_existing_path('RViz config', rviz_config)
@@ -94,13 +99,10 @@ def _validate_thor_launch(context, *args, **kwargs):
     detector_backend = LaunchConfiguration('detector_backend').perform(context)
     start_rtdetr = _truthy(LaunchConfiguration('start_rtdetr').perform(context))
 
-    if detector_backend == 'none' and start_rtdetr:
-        detector_backend = 'isaac_ros_rtdetr'
-
-    if detector_backend == 'isaac_ros_rtdetr':
-        _resolve_isaac_rtdetr_launch()
+    if detector_backend == 'isaac_ros_rtdetr' or (detector_backend == 'none' and start_rtdetr):
+        _RTDETR_LAUNCH_PATH = _resolve_isaac_rtdetr_launch()
     elif detector_backend == 'ultralytics_yolo':
-        _resolve_repo_yolo_include()
+        _REPO_YOLO_INCLUDE_PATH = _resolve_repo_yolo_include()
     elif detector_backend != 'none':
         raise RuntimeError(
             f'Unsupported detector_backend: {detector_backend}. '
@@ -125,15 +127,48 @@ def generate_launch_description() -> LaunchDescription:
     detector_backend = LaunchConfiguration('detector_backend')
     yolo_detections_topic = LaunchConfiguration('yolo_detections_topic')
     yolo_model = LaunchConfiguration('yolo_model')
-    use_rtdetr = PythonExpression([
-        '"', detector_backend, '" == "isaac_ros_rtdetr" or ("', detector_backend,
-        '" == "none" and "', start_rtdetr, '" in ["true", "True", "1", "yes", "on"])'
-    ])
-    use_yolo = PythonExpression(['"', detector_backend, '" == "ultralytics_yolo"'])
-
     rviz_config = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'rviz', 'vision_reasoning_results.rviz'
     ])
+
+    def launch_selected_detector(context, *args, **kwargs):
+        global _REPO_YOLO_INCLUDE_PATH
+        global _RTDETR_LAUNCH_PATH
+        actions = []
+        detector_backend_value = detector_backend.perform(context)
+        start_rtdetr_value = _truthy(start_rtdetr.perform(context))
+        if detector_backend_value == 'ultralytics_yolo':
+            actions.append(
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(_REPO_YOLO_INCLUDE_PATH),
+                    launch_arguments={
+                        'image_topic': image_topic,
+                        'detections_topic': detections_topic,
+                        'yolo_detections_topic': yolo_detections_topic,
+                        'yolo_model': yolo_model,
+                    }.items(),
+                )
+            )
+        if detector_backend_value == 'isaac_ros_rtdetr' or (
+            detector_backend_value == 'none' and start_rtdetr_value
+        ):
+            if _RTDETR_LAUNCH_PATH is None:
+                raise RuntimeError('RT-DETR launch path was not validated before backend startup.')
+            actions.append(
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(_RTDETR_LAUNCH_PATH),
+                    launch_arguments={
+                        'use_sim_time': use_sim_time,
+                        'image_topic': image_topic,
+                        'input_image_topic': image_topic,
+                        'camera_image_topic': image_topic,
+                        'detections_topic': detections_topic,
+                        'output_detections_topic': detections_topic,
+                        'detection2_d_array_topic': detections_topic,
+                    }.items(),
+                )
+            )
+        return actions
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
@@ -143,7 +178,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('result_topic', default_value='/vlm/result'),
         DeclareLaunchArgument('start_rtdetr', default_value='false'),
         DeclareLaunchArgument('detector_backend', default_value='none'),
-        DeclareLaunchArgument('detector_id', default_value='detector_external'),
+        DeclareLaunchArgument(
+            'detector_id',
+            default_value='detector_external',
+            description='Detector identity stamped into tracked observations. Override to values such as ultralytics_yolo or isaac_ros_rtdetr when launching a managed backend.',
+        ),
         DeclareLaunchArgument('tracker_id', default_value='iou_tracker'),
         DeclareLaunchArgument('yolo_detections_topic', default_value='/yolo/detections'),
         DeclareLaunchArgument('yolo_model', default_value='yolov8m.pt'),
@@ -152,6 +191,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('multimodal_engine_dir', default_value=''),
         DeclareLaunchArgument('edge_llm_plugin_path', default_value=''),
         OpaqueFunction(function=_validate_thor_launch),
+        OpaqueFunction(function=launch_selected_detector),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(base_launch),
             launch_arguments={
@@ -166,29 +206,6 @@ def generate_launch_description() -> LaunchDescription:
                 'multimodal_engine_dir': multimodal_engine_dir,
                 'edge_llm_plugin_path': edge_llm_plugin_path,
             }.items(),
-        ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(_resolve_isaac_rtdetr_launch()),
-            launch_arguments={
-                'use_sim_time': use_sim_time,
-                'image_topic': image_topic,
-                'input_image_topic': image_topic,
-                'camera_image_topic': image_topic,
-                'detections_topic': detections_topic,
-                'output_detections_topic': detections_topic,
-                'detection2_d_array_topic': detections_topic,
-            }.items(),
-            condition=IfCondition(use_rtdetr),
-        ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(_resolve_repo_yolo_include()),
-            launch_arguments={
-                'image_topic': image_topic,
-                'detections_topic': detections_topic,
-                'yolo_detections_topic': yolo_detections_topic,
-                'yolo_model': yolo_model,
-            }.items(),
-            condition=IfCondition(use_yolo),
         ),
         Node(
             package='edge_vlm_ros',
