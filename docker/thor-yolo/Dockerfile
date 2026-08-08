@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
     curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
       -o /usr/share/keyrings/ros-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(source /etc/os-release && echo \"${UBUNTU_CODENAME}\") main" \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(source /etc/os-release && echo \"${VERSION_CODENAME}\") main" \
       > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
       ros-dev-tools \
@@ -41,8 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ros-${ROS_DISTRO}-sensor-msgs \
       ros-${ROS_DISTRO}-std-srvs \
       ros-${ROS_DISTRO}-tf2-ros \
-      ros-${ROS_DISTRO}-visualization-msgs \
-      vcstool && \
+      ros-${ROS_DISTRO}-visualization-msgs && \
     rm -rf /var/lib/apt/lists/*
 
 COPY docker/thor-yolo/requirements.txt /tmp/edge_vlm_yolo_requirements.txt

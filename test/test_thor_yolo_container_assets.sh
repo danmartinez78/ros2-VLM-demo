@@ -27,7 +27,6 @@ grep -Fq 'software-properties-common' "${dockerfile}"
 grep -Fq 'add-apt-repository -y universe' "${dockerfile}"
 grep -Fq 'packages.ros.org/ros2/ubuntu' "${dockerfile}"
 grep -Fq 'ros-dev-tools' "${dockerfile}"
-grep -Fq 'vcstool' "${dockerfile}"
 
 grep -Fq 'runtime: nvidia' "${compose_file}"
 grep -Fq 'network_mode: host' "${compose_file}"
@@ -49,7 +48,7 @@ fi
 
 if grep -Fq 'python3-colcon-common-extensions' "${dockerfile}" || \
    grep -Fq 'python3-vcstool' "${dockerfile}"; then
-  echo "Thor YOLO Dockerfile must use supported Noble/Jazzy tooling package names." >&2
+  echo "Thor YOLO Dockerfile must use supported Noble/Jazzy tooling package names such as ros-dev-tools." >&2
   exit 1
 fi
 
@@ -61,9 +60,8 @@ line_number() {
 universe_line="$(line_number 'add-apt-repository -y universe')"
 ros_source_line="$(line_number 'packages.ros.org/ros2/ubuntu')"
 ros_dev_tools_line="$(line_number 'ros-dev-tools')"
-vcstool_line="$(line_number 'vcstool')"
 
-if [[ -z "${universe_line}" || -z "${ros_source_line}" || -z "${ros_dev_tools_line}" || -z "${vcstool_line}" ]]; then
+if [[ -z "${universe_line}" || -z "${ros_source_line}" || -z "${ros_dev_tools_line}" ]]; then
   echo "Thor YOLO Dockerfile is missing required bootstrap steps." >&2
   exit 1
 fi
@@ -73,7 +71,7 @@ if (( universe_line >= ros_source_line )); then
   exit 1
 fi
 
-if (( ros_source_line >= ros_dev_tools_line || ros_source_line >= vcstool_line )); then
+if (( ros_source_line >= ros_dev_tools_line )); then
   echo "Thor YOLO Dockerfile must add the ROS 2 apt source before installing ROS development tooling." >&2
   exit 1
 fi
