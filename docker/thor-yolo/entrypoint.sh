@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # shellcheck disable=SC1091
-source /opt/ros/jazzy/setup.bash
+source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 # shellcheck disable=SC1091
 source /opt/edge_vlm_yolo_ws/install/setup.bash
 
