@@ -240,6 +240,7 @@ jobs:
           bash -n scripts/experiment_stack.sh
           bash -n scripts/launch_thor_with_yolo_container.sh
           bash test/test_thor_yolo_container_assets.sh
+          docker compose version >/dev/null
           docker compose -f docker/compose.thor-yolo.yml config >/dev/null
 
   web-console-tests:

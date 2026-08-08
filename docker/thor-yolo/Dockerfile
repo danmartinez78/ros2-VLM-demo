@@ -10,7 +10,8 @@ ARG YOLO_MODEL_ASSET=yolov8m.pt
 ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     ROS_DISTRO=${ROS_DISTRO} \
-    ROS_WS=/opt/edge_vlm_yolo_ws
+    ROS_WS=/opt/edge_vlm_yolo_ws \
+    YOLO_MODEL_ASSET=${YOLO_MODEL_ASSET}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -77,7 +78,7 @@ RUN mkdir -p "${ROS_WS}/src" /opt/models && \
     cd "${ROS_WS}" && \
     colcon build --merge-install --packages-select yolo_msgs yolo_ros
 
-RUN YOLO_MODEL_ASSET="${YOLO_MODEL_ASSET}" python3 - <<'PY'
+RUN python3 - <<'PY'
 from pathlib import Path
 from ultralytics.utils.downloads import attempt_download_asset
 import os
