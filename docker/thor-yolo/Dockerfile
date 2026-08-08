@@ -24,8 +24,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       git \
       gnupg \
       locales \
-      python3-colcon-common-extensions \
-      python3-vcstool && \
+      software-properties-common && \
+    add-apt-repository -y universe && \
     locale-gen en_US en_US.UTF-8 && \
     update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
     curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(source /etc/os-release && echo \"${UBUNTU_CODENAME}\") main" \
       > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
+      ros-dev-tools \
       ros-${ROS_DISTRO}-cv-bridge \
       ros-${ROS_DISTRO}-geometry-msgs \
       ros-${ROS_DISTRO}-message-filters \
@@ -40,7 +41,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ros-${ROS_DISTRO}-sensor-msgs \
       ros-${ROS_DISTRO}-std-srvs \
       ros-${ROS_DISTRO}-tf2-ros \
-      ros-${ROS_DISTRO}-visualization-msgs && \
+      ros-${ROS_DISTRO}-visualization-msgs \
+      vcstool && \
     rm -rf /var/lib/apt/lists/*
 
 COPY docker/thor-yolo/requirements.txt /tmp/edge_vlm_yolo_requirements.txt
