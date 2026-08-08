@@ -5,7 +5,10 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 launch_file="${repo_root}/launch/ultralytics_yolo_detector.launch.py"
 
-[[ -f "${launch_file}" ]]
+if [[ ! -f "${launch_file}" ]]; then
+  echo "Launch file not found: ${launch_file}" >&2
+  exit 1
+fi
 
 grep -Fq "package='yolo_ros'" "${launch_file}"
 grep -Fq "executable='yolo_node'" "${launch_file}"
