@@ -84,6 +84,9 @@ from ultralytics.utils.downloads import attempt_download_asset
 import os
 model_asset = os.environ.get('YOLO_MODEL_ASSET', 'yolov8m.pt')
 source = Path(attempt_download_asset(model_asset))
+if not source.exists():
+    raise SystemExit(
+        f'Failed to download the pinned YOLO model asset during image build: {model_asset}')
 target = Path('/opt/models') / Path(model_asset).name
 if source.resolve() != target.resolve():
     target.write_bytes(source.read_bytes())
