@@ -25,7 +25,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gnupg \
       locales \
       python3-colcon-common-extensions \
-      python3-rosdep \
       python3-vcstool && \
     locale-gen en_US en_US.UTF-8 && \
     update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
@@ -79,6 +78,7 @@ RUN mkdir -p "${ROS_WS}/src" /opt/models && \
     colcon build --merge-install --packages-select yolo_msgs yolo_ros
 
 RUN python3 - <<'PY'
+import shutil
 from pathlib import Path
 from ultralytics.utils.downloads import attempt_download_asset
 import os
@@ -89,7 +89,7 @@ if not source.exists():
         f'Failed to download the pinned YOLO model asset during image build: {model_asset}')
 target = Path('/opt/models') / Path(model_asset).name
 if source.resolve() != target.resolve():
-    target.write_bytes(source.read_bytes())
+    shutil.copy2(source, target)
 PY
 
 COPY docker/thor-yolo/entrypoint.sh /usr/local/bin/edge-vlm-thor-yolo-entrypoint
