@@ -1,0 +1,20 @@
+services:
+  thor-yolo-detector:
+    image: edge-vlm-thor-yolo:4.6.1-e712bdee-yolov8m
+    build:
+      context: ..
+      dockerfile: docker/thor-yolo/Dockerfile
+      args:
+        BASE_IMAGE: nvcr.io/nvidia/pytorch:26.05-py3
+        YOLO_ROS_SHA: e712bdee9c5fcffb5e42a17b28792de004224964
+        YOLO_MODEL_ASSET: yolov8m.pt
+    network_mode: host
+    ipc: host
+    runtime: nvidia
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      YOLO_DEVICE: ${EDGE_VLM_YOLO_DEVICE:-cuda:0}
+      YOLO_IMAGE_TOPIC: ${EDGE_VLM_YOLO_IMAGE_TOPIC:-/camera0/color/image_raw}
+      YOLO_MODEL: ${EDGE_VLM_YOLO_MODEL:-yolov8m.pt}
+      YOLO_NAMESPACE: ${EDGE_VLM_YOLO_NAMESPACE:-yolo}

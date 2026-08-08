@@ -656,6 +656,12 @@ if(BUILD_TESTING)
     TIMEOUT 30
     GENERATE_RESULT_FOR_RETURN_CODE_ZERO
   )
+  ament_add_test(test_thor_yolo_container_assets
+    COMMAND "${BASH_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/test_thor_yolo_container_assets.sh"
+    TIMEOUT 30
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
 endif()
 
 ament_export_targets(vlm_reasoner_nodeTargets HAS_LIBRARY_TARGET)

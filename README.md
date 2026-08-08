@@ -173,27 +173,23 @@ Optional overrides:
 - `detector_backend:=none|ultralytics_yolo|isaac_ros_rtdetr`
 - `detector_id:=...` (optional override; otherwise managed backends stamp their own ID)
 - `start_rtdetr:=true`
-- `yolo_model:=yolov8m.pt`
+- `yolo_model:=yolov8m.pt` (wrapper/container model asset; the pinned image preloads this model)
 - `yolo_namespace:=yolo`
 - `enable_rviz:=false`
 - `use_sim_time:=false`
 
-Recommended Thor backend: `detector_backend:=ultralytics_yolo`. This uses the
-externally installed ROS 2 Jazzy `yolo_ros` package plus the repo-owned
-`edge_vlm_yolo_detection2d_adapter` bridge so the rest of this repository still receives detector-neutral
-`vision_msgs/msg/Detection2DArray` on `/detections` with the exact detector
-header stamp preserved.
+Recommended Thor backend: `detector_backend:=ultralytics_yolo`. The supported
+deployment now keeps the detector in a pinned Thor-compatible NVIDIA PyTorch
+container while the existing host-native `edge_vlm_ros` stack continues to run
+the repo-owned `edge_vlm_yolo_detection2d_adapter` bridge. The topic flow is:
 
-Example:
+`/camera0/color/image_raw` -> containerized `yolo_node` ->
+`/yolo/detections` (`yolo_msgs/msg/DetectionArray`) -> host
+`edge_vlm_yolo_detection2d_adapter` -> `/detections`
+(`vision_msgs/msg/Detection2DArray`).
 
-```bash
-ros2 launch edge_vlm_ros thor_tracked_observation.launch.py \
-  detector_backend:=ultralytics_yolo \
-  yolo_model:=yolov8m.pt \
-  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
-  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
-  edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH"
-```
+The adapter preserves the exact source image/detection header stamp, so the
+tracked-observation path still performs exact pairing.
 
 Set `detector_backend:=isaac_ros_rtdetr` (or the backward-compatible
 `start_rtdetr:=true`) to launch the optional Isaac ROS RT-DETR backend directly
@@ -202,20 +198,23 @@ from this entrypoint. When enabled, the launch wires
 `vision_msgs/msg/Detection2DArray` output to `/detections`.
 
 The launch fails early with a clear error if RViz2, the RViz config, or any
-required engine/plugin path is missing. When a detector backend is selected, it
-also fails early if the required external detector package is not installed. For
-`detector_backend:=ultralytics_yolo`, both `yolo_ros` and `edge_vlm_ros` must
-be rebuilt in an environment where `yolo_msgs` is installed so the repo-owned
-bridge executable is available.
+required engine/plugin path is missing. When a detector backend is selected, the
+launch also validates the repo-owned bridge path (and, for RT-DETR, the required
+external launch files). For `detector_backend:=ultralytics_yolo`, `edge_vlm_ros`
+must be rebuilt in an environment where the pinned `yolo_msgs` sources are
+present so the repo-owned bridge executable is available.
 
 ### Installing the recommended Ultralytics YOLO backend
 
-Tested upstream revision: [`mgonzs13/yolo_ros` tag `4.6.1`](https://github.com/mgonzs13/yolo_ros/releases/tag/4.6.1)
-(`e712bdee9c5fcffb5e42a17b28792de004224964`).
+Pinned detector image inputs:
 
-On Jetson AGX Thor / JetPack 7.2, install that exact ROS 2 Jazzy-compatible
-checkout in the same workspace, install its pinned Python runtime dependencies
-once into the same ROS 2 Jazzy environment, and then rebuild:
+- NVIDIA Thor base image: `nvcr.io/nvidia/pytorch:26.05-py3`
+- `yolo_ros` / `yolo_msgs`: [`mgonzs13/yolo_ros` tag `4.6.1`](https://github.com/mgonzs13/yolo_ros/releases/tag/4.6.1)
+  (`e712bdee9c5fcffb5e42a17b28792de004224964`)
+- Build-time-only dependency installer: `ghcr.io/astral-sh/uv:0.6.17`
+- Preloaded model asset in the image: `yolov8m.pt`
+
+Host build (needed once so `edge_vlm_yolo_detection2d_adapter` is compiled):
 
 ```bash
 cd "$ROS_WORKSPACE/src"
@@ -224,29 +223,54 @@ git clone https://github.com/mgonzs13/yolo_ros.git
 cd yolo_ros
 git checkout e712bdee9c5fcffb5e42a17b28792de004224964
 
-python3 -m pip install --user --break-system-packages \
-  "numpy<2" \
-  "opencv-python-headless>=4.8.1.78" \
-  "typing-extensions>=4.4.0" \
-  "ultralytics==8.4.6" \
-  "lap>=0.5.12"
-
 cd "$ROS_WORKSPACE"
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --packages-select yolo_msgs yolo_ros edge_vlm_ros --symlink-install
+colcon build --packages-up-to yolo_msgs edge_vlm_ros --symlink-install
 ```
 
-That package publishes `yolo_msgs/msg/DetectionArray`; this repository converts
-it to `vision_msgs/msg/Detection2DArray` on `/detections` without requiring any
-manual topic relay. The tracked-observation adapter then preserves the exact
-source image stamp when publishing `/tracked_observation`.
+The host does **not** need `pip`, `uv`, `torch`, or the `yolo_ros` Python
+runtime to launch. Only the pinned `yolo_msgs` source checkout is required so
+the adapter can be built.
 
-The supported `edge_vlm_ros` launch path starts `yolo_ros`'s `yolo_node`
-directly and does not run `uv sync` or any other package-manager step during
-`ros2 launch`. If you override `yolo_namespace:=...`, the repo-owned adapter
-automatically follows the detections topic at `/<namespace>/detections` and
-still republishes detector-neutral `vision_msgs/msg/Detection2DArray` on your
-selected `detections_topic`.
+One-time detector image build on Thor:
+
+```bash
+docker compose -f docker/compose.thor-yolo.yml build thor-yolo-detector
+```
+
+Supported one-command bring-up after the normal ROS/VLM environment is already
+built and sourced:
+
+```bash
+./scripts/launch_thor_with_yolo_container.sh \
+  yolo_model:=yolov8m.pt \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
+  edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH"
+```
+
+Manual equivalent if you prefer separate terminal control of the detector:
+
+```bash
+EDGE_VLM_YOLO_MODEL=yolov8m.pt \
+  docker compose -f docker/compose.thor-yolo.yml up -d thor-yolo-detector
+ros2 launch edge_vlm_ros thor_tracked_observation.launch.py \
+  detector_backend:=ultralytics_yolo \
+  llm_engine_dir:="$EDGE_VLM_LLM_ENGINE_DIR" \
+  multimodal_engine_dir:="$EDGE_VLM_MULTIMODAL_ENGINE_DIR" \
+  edge_llm_plugin_path:="$EDGELLM_PLUGIN_PATH"
+```
+
+The container image builds `yolo_msgs` and `yolo_ros`, installs pinned
+non-system Python dependencies at image-build time only, preserves the
+NVIDIA-provided CUDA-enabled PyTorch already present in the base image, and
+preloads `yolov8m.pt` so normal runtime performs no `uv sync`, no `pip
+install`, no package-manager actions, and no model download. If you override
+`yolo_namespace:=...`, the repo-owned adapter automatically follows
+`/<namespace>/detections` and still republishes detector-neutral
+`vision_msgs/msg/Detection2DArray` on your selected `detections_topic`. If you
+need a different pinned YOLO model, rebuild the detector image with
+`YOLO_MODEL_ASSET=<model>.pt` and then launch with the matching
+`yolo_model:=<model>.pt`.
 
 ## NVIDIA test data
 

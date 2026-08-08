@@ -10,21 +10,22 @@ if [[ ! -f "${launch_file}" ]]; then
   exit 1
 fi
 
-grep -Fq "package='yolo_ros'" "${launch_file}"
-grep -Fq "executable='yolo_node'" "${launch_file}"
-grep -Fq "The yolo_ros package is required" "${launch_file}"
+grep -Fq "package='edge_vlm_ros'" "${launch_file}"
+grep -Fq "executable='edge_vlm_yolo_detection2d_adapter'" "${launch_file}"
+grep -Fq 'The YOLO Detection2D adapter executable is not installed' "${launch_file}"
+grep -Fq "_namespaced_topic" "${launch_file}"
 
-if grep -Eq '(^|[^[:alnum:]_])uv([^[:alnum:]_]|$)' "${launch_file}"; then
-  echo "Launch file must not reference uv at runtime: ${launch_file}" >&2
+if grep -Fq "package='yolo_ros'" "${launch_file}"; then
+  echo "Launch file must not start yolo_ros on the host." >&2
   exit 1
 fi
 
-if grep -Fq 'yolo.launch.py' "${launch_file}"; then
-  echo "Launch file must not include the upstream yolo.launch.py entrypoint." >&2
+if grep -Eq '(^|[^[:alnum:]_])(uv|pip)([^[:alnum:]_]|$)' "${launch_file}"; then
+  echo "Launch file must not reference runtime package managers: ${launch_file}" >&2
   exit 1
 fi
 
 if grep -Fq 'IncludeLaunchDescription' "${launch_file}"; then
-  echo "Launch file must start yolo_ros directly instead of including another launch file." >&2
+  echo "Launch file must not include an upstream YOLO launch file." >&2
   exit 1
 fi

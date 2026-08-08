@@ -120,7 +120,7 @@ jobs:
           source install/setup.bash
           colcon test --packages-select edge_vlm_ros \
             --ctest-args \
-              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|latest_value_stage|iou_tracker|tracked_observation_adapter|worker_recovery_helpers|ultralytics_yolo_launch)" \
+              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|latest_value_stage|iou_tracker|tracked_observation_adapter|worker_recovery_helpers|ultralytics_yolo_launch|thor_yolo_container_assets)" \
               --output-on-failure
 
       - name: Publish test results
@@ -238,6 +238,9 @@ jobs:
           bash -n scripts/benchmark/run_observation_history_experiment.sh
           bash -n scripts/test_data/run_image_proc_test.sh
           bash -n scripts/experiment_stack.sh
+          bash -n scripts/launch_thor_with_yolo_container.sh
+          bash test/test_thor_yolo_container_assets.sh
+          docker compose -f docker/compose.thor-yolo.yml config >/dev/null
 
   web-console-tests:
     runs-on: ubuntu-24.04

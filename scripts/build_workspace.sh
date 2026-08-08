@@ -62,9 +62,13 @@ rosdep install \
   -r -y
 
 cd "${ros_workspace}"
+packages=(edge_vlm_ros)
+if [[ -d "${ros_workspace}/src/yolo_ros/yolo_msgs" || -d "${ros_workspace}/src/yolo_msgs" ]]; then
+  packages=(yolo_msgs edge_vlm_ros)
+fi
 colcon build \
   --symlink-install \
-  --packages-select edge_vlm_ros \
+  --packages-up-to "${packages[@]}" \
   --event-handlers console_direct+ \
   --cmake-args \
     -DCMAKE_BUILD_TYPE=Release \
