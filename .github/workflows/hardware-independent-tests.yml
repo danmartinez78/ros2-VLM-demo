@@ -120,7 +120,7 @@ jobs:
           source install/setup.bash
           colcon test --packages-select edge_vlm_ros \
             --ctest-args \
-              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|latest_value_stage|iou_tracker|tracked_observation_adapter|worker_recovery_helpers)" \
+              -R "test_(frame_sampling|node|rviz_formatting|ipc_protocol|ipc_inference_backend|inference_watchdog|latest_value_stage|iou_tracker|tracked_observation_adapter|worker_recovery_helpers|ultralytics_yolo_launch)" \
               --output-on-failure
 
       - name: Publish test results
@@ -160,21 +160,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Checkout pinned yolo_msgs sources
+      - name: Checkout pinned yolo_ros sources
         uses: actions/checkout@v4
         with:
           repository: mgonzs13/yolo_ros
           ref: ${{ env.YOLO_ROS_SHA }}
           path: external/yolo_ros
           sparse-checkout: |
+            pyproject.toml
             yolo_msgs
+            yolo_ros
 
       - name: Install package rosdep dependencies
         timeout-minutes: 3
         run: |
           rosdep update --rosdistro "${ROS_DISTRO}"
           rosdep install \
-            --from-paths . external/yolo_ros/yolo_msgs \
+            --from-paths . external/yolo_ros/yolo_msgs external/yolo_ros/yolo_ros \
             --ignore-src \
             --rosdistro "${ROS_DISTRO}" \
             -y \
@@ -185,14 +187,17 @@ jobs:
         run: |
           source "/opt/ros/${ROS_DISTRO}/setup.bash"
           colcon build \
-            --base-paths external/yolo_ros/yolo_msgs \
-            --packages-select yolo_msgs \
+            --base-paths external/yolo_ros/yolo_msgs external/yolo_ros/yolo_ros \
+            --packages-select yolo_msgs yolo_ros \
             --symlink-install
           source install/setup.bash
           colcon build \
             --packages-select edge_vlm_ros \
             --symlink-install \
             --cmake-args -DBUILD_TESTING=ON
+
+      - name: Verify yolo_ros executable
+        run: test -f install/yolo_ros/lib/yolo_ros/yolo_node
 
       - name: Verify YOLO adapter executable
         run: test -f install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_yolo_detection2d_adapter

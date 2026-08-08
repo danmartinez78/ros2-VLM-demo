@@ -4,51 +4,47 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
-"""Repo-owned include for the external Ultralytics YOLO backend plus Detection2D bridge."""
+"""Repo-owned native Ultralytics YOLO launch plus Detection2D bridge."""
 
 import os
 
-from ament_index_python.packages import PackageNotFoundError, get_package_prefix, get_package_share_directory
+from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
-_YOLO_LAUNCH_PATH = None
-
-
-def _resolve_yolo_launch() -> str:
-    candidates = [
-        ('yolo_bringup', os.path.join('launch', 'yolo.launch.py')),
-        ('yolo_ros', os.path.join('launch', 'yolo.launch.py')),
-    ]
-    attempted = []
-    for package_name, rel_path in candidates:
-        try:
-            share_dir = get_package_share_directory(package_name)
-        except PackageNotFoundError:
-            attempted.append(f'{package_name} (package missing)')
-            continue
-        launch_path = os.path.join(share_dir, rel_path)
-        if os.path.exists(launch_path):
-            return launch_path
-        attempted.append(f'{package_name}:{launch_path}')
-    joined = ', '.join(attempted) if attempted else 'no candidate packages checked'
-    raise RuntimeError(
-        'Supported Ultralytics YOLO launch file not found. Install the ROS 2 Jazzy '
-        f'YOLO packages and ensure one of these launch files exists: {joined}')
-
 
 def _validate_launch(context, *args, **kwargs):
-    global _YOLO_LAUNCH_PATH
     prefix = get_package_prefix('edge_vlm_ros')
-    adapter_executable = os.path.join(prefix, 'lib', 'edge_vlm_ros', 'edge_vlm_yolo_detection2d_adapter')
+    adapter_executable = os.path.join(
+        prefix, 'lib', 'edge_vlm_ros', 'edge_vlm_yolo_detection2d_adapter')
     if not os.path.exists(adapter_executable):
         raise RuntimeError(
             'The YOLO Detection2D adapter executable is not installed. Rebuild edge_vlm_ros '
             'in an environment where yolo_msgs is available before using this launch include.')
-    _YOLO_LAUNCH_PATH = _resolve_yolo_launch()
+
+    try:
+        yolo_prefix = get_package_prefix('yolo_ros')
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            'The yolo_ros package is required for detector_backend:=ultralytics_yolo. '
+            'Install/build yolo_ros in the sourced ROS workspace before launching.') from exc
+
+    yolo_executable = os.path.join(yolo_prefix, 'lib', 'yolo_ros', 'yolo_node')
+    if not os.path.exists(yolo_executable):
+        raise RuntimeError(
+            f'The yolo_ros executable was not found: {yolo_executable}. '
+            'Rebuild/install yolo_ros in the sourced ROS workspace before launching.')
+
+    yolo_detections_topic = _namespaced_topic(
+        LaunchConfiguration('yolo_namespace').perform(context), 'detections')
+    detections_topic = LaunchConfiguration('detections_topic').perform(context).strip()
+    if yolo_detections_topic == detections_topic:
+        raise RuntimeError(
+            'The YOLO backend detections topic matches the adapted output topic. '
+            'Use a non-empty yolo_namespace or set detections_topic to a different topic '
+            'to avoid republishing the adapter output back into its own input.')
     return []
 
 
@@ -60,23 +56,24 @@ def _namespaced_topic(namespace: str, topic_name: str) -> str:
 
 
 def _launch_yolo_backend(context, *args, **kwargs):
-    global _YOLO_LAUNCH_PATH
-    if _YOLO_LAUNCH_PATH is None:
-        raise RuntimeError('YOLO launch path was not validated before backend startup.')
-    image_topic = LaunchConfiguration('image_topic')
     detections_topic = LaunchConfiguration('detections_topic')
     yolo_namespace = LaunchConfiguration('yolo_namespace')
     yolo_model = LaunchConfiguration('yolo_model')
     yolo_detections_topic = _namespaced_topic(yolo_namespace.perform(context), 'detections')
     return [
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(_YOLO_LAUNCH_PATH),
-            launch_arguments={
-                'input_image_topic': image_topic,
-                'image_reliability': '2',
+        Node(
+            package='yolo_ros',
+            executable='yolo_node',
+            name='yolo_node',
+            namespace=yolo_namespace,
+            output='screen',
+            parameters=[{
                 'model': yolo_model,
-                'namespace': yolo_namespace,
-            }.items(),
+                'image_reliability': 2,
+            }],
+            remappings=[
+                ('image_raw', LaunchConfiguration('image_topic')),
+            ],
         ),
         Node(
             package='edge_vlm_ros',

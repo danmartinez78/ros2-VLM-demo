@@ -179,9 +179,8 @@ Optional overrides:
 - `use_sim_time:=false`
 
 Recommended Thor backend: `detector_backend:=ultralytics_yolo`. This uses the
-externally installed ROS 2 Jazzy `yolo_ros` / `yolo_bringup` package plus the
-repo-owned `edge_vlm_yolo_detection2d_adapter` bridge so the rest of this
-repository still receives detector-neutral
+externally installed ROS 2 Jazzy `yolo_ros` package plus the repo-owned
+`edge_vlm_yolo_detection2d_adapter` bridge so the rest of this repository still receives detector-neutral
 `vision_msgs/msg/Detection2DArray` on `/detections` with the exact detector
 header stamp preserved.
 
@@ -204,10 +203,10 @@ from this entrypoint. When enabled, the launch wires
 
 The launch fails early with a clear error if RViz2, the RViz config, or any
 required engine/plugin path is missing. When a detector backend is selected, it
-also fails early if the required external launch package is not installed. For
-`detector_backend:=ultralytics_yolo`, `edge_vlm_ros` must also be rebuilt in an
-environment where `yolo_msgs` is installed so the repo-owned bridge executable
-is available.
+also fails early if the required external detector package is not installed. For
+`detector_backend:=ultralytics_yolo`, both `yolo_ros` and `edge_vlm_ros` must
+be rebuilt in an environment where `yolo_msgs` is installed so the repo-owned
+bridge executable is available.
 
 ### Installing the recommended Ultralytics YOLO backend
 
@@ -215,8 +214,8 @@ Tested upstream revision: [`mgonzs13/yolo_ros` tag `4.6.1`](https://github.com/m
 (`e712bdee9c5fcffb5e42a17b28792de004224964`).
 
 On Jetson AGX Thor / JetPack 7.2, install that exact ROS 2 Jazzy-compatible
-checkout in the same workspace, make sure `uv` is installed on the target, and
-then rebuild:
+checkout in the same workspace, install its pinned Python runtime dependencies
+once into the same ROS 2 Jazzy environment, and then rebuild:
 
 ```bash
 cd "$ROS_WORKSPACE/src"
@@ -225,13 +224,16 @@ git clone https://github.com/mgonzs13/yolo_ros.git
 cd yolo_ros
 git checkout e712bdee9c5fcffb5e42a17b28792de004224964
 
-curl -LsSf https://astral.sh/uv/install.sh | sh
-export PATH="$HOME/.local/bin:$PATH"
-uv sync
+python3 -m pip install --user --break-system-packages \
+  "numpy<2" \
+  "opencv-python-headless>=4.8.1.78" \
+  "typing-extensions>=4.4.0" \
+  "ultralytics==8.4.6" \
+  "lap>=0.5.12"
 
 cd "$ROS_WORKSPACE"
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --packages-select yolo_msgs yolo_ros yolo_bringup edge_vlm_ros --symlink-install
+colcon build --packages-select yolo_msgs yolo_ros edge_vlm_ros --symlink-install
 ```
 
 That package publishes `yolo_msgs/msg/DetectionArray`; this repository converts
@@ -239,12 +241,12 @@ it to `vision_msgs/msg/Detection2DArray` on `/detections` without requiring any
 manual topic relay. The tracked-observation adapter then preserves the exact
 source image stamp when publishing `/tracked_observation`.
 
-Upstream `yolo_bringup/launch/yolo.launch.py` currently runs `uv sync` again at
-launch time, so `uv` must remain installed and available on `PATH` on the Thor
-system. If you override `yolo_namespace:=...`, the repo-owned adapter
-automatically follows the upstream detections topic at `/<namespace>/detections`
-and still republishes detector-neutral `vision_msgs/msg/Detection2DArray` on
-your selected `detections_topic`.
+The supported `edge_vlm_ros` launch path starts `yolo_ros`'s `yolo_node`
+directly and does not run `uv sync` or any other package-manager step during
+`ros2 launch`. If you override `yolo_namespace:=...`, the repo-owned adapter
+automatically follows the detections topic at `/<namespace>/detections` and
+still republishes detector-neutral `vision_msgs/msg/Detection2DArray` on your
+selected `detections_topic`.
 
 ## NVIDIA test data
 
