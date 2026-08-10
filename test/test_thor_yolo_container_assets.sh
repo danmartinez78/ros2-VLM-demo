@@ -5,10 +5,11 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 dockerfile="${repo_root}/docker/thor-yolo/Dockerfile"
 entrypoint="${repo_root}/docker/thor-yolo/entrypoint.sh"
+hpcx_env="${repo_root}/docker/thor-yolo/hpcx-env.sh"
 compose_file="${repo_root}/docker/compose.thor-yolo.yml"
 launcher_script="${repo_root}/scripts/launch_thor_with_yolo_container.sh"
 
-for required_file in "${dockerfile}" "${entrypoint}" "${compose_file}" "${launcher_script}"; do
+for required_file in "${dockerfile}" "${entrypoint}" "${hpcx_env}" "${compose_file}" "${launcher_script}"; do
   if [[ ! -f "${required_file}" ]]; then
     echo "Required Thor YOLO container asset missing: ${required_file}" >&2
     exit 1
@@ -18,15 +19,22 @@ done
 grep -Fq 'FROM ${BASE_IMAGE}' "${dockerfile}"
 grep -Fq 'ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3' "${dockerfile}"
 grep -Fq 'COPY --from=ghcr.io/astral-sh/uv:0.6.17 /uv /usr/local/bin/uv' "${dockerfile}"
+grep -Fq 'COPY docker/thor-yolo/hpcx-env.sh /usr/local/bin/edge-vlm-thor-yolo-hpcx-env' "${dockerfile}"
 grep -Fq 'uv pip install --system --no-deps ultralytics==8.4.6' "${dockerfile}"
 grep -Fq 'git checkout "${YOLO_ROS_SHA}"' "${dockerfile}"
 grep -Fq 'colcon build --merge-install --packages-select yolo_msgs yolo_ros' "${dockerfile}"
 grep -Fq 'attempt_download_asset' "${dockerfile}"
-grep -Fq 'torch changed from' "${dockerfile}"
+grep -Fq "source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env" "${dockerfile}"
+grep -Fq "python3 -c 'import torch; print(torch.__version__)'" "${dockerfile}"
+grep -Fq "python3 -c 'import torchvision; print(torchvision.__version__)'" "${dockerfile}"
 grep -Fq 'software-properties-common' "${dockerfile}"
 grep -Fq 'add-apt-repository -y universe' "${dockerfile}"
 grep -Fq 'packages.ros.org/ros2/ubuntu' "${dockerfile}"
 grep -Fq 'ros-dev-tools' "${dockerfile}"
+grep -Fq "source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env" "${entrypoint}"
+grep -Fq "libucs.so" "${hpcx_env}"
+grep -Fq "libucc.so" "${hpcx_env}"
+grep -Fq "libmpi.so" "${hpcx_env}"
 
 grep -Fq 'runtime: nvidia' "${compose_file}"
 grep -Fq 'network_mode: host' "${compose_file}"
@@ -60,8 +68,10 @@ line_number() {
 universe_line="$(line_number 'add-apt-repository -y universe')"
 ros_source_line="$(line_number 'packages.ros.org/ros2/ubuntu')"
 ros_dev_tools_line="$(line_number 'ros-dev-tools')"
+hpcx_env_copy_line="$(line_number 'COPY docker/thor-yolo/hpcx-env.sh /usr/local/bin/edge-vlm-thor-yolo-hpcx-env')"
+first_torch_import_line="$(line_number "python3 -c 'import torch; print(torch.__version__)'")"
 
-if [[ -z "${universe_line}" || -z "${ros_source_line}" || -z "${ros_dev_tools_line}" ]]; then
+if [[ -z "${universe_line}" || -z "${ros_source_line}" || -z "${ros_dev_tools_line}" || -z "${hpcx_env_copy_line}" || -z "${first_torch_import_line}" ]]; then
   echo "Thor YOLO Dockerfile is missing required bootstrap steps." >&2
   exit 1
 fi
@@ -75,3 +85,27 @@ if (( ros_source_line >= ros_dev_tools_line )); then
   echo "Thor YOLO Dockerfile must add the ROS 2 apt source before installing ROS development tooling." >&2
   exit 1
 fi
+
+if (( hpcx_env_copy_line >= first_torch_import_line )); then
+  echo "Thor YOLO Dockerfile must install the HPC-X library-path helper before validating torch imports." >&2
+  exit 1
+fi
+
+scratch_dir="$(mktemp -d)"
+trap 'rm -rf "${scratch_dir}"' EXIT
+mkdir -p \
+  "${scratch_dir}/ucx/lib" \
+  "${scratch_dir}/ucc/lib" \
+  "${scratch_dir}/ompi/lib"
+touch \
+  "${scratch_dir}/ucx/lib/libucs.so.0" \
+  "${scratch_dir}/ucc/lib/libucc.so.1" \
+  "${scratch_dir}/ompi/lib/libmpi.so.40"
+unset EDGE_VLM_THOR_YOLO_HPCX_LD_LIBRARY_PATH
+unset LD_LIBRARY_PATH
+export EDGE_VLM_THOR_YOLO_HPCX_ROOT="${scratch_dir}"
+# shellcheck disable=SC1090
+source "${hpcx_env}"
+expected_ld_library_path="${scratch_dir}/ucx/lib:${scratch_dir}/ucc/lib:${scratch_dir}/ompi/lib"
+[[ "${EDGE_VLM_THOR_YOLO_HPCX_LD_LIBRARY_PATH}" == "${expected_ld_library_path}" ]]
+[[ "${LD_LIBRARY_PATH}" == "${expected_ld_library_path}" ]]

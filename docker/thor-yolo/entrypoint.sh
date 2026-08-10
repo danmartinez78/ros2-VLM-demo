@@ -2,6 +2,8 @@
 set -Eeuo pipefail
 
 # shellcheck disable=SC1091
+source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env
+# shellcheck disable=SC1091
 source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 # shellcheck disable=SC1091
 source /opt/edge_vlm_yolo_ws/install/setup.bash

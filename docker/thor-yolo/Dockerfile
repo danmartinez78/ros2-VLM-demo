@@ -16,6 +16,8 @@ ENV LANG=en_US.UTF-8 \
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 COPY --from=ghcr.io/astral-sh/uv:0.6.17 /uv /usr/local/bin/uv
+COPY docker/thor-yolo/hpcx-env.sh /usr/local/bin/edge-vlm-thor-yolo-hpcx-env
+RUN chmod +x /usr/local/bin/edge-vlm-thor-yolo-hpcx-env
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
@@ -45,29 +47,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     rm -rf /var/lib/apt/lists/*
 
 COPY docker/thor-yolo/requirements.txt /tmp/edge_vlm_yolo_requirements.txt
-RUN python3 - <<'PY' > /tmp/torch_versions.json
-import json
-import torch
-import torchvision
-print(json.dumps({
-    'torch': torch.__version__,
-    'torchvision': torchvision.__version__,
-}))
-PY
-RUN uv pip install --system -r /tmp/edge_vlm_yolo_requirements.txt && \
+RUN source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env && \
+    python3 -c 'import torch; print(torch.__version__)' > /tmp/torch_version.txt && \
+    python3 -c 'import torchvision; print(torchvision.__version__)' > /tmp/torchvision_version.txt
+RUN source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env && \
+    uv pip install --system -r /tmp/edge_vlm_yolo_requirements.txt && \
     uv pip install --system --no-deps ultralytics==8.4.6 && \
-    python3 - <<'PY'
-import json
-from pathlib import Path
-import torch
-import torchvision
-versions = json.loads(Path('/tmp/torch_versions.json').read_text())
-if torch.__version__ != versions['torch']:
-    raise SystemExit(f"torch changed from {versions['torch']} to {torch.__version__}")
-if torchvision.__version__ != versions['torchvision']:
-    raise SystemExit(
-        f"torchvision changed from {versions['torchvision']} to {torchvision.__version__}")
-PY
+    python3 -c 'import torch; print(torch.__version__)' > /tmp/torch_version_after.txt && \
+    python3 -c 'import torchvision; print(torchvision.__version__)' > /tmp/torchvision_version_after.txt && \
+    test "$(cat /tmp/torch_version.txt)" = "$(cat /tmp/torch_version_after.txt)" && \
+    test "$(cat /tmp/torchvision_version.txt)" = "$(cat /tmp/torchvision_version_after.txt)"
 
 RUN mkdir -p "${ROS_WS}/src" /opt/models && \
     cd "${ROS_WS}/src" && \
@@ -78,7 +67,8 @@ RUN mkdir -p "${ROS_WS}/src" /opt/models && \
     cd "${ROS_WS}" && \
     colcon build --merge-install --packages-select yolo_msgs yolo_ros
 
-RUN python3 - <<'PY'
+RUN source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env && \
+    python3 - <<'PY'
 import shutil
 from pathlib import Path
 from ultralytics.utils.downloads import attempt_download_asset

@@ -262,13 +262,15 @@ ros2 launch edge_vlm_ros thor_tracked_observation.launch.py \
 
 The container image builds `yolo_msgs` and `yolo_ros`, installs pinned
 non-system Python dependencies at image-build time only, preserves the
-NVIDIA-provided CUDA-enabled PyTorch already present in the base image, and
-preloads `yolov8m.pt` so normal runtime performs no `uv sync`, no `pip
-install`, no package-manager actions, and no model download. If you override
-`yolo_namespace:=...`, the repo-owned adapter automatically follows
-`/<namespace>/detections` and still republishes detector-neutral
-`vision_msgs/msg/Detection2DArray` on your selected `detections_topic`. If you
-need a different pinned YOLO model, rebuild the detector image with
+NVIDIA-provided CUDA-enabled PyTorch already present in the base image,
+prepends the image's matching NVIDIA HPC-X UCX/UCC runtime libraries before
+every `import torch`, and preloads `yolov8m.pt` so normal runtime performs no
+`uv sync`, no `pip install`, no package-manager actions, and no model
+download. If you override `yolo_namespace:=...`, the repo-owned adapter
+automatically follows `/<namespace>/detections` and still republishes
+detector-neutral `vision_msgs/msg/Detection2DArray` on your selected
+`detections_topic`. If you need a different pinned YOLO model, rebuild the
+detector image with
 `YOLO_MODEL_ASSET=<model>.pt` and then launch with the matching
 `yolo_model:=<model>.pt`.
 
