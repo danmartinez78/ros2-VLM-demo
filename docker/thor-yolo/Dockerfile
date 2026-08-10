@@ -11,7 +11,10 @@ ENV LANG=en_US.UTF-8 \
     LC_ALL=en_US.UTF-8 \
     ROS_DISTRO=${ROS_DISTRO} \
     ROS_WS=/opt/edge_vlm_yolo_ws \
-    YOLO_MODEL_ASSET=${YOLO_MODEL_ASSET}
+    YOLO_MODEL_ASSET=${YOLO_MODEL_ASSET} \
+    YOLO_VENV=/opt/edge-vlm-yolo-venv \
+    VIRTUAL_ENV=/opt/edge-vlm-yolo-venv \
+    PATH=/opt/edge-vlm-yolo-venv/bin:${PATH}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -49,14 +52,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY docker/thor-yolo/requirements.txt /tmp/edge_vlm_yolo_requirements.txt
 RUN source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env && \
     python3 -c 'import torch; print(torch.__version__)' > /tmp/torch_version.txt && \
-    python3 -c 'import torchvision; print(torchvision.__version__)' > /tmp/torchvision_version.txt
+    python3 -c 'import torchvision; print(torchvision.__version__)' > /tmp/torchvision_version.txt && \
+    uv venv --system-site-packages "${YOLO_VENV}" && \
+    "${YOLO_VENV}/bin/python" -c 'import torch; print(torch.__version__)' > /tmp/torch_version_venv.txt && \
+    "${YOLO_VENV}/bin/python" -c 'import torchvision; print(torchvision.__version__)' > /tmp/torchvision_version_venv.txt && \
+    test "$(cat /tmp/torch_version.txt)" = "$(cat /tmp/torch_version_venv.txt)" && \
+    test "$(cat /tmp/torchvision_version.txt)" = "$(cat /tmp/torchvision_version_venv.txt)"
 RUN source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env && \
-    uv pip install --system -r /tmp/edge_vlm_yolo_requirements.txt && \
-    uv pip install --system --no-deps ultralytics==8.4.6 && \
-    python3 -c 'import torch; print(torch.__version__)' > /tmp/torch_version_after.txt && \
-    python3 -c 'import torchvision; print(torchvision.__version__)' > /tmp/torchvision_version_after.txt && \
-    test "$(cat /tmp/torch_version.txt)" = "$(cat /tmp/torch_version_after.txt)" && \
-    test "$(cat /tmp/torchvision_version.txt)" = "$(cat /tmp/torchvision_version_after.txt)"
+    uv pip install --python "${YOLO_VENV}/bin/python" -r /tmp/edge_vlm_yolo_requirements.txt && \
+    uv pip install --python "${YOLO_VENV}/bin/python" --no-deps ultralytics==8.4.6 && \
+    test "$(command -v python3)" = "${YOLO_VENV}/bin/python3" && \
+    python3 - <<'PY'
+from pathlib import Path
+import torch
+import torchvision
+import ultralytics
+
+expected_torch = Path('/tmp/torch_version.txt').read_text(encoding='utf-8').strip()
+expected_torchvision = Path('/tmp/torchvision_version.txt').read_text(encoding='utf-8').strip()
+
+if torch.__version__ != expected_torch:
+    raise SystemExit(
+        f'NVIDIA torch version changed unexpectedly: {torch.__version__} != {expected_torch}')
+if torchvision.__version__ != expected_torchvision:
+    raise SystemExit(
+        'NVIDIA torchvision version changed unexpectedly: '
+        f'{torchvision.__version__} != {expected_torchvision}')
+
+print(torch.__version__)
+print(torchvision.__version__)
+print(ultralytics.__version__)
+PY
 
 RUN mkdir -p "${ROS_WS}/src" /opt/models && \
     cd "${ROS_WS}/src" && \

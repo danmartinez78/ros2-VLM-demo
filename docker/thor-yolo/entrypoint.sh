@@ -3,6 +3,13 @@ set -Eeuo pipefail
 
 # shellcheck disable=SC1091
 source /usr/local/bin/edge-vlm-thor-yolo-hpcx-env
+yolo_venv="${YOLO_VENV:-/opt/edge-vlm-yolo-venv}"
+if [[ ! -x "${yolo_venv}/bin/python3" ]]; then
+  echo "YOLO virtual environment not found in the detector container: ${yolo_venv}" >&2
+  exit 1
+fi
+export VIRTUAL_ENV="${yolo_venv}"
+export PATH="${yolo_venv}/bin:${PATH}"
 # shellcheck disable=SC1091
 source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 # shellcheck disable=SC1091
