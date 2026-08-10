@@ -5,7 +5,7 @@ runs a TensorRT Edge-LLM VLM through a model-neutral IPC worker, and publishes
 structured vision-language results. Validated model configurations include
 NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
-The hardware path has been validated on JetPack 7.2 / Jetson Linux R39.2 with a
+The hardware path has been validated on JetPack 7.1 / Jetson Linux R38.4 with a
 Cosmos-Reason2-8B NVFP4 engine and an NVIDIA Isaac ROS image-proc rosbag.
 
 ## Architecture
@@ -43,12 +43,12 @@ for the investigation and evidence.
 | --- | --- |
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
-| JetPack / Jetson Linux | JetPack 7.2 / R39.2 |
+| JetPack / Jetson Linux | JetPack 7.1 / R38.4 |
 | CUDA | 13.2 |
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
 | Model | Cosmos-Reason2-8B, NVFP4 |
-| Isaac ROS | 4.5 Docker tooling optional; JetPack 7.2 combination remains outside NVIDIA's listed validation matrix |
+| Isaac ROS | 4.5 Docker tooling optional (RT-DETR path) |
 
 Other compatible models may work, but they have not yet been validated here.
 Model portability and optimization are tracked in
@@ -65,7 +65,7 @@ cd "$HOME/ros2_ws/src"
 git clone https://github.com/danmartinez78/ros2-VLM-demo.git
 cd ros2-VLM-demo
 
-bash scripts/setup_deployment.sh
+bash scripts/setup_thor_jp71.sh
 ```
 
 On its first run, setup installs the system dependencies and creates:
@@ -74,13 +74,24 @@ On its first run, setup installs the system dependencies and creates:
 scripts/edge_vlm_env.sh
 ```
 
-Review the paths in that file, then run:
+Review the paths in that file, then rerun:
+
+```bash
+bash scripts/setup_thor_jp71.sh
+```
+
+The deployment verifier can be re-run independently:
 
 ```bash
 source scripts/edge_vlm_env.sh
-bash scripts/build_workspace.sh
 source "$ROS_WORKSPACE/install/setup.bash"
-bash scripts/verify_deployment.sh
+bash scripts/verify_thor_jp71.sh --isaac-ros
+```
+
+Optional standalone Edge-LLM smoke check:
+
+```bash
+bash scripts/verify_thor_jp71.sh --isaac-ros --smoke-image /absolute/path/to/image.jpg
 ```
 
 The verifier confirms both executables are installed and enforces the process

@@ -50,7 +50,7 @@ l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 
 check "Ubuntu 24.04" bash -c 'source /etc/os-release && [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]]'
 check "aarch64 architecture" bash -c '[[ "$(uname -m)" == aarch64 ]]'
-check "Jetson Linux R39.2" grep -q '# R39 (release), REVISION: 2' /etc/nv_tegra_release
+check "Jetson Linux R38.4 (JetPack 7.1)" grep -q '# R38 (release), REVISION: 4' /etc/nv_tegra_release
 check "JetPack metapackage" dpkg-query -W nvidia-jetpack
 check "CUDA compiler" bash -c 'export PATH=/usr/local/cuda/bin:$PATH; command -v nvcc && nvcc --version'
 check "TensorRT development headers" bash -c 'test -f /usr/include/NvInfer.h || test -f /usr/include/aarch64-linux-gnu/NvInfer.h'
@@ -66,9 +66,9 @@ if [[ "${VERIFY_ISAAC_ROS}" -eq 1 ]]; then
   check "Docker service" systemctl is-active --quiet docker
   check "Docker CLI" command -v docker
 
-  if [[ "${l4t_release:-}" == *"# R39 (release), REVISION: 2"* ]]; then
-    printf 'WARN  Isaac ROS 4.5 is not yet officially validated on JetPack 7.2 / R39.2\n'
-    printf '      NVIDIA currently lists JetPack 7.1 / R38.4 for Jetson Thor.\n'
+  if [[ "${l4t_release:-}" != *"# R38 (release), REVISION: 4"* ]]; then
+    printf 'WARN  Isaac ROS 4.5 currently targets JetPack 7.1 / R38.4 on Jetson Thor.\n'
+    printf '      This host reports: %s\n' "${l4t_release:-unknown}"
   fi
 fi
 

@@ -155,6 +155,8 @@ jobs:
           bash -n scripts/benchmark/run_observation_history_experiment.sh
           bash -n scripts/test_data/run_image_proc_test.sh
           bash -n scripts/experiment_stack.sh
+          bash -n scripts/setup_thor_jp71.sh
+          bash -n scripts/verify_thor_jp71.sh
 
   web-console-tests:
     runs-on: ubuntu-24.04

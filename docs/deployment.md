@@ -6,7 +6,7 @@ This is the canonical deployment and validation recipe for
 ## Validated baseline
 
 - Ubuntu 24.04, aarch64
-- JetPack 7.2 / Jetson Linux R39.2
+- JetPack 7.1 / Jetson Linux R38.4
 - CUDA 13.2
 - ROS 2 Jazzy
 - TensorRT Edge-LLM built on the target Thor for `sm_110a`
@@ -26,7 +26,7 @@ free -h
 df -h /
 ```
 
-Expected key values are R39.2 and `aarch64`.
+Expected key values are R38.4 and `aarch64`.
 
 A fresh flash may contain the BSP without the complete developer toolchain.
 Install the JetPack metapackage if `nvcc` and TensorRT headers are absent:
@@ -123,20 +123,18 @@ cd ros2-VLM-demo
 Run setup as your normal user. The script uses `sudo` only for system changes:
 
 ```bash
-bash scripts/setup_deployment.sh
+bash scripts/setup_thor_jp71.sh
 ```
 
 Options:
 
 ```bash
-bash scripts/install_dependencies.sh --desktop
+bash scripts/setup_thor_jp71.sh --desktop
 bash scripts/install_dependencies.sh --isaac-ros
 ```
 
 Isaac ROS is optional. Version 4.5 is configured in Docker mode to avoid
-replacing the host CUDA, TensorRT, or NVIDIA OpenCV packages. NVIDIA's listed
-Thor validation matrix may lag the JetPack 7.2 host used here, so the verifier
-reports that combination as a warning.
+replacing the host CUDA, TensorRT, or NVIDIA OpenCV packages.
 
 If Docker group membership changes, log out and back in before continuing.
 
@@ -171,13 +169,18 @@ export EDGELLM_PLUGIN_PATH="$TENSORRT_EDGE_LLM_BUILD_DIR/libNvInfer_edgellm_plug
 ```bash
 cd "$HOME/ros2_ws/src/ros2-VLM-demo"
 source scripts/edge_vlm_env.sh
-bash scripts/build_workspace.sh
 source "$ROS_WORKSPACE/install/setup.bash"
-bash scripts/verify_deployment.sh
+bash scripts/verify_thor_jp71.sh --isaac-ros
 ```
 
 The verifier checks artifacts, engines, ROS executables, and the required
 process isolation.
+
+To confirm standalone Edge-LLM request/response behavior with a known image:
+
+```bash
+bash scripts/verify_thor_jp71.sh --isaac-ros --smoke-image /absolute/path/to/image.jpg
+```
 
 Confirm Thor CUDA images if diagnosing architecture errors:
 

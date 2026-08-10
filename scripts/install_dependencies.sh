@@ -10,13 +10,13 @@ usage() {
   cat <<'EOF'
 Usage: sudo -v && ./scripts/install_dependencies.sh [--desktop] [--isaac-ros] [--force]
 
-Installs the JetPack 7.2 development stack, ROS 2 Jazzy, rosdep/colcon,
+Installs the JetPack 7.1 development stack, ROS 2 Jazzy, rosdep/colcon,
 OpenCV, rosbag2, and all system packages needed by this repository.
 
 Options:
   --desktop   Install ros-jazzy-desktop instead of the headless ros-base variant.
   --isaac-ros Configure NVIDIA Isaac ROS 4.5 using its recommended Docker mode.
-              JetPack 7.2 / R39.2 is newer than NVIDIA's validated JetPack 7.1 / R38.4 target.
+              This repository's supported Thor path targets JetPack 7.1 / R38.4.
   --force    Continue on an unsupported OS, architecture, or Jetson Linux release.
 EOF
 }
@@ -43,14 +43,14 @@ l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 unsupported=0
 [[ "${ID}" == "ubuntu" && "${VERSION_ID}" == "24.04" ]] || unsupported=1
 [[ "${machine_arch}" == "aarch64" ]] || unsupported=1
-[[ "${l4t_release}" == *"# R39 (release), REVISION: 2"* ]] || unsupported=1
+[[ "${l4t_release}" == *"# R38 (release), REVISION: 4"* ]] || unsupported=1
 
 if [[ "${unsupported}" -ne 0 && "${FORCE_UNSUPPORTED}" -ne 1 ]]; then
   cat >&2 <<EOF
 Unsupported deployment target.
-Expected: Ubuntu 24.04, aarch64, Jetson Linux R39.2
+Expected: Ubuntu 24.04, aarch64, Jetson Linux R38.4 (JetPack 7.1)
 Detected: ${PRETTY_NAME:-unknown}, ${machine_arch}, ${l4t_release:-no /etc/nv_tegra_release}
-Use --force only if you understand that this repository targets JetPack 7.2.
+Use --force only if you understand that this repository targets JetPack 7.1.
 EOF
   exit 1
 fi
@@ -129,10 +129,8 @@ if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
   cat >&2 <<'EOF'
 
 WARNING: NVIDIA Isaac ROS 4.5 currently validates Jetson Thor on JetPack 7.1
-(Jetson Linux R38.4). This host targets JetPack 7.2 / R39.2 for TensorRT
-Edge-LLM. Isaac ROS is being configured in Docker isolation mode to avoid
-replacing the host CUDA, TensorRT, or OpenCV packages. This combination is
-experimental until NVIDIA adds JetPack 7.2 to its support matrix.
+(Jetson Linux R38.4). Isaac ROS is being configured in Docker isolation mode to
+avoid replacing the host CUDA, TensorRT, or OpenCV packages.
 EOF
 
   isaac_keyring="/usr/share/keyrings/nvidia-isaac-ros.gpg"
@@ -171,8 +169,8 @@ echo "  source /opt/ros/${ROS_DISTRO}/setup.bash"
 echo "Next:"
 echo "  cp scripts/edge_vlm_env.sh.example scripts/edge_vlm_env.sh"
 echo "  edit scripts/edge_vlm_env.sh"
-echo "  ./scripts/build_workspace.sh"
+echo "  ./scripts/setup_thor_jp71.sh"
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
   echo "Isaac ROS verification:"
-  echo "  ./scripts/verify_deployment.sh --isaac-ros"
+  echo "  ./scripts/verify_thor_jp71.sh --isaac-ros"
 fi
