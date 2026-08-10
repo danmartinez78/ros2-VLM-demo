@@ -152,8 +152,11 @@ jobs:
         run: |
           python3 scripts/benchmark/test_benchmark_parsers.py -v
           python3 scripts/benchmark/test_observation_history_summary.py -v
+          python3 scripts/test_thor_setup_planning.py -v
           bash -n scripts/benchmark/run_observation_history_experiment.sh
           bash -n scripts/test_data/run_image_proc_test.sh
+          bash -n scripts/test_data/prepare_datasets.sh
+          bash -n scripts/prepare_thor_jp71_assets.sh
           bash -n scripts/experiment_stack.sh
           bash -n scripts/setup_thor_jp71.sh
           bash -n scripts/verify_thor_jp71.sh

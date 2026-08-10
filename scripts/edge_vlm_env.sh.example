@@ -6,7 +6,6 @@ export ROS_DISTRO="jazzy"
 export ROS_WORKSPACE="${HOME}/ros2_ws"
 export TENSORRT_EDGE_LLM_ROOT="${HOME}/TensorRT-Edge-LLM"
 export TENSORRT_EDGE_LLM_BUILD_DIR="${TENSORRT_EDGE_LLM_ROOT}/build"
-export TRT_PACKAGE_DIR="/usr"
 
 export EDGE_VLM_MODEL_NAME="Cosmos-Reason2-8B"
 export EDGE_VLM_WORKSPACE_DIR="${HOME}/tensorrt-edgellm-workspace"

@@ -2,11 +2,11 @@
 
 ROS 2 Jazzy pipeline for NVIDIA Jetson AGX Thor that samples raw camera frames,
 runs a TensorRT Edge-LLM VLM through a model-neutral IPC worker, and publishes
-structured vision-language results. Validated model configurations include
+structured vision-language results. Supported model configurations include
 NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
-The hardware path has been validated on JetPack 7.1 / Jetson Linux R38.4 with a
-Cosmos-Reason2-8B NVFP4 engine and an NVIDIA Isaac ROS image-proc rosbag.
+The hardware path targets JetPack 7.1 / Jetson Linux R38.4 with a
+Cosmos-Reason2-8B NVFP4 engine and NVIDIA Isaac ROS assets.
 
 ## Architecture
 
@@ -37,9 +37,9 @@ See [docs/architecture.md](docs/architecture.md) for the detailed design and
 [docs/thor-edge-llm-prefill-stall-rca.md](docs/thor-edge-llm-prefill-stall-rca.md)
 for the investigation and evidence.
 
-## Validated platform
+## Supported target baseline
 
-| Component | Validated configuration |
+| Component | Target configuration |
 | --- | --- |
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
@@ -50,14 +50,11 @@ for the investigation and evidence.
 | Model | Cosmos-Reason2-8B, NVFP4 |
 | Isaac ROS | 4.5 Docker tooling optional (RT-DETR path) |
 
-Other compatible models may work, but they have not yet been validated here.
+Other compatible models may work, but they have not yet been hardware-verified here.
 Model portability and optimization are tracked in
 [#9](https://github.com/danmartinez78/ros2-VLM-demo/issues/9).
 
-## Quick start on a prepared Thor
-
-This assumes TensorRT Edge-LLM and the Cosmos engine bundle are already built
-on the Thor.
+## Quick start on a fresh Thor
 
 ```bash
 mkdir -p "$HOME/ros2_ws/src"
@@ -68,17 +65,8 @@ cd ros2-VLM-demo
 bash scripts/setup_thor_jp71.sh
 ```
 
-On its first run, setup installs the system dependencies and creates:
-
-```text
-scripts/edge_vlm_env.sh
-```
-
-Review the paths in that file, then rerun:
-
-```bash
-bash scripts/setup_thor_jp71.sh
-```
+Setup installs dependencies, pins/builds TensorRT Edge-LLM, prepares model/data
+layout, installs RT-DETR model assets, and generates `scripts/edge_vlm_env.sh`.
 
 The deployment verifier can be re-run independently:
 

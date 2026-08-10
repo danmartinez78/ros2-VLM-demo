@@ -167,8 +167,6 @@ echo "Dependency installation complete."
 echo "Open a new shell or run:"
 echo "  source /opt/ros/${ROS_DISTRO}/setup.bash"
 echo "Next:"
-echo "  cp scripts/edge_vlm_env.sh.example scripts/edge_vlm_env.sh"
-echo "  edit scripts/edge_vlm_env.sh"
 echo "  ./scripts/setup_thor_jp71.sh"
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
   echo "Isaac ROS verification:"

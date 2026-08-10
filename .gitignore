@@ -38,3 +38,5 @@ scripts/edge_vlm_env.sh
 
 # Downloaded test datasets
 test_data/
+!scripts/test_data/
+!scripts/test_data/**

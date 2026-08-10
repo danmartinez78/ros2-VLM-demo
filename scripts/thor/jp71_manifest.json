@@ -1,0 +1,46 @@
+{
+  "supported_target": {
+    "os": "ubuntu",
+    "version": "24.04",
+    "arch": "aarch64",
+    "l4t": "# R38 (release), REVISION: 4"
+  },
+  "edge_llm": {
+    "repo_url": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
+    "commit": "7f061f21f0a581ba234a1e233c9315b89d8e47d6",
+    "default_root": "${HOME}/TensorRT-Edge-LLM",
+    "default_build_dir": "${HOME}/TensorRT-Edge-LLM/build",
+    "plugin_name": "libNvInfer_edgellm_plugin.so",
+    "required_build_artifacts": [
+      "cpp/libedgellmCore.a",
+      "libNvInfer_edgellm_plugin.so"
+    ]
+  },
+  "models": {
+    "Cosmos-Reason2-8B": {
+      "required_llm_artifacts": [
+        "llm.engine",
+        "embedding.safetensors",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processed_chat_template.json"
+      ],
+      "required_visual_artifacts": [
+        "visual/visual.engine",
+        "visual/config.json",
+        "visual/preprocessor_config.json"
+      ]
+    },
+    "Qwen3-VL-2B-Instruct": {
+      "required_directories": [
+        "quantized",
+        "onnx",
+        "engine/llm",
+        "engine/visual"
+      ]
+    }
+  },
+  "default_model": "Cosmos-Reason2-8B",
+  "default_workspace": "${HOME}/tensorrt-edgellm-workspace"
+}

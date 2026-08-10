@@ -1,0 +1,46 @@
+{
+  "rosbags": [
+    {
+      "id": "image-proc",
+      "ngc_resource": "isaac_ros_image_proc_assets",
+      "required_path": "test_data/rosbags/image-proc"
+    },
+    {
+      "id": "h264",
+      "ngc_resource": "isaac_ros_h264_decoder_assets",
+      "required_path": "test_data/rosbags/h264"
+    },
+    {
+      "id": "nvblox",
+      "ngc_resource": "isaac_ros_nvblox_assets",
+      "required_path": "test_data/rosbags/nvblox"
+    },
+    {
+      "id": "rtdetr",
+      "ngc_resource": "isaac_ros_rtdetr_assets",
+      "required_path": "test_data/rosbags/rtdetr/isaac_ros_rtdetr/quickstart.bag"
+    }
+  ],
+  "datasets": [
+    {
+      "id": "jaad",
+      "required_paths": [
+        "test_data/datasets/jaad/annotations",
+        "test_data/datasets/jaad/clips",
+        "test_data/datasets/jaad/prepared/contact_sheets"
+      ],
+      "annotation_repo": "https://github.com/ykotseruba/JAAD.git",
+      "license_note": "JAAD clips require separate license acceptance and credentials."
+    },
+    {
+      "id": "nuscenes-mini",
+      "required_paths": [
+        "test_data/datasets/nuscenes-mini/samples",
+        "test_data/datasets/nuscenes-mini/sweeps",
+        "test_data/datasets/nuscenes-mini/maps",
+        "test_data/datasets/nuscenes-mini/prepared/sequences"
+      ],
+      "license_note": "nuScenes mini download requires a nuScenes account and license acceptance."
+    }
+  ]
+}

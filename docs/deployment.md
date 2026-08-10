@@ -3,7 +3,7 @@
 This is the canonical deployment and validation recipe for
 `edge_vlm_ros` on NVIDIA Jetson AGX Thor.
 
-## Validated baseline
+## Supported target baseline
 
 - Ubuntu 24.04, aarch64
 - JetPack 7.1 / Jetson Linux R38.4
@@ -14,7 +14,7 @@ This is the canonical deployment and validation recipe for
 
 Do not treat nearby JetPack, CUDA, TensorRT, or engine versions as binary
 compatible. TensorRT engines and CUDA-linked Edge-LLM artifacts should be built
-and validated on the target software stack.
+and hardware-verified on the target software stack.
 
 ## 1. Confirm the base system
 
@@ -47,45 +47,43 @@ Do not accept an APT transaction that removes `nvidia-jetpack`,
 `nvidia-jetpack-dev`, or `nvidia-opencv-dev` to install an Ubuntu OpenCV
 variant.
 
-## 2. Prepare TensorRT Edge-LLM and the model
+## 2. Prepare TensorRT Edge-LLM, models, and data
 
-Follow NVIDIA's TensorRT Edge-LLM instructions and the Jetson AI Lab guide:
-
-- <https://www.jetson-ai-lab.com/tutorials/tensorrt-edge-llm/#tensorrt-edge-llm-on-jetson>
-- <https://github.com/NVIDIA/TensorRT-Edge-LLM>
-
-Use the versions appropriate to the installed JetPack release. Build
-Edge-LLM on Thor with its Thor/Blackwell target and CuTe DSL artifacts enabled.
-The deployment expects:
-
-```text
-$HOME/TensorRT-Edge-LLM/build/cpp/libedgellmCore.a
-$HOME/TensorRT-Edge-LLM/build/libNvInfer_edgellm_plugin.so
-```
-
-The plugin may be a symlink to a versioned file:
+Run the repo-owned setup wrapper:
 
 ```bash
-cd "$HOME/TensorRT-Edge-LLM/build"
-ln -sfn libNvInfer_edgellm_plugin.so.1.0 libNvInfer_edgellm_plugin.so
+bash scripts/setup_thor_jp71.sh
 ```
 
-Only create that symlink when the matching versioned library actually exists.
+This performs deterministic path generation and setup for:
 
-Quantize and build the Cosmos engine following the same guide. The validated
-layout is:
+- TensorRT-Edge-LLM clone pinned to `7f061f21f0a581ba234a1e233c9315b89d8e47d6`;
+- Edge-LLM build outputs including `libNvInfer_edgellm_plugin.so`;
+- model workspace layout and required artifacts;
+- RT-DETR package + model installer path;
+- rosbag and dataset preparation wrappers.
 
-```text
-$HOME/tensorrt-edgellm-workspace/Cosmos-Reason2-8B/engine/
-$HOME/tensorrt-edgellm-workspace/Cosmos-Reason2-8B/engine/llm/
+For licensed/private model bundles, provide:
+
+```bash
+export EDGE_VLM_MODEL_ARCHIVE=/absolute/path/or/url/to/model_bundle.tar
+export EDGE_VLM_MODEL_ARCHIVE_SHA256=<optional_sha256>
 ```
 
-The `engine` directory contains the visual engine. `engine/llm` contains
-`llm.engine`, its configuration, tokenizer files, embedding data, and the
-processed chat template.
+or provide a deterministic preparation command:
 
-The runtime may report a missing `engine/action/action.engine`. That probe is
-optional for image reasoning and is not a deployment failure.
+```bash
+export EDGE_VLM_MODEL_BUILD_COMMAND='<command that emits engine layout under $EDGE_VLM_WORKSPACE_DIR>'
+```
+
+For dataset archives that cannot be fetched anonymously:
+
+```bash
+export JAAD_CLIPS_ARCHIVE=/absolute/path/or/url/to/jaad_clips_archive
+export NUSCENES_MINI_ARCHIVE=/absolute/path/or/url/to/nuscenes_mini_archive
+```
+
+Use `bash scripts/prepare_thor_jp71_assets.sh --dry-run` to inspect the plan.
 
 ## 3. Verify native inference first
 
@@ -120,12 +118,6 @@ git clone https://github.com/danmartinez78/ros2-VLM-demo.git
 cd ros2-VLM-demo
 ```
 
-Run setup as your normal user. The script uses `sudo` only for system changes:
-
-```bash
-bash scripts/setup_thor_jp71.sh
-```
-
 Options:
 
 ```bash
@@ -140,14 +132,7 @@ If Docker group membership changes, log out and back in before continuing.
 
 ## 5. Configure paths
 
-The first setup run creates `scripts/edge_vlm_env.sh` from the tracked example.
-Review it:
-
-```bash
-cd "$HOME/ros2_ws/src/ros2-VLM-demo"
-cp -n scripts/edge_vlm_env.sh.example scripts/edge_vlm_env.sh
-${EDITOR:-nano} scripts/edge_vlm_env.sh
-```
+Setup generates `scripts/edge_vlm_env.sh` from setup-produced paths.
 
 A typical Thor configuration is:
 
@@ -156,7 +141,6 @@ export ROS_DISTRO="jazzy"
 export ROS_WORKSPACE="$HOME/ros2_ws"
 export TENSORRT_EDGE_LLM_ROOT="$HOME/TensorRT-Edge-LLM"
 export TENSORRT_EDGE_LLM_BUILD_DIR="$TENSORRT_EDGE_LLM_ROOT/build"
-export TRT_PACKAGE_DIR="/usr"
 export EDGE_VLM_MODEL_NAME="Cosmos-Reason2-8B"
 export EDGE_VLM_WORKSPACE_DIR="$HOME/tensorrt-edgellm-workspace"
 export EDGE_VLM_LLM_ENGINE_DIR="$EDGE_VLM_WORKSPACE_DIR/$EDGE_VLM_MODEL_NAME/engine/llm"
@@ -173,8 +157,8 @@ source "$ROS_WORKSPACE/install/setup.bash"
 bash scripts/verify_thor_jp71.sh --isaac-ros
 ```
 
-The verifier checks artifacts, engines, ROS executables, and the required
-process isolation.
+The verifier checks artifacts, engine/plugin loadability, ROS executables, and
+the required process isolation.
 
 To confirm standalone Edge-LLM request/response behavior with a known image:
 
@@ -193,7 +177,7 @@ Confirm Thor CUDA images if diagnosing architecture errors:
 The Thor worker should include `sm_110a`. A stale `sm_75` image will fail with
 `device kernel image is invalid`.
 
-## 7. Run the validated rosbag test
+## 7. Run the target-baseline rosbag test
 
 ```bash
 cd "$HOME/ros2_ws/src/ros2-VLM-demo"
