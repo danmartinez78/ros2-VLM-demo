@@ -10,9 +10,15 @@ edge_vlm_thor_yolo_fail() {
 
 edge_vlm_thor_yolo_find_lib_dir() {
   local lib_name="$1"
+  local required="${2:-required}"
   local dir
   dir="$(find "${edge_vlm_thor_yolo_hpcx_root}" -maxdepth 4 -type f -name "${lib_name}" -printf '%h\n' 2>/dev/null | sort -u | head -n1 || true)"
-  [[ -n "${dir}" ]] || edge_vlm_thor_yolo_fail "Missing ${lib_name} under ${edge_vlm_thor_yolo_hpcx_root}"
+  if [[ -z "${dir}" ]]; then
+    if [[ "${required}" == "required" ]]; then
+      edge_vlm_thor_yolo_fail "Missing ${lib_name} under ${edge_vlm_thor_yolo_hpcx_root}"
+    fi
+    return 0
+  fi
   printf '%s\n' "${dir}"
 }
 
@@ -33,7 +39,7 @@ edge_vlm_thor_yolo_append_unique_path() {
 
 ucx_lib_dir="$(edge_vlm_thor_yolo_find_lib_dir 'libucs.so*')"
 ucc_lib_dir="$(edge_vlm_thor_yolo_find_lib_dir 'libucc.so*')"
-ompi_lib_dir="$(edge_vlm_thor_yolo_find_lib_dir 'libmpi.so*' || true)"
+ompi_lib_dir="$(edge_vlm_thor_yolo_find_lib_dir 'libmpi.so*' optional)"
 
 edge_vlm_thor_yolo_append_unique_path "${ucx_lib_dir}"
 edge_vlm_thor_yolo_append_unique_path "${ucc_lib_dir}"

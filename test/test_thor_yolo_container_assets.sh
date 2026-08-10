@@ -107,5 +107,11 @@ export EDGE_VLM_THOR_YOLO_HPCX_ROOT="${scratch_dir}"
 # shellcheck disable=SC1090
 source "${hpcx_env}"
 expected_ld_library_path="${scratch_dir}/ucx/lib:${scratch_dir}/ucc/lib:${scratch_dir}/ompi/lib"
-[[ "${EDGE_VLM_THOR_YOLO_HPCX_LD_LIBRARY_PATH}" == "${expected_ld_library_path}" ]]
-[[ "${LD_LIBRARY_PATH}" == "${expected_ld_library_path}" ]]
+if [[ "${EDGE_VLM_THOR_YOLO_HPCX_LD_LIBRARY_PATH}" != "${expected_ld_library_path}" ]]; then
+  echo "Resolved HPC-X library path did not preserve UCX/UCC/MPI ordering." >&2
+  exit 1
+fi
+if [[ "${LD_LIBRARY_PATH}" != "${expected_ld_library_path}" ]]; then
+  echo "LD_LIBRARY_PATH did not inherit the resolved HPC-X library path." >&2
+  exit 1
+fi
