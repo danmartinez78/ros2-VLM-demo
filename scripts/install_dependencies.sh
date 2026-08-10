@@ -5,10 +5,11 @@ ROS_DISTRO="jazzy"
 INSTALL_DESKTOP=0
 INSTALL_ISAAC_ROS=0
 FORCE_UNSUPPORTED=0
+DRY_RUN=0
 
 usage() {
   cat <<'EOF'
-Usage: sudo -v && ./scripts/install_dependencies.sh [--desktop] [--isaac-ros] [--force]
+Usage: sudo -v && ./scripts/install_dependencies.sh [--desktop] [--isaac-ros] [--force] [--dry-run]
 
 Installs the JetPack 7.1 development stack, ROS 2 Jazzy, rosdep/colcon,
 OpenCV, rosbag2, and all system packages needed by this repository.
@@ -18,6 +19,7 @@ Options:
   --isaac-ros Configure NVIDIA Isaac ROS 4.5 using its recommended Docker mode.
               This repository's supported Thor path targets JetPack 7.1 / R38.4.
   --force    Continue on an unsupported OS, architecture, or Jetson Linux release.
+  --dry-run  Print planned installation actions without mutating the system.
 EOF
 }
 
@@ -26,6 +28,7 @@ for arg in "$@"; do
     --desktop) INSTALL_DESKTOP=1 ;;
     --isaac-ros) INSTALL_ISAAC_ROS=1 ;;
     --force) FORCE_UNSUPPORTED=1 ;;
+    --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
   esac
@@ -53,6 +56,28 @@ Detected: ${PRETTY_NAME:-unknown}, ${machine_arch}, ${l4t_release:-no /etc/nv_te
 Use --force only if you understand that this repository targets JetPack 7.1.
 EOF
   exit 1
+fi
+
+ros_variant="ros-${ROS_DISTRO}-ros-base"
+if [[ "${INSTALL_DESKTOP}" -eq 1 ]]; then
+  ros_variant="ros-${ROS_DISTRO}-desktop"
+fi
+
+if [[ "${DRY_RUN}" -eq 1 ]]; then
+  cat <<EOF
+DRY-RUN  install_dependencies plan:
+  Supported target baseline: Ubuntu 24.04, aarch64, Jetson Linux R38.4
+  Selected ROS variant: ${ros_variant}
+  Isaac ROS setup requested: ${INSTALL_ISAAC_ROS}
+  Planned actions:
+    - sudo apt-get update
+    - install baseline packages + nvidia-jetpack
+    - install ROS apt source + ${ros_variant}
+    - install build/rosdep dependencies
+    - optionally configure Isaac ROS Docker mode (if --isaac-ros)
+    - initialize/update rosdep
+EOF
+  exit 0
 fi
 
 sudo -v
@@ -95,11 +120,6 @@ curl -fL \
   -o "${setup_tmp_dir}/${ros_source_deb}" \
   "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ros_source_version}/${ros_source_deb}"
 sudo dpkg -i "${setup_tmp_dir}/${ros_source_deb}"
-
-ros_variant="ros-${ROS_DISTRO}-ros-base"
-if [[ "${INSTALL_DESKTOP}" -eq 1 ]]; then
-  ros_variant="ros-${ROS_DISTRO}-desktop"
-fi
 
 sudo apt-get update
 sudo apt-get install -y \

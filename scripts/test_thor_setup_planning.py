@@ -10,6 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "scripts" / "thor" / "jp71_manifest.json"
 SETUP_SCRIPT = REPO_ROOT / "scripts" / "prepare_thor_jp71_assets.sh"
+TOP_LEVEL_SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_thor_jp71.sh"
 ASSETS_MANIFEST_PATH = REPO_ROOT / "scripts" / "test_data" / "manifests" / "assets_manifest.json"
 
 
@@ -57,6 +58,71 @@ class ThorSetupDryRunTests(unittest.TestCase):
             self.assertIn("Thor JP7.1 setup plan:", result.stdout)
             self.assertIn("DRY-RUN", result.stdout)
             self.assertFalse(env_file.exists())
+
+    def test_top_level_dry_run_is_non_mutating_and_skips_build_verify(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-top-level-dry-run-") as tmpdir:
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            env = os.environ.copy()
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+            result = subprocess.run(
+                [
+                    str(TOP_LEVEL_SETUP_SCRIPT),
+                    "--dry-run",
+                    "--force",
+                    "--skip-rosbag-download",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertIn("DRY-RUN  install_dependencies plan:", result.stdout)
+            self.assertIn(
+                "Dry-run mode requested; skipping environment source, build, and verification.",
+                result.stdout,
+            )
+            self.assertFalse(env_file.exists())
+
+    def test_cosmos_validation_does_not_require_qwen_workspace(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-cosmos-only-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            llm_dir = workspace / "Cosmos-Reason2-8B" / "engine" / "llm"
+            visual_dir = workspace / "Cosmos-Reason2-8B" / "engine" / "visual"
+            llm_dir.mkdir(parents=True, exist_ok=True)
+            visual_dir.mkdir(parents=True, exist_ok=True)
+
+            for name in (
+                "llm.engine",
+                "embedding.safetensors",
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "processed_chat_template.json",
+            ):
+                (llm_dir / name).touch()
+            for name in ("visual.engine", "config.json", "preprocessor_config.json"):
+                (visual_dir / name).touch()
+
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            env = os.environ.copy()
+            env["EDGE_VLM_WORKSPACE_DIR"] = str(workspace)
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+
+            subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--skip-edge-llm",
+                    "--skip-rtdetr",
+                    "--skip-data",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertTrue(env_file.exists())
 
 
 if __name__ == "__main__":

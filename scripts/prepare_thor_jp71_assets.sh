@@ -79,6 +79,30 @@ for item in value:
 PY
 }
 
+manifest_list_optional() {
+  local path="$1"
+  python3 - "$manifest_path" "$path" <<'PY'
+import json
+import sys
+manifest_path, path = sys.argv[1:3]
+with open(manifest_path, 'r', encoding='utf-8') as f:
+    data = json.load(f)
+value = data
+for part in path.split('.'):
+    if isinstance(value, dict) and part in value:
+        value = value[part]
+    else:
+        value = []
+        break
+if value is None:
+    value = []
+if not isinstance(value, list):
+    raise SystemExit(f"manifest path is not a list: {path}")
+for item in value:
+    print(item)
+PY
+}
+
 run_cmd() {
   if [[ "$dry_run" -eq 1 ]]; then
     printf 'DRY-RUN  %s\n' "$*"
@@ -142,16 +166,15 @@ validate_model_layout() {
 
   while IFS= read -r artifact; do
     [[ -f "${model_root}/engine/llm/${artifact}" ]] || missing=1
-  done < <(manifest_list "models.${chosen_model}.required_llm_artifacts")
+  done < <(manifest_list_optional "models.${chosen_model}.required_llm_artifacts")
 
   while IFS= read -r artifact; do
     [[ -f "${model_root}/engine/${artifact}" ]] || missing=1
-  done < <(manifest_list "models.${chosen_model}.required_visual_artifacts")
+  done < <(manifest_list_optional "models.${chosen_model}.required_visual_artifacts")
 
-  [[ -d "${workspace_dir}/Qwen3-VL-2B-Instruct/quantized" ]] || missing=1
-  [[ -d "${workspace_dir}/Qwen3-VL-2B-Instruct/onnx" ]] || missing=1
-  [[ -d "${workspace_dir}/Qwen3-VL-2B-Instruct/engine/llm" ]] || missing=1
-  [[ -d "${workspace_dir}/Qwen3-VL-2B-Instruct/engine/visual" ]] || missing=1
+  while IFS= read -r rel_dir; do
+    [[ -d "${model_root}/${rel_dir}" ]] || missing=1
+  done < <(manifest_list_optional "models.${chosen_model}.required_directories")
 
   [[ "${missing}" -eq 0 ]]
 }
