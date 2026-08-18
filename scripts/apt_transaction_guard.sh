@@ -103,19 +103,28 @@ assert_safe_rosdep_install_plan() {
   local from_paths="$1"
   local ros_distro="$2"
   local simulation_output
+  local simulation_stderr=""
+  local stderr_file
+  local -a tokens=()
+  local -a packages=()
+  local token
+  local in_install_args
+  stderr_file="$(mktemp)"
 
-  if ! simulation_output="$(simulate_rosdep_install_output "${from_paths}" "${ros_distro}" 2>&1)"; then
-    apt_guard_fail "Unable to simulate rosdep install plan. Output:"$'\n'"${simulation_output}"
+  if ! simulation_output="$(simulate_rosdep_install_output "${from_paths}" "${ros_distro}" 2>"${stderr_file}")"; then
+    simulation_stderr="$(cat -- "${stderr_file}" 2>/dev/null || true)"
+    rm -f -- "${stderr_file}"
+    apt_guard_fail "Unable to simulate rosdep install plan. Stdout:"$'\n'"${simulation_output}"$'\n'"Stderr:"$'\n'"${simulation_stderr}"
     return 1
   fi
+  rm -f -- "${stderr_file}"
 
   while IFS= read -r line; do
     [[ "${line}" == *"apt-get install"* ]] || continue
 
-    local -a tokens=()
-    local -a packages=()
-    local token
-    local in_install_args=0
+    tokens=()
+    packages=()
+    in_install_args=0
     read -r -a tokens <<<"${line}"
 
     for token in "${tokens[@]}"; do
