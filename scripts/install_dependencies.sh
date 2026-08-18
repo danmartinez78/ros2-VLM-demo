@@ -6,6 +6,41 @@ INSTALL_DESKTOP=0
 INSTALL_ISAAC_ROS=0
 FORCE_UNSUPPORTED=0
 DRY_RUN=0
+PROTECTED_NVIDIA_PACKAGES=(
+  nvidia-jetpack
+  nvidia-jetpack-dev
+  nvidia-opencv-dev
+)
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+simulate_apt_install_output() {
+  if [[ -n "${EDGE_VLM_APT_SIMULATION_OUTPUT:-}" ]]; then
+    printf '%s\n' "${EDGE_VLM_APT_SIMULATION_OUTPUT}"
+    return "${EDGE_VLM_APT_SIMULATION_EXIT_CODE:-0}"
+  fi
+  sudo apt-get -s install -y "$@"
+}
+
+assert_safe_apt_transaction() {
+  local description="$1"
+  shift
+  local simulation_output
+
+  if ! simulation_output="$(simulate_apt_install_output "$@" 2>&1)"; then
+    fail "Unable to simulate APT transaction for ${description}. Output:\n${simulation_output}"
+  fi
+
+  local protected_pkg
+  for protected_pkg in "${PROTECTED_NVIDIA_PACKAGES[@]}"; do
+    if printf '%s\n' "${simulation_output}" | grep -Eq "^Remv[[:space:]]+${protected_pkg}([:[:alnum:]_.+-]+)?\\b"; then
+      fail "Refusing to continue: planned APT transaction for ${description} removes protected package '${protected_pkg}'. Keep the JP7.1 NVIDIA stack intact."
+    fi
+  done
+}
 
 usage() {
   cat <<'EOF'
@@ -71,6 +106,8 @@ DRY-RUN  install_dependencies plan:
   Isaac ROS setup requested: ${INSTALL_ISAAC_ROS}
   Planned actions:
     - sudo apt-get update
+    - simulate APT transactions and block removal of protected NVIDIA packages
+      (${PROTECTED_NVIDIA_PACKAGES[*]})
     - install baseline packages + nvidia-jetpack
     - install ROS apt source + ${ros_variant}
     - install build/rosdep dependencies
@@ -80,10 +117,24 @@ EOF
   exit 0
 fi
 
+if [[ "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" == "1" ]]; then
+  assert_safe_apt_transaction "guard test transaction" guard-test-package
+  echo "APT guard test transaction passed."
+  exit 0
+fi
+
 sudo -v
 sudo apt-get update
-sudo apt-get install -y --no-install-recommends \
-  ca-certificates curl jq locales software-properties-common gnupg
+bootstrap_packages=(
+  ca-certificates
+  curl
+  jq
+  locales
+  software-properties-common
+  gnupg
+)
+assert_safe_apt_transaction "bootstrap packages" "${bootstrap_packages[@]}"
+sudo apt-get install -y --no-install-recommends "${bootstrap_packages[@]}"
 
 sudo locale-gen en_US en_US.UTF-8
 sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
@@ -94,7 +145,9 @@ sudo add-apt-repository -y universe
 # The Jetson ISO installs the BSP. The full JetPack SDK adds CUDA development
 # tools, TensorRT headers/libraries, cuDNN, and the remaining developer packages.
 sudo apt-get update
-sudo apt-get install -y nvidia-jetpack
+jetpack_packages=(nvidia-jetpack)
+assert_safe_apt_transaction "JetPack SDK packages" "${jetpack_packages[@]}"
+sudo apt-get install -y "${jetpack_packages[@]}"
 
 ros_source_version="$(
   curl -fsSL https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest |
@@ -122,28 +175,30 @@ curl -fL \
 sudo dpkg -i "${setup_tmp_dir}/${ros_source_deb}"
 
 sudo apt-get update
-sudo apt-get install -y \
-  "${ros_variant}" \
-  ros-dev-tools \
-  python3-rosdep \
-  python3-colcon-common-extensions \
-  python3-vcstool \
-  build-essential \
-  cmake \
-  ninja-build \
-  git \
-  pkg-config \
-  libopencv-dev \
-  libnvinfer-dev \
-  libnvonnxparsers-dev \
-  "ros-${ROS_DISTRO}-image-transport" \
-  "ros-${ROS_DISTRO}-image-transport-plugins" \
-  "ros-${ROS_DISTRO}-rosbag2" \
-  "ros-${ROS_DISTRO}-rosbag2-storage-mcap" \
-  "ros-${ROS_DISTRO}-rclcpp" \
-  "ros-${ROS_DISTRO}-rcl-interfaces" \
-  "ros-${ROS_DISTRO}-sensor-msgs" \
+ros_and_build_packages=(
+  "${ros_variant}"
+  ros-dev-tools
+  python3-rosdep
+  python3-colcon-common-extensions
+  python3-vcstool
+  build-essential
+  cmake
+  ninja-build
+  git
+  pkg-config
+  libnvinfer-dev
+  libnvonnxparsers-dev
+  "ros-${ROS_DISTRO}-image-transport"
+  "ros-${ROS_DISTRO}-image-transport-plugins"
+  "ros-${ROS_DISTRO}-rosbag2"
+  "ros-${ROS_DISTRO}-rosbag2-storage-mcap"
+  "ros-${ROS_DISTRO}-rclcpp"
+  "ros-${ROS_DISTRO}-rcl-interfaces"
+  "ros-${ROS_DISTRO}-sensor-msgs"
   "ros-${ROS_DISTRO}-std-msgs"
+)
+assert_safe_apt_transaction "ROS and build dependencies" "${ros_and_build_packages[@]}"
+sudo apt-get install -y "${ros_and_build_packages[@]}"
 
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
   cat >&2 <<'EOF'
@@ -162,7 +217,9 @@ EOF
   echo "${isaac_source}" | sudo tee "${isaac_source_file}" >/dev/null
 
   sudo apt-get update
-  sudo apt-get install -y isaac-ros-cli nvidia-container-toolkit
+  isaac_docker_packages=(isaac-ros-cli nvidia-container-toolkit)
+  assert_safe_apt_transaction "Isaac ROS Docker dependencies" "${isaac_docker_packages[@]}"
+  sudo apt-get install -y "${isaac_docker_packages[@]}"
   sudo usermod -aG docker "${USER}"
   sudo systemctl enable --now docker
   sudo systemctl restart docker

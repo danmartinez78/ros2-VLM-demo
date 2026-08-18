@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MANIFEST_PATH = REPO_ROOT / "scripts" / "thor" / "jp71_manifest.json"
 SETUP_SCRIPT = REPO_ROOT / "scripts" / "prepare_thor_jp71_assets.sh"
 TOP_LEVEL_SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_thor_jp71.sh"
+INSTALL_DEPENDENCIES_SCRIPT = REPO_ROOT / "scripts" / "install_dependencies.sh"
 ASSETS_MANIFEST_PATH = REPO_ROOT / "scripts" / "test_data" / "manifests" / "assets_manifest.json"
 
 
@@ -245,6 +246,39 @@ class ThorSetupDryRunTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Missing Hugging Face credentials", result.stderr)
             self.assertFalse(workspace.exists())
+
+
+class InstallDependenciesGuardTests(unittest.TestCase):
+    def test_guard_rejects_protected_nvidia_removal(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_APT_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Remv nvidia-opencv-dev [4.8.0]"
+
+        result = subprocess.run(
+            ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("removes protected package 'nvidia-opencv-dev'", result.stderr)
+
+    def test_guard_accepts_safe_transaction(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_APT_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst python3-rosdep (0.26.0)"
+
+        result = subprocess.run(
+            ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        self.assertIn("APT guard test transaction passed.", result.stdout)
 
 
 if __name__ == "__main__":
