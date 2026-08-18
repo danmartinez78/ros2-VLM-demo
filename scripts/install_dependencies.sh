@@ -13,7 +13,7 @@ PROTECTED_NVIDIA_PACKAGES=(
 )
 
 fail() {
-  printf 'ERROR: %b\n' "$*" >&2
+  printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
 
@@ -31,7 +31,7 @@ assert_safe_apt_transaction() {
   local simulation_output
 
   if ! simulation_output="$(simulate_apt_install_output "$@" 2>&1)"; then
-    fail "Unable to simulate APT transaction for ${description}. Output:\n${simulation_output}"
+    fail "Unable to simulate APT transaction for ${description}. Output:"$'\n'"${simulation_output}"
   fi
 
   local protected_pkg
