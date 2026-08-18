@@ -276,8 +276,9 @@ class InstallDependenciesGuardTests(unittest.TestCase):
             env=env,
             text=True,
             capture_output=True,
-            check=True,
+            check=False,
         )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("APT guard test transaction passed.", result.stdout)
 
     def test_guard_rejects_arch_qualified_protected_removal(self) -> None:
@@ -295,6 +296,23 @@ class InstallDependenciesGuardTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("removes protected package 'nvidia-opencv-dev'", result.stderr)
+
+    def test_guard_reports_simulation_failure(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_APT_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "E: Simulated resolver failure"
+        env["EDGE_VLM_APT_SIMULATION_EXIT_CODE"] = "100"
+
+        result = subprocess.run(
+            ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unable to simulate APT transaction", result.stderr)
 
 
 if __name__ == "__main__":
