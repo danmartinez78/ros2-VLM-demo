@@ -45,6 +45,10 @@ class ThorSetupManifestTests(unittest.TestCase):
         self.assertEqual({"image-proc", "h264", "nvblox", "rtdetr"}, rosbag_ids)
         self.assertTrue({"jaad", "nuscenes-mini"}.issubset(dataset_ids))
 
+    def test_hf_preflight_uses_bearer_token_header(self) -> None:
+        setup_script = SETUP_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("Authorization: Bearer " + "$" + "{token}", setup_script)
+
 
 class ThorSetupDryRunTests(unittest.TestCase):
     def test_dry_run_generates_plan_without_side_effects(self) -> None:

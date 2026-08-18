@@ -218,9 +218,10 @@ preflight_cosmos_hf_access() {
   fi
 
   local status
+  local auth_header="Authorization: Bearer ${token}"
   status="$(
     curl -sS -o /dev/null -w '%{http_code}' \
-      -H "Authorization: Bearer ${token}" \
+      -H "${auth_header}" \
       "https://huggingface.co/${hf_model_id}/resolve/main/config.json"
   )"
 
