@@ -13,7 +13,7 @@ PROTECTED_NVIDIA_PACKAGES=(
 )
 
 fail() {
-  echo "ERROR: $*" >&2
+  printf 'ERROR: %b\n' "$*" >&2
   exit 1
 }
 
@@ -35,10 +35,13 @@ assert_safe_apt_transaction() {
   fi
 
   local protected_pkg
+  local removed_pkg
   for protected_pkg in "${PROTECTED_NVIDIA_PACKAGES[@]}"; do
-    if printf '%s\n' "${simulation_output}" | grep -Eq "^Remv[[:space:]]+${protected_pkg}([:[:alnum:]_.+-]+)?\\b"; then
-      fail "Refusing to continue: planned APT transaction for ${description} removes protected package '${protected_pkg}'. Keep the JP7.1 NVIDIA stack intact."
-    fi
+    while IFS= read -r removed_pkg; do
+      if [[ "${removed_pkg}" == "${protected_pkg}" || "${removed_pkg}" == "${protected_pkg}:"* ]]; then
+        fail "Refusing to continue: planned APT transaction for ${description} removes protected package '${protected_pkg}'. Keep the JP7.1 NVIDIA stack intact."
+      fi
+    done < <(printf '%s\n' "${simulation_output}" | awk '/^Remv[[:space:]]/{print $2}')
   done
 }
 
