@@ -47,7 +47,9 @@ class ThorSetupManifestTests(unittest.TestCase):
 
     def test_hf_preflight_uses_bearer_token_header(self) -> None:
         setup_script = SETUP_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("Authorization: Bearer " + "$" + "{token}", setup_script)
+        expected_auth_header = "Authorization: Bearer " + "$" + "{token}"
+        self.assertIn(expected_auth_header, setup_script)
+        self.assertIn('-H "${auth_header}"', setup_script)
 
 
 class ThorSetupDryRunTests(unittest.TestCase):
