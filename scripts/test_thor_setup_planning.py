@@ -361,5 +361,92 @@ class PrepareThorRtdetrGuardTests(unittest.TestCase):
         self.assertIn("APT guard test transaction passed for RT-DETR packages.", result.stdout)
 
 
+class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
+    def test_isaac_ros_opencv_pref_is_neutralized(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-") as tmpdir:
+            prefs_dir = Path(tmpdir) / "preferences.d"
+            prefs_dir.mkdir(parents=True, exist_ok=True)
+            pref_file = prefs_dir / "isaac-ros-opencv-4-6.pref"
+            pref_file.write_text(
+                "Package: libopencv*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
+                "libopencv-dev:\n"
+                "  Installed: 4.8.0-3-g6ef37b4\n"
+                "  Candidate: 4.8.0-3-g6ef37b4\n"
+            )
+
+            result = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertFalse(pref_file.exists())
+            self.assertTrue((prefs_dir / "isaac-ros-opencv-4-6.pref.disabled-by-edge-vlm").exists())
+            self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
+
+    def test_isaac_ros_pref_guard_rejects_protected_package_removal_plan(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-removal-") as tmpdir:
+            prefs_dir = Path(tmpdir) / "preferences.d"
+            prefs_dir.mkdir(parents=True, exist_ok=True)
+            (prefs_dir / "isaac-ros-opencv-4-6.pref").write_text(
+                "Package: libopencv*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Remv nvidia-opencv-dev [7.1-b112]"
+            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
+                "libopencv-dev:\n"
+                "  Installed: 4.8.0-3-g6ef37b4\n"
+                "  Candidate: 4.8.0-3-g6ef37b4\n"
+            )
+
+            result = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("removes protected package 'nvidia-opencv-dev'", result.stderr)
+
+    def test_isaac_ros_pref_guard_rejects_opencv_candidate_downgrade(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_APT_PREFERENCES_DIR"] = "/tmp/does-not-matter"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+        env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
+            "libopencv-dev:\n"
+            "  Installed: 4.8.0-3-g6ef37b4\n"
+            "  Candidate: 4.6.0+dfsg-12\n"
+        )
+
+        result = subprocess.run(
+            ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Candidate version for libopencv-dev", result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

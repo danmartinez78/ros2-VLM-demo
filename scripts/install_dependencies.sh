@@ -8,6 +8,7 @@ INSTALL_DESKTOP=0
 INSTALL_ISAAC_ROS=0
 FORCE_UNSUPPORTED=0
 DRY_RUN=0
+APT_PREFERENCES_DIR="${EDGE_VLM_APT_PREFERENCES_DIR:-/etc/apt/preferences.d}"
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -15,6 +16,54 @@ fail() {
 }
 
 source "${script_dir}/apt_transaction_guard.sh"
+
+is_isaac_pref_hazard() {
+  local pref_file="$1"
+  grep -Eq '^[[:space:]]*Package:[[:space:]]*(libopencv[^[:space:]]*|nvidia-jetpack|nvidia-jetpack-dev|nvidia-opencv-dev)' "${pref_file}"
+}
+
+neutralize_isaac_ros_host_preferences() {
+  local changed=0
+  local pref_file
+
+  shopt -s nullglob
+  local pref_files=("${APT_PREFERENCES_DIR}"/isaac-ros-*.pref)
+  shopt -u nullglob
+
+  for pref_file in "${pref_files[@]}"; do
+    [[ -f "${pref_file}" ]] || continue
+    if ! is_isaac_pref_hazard "${pref_file}"; then
+      continue
+    fi
+
+    local disabled_file="${pref_file}.disabled-by-edge-vlm"
+    if [[ "${DRY_RUN}" -eq 1 ]]; then
+      echo "DRY-RUN  disable Isaac ROS host APT preference ${pref_file} (move to ${disabled_file})"
+      continue
+    fi
+
+    if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
+      mv -f -- "${pref_file}" "${disabled_file}"
+    else
+      sudo mv -f -- "${pref_file}" "${disabled_file}"
+    fi
+    changed=1
+    echo "Neutralized Isaac ROS host APT preference: ${pref_file}"
+  done
+
+  if [[ "${changed}" -eq 1 ]]; then
+    if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
+      :
+    else
+      sudo apt-get update
+    fi
+  fi
+}
+
+assert_host_opencv_stack_safe() {
+  assert_safe_apt_transaction "host OpenCV safety check" libopencv-dev
+  assert_libopencv_candidate_matches_installed
+}
 
 usage() {
   cat <<'EOF'
@@ -86,6 +135,8 @@ DRY-RUN  install_dependencies plan:
     - install ROS apt source + ${ros_variant}
     - install build/rosdep dependencies
     - optionally configure Isaac ROS Docker mode (if --isaac-ros)
+      - neutralize Isaac ROS host APT preferences that target protected JetPack/OpenCV packages
+      - verify libopencv-dev candidate does not pressure downgrade/removal of protected NVIDIA packages
     - initialize/update rosdep
 EOF
   exit 0
@@ -96,6 +147,13 @@ if [[ "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" == "1" ]]; then
     "EDGE_VLM_APT_GUARD_TEST_MODE requires EDGE_VLM_APT_SIMULATION_OUTPUT."
   assert_safe_apt_transaction "guard test transaction" guard-test-package
   echo "APT guard test transaction passed."
+  exit 0
+fi
+
+if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
+  neutralize_isaac_ros_host_preferences
+  assert_host_opencv_stack_safe
+  echo "Isaac ROS host preference guard test passed."
   exit 0
 fi
 
@@ -206,6 +264,8 @@ EOF
   # host-side TensorRT Edge-LLM stack from Isaac ROS package version pins.
   # Initialization writes system configuration and therefore requires root.
   sudo isaac-ros init docker
+  neutralize_isaac_ros_host_preferences
+  assert_host_opencv_stack_safe
 
   echo
   echo "Isaac ROS Docker mode initialized."

@@ -45,3 +45,40 @@ assert_safe_apt_transaction() {
     done
   done
 }
+
+libopencv_policy_output() {
+  if [[ -n "${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT:-}" ]]; then
+    printf '%s\n' "${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT}"
+    return 0
+  fi
+  apt-cache policy libopencv-dev
+}
+
+assert_libopencv_candidate_matches_installed() {
+  local policy_output
+  local installed_version
+  local candidate_version
+
+  if ! policy_output="$(libopencv_policy_output 2>&1)"; then
+    apt_guard_fail "Unable to inspect apt policy for libopencv-dev. Output:"$'\n'"${policy_output}"
+    return 1
+  fi
+
+  installed_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Installed:/{print $2; exit}')"
+  candidate_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Candidate:/{print $2; exit}')"
+
+  [[ -n "${installed_version}" && "${installed_version}" != "(none)" ]] || {
+    apt_guard_fail "libopencv-dev is not installed on the host."
+    return 1
+  }
+  [[ -n "${candidate_version}" && "${candidate_version}" != "(none)" ]] || {
+    apt_guard_fail "No install candidate is available for libopencv-dev."
+    return 1
+  }
+
+  if [[ "${installed_version}" != "${candidate_version}" ]]; then
+    apt_guard_fail \
+      "Candidate version for libopencv-dev (${candidate_version}) differs from installed (${installed_version}). Refusing to continue because this indicates host OpenCV downgrade/replacement pressure."
+    return 1
+  fi
+}

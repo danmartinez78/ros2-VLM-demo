@@ -20,6 +20,7 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
+source "${script_dir}/apt_transaction_guard.sh"
 
 if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090
@@ -75,6 +76,10 @@ fi
 check "rosdep" command -v rosdep
 check "colcon" command -v colcon
 check "OpenCV development package" dpkg-query -W libopencv-dev
+check "NVIDIA OpenCV development package" dpkg-query -W nvidia-opencv-dev
+check "OpenCV candidate matches installed version" assert_libopencv_candidate_matches_installed
+check "OpenCV transaction preserves protected NVIDIA packages" \
+  assert_safe_apt_transaction "deployment verification OpenCV safety" libopencv-dev
 check "Edge-LLM runtime header" test -f "${edge_root}/cpp/runtime/llmInferenceRuntime.h"
 check "Edge-LLM core archive" bash -c 'find "$1" -name libedgellmCore.a -print -quit | grep -q .' _ "${edge_build}"
 check "Edge-LLM plugin" test -f "${plugin_path}"
