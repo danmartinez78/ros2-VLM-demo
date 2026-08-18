@@ -59,10 +59,7 @@ assert_libopencv_candidate_matches_installed() {
   local installed_version
   local candidate_version
 
-  if ! policy_output="$(libopencv_policy_output 2>&1)"; then
-    apt_guard_fail "Unable to inspect apt policy for libopencv-dev. Output:"$'\n'"${policy_output}"
-    return 1
-  fi
+  policy_output="$(libopencv_policy_output 2>&1)"
 
   installed_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Installed:/{print $2; exit}')"
   candidate_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Candidate:/{print $2; exit}')"

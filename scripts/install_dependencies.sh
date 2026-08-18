@@ -52,11 +52,7 @@ neutralize_isaac_ros_host_preferences() {
   done
 
   if [[ "${changed}" -eq 1 ]]; then
-    if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
-      :
-    else
-      sudo apt-get update
-    fi
+    [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]] || sudo apt-get update
   fi
 }
 

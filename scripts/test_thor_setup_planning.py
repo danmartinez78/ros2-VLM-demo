@@ -426,26 +426,27 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             self.assertIn("removes protected package 'nvidia-opencv-dev'", result.stderr)
 
     def test_isaac_ros_pref_guard_rejects_opencv_candidate_downgrade(self) -> None:
-        env = os.environ.copy()
-        env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
-        env["EDGE_VLM_APT_PREFERENCES_DIR"] = "/tmp/does-not-matter"
-        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
-        env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
-            "libopencv-dev:\n"
-            "  Installed: 4.8.0-3-g6ef37b4\n"
-            "  Candidate: 4.6.0+dfsg-12\n"
-        )
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-candidate-") as tmpdir:
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(Path(tmpdir) / "preferences.d")
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
+                "libopencv-dev:\n"
+                "  Installed: 4.8.0-3-g6ef37b4\n"
+                "  Candidate: 4.6.0+dfsg-12\n"
+            )
 
-        result = subprocess.run(
-            ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
-            cwd=REPO_ROOT,
-            env=env,
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Candidate version for libopencv-dev", result.stderr)
+            result = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Candidate version for libopencv-dev", result.stderr)
 
 
 if __name__ == "__main__":
