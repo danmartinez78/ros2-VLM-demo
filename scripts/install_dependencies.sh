@@ -19,7 +19,24 @@ source "${script_dir}/apt_transaction_guard.sh"
 
 is_isaac_pref_hazard() {
   local pref_file="$1"
-  grep -Eq '^[[:space:]]*Package:[[:space:]]*(libopencv[^[:space:]]*|nvidia-jetpack|nvidia-jetpack-dev|nvidia-opencv-dev)' "${pref_file}"
+  local pref_name
+  local pin_priority=""
+  pref_name="$(basename -- "${pref_file}")"
+
+  [[ "${pref_name}" == isaac-ros-*.pref ]] || return 1
+
+  case "${pref_name}" in
+    isaac-ros-opencv-4-6.pref|isaac-ros-cuda-13-0.pref|isaac-ros-tensorrt-13-0.pref|isaac-ros-dgx-spark.pref)
+      return 0
+      ;;
+  esac
+
+  pin_priority="$(awk 'tolower($1)=="pin-priority:"{print $2; exit}' "${pref_file}")"
+  if [[ "${pin_priority}" =~ ^[0-9]+$ ]] && (( pin_priority >= 1000 )); then
+    return 0
+  fi
+
+  grep -Eq '^[[:space:]]*Package:[[:space:]]*(libopencv[^[:space:]]*|cuda[^[:space:]]*|libnvinfer[^[:space:]]*|tensorrt[^[:space:]]*|nvidia-jetpack|nvidia-jetpack-dev|nvidia-opencv-dev)' "${pref_file}"
 }
 
 neutralize_isaac_ros_host_preferences() {
@@ -58,9 +75,23 @@ neutralize_isaac_ros_host_preferences() {
   fi
 }
 
-assert_host_opencv_stack_safe() {
+assert_host_jetpack_stack_safe() {
+  local cuda_owner_pkg="${EDGE_VLM_CUDA_PACKAGE_FOR_TEST:-}"
+
   assert_safe_apt_transaction "host OpenCV safety check" libopencv-dev
-  assert_libopencv_candidate_matches_installed
+  assert_package_candidate_matches_installed libopencv-dev "OpenCV development package"
+
+  assert_safe_apt_transaction "host TensorRT safety check" libnvinfer-dev
+  assert_package_candidate_matches_installed libnvinfer-dev "TensorRT development package"
+
+  if [[ -z "${cuda_owner_pkg}" ]]; then
+    cuda_owner_pkg="$(resolve_nvcc_owner_package || true)"
+  fi
+  [[ -n "${cuda_owner_pkg}" ]] || fail \
+    "Unable to resolve the installed CUDA package owning nvcc. Ensure the JP7.1 CUDA toolkit is installed before enabling Isaac ROS Docker mode."
+
+  assert_safe_apt_transaction "host CUDA safety check (${cuda_owner_pkg})" "${cuda_owner_pkg}"
+  assert_package_candidate_matches_installed "${cuda_owner_pkg}" "CUDA compiler package"
 }
 
 usage() {
@@ -133,8 +164,8 @@ DRY-RUN  install_dependencies plan:
     - install ROS apt source + ${ros_variant}
     - install build/rosdep dependencies
     - optionally configure Isaac ROS Docker mode (if --isaac-ros)
-      - neutralize Isaac ROS host APT preferences that target protected JetPack/OpenCV packages
-      - verify libopencv-dev candidate does not pressure downgrade/removal of protected NVIDIA packages
+      - neutralize Isaac ROS host APT preferences that can pin host CUDA/TensorRT/OpenCV package resolution
+      - verify CUDA/TensorRT/OpenCV install candidates remain aligned with installed JP7.1 host packages
     - initialize/update rosdep
 EOF
   exit 0
@@ -150,7 +181,7 @@ fi
 
 if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
   neutralize_isaac_ros_host_preferences
-  assert_host_opencv_stack_safe
+  assert_host_jetpack_stack_safe
   echo "Isaac ROS host preference guard test passed."
   exit 0
 fi
@@ -263,7 +294,7 @@ EOF
   # Initialization writes system configuration and therefore requires root.
   sudo isaac-ros init docker
   neutralize_isaac_ros_host_preferences
-  assert_host_opencv_stack_safe
+  assert_host_jetpack_stack_safe
 
   echo
   echo "Isaac ROS Docker mode initialized."

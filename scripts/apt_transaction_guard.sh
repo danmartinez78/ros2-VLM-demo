@@ -46,40 +46,79 @@ assert_safe_apt_transaction() {
   done
 }
 
-libopencv_policy_output() {
-  if [[ -n "${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT:-}" ]]; then
-    printf '%s\n' "${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT}"
+package_policy_output() {
+  local package_name="$1"
+  local override_var
+  local override_var_suffix
+  local override_value=""
+
+  override_var_suffix="$(printf '%s' "${package_name}" | tr '[:lower:]-.+/' '[:upper:]_____')"
+  override_var="EDGE_VLM_APT_POLICY_${override_var_suffix}_OUTPUT"
+  override_value="${!override_var:-}"
+
+  if [[ -z "${override_value}" && "${package_name}" == "libopencv-dev" ]] && [[ -n "${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT:-}" ]]; then
+    override_value="${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT}"
+  fi
+
+  if [[ -n "${override_value}" ]]; then
+    printf '%s\n' "${override_value}"
     return 0
   fi
-  apt-cache policy libopencv-dev
+
+  apt-cache policy "${package_name}"
 }
 
-assert_libopencv_candidate_matches_installed() {
+assert_package_candidate_matches_installed() {
+  local package_name="$1"
+  local package_label="${2:-${package_name}}"
   local policy_output
   local installed_version
   local candidate_version
 
-  policy_output="$(libopencv_policy_output 2>&1)"
+  policy_output="$(package_policy_output "${package_name}" 2>&1)"
 
   installed_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Installed:/{print $2; exit}')"
   candidate_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Candidate:/{print $2; exit}')"
 
   [[ -n "${installed_version}" && "${installed_version}" != "(none)" ]] || {
-    apt_guard_fail "libopencv-dev is not installed on the host."
+    apt_guard_fail "${package_label} (${package_name}) is not installed on the host."
     return 1
   }
   [[ -n "${candidate_version}" && "${candidate_version}" != "(none)" ]] || {
-    apt_guard_fail "No install candidate is available for libopencv-dev."
+    apt_guard_fail "No install candidate is available for ${package_label} (${package_name})."
     return 1
   }
 
   if [[ "${installed_version}" != "${candidate_version}" ]]; then
     apt_guard_fail \
-      "Candidate version for libopencv-dev (${candidate_version}) differs from installed (${installed_version}). Refusing to continue because this indicates host OpenCV downgrade/replacement pressure."
+      "Candidate version for ${package_label} (${package_name}) (${candidate_version}) differs from installed (${installed_version}). Refusing to continue because this indicates host stack downgrade/replacement pressure."
     return 1
   fi
 
   return 0
+}
+
+assert_libopencv_candidate_matches_installed() {
+  assert_package_candidate_matches_installed "libopencv-dev" "OpenCV development package"
+}
+
+resolve_nvcc_owner_package() {
+  local nvcc_bin=""
+  local nvcc_path
+  local owner_pkg
+
+  if command -v nvcc >/dev/null 2>&1; then
+    nvcc_bin="$(command -v nvcc)"
+  elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
+    nvcc_bin="/usr/local/cuda/bin/nvcc"
+  else
+    return 1
+  fi
+
+  nvcc_path="$(readlink -f -- "${nvcc_bin}")"
+  owner_pkg="$(dpkg-query -S "${nvcc_path}" 2>/dev/null | awk -F: 'NR==1{print $1}')"
+  [[ -n "${owner_pkg}" ]] || return 1
+  printf '%s\n' "${owner_pkg}"
 }
 
 simulate_rosdep_install_output() {

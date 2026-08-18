@@ -408,6 +408,25 @@ class RosdepGuardTests(unittest.TestCase):
 
 
 class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
+    @staticmethod
+    def _set_stack_policy_env(env: dict[str, str]) -> None:
+        env["EDGE_VLM_CUDA_PACKAGE_FOR_TEST"] = "cuda-compiler-13-0"
+        env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
+            "libopencv-dev:\n"
+            "  Installed: 4.8.0-3-g6ef37b4\n"
+            "  Candidate: 4.8.0-3-g6ef37b4\n"
+        )
+        env["EDGE_VLM_APT_POLICY_LIBNVINFER_DEV_OUTPUT"] = (
+            "libnvinfer-dev:\n"
+            "  Installed: 10.0.1-1+cuda13.0\n"
+            "  Candidate: 10.0.1-1+cuda13.0\n"
+        )
+        env["EDGE_VLM_APT_POLICY_CUDA_COMPILER_13_0_OUTPUT"] = (
+            "cuda-compiler-13-0:\n"
+            "  Installed: 13.0.0-1\n"
+            "  Candidate: 13.0.0-1\n"
+        )
+
     def test_isaac_ros_opencv_pref_is_neutralized(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-") as tmpdir:
             prefs_dir = Path(tmpdir) / "preferences.d"
@@ -422,11 +441,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
             env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
-            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
-                "libopencv-dev:\n"
-                "  Installed: 4.8.0-3-g6ef37b4\n"
-                "  Candidate: 4.8.0-3-g6ef37b4\n"
-            )
+            self._set_stack_policy_env(env)
 
             result = subprocess.run(
                 ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
@@ -441,6 +456,38 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             self.assertTrue((prefs_dir / "isaac-ros-opencv-4-6.pref.disabled-by-edge-vlm").exists())
             self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
 
+    def test_isaac_ros_thor_stack_pref_files_are_neutralized(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-thor-prefs-") as tmpdir:
+            prefs_dir = Path(tmpdir) / "preferences.d"
+            prefs_dir.mkdir(parents=True, exist_ok=True)
+            pref_contents = {
+                "isaac-ros-opencv-4-6.pref": "Package: libopencv*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                "isaac-ros-cuda-13-0.pref": "Package: cuda*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                "isaac-ros-tensorrt-13-0.pref": "Package: libnvinfer*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                "isaac-ros-dgx-spark.pref": "Package: *\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+            }
+            for name, content in pref_contents.items():
+                (prefs_dir / name).write_text(content, encoding="utf-8")
+
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            self._set_stack_policy_env(env)
+
+            result = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            for pref_name in pref_contents:
+                self.assertFalse((prefs_dir / pref_name).exists())
+                self.assertTrue((prefs_dir / f"{pref_name}.disabled-by-edge-vlm").exists())
+
     def test_isaac_ros_pref_guard_rejects_protected_package_removal_plan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-removal-") as tmpdir:
             prefs_dir = Path(tmpdir) / "preferences.d"
@@ -454,11 +501,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
             env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Remv nvidia-opencv-dev [7.1-b112]"
-            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
-                "libopencv-dev:\n"
-                "  Installed: 4.8.0-3-g6ef37b4\n"
-                "  Candidate: 4.8.0-3-g6ef37b4\n"
-            )
+            self._set_stack_policy_env(env)
 
             result = subprocess.run(
                 ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
@@ -477,6 +520,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(Path(tmpdir) / "preferences.d")
             env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            self._set_stack_policy_env(env)
             env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
                 "libopencv-dev:\n"
                 "  Installed: 4.8.0-3-g6ef37b4\n"
@@ -492,7 +536,31 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Candidate version for libopencv-dev", result.stderr)
+            self.assertIn("Candidate version for OpenCV development package", result.stderr)
+
+    def test_isaac_ros_pref_guard_rejects_tensorrt_candidate_downgrade(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-trt-candidate-") as tmpdir:
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(Path(tmpdir) / "preferences.d")
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            self._set_stack_policy_env(env)
+            env["EDGE_VLM_APT_POLICY_LIBNVINFER_DEV_OUTPUT"] = (
+                "libnvinfer-dev:\n"
+                "  Installed: 10.0.1-1+cuda13.0\n"
+                "  Candidate: 9.4.0-1+cuda12.6\n"
+            )
+
+            result = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Candidate version for TensorRT development package", result.stderr)
 
 
 if __name__ == "__main__":

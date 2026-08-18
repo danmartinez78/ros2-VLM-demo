@@ -56,6 +56,11 @@ check "JetPack metapackage" dpkg-query -W nvidia-jetpack
 check "JetPack developer metapackage" dpkg-query -W nvidia-jetpack-dev
 check "CUDA compiler" bash -c 'export PATH=/usr/local/cuda/bin:$PATH; command -v nvcc && nvcc --version'
 check "TensorRT development headers" bash -c 'test -f /usr/include/NvInfer.h || test -f /usr/include/aarch64-linux-gnu/NvInfer.h'
+check "TensorRT development package" dpkg-query -W libnvinfer-dev
+check "TensorRT candidate matches installed version" \
+  assert_package_candidate_matches_installed libnvinfer-dev "TensorRT development package"
+check "TensorRT transaction preserves protected NVIDIA packages" \
+  assert_safe_apt_transaction "deployment verification TensorRT safety" libnvinfer-dev
 check "ROS 2 Jazzy setup" test -f "/opt/ros/${ros_distro}/setup.bash"
 
 if [[ "${VERIFY_ISAAC_ROS}" -eq 1 ]]; then
@@ -81,6 +86,15 @@ check "NVIDIA OpenCV development package" dpkg-query -W nvidia-opencv-dev
 check "OpenCV candidate matches installed version" assert_libopencv_candidate_matches_installed
 check "OpenCV transaction preserves protected NVIDIA packages" \
   assert_safe_apt_transaction "deployment verification OpenCV safety" libopencv-dev
+if cuda_owner_pkg="$(resolve_nvcc_owner_package 2>/dev/null)"; then
+  check "CUDA package candidate matches installed version (${cuda_owner_pkg})" \
+    assert_package_candidate_matches_installed "${cuda_owner_pkg}" "CUDA compiler package"
+  check "CUDA transaction preserves protected NVIDIA packages (${cuda_owner_pkg})" \
+    assert_safe_apt_transaction "deployment verification CUDA safety" "${cuda_owner_pkg}"
+else
+  printf 'FAIL  CUDA compiler package ownership\n'
+  failures=$((failures + 1))
+fi
 check "Edge-LLM runtime header" test -f "${edge_root}/cpp/runtime/llmInferenceRuntime.h"
 check "Edge-LLM core archive" bash -c 'find "$1" -name libedgellmCore.a -print -quit | grep -q .' _ "${edge_build}"
 check "Edge-LLM plugin" test -f "${plugin_path}"
