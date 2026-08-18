@@ -290,7 +290,7 @@ prepare_edge_llm() {
       -GNinja \
       -DCMAKE_BUILD_TYPE=Release \
       -DTRT_PACKAGE_DIR=/usr \
-      -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+      -DCMAKE_TOOLCHAIN_FILE="${edge_root}/cmake/aarch64_linux_toolchain.cmake" \
       -DEMBEDDED_TARGET=jetson-thor \
       -DCUDA_CTK_VERSION="${cuda_ctk_version}" \
       -DENABLE_CUTE_DSL=ALL
@@ -308,15 +308,15 @@ install_rtdetr_models() {
   local ros_distro="$1"
   local marker_file="${repo_root}/test_data/.rtdetr_models_install.ok"
 
-  run_cmd sudo apt-get update
-  run_cmd sudo apt-get install -y \
-    "ros-${ros_distro}-isaac-ros-rtdetr" \
-    "ros-${ros_distro}-isaac-ros-rtdetr-models-install"
-
   if [[ -f "${marker_file}" ]]; then
     echo "RT-DETR models installer already completed (marker: ${marker_file})."
     return
   fi
+
+  run_cmd sudo apt-get update
+  run_cmd sudo apt-get install -y \
+    "ros-${ros_distro}-isaac-ros-rtdetr" \
+    "ros-${ros_distro}-isaac-ros-rtdetr-models-install"
 
   if [[ "${dry_run}" -eq 1 ]]; then
     printf 'DRY-RUN  source /opt/ros/%s/setup.bash && ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula\n' "${ros_distro}"
@@ -409,6 +409,7 @@ run_cosmos_container_stage() {
   local model_name_local="$4"
   local script_body="$5"
   local hf_token="$6"
+  local hf_token_temp_dir=""
 
   ensure_docker_available
   run_cmd docker pull "${container_image}"
@@ -417,8 +418,6 @@ run_cosmos_container_stage() {
     docker run --rm --runtime nvidia --gpus all
     -v "${edge_root}:${edge_root}"
     -v "${workspace_dir}:${workspace_dir}"
-    -v "${HOME}/.cache/huggingface:${HOME}/.cache/huggingface"
-    -v "${HOME}/.huggingface:${HOME}/.huggingface"
     -e "HOME=${HOME}"
     -e "HF_HOME=${HF_HOME:-${HOME}/.cache/huggingface}"
     -e "MODEL_NAME=${model_name_local}"
@@ -426,12 +425,26 @@ run_cosmos_container_stage() {
     -w "${workspace_dir}"
   )
 
-  if [[ -n "${hf_token}" ]]; then
-    docker_args+=( -e "HUGGING_FACE_HUB_TOKEN=${hf_token}" )
+  if [[ -d "${HOME}/.cache/huggingface" ]]; then
+    docker_args+=( -v "${HOME}/.cache/huggingface:${HOME}/.cache/huggingface" )
+  fi
+  if [[ -d "${HOME}/.huggingface" ]]; then
+    docker_args+=( -v "${HOME}/.huggingface:${HOME}/.huggingface" )
+  fi
+
+  if [[ -n "${hf_token}" ]] && [[ ! -f "${HOME}/.cache/huggingface/token" ]] && [[ ! -f "${HOME}/.huggingface/token" ]]; then
+    hf_token_temp_dir="$(mktemp -d /tmp/edge-vlm-hf-token.XXXXXX)"
+    printf '%s\n' "${hf_token}" >"${hf_token_temp_dir}/token"
+    chmod 600 "${hf_token_temp_dir}/token"
+    docker_args+=( -v "${hf_token_temp_dir}/token:${HOME}/.cache/huggingface/token:ro" )
   fi
 
   docker_args+=( "${container_image}" bash -lc "${script_body}" )
   run_cmd "${docker_args[@]}"
+
+  if [[ -n "${hf_token_temp_dir}" ]]; then
+    rm -rf -- "${hf_token_temp_dir}"
+  fi
 }
 
 build_cosmos_engines() {
@@ -471,6 +484,10 @@ prepare_cosmos_default() {
   local quantized_ready
   local onnx_ready
   local engine_ready
+  local plan_quantize
+  local plan_export
+  local plan_engine_build
+  local container_preamble
 
   hf_model_id="$(manifest_value "models.${chosen_model}.hf_model_id")"
   quantization="$(manifest_value "models.${chosen_model}.quantization")"
@@ -494,18 +511,37 @@ prepare_cosmos_default() {
     "${chosen_model}" "${quantized_ready}" "${onnx_ready}" "${engine_ready}"
 
   preflight_cosmos_hf_access "${hf_model_id}"
+  container_preamble="set -Eeuo pipefail; cd '${edge_root}'; python3 -m venv --system-site-packages /tmp/edgellm-venv; source /tmp/edgellm-venv/bin/activate; pip3 install --no-deps .; sed '/^torch/d' requirements.txt > /tmp/edge-llm-reqs-no-torch.txt; pip3 install -r /tmp/edge-llm-reqs-no-torch.txt; cd '${workspace_dir}'; mkdir -p '${chosen_model}'"
 
   if [[ "${dry_run}" -eq 1 ]]; then
-    printf 'DRY-RUN  planned stage: docker pull %s\n' "${container_image}"
+    plan_quantize=0
+    plan_export=0
+    plan_engine_build=0
     if [[ "${quantized_ready}" -eq 0 ]]; then
+      plan_quantize=1
+      onnx_ready=0
+      engine_ready=0
+    fi
+    if [[ "${onnx_ready}" -eq 0 ]]; then
+      plan_export=1
+      engine_ready=0
+    fi
+    if [[ "${engine_ready}" -eq 0 ]]; then
+      plan_engine_build=1
+    fi
+
+    if [[ "${plan_quantize}" -eq 1 || "${plan_export}" -eq 1 ]]; then
+      printf 'DRY-RUN  planned stage: docker pull %s\n' "${container_image}"
+    fi
+    if [[ "${plan_quantize}" -eq 1 ]]; then
       printf 'DRY-RUN  planned stage: docker run %s ... tensorrt-edgellm-quantize llm --model_dir %s --output_dir %s/quantized --quantization %s\n' \
         "${container_image}" "${hf_model_id}" "${chosen_model}" "${quantization}"
     fi
-    if [[ "${onnx_ready}" -eq 0 || "${quantized_ready}" -eq 0 ]]; then
+    if [[ "${plan_export}" -eq 1 ]]; then
       printf 'DRY-RUN  planned stage: docker run %s ... tensorrt-edgellm-export %s/quantized %s/onnx\n' \
         "${container_image}" "${chosen_model}" "${chosen_model}"
     fi
-    if [[ "${engine_ready}" -eq 0 || "${onnx_ready}" -eq 0 || "${quantized_ready}" -eq 0 ]]; then
+    if [[ "${plan_engine_build}" -eq 1 ]]; then
       printf 'DRY-RUN  planned stage: native Thor llm_build --onnxDir %s/onnx/llm --engineDir %s/engine/llm\n' \
         "${model_root}" "${model_root}"
       printf 'DRY-RUN  planned stage: native Thor visual_build --onnxDir %s/onnx/visual --engineDir %s/engine\n' \
@@ -523,7 +559,7 @@ prepare_cosmos_default() {
       "${edge_root}" \
       "${workspace_dir}" \
       "${chosen_model}" \
-      "set -Eeuo pipefail; cd '${edge_root}'; python3 -m venv --system-site-packages /tmp/edgellm-venv; source /tmp/edgellm-venv/bin/activate; pip3 install --no-deps .; sed '/^torch/d' requirements.txt > /tmp/edge-llm-reqs-no-torch.txt; pip3 install -r /tmp/edge-llm-reqs-no-torch.txt; cd '${workspace_dir}'; mkdir -p '${chosen_model}'; tensorrt-edgellm-quantize llm --model_dir '${hf_model_id}' --output_dir '${chosen_model}/quantized' --quantization '${quantization}'" \
+      "${container_preamble}; tensorrt-edgellm-quantize llm --model_dir '${hf_model_id}' --output_dir '${chosen_model}/quantized' --quantization '${quantization}'" \
       "${token}"
     quantized_ready=1
     onnx_ready=0
@@ -536,7 +572,7 @@ prepare_cosmos_default() {
       "${edge_root}" \
       "${workspace_dir}" \
       "${chosen_model}" \
-      "set -Eeuo pipefail; cd '${edge_root}'; python3 -m venv --system-site-packages /tmp/edgellm-venv; source /tmp/edgellm-venv/bin/activate; pip3 install --no-deps .; sed '/^torch/d' requirements.txt > /tmp/edge-llm-reqs-no-torch.txt; pip3 install -r /tmp/edge-llm-reqs-no-torch.txt; cd '${workspace_dir}'; tensorrt-edgellm-export '${chosen_model}/quantized' '${chosen_model}/onnx'" \
+      "${container_preamble}; tensorrt-edgellm-export '${chosen_model}/quantized' '${chosen_model}/onnx'" \
       "${token}"
     onnx_ready=1
     engine_ready=0
