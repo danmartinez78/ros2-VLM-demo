@@ -280,6 +280,22 @@ class InstallDependenciesGuardTests(unittest.TestCase):
         )
         self.assertIn("APT guard test transaction passed.", result.stdout)
 
+    def test_guard_rejects_arch_qualified_protected_removal(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_APT_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Remv nvidia-opencv-dev:arm64 [4.8.0]"
+
+        result = subprocess.run(
+            ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("removes protected package 'nvidia-opencv-dev'", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
