@@ -44,7 +44,7 @@ for the investigation and evidence.
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
 | JetPack / Jetson Linux | JetPack 7.1 / R38.4 |
-| CUDA | 13.2 |
+| CUDA | 13.0 (Thor profile) |
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
 | Model | Cosmos-Reason2-8B, NVFP4 |
@@ -67,6 +67,8 @@ bash scripts/setup_thor_jp71.sh
 
 Setup installs dependencies, pins/builds TensorRT Edge-LLM, prepares model/data
 layout, installs RT-DETR model assets, and generates `scripts/edge_vlm_env.sh`.
+Before first run, accept the gated Cosmos license and authenticate with
+Hugging Face (`huggingface-cli login`) on the Thor host.
 
 The deployment verifier can be re-run independently:
 

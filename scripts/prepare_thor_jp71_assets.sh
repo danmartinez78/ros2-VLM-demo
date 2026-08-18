@@ -19,8 +19,8 @@ Usage: ./scripts/prepare_thor_jp71_assets.sh [options]
 
 Deterministic Thor JP7.1 asset preparation:
 - clones/pins TensorRT-Edge-LLM to the tested revision,
-- builds Edge-LLM plugin/runtime,
-- prepares or validates model workspace layout,
+- builds Edge-LLM plugin/runtime with Thor CMake target settings,
+- prepares Cosmos-Reason2-8B quantized/onnx/engine stages,
 - installs RT-DETR packages/models,
 - prepares repo-owned test data assets,
 - generates scripts/edge_vlm_env.sh from derived paths.
@@ -34,7 +34,7 @@ Options:
   --dry-run                  Print planned actions without mutating the system
   -h, --help                 Show this help
 
-Model acquisition knobs (for licensed/private assets):
+Optional model override knobs (fallback path):
   EDGE_VLM_MODEL_ARCHIVE             tar/tgz path or URL with prepared model directory
   EDGE_VLM_MODEL_ARCHIVE_SHA256      optional sha256 checksum for archive validation
   EDGE_VLM_MODEL_BUILD_COMMAND       command that prepares engine artifacts in workspace
@@ -179,72 +179,100 @@ validate_model_layout() {
   [[ "${missing}" -eq 0 ]]
 }
 
-prepare_model_layout() {
-  local workspace_dir="$1"
-  local chosen_model="$2"
-  local archive_source="${EDGE_VLM_MODEL_ARCHIVE:-}"
-  local archive_sha256="${EDGE_VLM_MODEL_ARCHIVE_SHA256:-}"
-  local prep_command="${EDGE_VLM_MODEL_BUILD_COMMAND:-}"
-  local archive_file
-  local stage_dir
-
-  mkdir -p "${workspace_dir}"
-
-  if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
-    echo "Model workspace already valid at ${workspace_dir}."
+resolve_hf_token() {
+  if [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" ]]; then
+    printf '%s\n' "${HUGGING_FACE_HUB_TOKEN}"
     return
   fi
-
-  if [[ "${dry_run}" -eq 1 && -z "${archive_source}" && -z "${prep_command}" ]]; then
-    echo "DRY-RUN  model workspace validation would fail without EDGE_VLM_MODEL_ARCHIVE or EDGE_VLM_MODEL_BUILD_COMMAND."
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    printf '%s\n' "${HF_TOKEN}"
     return
   fi
+  if [[ -f "${HOME}/.cache/huggingface/token" ]]; then
+    head -n 1 "${HOME}/.cache/huggingface/token"
+    return
+  fi
+  if [[ -f "${HOME}/.huggingface/token" ]]; then
+    head -n 1 "${HOME}/.huggingface/token"
+    return
+  fi
+  printf '\n'
+}
 
-  if [[ -n "${archive_source}" ]]; then
-    stage_dir="$(mktemp -d /tmp/edge-vlm-model.XXXXXX)"
-    archive_file="${stage_dir}/model.tar"
-    trap 'rm -rf -- "${stage_dir}"' RETURN
+preflight_cosmos_hf_access() {
+  local hf_model_id="$1"
+  local token
+  token="$(resolve_hf_token)"
 
-    if [[ "${archive_source}" =~ ^https?:// ]]; then
-      run_cmd curl -fL --retry 3 --retry-delay 2 -o "${archive_file}" "${archive_source}"
+  if [[ "${dry_run}" -eq 1 ]]; then
+    if [[ -n "${token}" ]]; then
+      printf 'DRY-RUN  verify Hugging Face access for %s using cached token\n' "${hf_model_id}"
     else
-      [[ -f "${archive_source}" ]] || fail "Model archive does not exist: ${archive_source}"
-      run_cmd cp "${archive_source}" "${archive_file}"
+      printf 'DRY-RUN  verify Hugging Face access for %s (token required: run huggingface-cli login and accept model license)\n' "${hf_model_id}"
     fi
-
-    if [[ -n "${archive_sha256}" ]]; then
-      if [[ "${dry_run}" -eq 1 ]]; then
-        printf 'DRY-RUN  verify sha256 %s\n' "${archive_sha256}"
-      else
-        echo "${archive_sha256}  ${archive_file}" | sha256sum -c -
-      fi
-    fi
-
-    run_cmd tar -xf "${archive_file}" -C "${workspace_dir}"
+    return
   fi
 
-  if ! validate_model_layout "${workspace_dir}" "${chosen_model}"; then
-    if [[ -n "${prep_command}" ]]; then
-      if [[ "${dry_run}" -eq 1 ]]; then
-        printf 'DRY-RUN  %s\n' "${prep_command}"
-      else
-        EDGE_VLM_WORKSPACE_DIR="${workspace_dir}" EDGE_VLM_MODEL_NAME="${chosen_model}" bash -lc "${prep_command}"
-      fi
-    fi
+  if [[ -z "${token}" ]]; then
+    fail "Missing Hugging Face credentials for ${hf_model_id}. Accept the license at https://huggingface.co/${hf_model_id} and run 'huggingface-cli login' (or set HUGGING_FACE_HUB_TOKEN)."
+  fi
+
+  local status
+  status="$(
+    curl -sS -o /dev/null -w '%{http_code}' \
+      -H "Authorization: Bearer ${token}" \
+      "https://huggingface.co/${hf_model_id}/resolve/main/config.json"
+  )"
+
+  if [[ "${status}" == "200" ]]; then
+    return
+  fi
+
+  if [[ "${status}" == "401" || "${status}" == "403" ]]; then
+    fail "Hugging Face access denied for ${hf_model_id} (HTTP ${status}). Accept the gated license and ensure your token has read access."
+  fi
+
+  fail "Unable to verify Hugging Face access for ${hf_model_id} (HTTP ${status})."
+}
+
+detect_cuda_ctk_version() {
+  nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
+validate_thor_build_inputs() {
+  local edge_root="$1"
+  local expected_cuda_ctk="$2"
+  local detected_cuda_ctk=""
+
+  if command -v nvcc >/dev/null 2>&1; then
+    detected_cuda_ctk="$(detect_cuda_ctk_version)"
   fi
 
   if [[ "${dry_run}" -eq 1 ]]; then
-    echo "DRY-RUN  model layout validation complete."
-  else
-    validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
-      "Model workspace is incomplete. Provide EDGE_VLM_MODEL_ARCHIVE or EDGE_VLM_MODEL_BUILD_COMMAND."
+    printf 'DRY-RUN  validate Thor build inputs (nvcc, TensorRT headers, toolchain file)\n'
+    if [[ -n "${detected_cuda_ctk}" ]]; then
+      printf 'DRY-RUN  detected CUDA toolkit: %s (configure target: %s)\n' "${detected_cuda_ctk}" "${expected_cuda_ctk}"
+    else
+      printf 'DRY-RUN  CUDA toolkit detection deferred to runtime host\n'
+    fi
+    return
   fi
+
+  command -v nvcc >/dev/null 2>&1 || fail "nvcc not found. Install the JP7.1 CUDA toolkit components before building Edge-LLM."
+  [[ -n "${detected_cuda_ctk}" ]] || fail "Unable to detect CUDA toolkit version from nvcc."
+  [[ "${detected_cuda_ctk}" == "${expected_cuda_ctk}" ]] || fail \
+    "Detected CUDA toolkit ${detected_cuda_ctk}, but Thor profile requires ${expected_cuda_ctk}. Use the JP7.1-supported stack on this host (no auto-upgrade is performed by this script)."
+  [[ -f "${edge_root}/cmake/aarch64_linux_toolchain.cmake" ]] || fail \
+    "Missing TensorRT-Edge-LLM toolchain file: ${edge_root}/cmake/aarch64_linux_toolchain.cmake"
+  [[ -f /usr/include/NvInfer.h || -f /usr/include/aarch64-linux-gnu/NvInfer.h ]] || fail \
+    "TensorRT development headers not found under /usr/include. Install JP7.1 TensorRT dev packages before building."
 }
 
 prepare_edge_llm() {
   local edge_root="$1"
   local edge_commit="$2"
   local edge_build="$3"
+  local cuda_ctk_version="$4"
 
   if [[ -d "${edge_root}/.git" ]]; then
     run_cmd git -C "${edge_root}" fetch --tags --prune origin
@@ -253,10 +281,19 @@ prepare_edge_llm() {
   fi
 
   run_cmd git -C "${edge_root}" checkout "${edge_commit}"
+  run_cmd git -C "${edge_root}" submodule update --init --recursive
   run_cmd mkdir -p "${edge_build}"
 
   if ! validate_edge_artifacts "${edge_build}"; then
-    run_cmd cmake -S "${edge_root}" -B "${edge_build}" -GNinja -DCMAKE_BUILD_TYPE=Release
+    validate_thor_build_inputs "${edge_root}" "${cuda_ctk_version}"
+    run_cmd cmake -S "${edge_root}" -B "${edge_build}" \
+      -GNinja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DTRT_PACKAGE_DIR=/usr \
+      -DCMAKE_TOOLCHAIN_FILE=cmake/aarch64_linux_toolchain.cmake \
+      -DEMBEDDED_TARGET=jetson-thor \
+      -DCUDA_CTK_VERSION="${cuda_ctk_version}" \
+      -DENABLE_CUTE_DSL=ALL
     run_cmd cmake --build "${edge_build}" --parallel
   fi
 
@@ -289,6 +326,256 @@ install_rtdetr_models() {
     ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula
     mkdir -p "${repo_root}/test_data"
     date -u +%Y-%m-%dT%H:%M:%SZ >"${marker_file}"
+  fi
+}
+
+apply_model_overrides() {
+  local workspace_dir="$1"
+  local chosen_model="$2"
+  local archive_source="${EDGE_VLM_MODEL_ARCHIVE:-}"
+  local archive_sha256="${EDGE_VLM_MODEL_ARCHIVE_SHA256:-}"
+  local prep_command="${EDGE_VLM_MODEL_BUILD_COMMAND:-}"
+  local archive_file
+  local stage_dir
+
+  [[ -n "${archive_source}" || -n "${prep_command}" ]] || return 0
+
+  if [[ "${dry_run}" -eq 1 ]]; then
+    echo "DRY-RUN  model override inputs detected; showing override/fallback actions first."
+  fi
+
+  run_cmd mkdir -p "${workspace_dir}"
+
+  if [[ -n "${archive_source}" ]]; then
+    stage_dir="$(mktemp -d /tmp/edge-vlm-model.XXXXXX)"
+    archive_file="${stage_dir}/model.tar"
+    trap 'rm -rf -- "${stage_dir}"' RETURN
+
+    if [[ "${archive_source}" =~ ^https?:// ]]; then
+      run_cmd curl -fL --retry 3 --retry-delay 2 -o "${archive_file}" "${archive_source}"
+    else
+      [[ -f "${archive_source}" ]] || fail "Model archive does not exist: ${archive_source}"
+      run_cmd cp "${archive_source}" "${archive_file}"
+    fi
+
+    if [[ -n "${archive_sha256}" ]]; then
+      if [[ "${dry_run}" -eq 1 ]]; then
+        printf 'DRY-RUN  verify sha256 %s\n' "${archive_sha256}"
+      else
+        echo "${archive_sha256}  ${archive_file}" | sha256sum -c -
+      fi
+    fi
+
+    run_cmd tar -xf "${archive_file}" -C "${workspace_dir}"
+  fi
+
+  if ! validate_model_layout "${workspace_dir}" "${chosen_model}" && [[ -n "${prep_command}" ]]; then
+    if [[ "${dry_run}" -eq 1 ]]; then
+      printf 'DRY-RUN  %s\n' "${prep_command}"
+    else
+      EDGE_VLM_WORKSPACE_DIR="${workspace_dir}" EDGE_VLM_MODEL_NAME="${chosen_model}" bash -lc "${prep_command}"
+    fi
+  fi
+}
+
+is_quantized_ready() {
+  local model_root="$1"
+  local quantized_dir="${model_root}/quantized"
+  [[ -d "${quantized_dir}" ]] || return 1
+  find "${quantized_dir}" -type f \( -name '*.safetensors' -o -name '*.json' \) -print -quit | grep -q .
+}
+
+is_onnx_ready() {
+  local model_root="$1"
+  local llm_onnx_dir="${model_root}/onnx/llm"
+  local visual_onnx_dir="${model_root}/onnx/visual"
+  [[ -d "${llm_onnx_dir}" && -d "${visual_onnx_dir}" ]] || return 1
+  find "${llm_onnx_dir}" -type f -name '*.onnx' -print -quit | grep -q . && \
+    find "${visual_onnx_dir}" -type f -name '*.onnx' -print -quit | grep -q .
+}
+
+ensure_docker_available() {
+  if [[ "${dry_run}" -eq 1 ]]; then
+    printf 'DRY-RUN  validate Docker + NVIDIA runtime availability\n'
+    return
+  fi
+  command -v docker >/dev/null 2>&1 || fail "docker is required for Cosmos export/quantization stage."
+}
+
+run_cosmos_container_stage() {
+  local container_image="$1"
+  local edge_root="$2"
+  local workspace_dir="$3"
+  local model_name_local="$4"
+  local script_body="$5"
+  local hf_token="$6"
+
+  ensure_docker_available
+  run_cmd docker pull "${container_image}"
+
+  local -a docker_args=(
+    docker run --rm --runtime nvidia --gpus all
+    -v "${edge_root}:${edge_root}"
+    -v "${workspace_dir}:${workspace_dir}"
+    -v "${HOME}/.cache/huggingface:${HOME}/.cache/huggingface"
+    -v "${HOME}/.huggingface:${HOME}/.huggingface"
+    -e "HOME=${HOME}"
+    -e "HF_HOME=${HF_HOME:-${HOME}/.cache/huggingface}"
+    -e "MODEL_NAME=${model_name_local}"
+    -e "WORKSPACE_DIR=${workspace_dir}"
+    -w "${workspace_dir}"
+  )
+
+  if [[ -n "${hf_token}" ]]; then
+    docker_args+=( -e "HUGGING_FACE_HUB_TOKEN=${hf_token}" )
+  fi
+
+  docker_args+=( "${container_image}" bash -lc "${script_body}" )
+  run_cmd "${docker_args[@]}"
+}
+
+build_cosmos_engines() {
+  local model_root="$1"
+  local edge_build="$2"
+
+  local llm_builder="${edge_build}/examples/llm/llm_build"
+  local visual_builder="${edge_build}/examples/multimodal/visual_build"
+
+  if [[ "${dry_run}" -ne 1 ]]; then
+    [[ -x "${llm_builder}" ]] || fail "Missing llm_build executable at ${llm_builder}. Build Edge-LLM first."
+    [[ -x "${visual_builder}" ]] || fail "Missing visual_build executable at ${visual_builder}. Build Edge-LLM first."
+  fi
+
+  run_cmd mkdir -p "${model_root}/engine/llm" "${model_root}/engine"
+  run_cmd "${llm_builder}" \
+    --onnxDir "${model_root}/onnx/llm" \
+    --engineDir "${model_root}/engine/llm" \
+    --maxBatchSize "${EDGE_VLM_LLM_MAX_BATCH_SIZE:-1}" \
+    --maxInputLen "${EDGE_VLM_LLM_MAX_INPUT_LEN:-1024}" \
+    --maxKVCacheCapacity "${EDGE_VLM_LLM_MAX_KV_CACHE_CAPACITY:-4096}"
+  run_cmd "${visual_builder}" \
+    --onnxDir "${model_root}/onnx/visual" \
+    --engineDir "${model_root}/engine"
+}
+
+prepare_cosmos_default() {
+  local workspace_dir="$1"
+  local chosen_model="$2"
+  local edge_root="$3"
+  local edge_build="$4"
+  local model_root="${workspace_dir}/${chosen_model}"
+  local hf_model_id
+  local quantization
+  local container_image
+  local token
+  local quantized_ready
+  local onnx_ready
+  local engine_ready
+
+  hf_model_id="$(manifest_value "models.${chosen_model}.hf_model_id")"
+  quantization="$(manifest_value "models.${chosen_model}.quantization")"
+  container_image="$(manifest_value "models.${chosen_model}.pytorch_container")"
+
+  quantized_ready=0
+  onnx_ready=0
+  engine_ready=0
+
+  if is_quantized_ready "${model_root}"; then
+    quantized_ready=1
+  fi
+  if is_onnx_ready "${model_root}"; then
+    onnx_ready=1
+  fi
+  if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
+    engine_ready=1
+  fi
+
+  printf 'Cosmos stage status (%s): quantized=%s onnx=%s engines=%s\n' \
+    "${chosen_model}" "${quantized_ready}" "${onnx_ready}" "${engine_ready}"
+
+  preflight_cosmos_hf_access "${hf_model_id}"
+
+  if [[ "${dry_run}" -eq 1 ]]; then
+    printf 'DRY-RUN  planned stage: docker pull %s\n' "${container_image}"
+    if [[ "${quantized_ready}" -eq 0 ]]; then
+      printf 'DRY-RUN  planned stage: docker run %s ... tensorrt-edgellm-quantize llm --model_dir %s --output_dir %s/quantized --quantization %s\n' \
+        "${container_image}" "${hf_model_id}" "${chosen_model}" "${quantization}"
+    fi
+    if [[ "${onnx_ready}" -eq 0 || "${quantized_ready}" -eq 0 ]]; then
+      printf 'DRY-RUN  planned stage: docker run %s ... tensorrt-edgellm-export %s/quantized %s/onnx\n' \
+        "${container_image}" "${chosen_model}" "${chosen_model}"
+    fi
+    if [[ "${engine_ready}" -eq 0 || "${onnx_ready}" -eq 0 || "${quantized_ready}" -eq 0 ]]; then
+      printf 'DRY-RUN  planned stage: native Thor llm_build --onnxDir %s/onnx/llm --engineDir %s/engine/llm\n' \
+        "${model_root}" "${model_root}"
+      printf 'DRY-RUN  planned stage: native Thor visual_build --onnxDir %s/onnx/visual --engineDir %s/engine\n' \
+        "${model_root}" "${model_root}"
+    fi
+    return
+  fi
+
+  token="$(resolve_hf_token)"
+  run_cmd mkdir -p "${workspace_dir}" "${model_root}"
+
+  if [[ "${quantized_ready}" -eq 0 ]]; then
+    run_cosmos_container_stage \
+      "${container_image}" \
+      "${edge_root}" \
+      "${workspace_dir}" \
+      "${chosen_model}" \
+      "set -Eeuo pipefail; cd '${edge_root}'; python3 -m venv --system-site-packages /tmp/edgellm-venv; source /tmp/edgellm-venv/bin/activate; pip3 install --no-deps .; sed '/^torch/d' requirements.txt > /tmp/edge-llm-reqs-no-torch.txt; pip3 install -r /tmp/edge-llm-reqs-no-torch.txt; cd '${workspace_dir}'; mkdir -p '${chosen_model}'; tensorrt-edgellm-quantize llm --model_dir '${hf_model_id}' --output_dir '${chosen_model}/quantized' --quantization '${quantization}'" \
+      "${token}"
+    quantized_ready=1
+    onnx_ready=0
+    engine_ready=0
+  fi
+
+  if [[ "${onnx_ready}" -eq 0 ]]; then
+    run_cosmos_container_stage \
+      "${container_image}" \
+      "${edge_root}" \
+      "${workspace_dir}" \
+      "${chosen_model}" \
+      "set -Eeuo pipefail; cd '${edge_root}'; python3 -m venv --system-site-packages /tmp/edgellm-venv; source /tmp/edgellm-venv/bin/activate; pip3 install --no-deps .; sed '/^torch/d' requirements.txt > /tmp/edge-llm-reqs-no-torch.txt; pip3 install -r /tmp/edge-llm-reqs-no-torch.txt; cd '${workspace_dir}'; tensorrt-edgellm-export '${chosen_model}/quantized' '${chosen_model}/onnx'" \
+      "${token}"
+    onnx_ready=1
+    engine_ready=0
+  fi
+
+  if [[ "${engine_ready}" -eq 0 ]]; then
+    build_cosmos_engines "${model_root}" "${edge_build}"
+  fi
+
+  validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
+    "Model workspace is incomplete after first-class Cosmos preparation."
+}
+
+prepare_model_layout() {
+  local workspace_dir="$1"
+  local chosen_model="$2"
+  local edge_root="$3"
+  local edge_build="$4"
+
+  if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
+    echo "Model workspace already valid at ${workspace_dir}."
+    return
+  fi
+
+  apply_model_overrides "${workspace_dir}" "${chosen_model}"
+  if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
+    echo "Model workspace is valid after applying override inputs."
+    return
+  fi
+
+  if [[ "${chosen_model}" == "Cosmos-Reason2-8B" ]]; then
+    prepare_cosmos_default "${workspace_dir}" "${chosen_model}" "${edge_root}" "${edge_build}"
+  fi
+
+  if [[ "${dry_run}" -eq 1 ]]; then
+    echo "DRY-RUN  model layout planning complete."
+  else
+    validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
+      "Model workspace is incomplete. First-class Cosmos setup failed and optional overrides did not provide a valid layout."
   fi
 }
 
@@ -357,6 +644,7 @@ ros_workspace="$(infer_ros_workspace)"
 default_edge_root="$(manifest_value edge_llm.default_root)"
 default_edge_build="$(manifest_value edge_llm.default_build_dir)"
 default_workspace="$(manifest_value default_workspace)"
+cuda_ctk_version="${EDGE_VLM_CUDA_CTK_VERSION:-$(manifest_value edge_llm.cuda_ctk_version)}"
 
 edge_root="${TENSORRT_EDGE_LLM_ROOT:-${default_edge_root}}"
 edge_root="${edge_root/\$\{HOME\}/${HOME}}"
@@ -374,16 +662,17 @@ printf '  ROS_WORKSPACE: %s\n' "${ros_workspace}"
 printf '  Edge-LLM root: %s\n' "${edge_root}"
 printf '  Edge-LLM build: %s\n' "${edge_build}"
 printf '  Edge-LLM commit: %s\n' "$(manifest_value edge_llm.commit)"
+printf '  Thor CUDA_CTK_VERSION: %s\n' "${cuda_ctk_version}"
 printf '  Model: %s\n' "${model_name}"
 printf '  Model workspace: %s\n' "${workspace_dir}"
 printf '  Env file: %s\n' "${env_file}"
 
 if [[ "${skip_edge_llm}" -eq 0 ]]; then
-  prepare_edge_llm "${edge_root}" "$(manifest_value edge_llm.commit)" "${edge_build}"
+  prepare_edge_llm "${edge_root}" "$(manifest_value edge_llm.commit)" "${edge_build}" "${cuda_ctk_version}"
 fi
 
 if [[ "${skip_model}" -eq 0 ]]; then
-  prepare_model_layout "${workspace_dir}" "${model_name}"
+  prepare_model_layout "${workspace_dir}" "${model_name}" "${edge_root}" "${edge_build}"
 fi
 
 if [[ "${skip_rtdetr}" -eq 0 ]]; then

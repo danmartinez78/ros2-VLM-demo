@@ -7,7 +7,7 @@ This is the canonical deployment and validation recipe for
 
 - Ubuntu 24.04, aarch64
 - JetPack 7.1 / Jetson Linux R38.4
-- CUDA 13.2
+- CUDA 13.0 (Thor TensorRT-Edge-LLM build profile)
 - ROS 2 Jazzy
 - TensorRT Edge-LLM built on the target Thor for `sm_110a`
 - Cosmos-Reason2-8B NVFP4 engine bundle (model-specific)
@@ -58,19 +58,26 @@ bash scripts/setup_thor_jp71.sh
 This performs deterministic path generation and setup for:
 
 - TensorRT-Edge-LLM clone pinned to `7f061f21f0a581ba234a1e233c9315b89d8e47d6`;
-- Edge-LLM build outputs including `libNvInfer_edgellm_plugin.so`;
-- model workspace layout and required artifacts;
+- Thor-targeted Edge-LLM build outputs (`jetson-thor`, CUDA_CTK_VERSION=13.0) including `libNvInfer_edgellm_plugin.so`;
+- first-class Cosmos-Reason2-8B preparation stages (HF preflight, NVFP4 quantize, ONNX export, native `llm_build` + `visual_build`);
 - RT-DETR package + model installer path;
 - rosbag and dataset preparation wrappers.
 
-For licensed/private model bundles, provide:
+Cosmos is gated on Hugging Face. Before running setup, accept the model license
+and authenticate on the Thor host:
+
+```bash
+huggingface-cli login
+```
+
+Optional fallback overrides (not the default path):
 
 ```bash
 export EDGE_VLM_MODEL_ARCHIVE=/absolute/path/or/url/to/model_bundle.tar
 export EDGE_VLM_MODEL_ARCHIVE_SHA256=<optional_sha256>
 ```
 
-or provide a deterministic preparation command:
+or:
 
 ```bash
 export EDGE_VLM_MODEL_BUILD_COMMAND='<command that emits engine layout under $EDGE_VLM_WORKSPACE_DIR>'
@@ -83,7 +90,8 @@ export JAAD_CLIPS_ARCHIVE=/absolute/path/or/url/to/jaad_clips_archive
 export NUSCENES_MINI_ARCHIVE=/absolute/path/or/url/to/nuscenes_mini_archive
 ```
 
-Use `bash scripts/prepare_thor_jp71_assets.sh --dry-run` to inspect the plan.
+Use `bash scripts/prepare_thor_jp71_assets.sh --dry-run` to inspect the full
+Cosmos stage plan without mutating the host.
 
 ## 3. Verify native inference first
 

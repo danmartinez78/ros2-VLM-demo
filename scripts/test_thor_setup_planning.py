@@ -26,6 +26,11 @@ class ThorSetupManifestTests(unittest.TestCase):
     def test_manifest_declares_required_cosmos_artifacts(self) -> None:
         with MANIFEST_PATH.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
+        self.assertEqual(manifest["edge_llm"]["cuda_ctk_version"], "13.0")
+        self.assertEqual(
+            manifest["models"]["Cosmos-Reason2-8B"]["pytorch_container"],
+            "nvcr.io/nvidia/pytorch:26.05-py3",
+        )
         required_llm = set(manifest["models"]["Cosmos-Reason2-8B"]["required_llm_artifacts"])
         required_visual = set(manifest["models"]["Cosmos-Reason2-8B"]["required_visual_artifacts"])
         self.assertIn("llm.engine", required_llm)
@@ -45,10 +50,18 @@ class ThorSetupDryRunTests(unittest.TestCase):
     def test_dry_run_generates_plan_without_side_effects(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-env-") as tmpdir:
             env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            workspace = Path(tmpdir) / "workspace"
             env = os.environ.copy()
             env["EDGE_VLM_ENV_FILE"] = str(env_file)
+            env["EDGE_VLM_WORKSPACE_DIR"] = str(workspace)
             result = subprocess.run(
-                [str(SETUP_SCRIPT), "--dry-run"],
+                [
+                    str(SETUP_SCRIPT),
+                    "--dry-run",
+                    "--skip-edge-llm",
+                    "--skip-rtdetr",
+                    "--skip-data",
+                ],
                 cwd=REPO_ROOT,
                 env=env,
                 text=True,
@@ -56,7 +69,11 @@ class ThorSetupDryRunTests(unittest.TestCase):
                 check=True,
             )
             self.assertIn("Thor JP7.1 setup plan:", result.stdout)
-            self.assertIn("DRY-RUN", result.stdout)
+            self.assertIn("planned stage: docker pull nvcr.io/nvidia/pytorch:26.05-py3", result.stdout)
+            self.assertIn("tensorrt-edgellm-quantize llm", result.stdout)
+            self.assertIn("tensorrt-edgellm-export", result.stdout)
+            self.assertIn("native Thor llm_build", result.stdout)
+            self.assertIn("native Thor visual_build", result.stdout)
             self.assertFalse(env_file.exists())
 
     def test_top_level_dry_run_is_non_mutating_and_skips_build_verify(self) -> None:
@@ -83,6 +100,77 @@ class ThorSetupDryRunTests(unittest.TestCase):
                 result.stdout,
             )
             self.assertFalse(env_file.exists())
+
+    def test_quantized_workspace_skips_quantize_stage(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-quantized-only-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            quantized_dir = workspace / "Cosmos-Reason2-8B" / "quantized"
+            quantized_dir.mkdir(parents=True, exist_ok=True)
+            (quantized_dir / "weights.safetensors").touch()
+            (quantized_dir / "config.json").touch()
+
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            env = os.environ.copy()
+            env["EDGE_VLM_WORKSPACE_DIR"] = str(workspace)
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+
+            result = subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--dry-run",
+                    "--skip-edge-llm",
+                    "--skip-rtdetr",
+                    "--skip-data",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertNotIn("tensorrt-edgellm-quantize llm", result.stdout)
+            self.assertIn("tensorrt-edgellm-export", result.stdout)
+            self.assertIn("native Thor llm_build", result.stdout)
+            self.assertIn("native Thor visual_build", result.stdout)
+
+    def test_onnx_ready_workspace_skips_quantize_and_export(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-onnx-ready-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            model_root = workspace / "Cosmos-Reason2-8B"
+            quantized_dir = model_root / "quantized"
+            llm_onnx_dir = model_root / "onnx" / "llm"
+            visual_onnx_dir = model_root / "onnx" / "visual"
+            quantized_dir.mkdir(parents=True, exist_ok=True)
+            llm_onnx_dir.mkdir(parents=True, exist_ok=True)
+            visual_onnx_dir.mkdir(parents=True, exist_ok=True)
+            (quantized_dir / "weights.safetensors").touch()
+            (quantized_dir / "config.json").touch()
+            (llm_onnx_dir / "llm.onnx").touch()
+            (visual_onnx_dir / "visual.onnx").touch()
+
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            env = os.environ.copy()
+            env["EDGE_VLM_WORKSPACE_DIR"] = str(workspace)
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+
+            result = subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--dry-run",
+                    "--skip-edge-llm",
+                    "--skip-rtdetr",
+                    "--skip-data",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+            self.assertNotIn("tensorrt-edgellm-quantize llm", result.stdout)
+            self.assertNotIn("tensorrt-edgellm-export", result.stdout)
+            self.assertIn("native Thor llm_build", result.stdout)
+            self.assertIn("native Thor visual_build", result.stdout)
 
     def test_cosmos_validation_does_not_require_qwen_workspace(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-cosmos-only-") as tmpdir:
@@ -123,6 +211,32 @@ class ThorSetupDryRunTests(unittest.TestCase):
                 check=True,
             )
             self.assertTrue(env_file.exists())
+
+    def test_missing_hf_access_fails_before_workspace_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-hf-preflight-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            env = os.environ.copy()
+            env["HOME"] = tmpdir
+            env["EDGE_VLM_WORKSPACE_DIR"] = str(workspace)
+            env["HUGGING_FACE_HUB_TOKEN"] = ""
+            env["HF_TOKEN"] = ""
+
+            result = subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--skip-edge-llm",
+                    "--skip-rtdetr",
+                    "--skip-data",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Missing Hugging Face credentials", result.stderr)
+            self.assertFalse(workspace.exists())
 
 
 if __name__ == "__main__":
