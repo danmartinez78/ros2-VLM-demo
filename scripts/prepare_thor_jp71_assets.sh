@@ -116,6 +116,8 @@ fail() {
   exit 1
 }
 
+source "${script_dir}/apt_transaction_guard.sh"
+
 infer_ros_workspace() {
   if [[ -n "${ROS_WORKSPACE:-}" ]]; then
     printf '%s\n' "${ROS_WORKSPACE}"
@@ -308,16 +310,29 @@ prepare_edge_llm() {
 install_rtdetr_models() {
   local ros_distro="$1"
   local marker_file="${repo_root}/test_data/.rtdetr_models_install.ok"
+  local -a rtdetr_packages=(
+    "ros-${ros_distro}-isaac-ros-rtdetr"
+    "ros-${ros_distro}-isaac-ros-rtdetr-models-install"
+  )
+
+  if [[ "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" == "1" ]]; then
+    [[ -n "${EDGE_VLM_APT_SIMULATION_OUTPUT:-}" ]] || fail \
+      "EDGE_VLM_APT_GUARD_TEST_MODE requires EDGE_VLM_APT_SIMULATION_OUTPUT."
+    assert_safe_apt_transaction "RT-DETR packages" "${rtdetr_packages[@]}"
+    echo "APT guard test transaction passed for RT-DETR packages."
+    return
+  fi
 
   if [[ -f "${marker_file}" ]]; then
     echo "RT-DETR models installer already completed (marker: ${marker_file})."
     return
   fi
 
+  if [[ "${dry_run}" -ne 1 ]]; then
+    assert_safe_apt_transaction "RT-DETR packages" "${rtdetr_packages[@]}"
+  fi
   run_cmd sudo apt-get update
-  run_cmd sudo apt-get install -y \
-    "ros-${ros_distro}-isaac-ros-rtdetr" \
-    "ros-${ros_distro}-isaac-ros-rtdetr-models-install"
+  run_cmd sudo apt-get install -y "${rtdetr_packages[@]}"
 
   if [[ "${dry_run}" -eq 1 ]]; then
     printf 'DRY-RUN  source /opt/ros/%s/setup.bash && ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula\n' "${ros_distro}"

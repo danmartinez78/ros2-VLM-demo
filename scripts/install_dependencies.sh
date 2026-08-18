@@ -1,51 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
 ROS_DISTRO="jazzy"
 INSTALL_DESKTOP=0
 INSTALL_ISAAC_ROS=0
 FORCE_UNSUPPORTED=0
 DRY_RUN=0
-PROTECTED_NVIDIA_PACKAGES=(
-  nvidia-jetpack
-  nvidia-jetpack-dev
-  nvidia-opencv-dev
-)
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
 
-simulate_apt_install_output() {
-  if [[ -n "${EDGE_VLM_APT_SIMULATION_OUTPUT:-}" ]]; then
-    printf '%s\n' "${EDGE_VLM_APT_SIMULATION_OUTPUT}"
-    return "${EDGE_VLM_APT_SIMULATION_EXIT_CODE:-0}"
-  fi
-  sudo apt-get -s install -y "$@"
-}
-
-assert_safe_apt_transaction() {
-  local description="$1"
-  shift
-  local simulation_output
-
-  if ! simulation_output="$(simulate_apt_install_output "$@" 2>&1)"; then
-    fail "Unable to simulate APT transaction for ${description}. Output:"$'\n'"${simulation_output}"
-  fi
-
-  local protected_pkg
-  local removed_pkg
-  local -a removed_pkgs=()
-  mapfile -t removed_pkgs < <(printf '%s\n' "${simulation_output}" | awk '/^Remv[[:space:]]/{print $2}')
-  for protected_pkg in "${PROTECTED_NVIDIA_PACKAGES[@]}"; do
-    for removed_pkg in "${removed_pkgs[@]}"; do
-      if [[ "${removed_pkg}" == "${protected_pkg}" || "${removed_pkg}" == "${protected_pkg}:"* ]]; then
-        fail "Refusing to continue: planned APT transaction for ${description} removes protected package '${protected_pkg}'. Keep the NVIDIA Jetson stack intact."
-      fi
-    done
-  done
-}
+source "${script_dir}/apt_transaction_guard.sh"
 
 usage() {
   cat <<'EOF'

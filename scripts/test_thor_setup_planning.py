@@ -315,5 +315,51 @@ class InstallDependenciesGuardTests(unittest.TestCase):
         self.assertIn("Unable to simulate APT transaction", result.stderr)
 
 
+class PrepareThorRtdetrGuardTests(unittest.TestCase):
+    def test_rtdetr_guard_rejects_protected_nvidia_removal(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_APT_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Remv nvidia-jetpack-dev [7.1]"
+
+        result = subprocess.run(
+            [
+                str(SETUP_SCRIPT),
+                "--dry-run",
+                "--skip-edge-llm",
+                "--skip-model",
+                "--skip-data",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("removes protected package 'nvidia-jetpack-dev'", result.stderr)
+
+    def test_rtdetr_guard_accepts_safe_transaction(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_APT_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst ros-jazzy-isaac-ros-rtdetr (4.5.0)"
+
+        result = subprocess.run(
+            [
+                str(SETUP_SCRIPT),
+                "--dry-run",
+                "--skip-edge-llm",
+                "--skip-model",
+                "--skip-data",
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("APT guard test transaction passed for RT-DETR packages.", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
