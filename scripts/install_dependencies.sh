@@ -36,6 +36,7 @@ assert_safe_apt_transaction() {
 
   local protected_pkg
   local removed_pkg
+  local -a removed_pkgs=()
   mapfile -t removed_pkgs < <(printf '%s\n' "${simulation_output}" | awk '/^Remv[[:space:]]/{print $2}')
   for protected_pkg in "${PROTECTED_NVIDIA_PACKAGES[@]}"; do
     for removed_pkg in "${removed_pkgs[@]}"; do
@@ -122,6 +123,8 @@ EOF
 fi
 
 if [[ "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" == "1" ]]; then
+  [[ -n "${EDGE_VLM_APT_SIMULATION_OUTPUT:-}" ]] || fail \
+    "EDGE_VLM_APT_GUARD_TEST_MODE requires EDGE_VLM_APT_SIMULATION_OUTPUT."
   assert_safe_apt_transaction "guard test transaction" guard-test-package
   echo "APT guard test transaction passed."
   exit 0
