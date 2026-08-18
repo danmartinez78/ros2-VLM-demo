@@ -164,7 +164,10 @@ DRY-RUN  install_dependencies plan:
     - install ROS apt source + ${ros_variant}
     - install build/rosdep dependencies
     - optionally configure Isaac ROS Docker mode (if --isaac-ros)
-      - neutralize Isaac ROS host APT preferences that can pin host CUDA/TensorRT/OpenCV package resolution
+      - before the first host APT transaction, neutralize stale Isaac ROS host APT preferences from previous runs
+        that can pin CUDA/TensorRT/OpenCV package resolution and refresh apt metadata if files changed
+      - after "isaac-ros init docker", neutralize any newly created Isaac ROS host APT preferences
+        that can pin host CUDA/TensorRT/OpenCV package resolution
       - verify CUDA/TensorRT/OpenCV install candidates remain aligned with installed JP7.1 host packages
     - initialize/update rosdep
 EOF
@@ -187,6 +190,9 @@ if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
 fi
 
 sudo -v
+if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
+  neutralize_isaac_ros_host_preferences
+fi
 sudo apt-get update
 bootstrap_packages=(
   ca-certificates

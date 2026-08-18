@@ -15,6 +15,16 @@ apt_guard_fail() {
 }
 
 simulate_apt_install_output() {
+  if [[ -n "${EDGE_VLM_APT_SIMULATION_OUTPUT_COMMAND:-}" ]]; then
+    if [[ "${EDGE_VLM_ALLOW_APT_SIMULATION_COMMAND:-0}" != "1" && \
+          "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" != "1" && \
+          "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" != "1" ]]; then
+      apt_guard_fail "EDGE_VLM_APT_SIMULATION_OUTPUT_COMMAND is test-only. Set EDGE_VLM_ALLOW_APT_SIMULATION_COMMAND=1 to override deliberately."
+      return 1
+    fi
+    "${EDGE_VLM_APT_SIMULATION_OUTPUT_COMMAND}" "$@"
+    return
+  fi
   if [[ -n "${EDGE_VLM_APT_SIMULATION_OUTPUT:-}" ]]; then
     printf '%s\n' "${EDGE_VLM_APT_SIMULATION_OUTPUT}"
     return "${EDGE_VLM_APT_SIMULATION_EXIT_CODE:-0}"

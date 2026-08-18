@@ -104,6 +104,10 @@ class ThorSetupDryRunTests(unittest.TestCase):
             )
             self.assertIn("DRY-RUN  install_dependencies plan:", result.stdout)
             self.assertIn(
+                "before the first host APT transaction, neutralize stale Isaac ROS host APT preferences from previous runs",
+                result.stdout,
+            )
+            self.assertIn(
                 "Dry-run mode requested; skipping environment source, build, and verification.",
                 result.stdout,
             )
@@ -473,6 +477,58 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
             env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            self._set_stack_policy_env(env)
+
+            result = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            for pref_name in pref_contents:
+                self.assertFalse((prefs_dir / pref_name).exists())
+                self.assertTrue((prefs_dir / f"{pref_name}.disabled-by-edge-vlm").exists())
+            self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
+
+    def test_stale_isaac_prefs_are_neutralized_before_first_simulated_transaction(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-order-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            prefs_dir = tmpdir_path / "preferences.d"
+            prefs_dir.mkdir(parents=True, exist_ok=True)
+            pref_contents = {
+                "isaac-ros-opencv-4-6.pref": "Package: libopencv*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                "isaac-ros-cuda-13-0.pref": "Package: cuda*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                "isaac-ros-tensorrt-13-0.pref": "Package: libnvinfer*\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+                "isaac-ros-dgx-spark.pref": "Package: *\nPin: release o=Ubuntu\nPin-Priority: 1001\n",
+            }
+            for name, content in pref_contents.items():
+                (prefs_dir / name).write_text(content, encoding="utf-8")
+
+            simulation_script = tmpdir_path / "simulate_apt.sh"
+            simulation_script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -eu",
+                        'if compgen -G "${EDGE_VLM_APT_PREFERENCES_DIR}/isaac-ros-*.pref" >/dev/null; then',
+                        '  echo "Remv nvidia-opencv-dev [7.1-b112]"',
+                        "else",
+                        '  echo "Inst libopencv-dev (4.8.0-3-g6ef37b4)"',
+                        "fi",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            simulation_script.chmod(0o755)
+
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT_COMMAND"] = str(simulation_script)
             self._set_stack_policy_env(env)
 
             result = subprocess.run(
