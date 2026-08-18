@@ -511,26 +511,28 @@ prepare_cosmos_default() {
   printf 'Cosmos stage status (%s): quantized=%s onnx=%s engines=%s\n' \
     "${chosen_model}" "${quantized_ready}" "${onnx_ready}" "${engine_ready}"
 
-  preflight_cosmos_hf_access "${hf_model_id}"
+  plan_quantize=0
+  plan_export=0
+  plan_engine_build=0
+  if [[ "${quantized_ready}" -eq 0 ]]; then
+    plan_quantize=1
+    onnx_ready=0
+    engine_ready=0
+  fi
+  if [[ "${onnx_ready}" -eq 0 ]]; then
+    plan_export=1
+    engine_ready=0
+  fi
+  if [[ "${engine_ready}" -eq 0 ]]; then
+    plan_engine_build=1
+  fi
+
+  if [[ "${plan_quantize}" -eq 1 ]]; then
+    preflight_cosmos_hf_access "${hf_model_id}"
+  fi
   container_preamble="set -Eeuo pipefail; cd '${edge_root}'; python3 -m venv --system-site-packages /tmp/edgellm-venv; source /tmp/edgellm-venv/bin/activate; pip3 install --no-deps .; sed '/^torch/d' requirements.txt > /tmp/edge-llm-reqs-no-torch.txt; pip3 install -r /tmp/edge-llm-reqs-no-torch.txt; cd '${workspace_dir}'; mkdir -p '${chosen_model}'"
 
   if [[ "${dry_run}" -eq 1 ]]; then
-    plan_quantize=0
-    plan_export=0
-    plan_engine_build=0
-    if [[ "${quantized_ready}" -eq 0 ]]; then
-      plan_quantize=1
-      onnx_ready=0
-      engine_ready=0
-    fi
-    if [[ "${onnx_ready}" -eq 0 ]]; then
-      plan_export=1
-      engine_ready=0
-    fi
-    if [[ "${engine_ready}" -eq 0 ]]; then
-      plan_engine_build=1
-    fi
-
     if [[ "${plan_quantize}" -eq 1 || "${plan_export}" -eq 1 ]]; then
       printf 'DRY-RUN  planned stage: docker pull %s\n' "${container_image}"
     fi
@@ -551,7 +553,10 @@ prepare_cosmos_default() {
     return
   fi
 
-  token="$(resolve_hf_token)"
+  token=""
+  if [[ "${plan_quantize}" -eq 1 || "${plan_export}" -eq 1 ]]; then
+    token="$(resolve_hf_token)"
+  fi
   run_cmd mkdir -p "${workspace_dir}" "${model_root}"
 
   if [[ "${quantized_ready}" -eq 0 ]]; then

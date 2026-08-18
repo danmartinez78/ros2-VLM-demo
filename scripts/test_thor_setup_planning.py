@@ -138,6 +138,7 @@ class ThorSetupDryRunTests(unittest.TestCase):
             self.assertIn("tensorrt-edgellm-export", result.stdout)
             self.assertIn("native Thor llm_build", result.stdout)
             self.assertIn("native Thor visual_build", result.stdout)
+            self.assertNotIn("verify Hugging Face access", result.stdout)
 
     def test_onnx_ready_workspace_skips_quantize_and_export(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-onnx-ready-") as tmpdir:
@@ -177,6 +178,7 @@ class ThorSetupDryRunTests(unittest.TestCase):
             self.assertNotIn("tensorrt-edgellm-export", result.stdout)
             self.assertIn("native Thor llm_build", result.stdout)
             self.assertIn("native Thor visual_build", result.stdout)
+            self.assertNotIn("verify Hugging Face access", result.stdout)
 
     def test_cosmos_validation_does_not_require_qwen_workspace(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-cosmos-only-") as tmpdir:
