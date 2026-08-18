@@ -56,10 +56,6 @@ package_policy_output() {
   override_var="EDGE_VLM_APT_POLICY_${override_var_suffix}_OUTPUT"
   override_value="${!override_var:-}"
 
-  if [[ -z "${override_value}" && "${package_name}" == "libopencv-dev" ]] && [[ -n "${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT:-}" ]]; then
-    override_value="${EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT}"
-  fi
-
   if [[ -n "${override_value}" ]]; then
     printf '%s\n' "${override_value}"
     return 0

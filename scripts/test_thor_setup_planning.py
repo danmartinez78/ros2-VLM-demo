@@ -487,6 +487,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             for pref_name in pref_contents:
                 self.assertFalse((prefs_dir / pref_name).exists())
                 self.assertTrue((prefs_dir / f"{pref_name}.disabled-by-edge-vlm").exists())
+            self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
 
     def test_isaac_ros_pref_guard_rejects_protected_package_removal_plan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-removal-") as tmpdir:
