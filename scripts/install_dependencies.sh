@@ -43,9 +43,11 @@ neutralize_isaac_ros_host_preferences() {
     fi
 
     if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
-      mv -f -- "${pref_file}" "${disabled_file}"
+      mv -f -- "${pref_file}" "${disabled_file}" || fail \
+        "Failed to disable Isaac ROS host APT preference ${pref_file}."
     else
-      sudo mv -f -- "${pref_file}" "${disabled_file}"
+      sudo mv -f -- "${pref_file}" "${disabled_file}" || fail \
+        "Failed to disable Isaac ROS host APT preference ${pref_file}."
     fi
     changed=1
     echo "Neutralized Isaac ROS host APT preference: ${pref_file}"

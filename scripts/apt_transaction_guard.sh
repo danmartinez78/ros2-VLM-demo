@@ -78,4 +78,6 @@ assert_libopencv_candidate_matches_installed() {
       "Candidate version for libopencv-dev (${candidate_version}) differs from installed (${installed_version}). Refusing to continue because this indicates host OpenCV downgrade/replacement pressure."
     return 1
   fi
+
+  return 0
 }
