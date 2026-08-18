@@ -53,6 +53,7 @@ check "Ubuntu 24.04" bash -c 'source /etc/os-release && [[ "$ID" == ubuntu && "$
 check "aarch64 architecture" bash -c '[[ "$(uname -m)" == aarch64 ]]'
 check "Jetson Linux R38.4 (JetPack 7.1)" grep -q '# R38 (release), REVISION: 4' /etc/nv_tegra_release
 check "JetPack metapackage" dpkg-query -W nvidia-jetpack
+check "JetPack developer metapackage" dpkg-query -W nvidia-jetpack-dev
 check "CUDA compiler" bash -c 'export PATH=/usr/local/cuda/bin:$PATH; command -v nvcc && nvcc --version'
 check "TensorRT development headers" bash -c 'test -f /usr/include/NvInfer.h || test -f /usr/include/aarch64-linux-gnu/NvInfer.h'
 check "ROS 2 Jazzy setup" test -f "/opt/ros/${ros_distro}/setup.bash"

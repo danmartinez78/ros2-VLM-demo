@@ -12,6 +12,7 @@ MANIFEST_PATH = REPO_ROOT / "scripts" / "thor" / "jp71_manifest.json"
 SETUP_SCRIPT = REPO_ROOT / "scripts" / "prepare_thor_jp71_assets.sh"
 TOP_LEVEL_SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_thor_jp71.sh"
 INSTALL_DEPENDENCIES_SCRIPT = REPO_ROOT / "scripts" / "install_dependencies.sh"
+APT_GUARD_SCRIPT = REPO_ROOT / "scripts" / "apt_transaction_guard.sh"
 ASSETS_MANIFEST_PATH = REPO_ROOT / "scripts" / "test_data" / "manifests" / "assets_manifest.json"
 
 
@@ -359,6 +360,51 @@ class PrepareThorRtdetrGuardTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("APT guard test transaction passed for RT-DETR packages.", result.stdout)
+
+
+class RosdepGuardTests(unittest.TestCase):
+    def test_rosdep_guard_rejects_protected_nvidia_removal(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_ROSDEP_SIMULATION_OUTPUT"] = (
+            "sudo -H apt-get install -y ros-jazzy-image-transport libopencv-dev"
+        )
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Remv nvidia-jetpack [7.1-b112]"
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f'source "{APT_GUARD_SCRIPT}" && assert_safe_rosdep_install_plan "{REPO_ROOT}" "jazzy"',
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("removes protected package 'nvidia-jetpack'", result.stderr)
+
+    def test_rosdep_guard_accepts_safe_transaction(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_ROSDEP_SIMULATION_OUTPUT"] = (
+            "sudo -H apt-get install -y ros-jazzy-image-transport python3-rosdep"
+        )
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst python3-rosdep (0.26.0)"
+
+        result = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f'source "{APT_GUARD_SCRIPT}" && assert_safe_rosdep_install_plan "{REPO_ROOT}" "jazzy"',
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
 
 
 class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):

@@ -81,3 +81,59 @@ assert_libopencv_candidate_matches_installed() {
 
   return 0
 }
+
+simulate_rosdep_install_output() {
+  local from_paths="$1"
+  local ros_distro="$2"
+
+  if [[ -n "${EDGE_VLM_ROSDEP_SIMULATION_OUTPUT:-}" ]]; then
+    printf '%s\n' "${EDGE_VLM_ROSDEP_SIMULATION_OUTPUT}"
+    return "${EDGE_VLM_ROSDEP_SIMULATION_EXIT_CODE:-0}"
+  fi
+
+  rosdep install \
+    --simulate \
+    --from-paths "${from_paths}" \
+    --ignore-src \
+    --rosdistro "${ros_distro}" \
+    -r -y
+}
+
+assert_safe_rosdep_install_plan() {
+  local from_paths="$1"
+  local ros_distro="$2"
+  local simulation_output
+
+  if ! simulation_output="$(simulate_rosdep_install_output "${from_paths}" "${ros_distro}" 2>&1)"; then
+    apt_guard_fail "Unable to simulate rosdep install plan. Output:"$'\n'"${simulation_output}"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    [[ "${line}" == *"apt-get install"* ]] || continue
+
+    local -a tokens=()
+    local -a packages=()
+    local token
+    local in_install_args=0
+    read -r -a tokens <<<"${line}"
+
+    for token in "${tokens[@]}"; do
+      if [[ "${in_install_args}" -eq 0 ]]; then
+        [[ "${token}" == "install" ]] && in_install_args=1
+        continue
+      fi
+
+      [[ -z "${token}" || "${token}" == -* ]] && continue
+      token="${token//;/}"
+      token="${token//,/}"
+      [[ -n "${token}" ]] && packages+=("${token}")
+    done
+
+    if [[ "${#packages[@]}" -gt 0 ]]; then
+      assert_safe_apt_transaction "rosdep-managed packages" "${packages[@]}" || return 1
+    fi
+  done <<<"${simulation_output}"
+
+  return 0
+}
