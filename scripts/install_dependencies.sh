@@ -41,7 +41,7 @@ assert_safe_apt_transaction() {
   for protected_pkg in "${PROTECTED_NVIDIA_PACKAGES[@]}"; do
     for removed_pkg in "${removed_pkgs[@]}"; do
       if [[ "${removed_pkg}" == "${protected_pkg}" || "${removed_pkg}" == "${protected_pkg}:"* ]]; then
-        fail "Refusing to continue: planned APT transaction for ${description} removes protected package '${protected_pkg}'. Keep the JP7.1 NVIDIA stack intact."
+        fail "Refusing to continue: planned APT transaction for ${description} removes protected package '${protected_pkg}'. Keep the NVIDIA Jetson stack intact."
       fi
     done
   done
