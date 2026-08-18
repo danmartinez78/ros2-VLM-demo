@@ -36,12 +36,13 @@ assert_safe_apt_transaction() {
 
   local protected_pkg
   local removed_pkg
+  mapfile -t removed_pkgs < <(printf '%s\n' "${simulation_output}" | awk '/^Remv[[:space:]]/{print $2}')
   for protected_pkg in "${PROTECTED_NVIDIA_PACKAGES[@]}"; do
-    while IFS= read -r removed_pkg; do
+    for removed_pkg in "${removed_pkgs[@]}"; do
       if [[ "${removed_pkg}" == "${protected_pkg}" || "${removed_pkg}" == "${protected_pkg}:"* ]]; then
         fail "Refusing to continue: planned APT transaction for ${description} removes protected package '${protected_pkg}'. Keep the JP7.1 NVIDIA stack intact."
       fi
-    done < <(printf '%s\n' "${simulation_output}" | awk '/^Remv[[:space:]]/{print $2}')
+    done
   done
 }
 
@@ -178,6 +179,8 @@ curl -fL \
 sudo dpkg -i "${setup_tmp_dir}/${ros_source_deb}"
 
 sudo apt-get update
+# JetPack installs NVIDIA's OpenCV development packages (nvidia-opencv-dev),
+# so avoid pulling Ubuntu's generic libopencv-dev on Thor.
 ros_and_build_packages=(
   "${ros_variant}"
   ros-dev-tools
