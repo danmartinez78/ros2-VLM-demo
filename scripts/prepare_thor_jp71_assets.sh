@@ -310,7 +310,9 @@ prepare_edge_llm() {
 
 install_rtdetr_models() {
   local ros_distro="$1"
-  local marker_file="${repo_root}/test_data/.rtdetr_models_install.ok"
+  local isaac_ros_ws="$2"
+  local ros_setup="${EDGE_VLM_ROS_SETUP_PATH:-/opt/ros/${ros_distro}/setup.bash}"
+  local marker_file="${EDGE_VLM_RTDETR_MARKER_FILE:-${repo_root}/test_data/.rtdetr_models_install.ok}"
   local -a rtdetr_packages=(
     "ros-${ros_distro}-isaac-ros-rtdetr"
     "ros-${ros_distro}-isaac-ros-rtdetr-models-install"
@@ -329,6 +331,8 @@ install_rtdetr_models() {
     return
   fi
 
+  run_cmd mkdir -p "${isaac_ros_ws}/src"
+
   if [[ "${dry_run}" -ne 1 ]]; then
     assert_safe_apt_transaction "RT-DETR packages" "${rtdetr_packages[@]}"
   fi
@@ -336,12 +340,12 @@ install_rtdetr_models() {
   run_cmd sudo apt-get install -y "${rtdetr_packages[@]}"
 
   if [[ "${dry_run}" -eq 1 ]]; then
-    printf 'DRY-RUN  source /opt/ros/%s/setup.bash && ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula\n' "${ros_distro}"
+    printf 'DRY-RUN  source %s && ISAAC_ROS_WS=%s ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula\n' "${ros_setup}" "${isaac_ros_ws}"
   else
-    source_ros_setup_nounset_safe "/opt/ros/${ros_distro}/setup.bash" || fail \
-      "Unable to source /opt/ros/${ros_distro}/setup.bash."
-    ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula
-    mkdir -p "${repo_root}/test_data"
+    source_ros_setup_nounset_safe "${ros_setup}" || fail \
+      "Unable to source ${ros_setup}."
+    env "ISAAC_ROS_WS=${isaac_ros_ws}" ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula
+    mkdir -p "$(dirname -- "${marker_file}")"
     date -u +%Y-%m-%dT%H:%M:%SZ >"${marker_file}"
   fi
 }
@@ -656,6 +660,7 @@ generate_env_file() {
   local llm_dir="$7"
   local multimodal_dir="$8"
   local plugin_path="$9"
+  local isaac_ros_ws="${10}"
 
   if [[ "${dry_run}" -eq 1 ]]; then
     printf 'DRY-RUN  generate %s\n' "${env_file}"
@@ -675,6 +680,7 @@ export EDGE_VLM_WORKSPACE_DIR="${workspace_dir}"
 export EDGE_VLM_LLM_ENGINE_DIR="${llm_dir}"
 export EDGE_VLM_MULTIMODAL_ENGINE_DIR="${multimodal_dir}"
 export EDGELLM_PLUGIN_PATH="${plugin_path}"
+export ISAAC_ROS_WS="${isaac_ros_ws}"
 ENV
   chmod +x "${env_file}"
 }
@@ -708,6 +714,9 @@ fi
 
 ros_distro="${ROS_DISTRO:-jazzy}"
 ros_workspace="$(infer_ros_workspace)"
+isaac_ros_ws="${ISAAC_ROS_WS:-${ros_workspace}}"
+isaac_ros_ws="${isaac_ros_ws/\$\{HOME\}/${HOME}}"
+isaac_ros_ws="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "${isaac_ros_ws}")"
 default_edge_root="$(manifest_value edge_llm.default_root)"
 default_edge_build="$(manifest_value edge_llm.default_build_dir)"
 default_workspace="$(manifest_value default_workspace)"
@@ -726,6 +735,7 @@ plugin_path="${EDGELLM_PLUGIN_PATH:-${edge_build}/libNvInfer_edgellm_plugin.so}"
 printf 'Thor JP7.1 setup plan:\n'
 printf '  ROS_DISTRO: %s\n' "${ros_distro}"
 printf '  ROS_WORKSPACE: %s\n' "${ros_workspace}"
+printf '  ISAAC_ROS_WS: %s\n' "${isaac_ros_ws}"
 printf '  Edge-LLM root: %s\n' "${edge_root}"
 printf '  Edge-LLM build: %s\n' "${edge_build}"
 printf '  Edge-LLM commit: %s\n' "$(manifest_value edge_llm.commit)"
@@ -743,7 +753,7 @@ if [[ "${skip_model}" -eq 0 ]]; then
 fi
 
 if [[ "${skip_rtdetr}" -eq 0 ]]; then
-  install_rtdetr_models "${ros_distro}"
+  install_rtdetr_models "${ros_distro}" "${isaac_ros_ws}"
 fi
 
 if [[ "${skip_data}" -eq 0 ]]; then
@@ -763,6 +773,7 @@ generate_env_file \
   "${workspace_dir}" \
   "${llm_dir}" \
   "${multimodal_dir}" \
-  "${plugin_path}"
+  "${plugin_path}" \
+  "${isaac_ros_ws}"
 
 echo "Preparation completed."

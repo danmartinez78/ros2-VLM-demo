@@ -477,6 +477,102 @@ class PrepareThorRtdetrGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("APT guard test transaction passed for RT-DETR packages.", result.stdout)
 
+    def test_rtdetr_install_sets_deterministic_isaac_ros_ws_and_reruns_safely(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-rtdetr-isaac-ws-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake_bin = tmpdir_path / "bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            marker_file = tmpdir_path / "rtdetr.ok"
+            env_file = tmpdir_path / "edge_vlm_env.sh"
+            ros_setup = tmpdir_path / "setup.bash"
+            ros_setup.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            ros_setup.chmod(0o755)
+
+            sudo_script = fake_bin / "sudo"
+            sudo_script.write_text("#!/usr/bin/env bash\nexec \"$@\"\n", encoding="utf-8")
+            sudo_script.chmod(0o755)
+
+            apt_get_script = fake_bin / "apt-get"
+            apt_get_script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -eu",
+                        'if [[ \"${1:-}\" == \"-s\" ]]; then',
+                        '  echo \"Inst ros-jazzy-isaac-ros-rtdetr (4.5.0)\"',
+                        "fi",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            apt_get_script.chmod(0o755)
+
+            ros2_log = tmpdir_path / "ros2-invocations.log"
+            ros2_script = fake_bin / "ros2"
+            ros2_script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -eu",
+                        '[[ -n \"${ISAAC_ROS_WS:-}\" ]] || { echo \"ERROR: ISAAC_ROS_WS is not set.\" >&2; exit 1; }',
+                        '[[ \"${ISAAC_ROS_WS}\" == /* ]] || { echo \"ERROR: ISAAC_ROS_WS is not absolute.\" >&2; exit 1; }',
+                        'printf \"%s\\n\" \"${ISAAC_ROS_WS}\" >>\"${EDGE_VLM_TEST_ROS2_LOG}\"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            ros2_script.chmod(0o755)
+
+            ros_workspace = tmpdir_path / "thor-ros-ws"
+            expected_isaac_ws = str(ros_workspace)
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["ROS_WORKSPACE"] = expected_isaac_ws
+            env.pop("ISAAC_ROS_WS", None)
+            env["EDGE_VLM_ROS_SETUP_PATH"] = str(ros_setup)
+            env["EDGE_VLM_RTDETR_MARKER_FILE"] = str(marker_file)
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+            env["EDGE_VLM_TEST_ROS2_LOG"] = str(ros2_log)
+
+            first = subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--skip-edge-llm",
+                    "--skip-model",
+                    "--skip-data",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            self.assertTrue((ros_workspace / "src").is_dir())
+            self.assertTrue(marker_file.exists())
+            self.assertTrue(env_file.exists())
+            self.assertIn(f'export ISAAC_ROS_WS="{expected_isaac_ws}"', env_file.read_text(encoding="utf-8"))
+            self.assertEqual(ros2_log.read_text(encoding="utf-8").strip(), expected_isaac_ws)
+
+            second = subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--skip-edge-llm",
+                    "--skip-model",
+                    "--skip-data",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(second.returncode, 0, msg=second.stderr)
+            self.assertIn("RT-DETR models installer already completed", second.stdout)
+            self.assertEqual(ros2_log.read_text(encoding="utf-8").splitlines(), [expected_isaac_ws])
+
 
 class RosdepGuardTests(unittest.TestCase):
     def test_rosdep_guard_rejects_protected_nvidia_removal(self) -> None:
