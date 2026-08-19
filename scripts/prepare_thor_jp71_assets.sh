@@ -5,6 +5,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 manifest_path="${script_dir}/thor/jp71_manifest.json"
 env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
+source "${script_dir}/ros_setup_guard.sh"
 
 dry_run=0
 skip_edge_llm=0
@@ -337,8 +338,8 @@ install_rtdetr_models() {
   if [[ "${dry_run}" -eq 1 ]]; then
     printf 'DRY-RUN  source /opt/ros/%s/setup.bash && ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula\n' "${ros_distro}"
   else
-    # shellcheck disable=SC1090
-    source "/opt/ros/${ros_distro}/setup.bash"
+    source_ros_setup_nounset_safe "/opt/ros/${ros_distro}/setup.bash" || fail \
+      "Unable to source /opt/ros/${ros_distro}/setup.bash."
     ros2 run isaac_ros_rtdetr_models_install install_rtdetr_models.sh --eula
     mkdir -p "${repo_root}/test_data"
     date -u +%Y-%m-%dT%H:%M:%SZ >"${marker_file}"

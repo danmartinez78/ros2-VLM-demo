@@ -21,6 +21,7 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
 source "${script_dir}/apt_transaction_guard.sh"
+source "${script_dir}/ros_setup_guard.sh"
 
 if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090
@@ -109,13 +110,14 @@ else
 fi
 
 if [[ -n "${ros_workspace}" && -f "${ros_workspace}/install/setup.bash" ]]; then
-  # ROS-generated setup scripts may read optional variables without defaults.
-  set +u
-  # shellcheck disable=SC1090
-  source "/opt/ros/${ros_distro}/setup.bash"
-  # shellcheck disable=SC1090
-  source "${ros_workspace}/install/setup.bash"
-  set -u
+  source_ros_setup_nounset_safe "/opt/ros/${ros_distro}/setup.bash" || {
+    printf 'FAIL  Source ROS distro setup\n'
+    failures=$((failures + 1))
+  }
+  source_ros_setup_nounset_safe "${ros_workspace}/install/setup.bash" || {
+    printf 'FAIL  Source ROS workspace setup\n'
+    failures=$((failures + 1))
+  }
 
   check "Installed ROS package" ros2 pkg prefix edge_vlm_ros
   check "Installed reasoner executable" bash -c \

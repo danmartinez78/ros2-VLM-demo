@@ -14,6 +14,7 @@ SETUP_SCRIPT = REPO_ROOT / "scripts" / "prepare_thor_jp71_assets.sh"
 TOP_LEVEL_SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_thor_jp71.sh"
 INSTALL_DEPENDENCIES_SCRIPT = REPO_ROOT / "scripts" / "install_dependencies.sh"
 APT_GUARD_SCRIPT = REPO_ROOT / "scripts" / "apt_transaction_guard.sh"
+ROS_SETUP_GUARD_SCRIPT = REPO_ROOT / "scripts" / "ros_setup_guard.sh"
 ASSETS_MANIFEST_PATH = REPO_ROOT / "scripts" / "test_data" / "manifests" / "assets_manifest.json"
 
 
@@ -58,6 +59,74 @@ class ThorSetupManifestTests(unittest.TestCase):
         setup_script = SETUP_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${llm_builder}"', setup_script)
         self.assertIn('run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${visual_builder}"', setup_script)
+
+
+class RosSetupGuardTests(unittest.TestCase):
+    def test_helper_sources_ros_style_script_under_nounset_and_restores_state(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-ros-setup-guard-") as tmpdir:
+            setup_script = Path(tmpdir) / "setup.bash"
+            setup_script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        'if [ -n "$AMENT_TRACE_SETUP_FILES" ]; then',
+                        "  :",
+                        "fi",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    "\n".join(
+                        [
+                            "set -eu",
+                            f'source "{ROS_SETUP_GUARD_SCRIPT}"',
+                            "unset AMENT_TRACE_SETUP_FILES 2>/dev/null || true",
+                            f'source_ros_setup_nounset_safe "{setup_script}"',
+                            '[[ "$-" == *u* ]]',
+                        ]
+                    ),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_helper_preserves_disabled_nounset_state(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-ros-setup-guard-off-") as tmpdir:
+            setup_script = Path(tmpdir) / "setup.bash"
+            setup_script.write_text(
+                'if [ -n "$AMENT_TRACE_SETUP_FILES" ]; then :; fi\n',
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    "\n".join(
+                        [
+                            "set -e",
+                            f'source "{ROS_SETUP_GUARD_SCRIPT}"',
+                            "unset AMENT_TRACE_SETUP_FILES 2>/dev/null || true",
+                            f'source_ros_setup_nounset_safe "{setup_script}"',
+                            '[[ "$-" != *u* ]]',
+                        ]
+                    ),
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
 
 
 class ThorSetupDryRunTests(unittest.TestCase):

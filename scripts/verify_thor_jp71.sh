@@ -4,6 +4,7 @@ set -Eeuo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
+source "${script_dir}/ros_setup_guard.sh"
 run_standalone_smoke=0
 smoke_image=""
 passthrough_args=()
@@ -27,6 +28,18 @@ check() {
     printf 'FAIL  %s\n' "${description}"
     failures=$((failures + 1))
   fi
+}
+
+check_ros_package_available() {
+  local package_name="$1"
+  local source_workspace_setup="${2:-0}"
+
+  source_ros_setup_nounset_safe "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash" || return 1
+  if [[ "${source_workspace_setup}" -eq 1 ]] && [[ -n "${ROS_WORKSPACE:-}" ]] && [[ -f "${ROS_WORKSPACE}/install/setup.bash" ]]; then
+    source_ros_setup_nounset_safe "${ROS_WORKSPACE}/install/setup.bash" || return 1
+  fi
+
+  ros2 pkg prefix "${package_name}" >/dev/null 2>&1
 }
 
 for ((i = 1; i <= $#; i++)); do
@@ -97,21 +110,8 @@ else
 fi
 
 if [[ " ${passthrough_args[*]} " == *" --isaac-ros "* ]]; then
-  check "Isaac ROS RT-DETR package available" bash -c '
-    set +u
-    source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
-    if [[ -n "${ROS_WORKSPACE:-}" && -f "${ROS_WORKSPACE}/install/setup.bash" ]]; then
-      source "${ROS_WORKSPACE}/install/setup.bash"
-    fi
-    set -u
-    ros2 pkg prefix isaac_ros_rtdetr >/dev/null 2>&1
-  '
-  check "Isaac ROS RT-DETR model installer package available" bash -c '
-    set +u
-    source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
-    set -u
-    ros2 pkg prefix isaac_ros_rtdetr_models_install >/dev/null 2>&1
-  '
+  check "Isaac ROS RT-DETR package available" check_ros_package_available isaac_ros_rtdetr 1
+  check "Isaac ROS RT-DETR model installer package available" check_ros_package_available isaac_ros_rtdetr_models_install
 fi
 
 check "Edge-LLM runtime can load engines and become ready" bash -c '
