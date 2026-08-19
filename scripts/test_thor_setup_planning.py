@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -52,6 +53,11 @@ class ThorSetupManifestTests(unittest.TestCase):
         expected_auth_header = "Authorization: Bearer " + "$" + "{token}"
         self.assertIn(expected_auth_header, setup_script)
         self.assertIn('-H "${auth_header}"', setup_script)
+
+    def test_engine_builders_receive_explicit_plugin_path_env(self) -> None:
+        setup_script = SETUP_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${llm_builder}"', setup_script)
+        self.assertIn('run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${visual_builder}"', setup_script)
 
 
 class ThorSetupDryRunTests(unittest.TestCase):
@@ -185,6 +191,43 @@ class ThorSetupDryRunTests(unittest.TestCase):
             self.assertIn("native Thor llm_build", result.stdout)
             self.assertIn("native Thor visual_build", result.stdout)
             self.assertNotIn("verify Hugging Face access", result.stdout)
+
+    def test_dry_run_engine_plan_exports_absolute_plugin_path_outside_repo_cwd(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-plugin-env-") as tmpdir:
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            workspace = Path(tmpdir) / "workspace"
+            env = os.environ.copy()
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+            env["EDGE_VLM_WORKSPACE_DIR"] = str(workspace)
+
+            result = subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--dry-run",
+                    "--skip-edge-llm",
+                    "--skip-rtdetr",
+                    "--skip-data",
+                ],
+                cwd=tmpdir,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            llm_match = re.search(
+                r"EDGELLM_PLUGIN_PATH=([^\s]+)\s+native Thor llm_build",
+                result.stdout,
+            )
+            visual_match = re.search(
+                r"EDGELLM_PLUGIN_PATH=([^\s]+)\s+native Thor visual_build",
+                result.stdout,
+            )
+            self.assertIsNotNone(llm_match)
+            self.assertIsNotNone(visual_match)
+            assert llm_match is not None and visual_match is not None
+            self.assertTrue(Path(llm_match.group(1)).is_absolute())
+            self.assertEqual(llm_match.group(1), visual_match.group(1))
 
     def test_cosmos_validation_does_not_require_qwen_workspace(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-cosmos-only-") as tmpdir:

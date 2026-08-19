@@ -466,23 +466,30 @@ run_cosmos_container_stage() {
 build_cosmos_engines() {
   local model_root="$1"
   local edge_build="$2"
+  local plugin_path="$3"
 
   local llm_builder="${edge_build}/examples/llm/llm_build"
   local visual_builder="${edge_build}/examples/multimodal/visual_build"
+  local plugin_dir=""
+
+  plugin_dir="$(cd -- "$(dirname -- "${plugin_path}")" && pwd)"
+  plugin_path="${plugin_dir}/$(basename -- "${plugin_path}")"
 
   if [[ "${dry_run}" -ne 1 ]]; then
     [[ -x "${llm_builder}" ]] || fail "Missing llm_build executable at ${llm_builder}. Build Edge-LLM first."
     [[ -x "${visual_builder}" ]] || fail "Missing visual_build executable at ${visual_builder}. Build Edge-LLM first."
+    [[ -f "${plugin_path}" ]] || fail \
+      "Missing Edge-LLM plugin at ${plugin_path}. Build TensorRT-Edge-LLM and ensure EDGELLM_PLUGIN_PATH points to libNvInfer_edgellm_plugin.so."
   fi
 
   run_cmd mkdir -p "${model_root}/engine/llm" "${model_root}/engine"
-  run_cmd "${llm_builder}" \
+  run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${llm_builder}" \
     --onnxDir "${model_root}/onnx/llm" \
     --engineDir "${model_root}/engine/llm" \
     --maxBatchSize "${EDGE_VLM_LLM_MAX_BATCH_SIZE:-1}" \
     --maxInputLen "${EDGE_VLM_LLM_MAX_INPUT_LEN:-1024}" \
     --maxKVCacheCapacity "${EDGE_VLM_LLM_MAX_KV_CACHE_CAPACITY:-4096}"
-  run_cmd "${visual_builder}" \
+  run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${visual_builder}" \
     --onnxDir "${model_root}/onnx/visual" \
     --engineDir "${model_root}/engine"
 }
@@ -504,6 +511,7 @@ prepare_cosmos_default() {
   local plan_export
   local plan_engine_build
   local container_preamble
+  local plugin_path="$5"
 
   hf_model_id="$(manifest_value "models.${chosen_model}.hf_model_id")"
   quantization="$(manifest_value "models.${chosen_model}.quantization")"
@@ -560,10 +568,10 @@ prepare_cosmos_default() {
         "${container_image}" "${chosen_model}" "${chosen_model}"
     fi
     if [[ "${plan_engine_build}" -eq 1 ]]; then
-      printf 'DRY-RUN  planned stage: native Thor llm_build --onnxDir %s/onnx/llm --engineDir %s/engine/llm\n' \
-        "${model_root}" "${model_root}"
-      printf 'DRY-RUN  planned stage: native Thor visual_build --onnxDir %s/onnx/visual --engineDir %s/engine\n' \
-        "${model_root}" "${model_root}"
+      printf 'DRY-RUN  planned stage: EDGELLM_PLUGIN_PATH=%s native Thor llm_build --onnxDir %s/onnx/llm --engineDir %s/engine/llm\n' \
+        "${plugin_path}" "${model_root}" "${model_root}"
+      printf 'DRY-RUN  planned stage: EDGELLM_PLUGIN_PATH=%s native Thor visual_build --onnxDir %s/onnx/visual --engineDir %s/engine\n' \
+        "${plugin_path}" "${model_root}" "${model_root}"
     fi
     return
   fi
@@ -600,7 +608,7 @@ prepare_cosmos_default() {
   fi
 
   if [[ "${engine_ready}" -eq 0 ]]; then
-    build_cosmos_engines "${model_root}" "${edge_build}"
+    build_cosmos_engines "${model_root}" "${edge_build}" "${plugin_path}"
   fi
 
   validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
@@ -612,6 +620,7 @@ prepare_model_layout() {
   local chosen_model="$2"
   local edge_root="$3"
   local edge_build="$4"
+  local plugin_path="$5"
 
   if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
     echo "Model workspace already valid at ${workspace_dir}."
@@ -625,7 +634,7 @@ prepare_model_layout() {
   fi
 
   if [[ "${chosen_model}" == "Cosmos-Reason2-8B" ]]; then
-    prepare_cosmos_default "${workspace_dir}" "${chosen_model}" "${edge_root}" "${edge_build}"
+    prepare_cosmos_default "${workspace_dir}" "${chosen_model}" "${edge_root}" "${edge_build}" "${plugin_path}"
   fi
 
   if [[ "${dry_run}" -eq 1 ]]; then
@@ -729,7 +738,7 @@ if [[ "${skip_edge_llm}" -eq 0 ]]; then
 fi
 
 if [[ "${skip_model}" -eq 0 ]]; then
-  prepare_model_layout "${workspace_dir}" "${model_name}" "${edge_root}" "${edge_build}"
+  prepare_model_layout "${workspace_dir}" "${model_name}" "${edge_root}" "${edge_build}" "${plugin_path}"
 fi
 
 if [[ "${skip_rtdetr}" -eq 0 ]]; then
