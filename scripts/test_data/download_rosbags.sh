@@ -112,9 +112,9 @@ download_asset() {
   trap 'if [[ -n "${staging:-}" && -d "${staging}" ]]; then rm -rf -- "${staging}"; fi' ERR
   echo "Downloading ${key} (NGC ${resource} ${version})..."
   curl -fL --retry 3 --retry-delay 2 -C - -o "${archive}" "${download_url}"
-  tar -tzf "${archive}" >/dev/null
+  tar -tf "${archive}" >/dev/null
   mkdir "${staging}"
-  tar -xzf "${archive}" -C "${staging}"
+  tar -xf "${archive}" -C "${staging}"
   printf '%s\n' "${version}" >"${staging}/.ngc-version"
   mv "${staging}" "${target}"
   trap - ERR

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ INSTALL_DEPENDENCIES_SCRIPT = REPO_ROOT / "scripts" / "install_dependencies.sh"
 APT_GUARD_SCRIPT = REPO_ROOT / "scripts" / "apt_transaction_guard.sh"
 ROS_SETUP_GUARD_SCRIPT = REPO_ROOT / "scripts" / "ros_setup_guard.sh"
 ASSETS_MANIFEST_PATH = REPO_ROOT / "scripts" / "test_data" / "manifests" / "assets_manifest.json"
+DOWNLOAD_ROSBAGS_SCRIPT = REPO_ROOT / "scripts" / "test_data" / "download_rosbags.sh"
 
 
 class ThorSetupManifestTests(unittest.TestCase):
@@ -826,6 +828,101 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Candidate version for TensorRT development package", result.stderr)
+
+
+class DownloadRosbagsArchiveFormatTests(unittest.TestCase):
+    @staticmethod
+    def _write_fake_curl(fake_curl_path: Path) -> None:
+        fake_curl_path.write_text(
+            "\n".join(
+                [
+                    "#!/usr/bin/env bash",
+                    "set -eu",
+                    'url="${@: -1}"',
+                    'if [[ "${url}" == */files/quickstart.tar.gz ]]; then',
+                    '  out_file=""',
+                    "  while [[ $# -gt 0 ]]; do",
+                    '    if [[ "$1" == "-o" ]]; then',
+                    '      out_file="$2"',
+                    "      shift 2",
+                    "      continue",
+                    "    fi",
+                    "    shift",
+                    "  done",
+                    '  [[ -n "${out_file}" ]]',
+                    '  cp "${EDGE_VLM_TEST_ARCHIVE_PATH}" "${out_file}"',
+                    "  exit 0",
+                    "fi",
+                    'if [[ "${url}" == */versions ]]; then',
+                    '  printf \'%s\\n\' \'{"recipeVersions":[{"versionId":"4.0.0"}]}\'',
+                    "  exit 0",
+                    "fi",
+                    'echo "Unexpected curl URL: ${url}" >&2',
+                    "exit 2",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        fake_curl_path.chmod(0o755)
+
+    @staticmethod
+    def _create_sample_archive(archive_path: Path, compressed: bool) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-rosbag-archive-src-") as source_dir:
+            source_path = Path(source_dir)
+            bag_root = source_path / "isaac_ros_nvblox" / "quickstart"
+            bag_root.mkdir(parents=True, exist_ok=True)
+            (bag_root / "metadata.yaml").write_text("rosbag2_bagfile_information: {}\n", encoding="utf-8")
+            mode = "w:gz" if compressed else "w"
+            with tarfile.open(archive_path, mode) as archive:
+                archive.add(source_path / "isaac_ros_nvblox", arcname="isaac_ros_nvblox")
+
+    def _run_download_with_archive(self, *, compressed: bool) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-rosbag-download-test-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake_bin = tmpdir_path / "bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            archive_path = tmpdir_path / "quickstart.tar.gz"
+            self._create_sample_archive(archive_path, compressed=compressed)
+            self._write_fake_curl(fake_bin / "curl")
+
+            output_root = tmpdir_path / "rosbags"
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["ROSBAG_DIR"] = str(output_root)
+            env["EDGE_VLM_TEST_ARCHIVE_PATH"] = str(archive_path)
+
+            first = subprocess.run(
+                ["bash", str(DOWNLOAD_ROSBAGS_SCRIPT), "download", "nvblox"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            target = output_root / "nvblox"
+            self.assertTrue((target / ".ngc-version").exists())
+            self.assertEqual((target / ".ngc-version").read_text(encoding="utf-8").strip(), "4.0.0")
+            self.assertTrue((target / "isaac_ros_nvblox" / "quickstart" / "metadata.yaml").exists())
+
+            second = subprocess.run(
+                ["bash", str(DOWNLOAD_ROSBAGS_SCRIPT), "download", "nvblox"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(second.returncode, 0, msg=second.stderr)
+            self.assertIn("already installed", second.stdout)
+            return second
+
+    def test_download_accepts_gzip_tar_archive(self) -> None:
+        self._run_download_with_archive(compressed=True)
+
+    def test_download_accepts_plain_tar_with_tar_gz_suffix(self) -> None:
+        self._run_download_with_archive(compressed=False)
 
 
 if __name__ == "__main__":
