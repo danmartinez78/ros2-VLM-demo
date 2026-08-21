@@ -2,6 +2,10 @@
 set -Eeuo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+install_script="${EDGE_VLM_INSTALL_DEPENDENCIES_SCRIPT:-${script_dir}/install_dependencies.sh}"
+prepare_script="${EDGE_VLM_PREPARE_THOR_ASSETS_SCRIPT:-${script_dir}/prepare_thor_jp72_assets.sh}"
+build_script="${EDGE_VLM_BUILD_WORKSPACE_SCRIPT:-${script_dir}/build_workspace.sh}"
+verify_script="${EDGE_VLM_VERIFY_THOR_SCRIPT:-${script_dir}/verify_thor_jp72.sh}"
 download_rosbags=1
 install_args=(--isaac-ros)
 prepare_args=()
@@ -34,13 +38,53 @@ for arg in "$@"; do
   esac
 done
 
-bash "${script_dir}/install_dependencies.sh" "${install_args[@]}"
+ensure_docker_session_ready() {
+  command -v docker >/dev/null 2>&1 || {
+    echo "ERROR: docker is required for Thor asset preparation, but it is not installed." >&2
+    exit 1
+  }
+
+  docker info >/dev/null 2>&1 && return 0
+
+  local current_shell_has_docker_group=0
+  if id -nG | tr ' ' '\n' | grep -Fxq docker; then
+    current_shell_has_docker_group=1
+  fi
+
+  local configured_for_user=0
+  if getent group docker >/dev/null 2>&1; then
+    if getent group docker | awk -F: '{print $4}' | tr ',' '\n' | grep -Fxq "${USER}"; then
+      configured_for_user=1
+    fi
+  fi
+
+  if [[ "${configured_for_user}" -eq 1 && "${current_shell_has_docker_group}" -eq 0 ]]; then
+    cat >&2 <<EOF
+ERROR: Docker group membership was configured for ${USER}, but this shell has not picked it up yet.
+Log out and back in, then rerun this same command before continuing:
+  bash scripts/setup_thor_jp72.sh
+EOF
+    exit 1
+  fi
+
+  cat >&2 <<'EOF'
+ERROR: Unable to run Docker as the current user (`docker info` failed).
+Ensure Docker is running and that this shell has active docker-group membership.
+EOF
+  exit 1
+}
+
+bash "${install_script}" "${install_args[@]}"
+
+if [[ "${dry_run}" -ne 1 ]]; then
+  ensure_docker_session_ready
+fi
 
 if [[ "${download_rosbags}" -eq 0 ]]; then
   prepare_args+=(--skip-data)
 fi
 
-bash "${script_dir}/prepare_thor_jp72_assets.sh" "${prepare_args[@]}"
+bash "${prepare_script}" "${prepare_args[@]}"
 
 if [[ "${dry_run}" -eq 1 ]]; then
   echo "Dry-run mode requested; skipping environment source, build, and verification."
@@ -50,5 +94,5 @@ fi
 # shellcheck disable=SC1090
 source "${script_dir}/edge_vlm_env.sh"
 
-bash "${script_dir}/build_workspace.sh"
-bash "${script_dir}/verify_thor_jp72.sh" --isaac-ros
+bash "${build_script}"
+bash "${verify_script}" --isaac-ros

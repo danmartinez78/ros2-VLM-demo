@@ -57,6 +57,10 @@ Run the repo-owned setup wrapper:
 bash scripts/setup_thor_jp72.sh
 ```
 
+On a fresh flash, if setup stops after dependency installation because Docker
+group membership is not yet active in the current shell, log out/in and rerun
+the same command before continuing.
+
 This performs deterministic path generation and setup for:
 
 - TensorRT-Edge-LLM clone pinned to `71dd1bae032e70771265917ec74d3ff4cad07a10` (v0.10.0);

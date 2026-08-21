@@ -72,6 +72,9 @@ bash scripts/setup_thor_jp72.sh
 
 Setup installs dependencies, pins/builds TensorRT Edge-LLM, prepares model/data
 layout, installs RT-DETR model assets, and generates `scripts/edge_vlm_env.sh`.
+On a fresh flash, if setup reports that Docker group membership is newly
+configured but not active in the current shell, log out/in and rerun the same
+setup command.
 Before first run, accept the gated Cosmos license and authenticate with
 Hugging Face (`huggingface-cli login`) on the Thor host.
 

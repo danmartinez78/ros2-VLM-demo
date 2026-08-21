@@ -369,6 +369,86 @@ class ThorSetupDryRunTests(unittest.TestCase):
             self.assertFalse(workspace.exists())
 
 
+class ThorSetupDockerHandoffTests(unittest.TestCase):
+    def test_top_level_setup_stops_before_prepare_when_docker_group_needs_relogin(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-docker-handoff-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake_bin = tmpdir_path / "bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+            install_marker = tmpdir_path / "install-ran.ok"
+            prepare_marker = tmpdir_path / "prepare-ran.ok"
+
+            install_script = tmpdir_path / "install_dependencies.sh"
+            install_script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -eu",
+                        f'touch "{install_marker}"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            install_script.chmod(0o755)
+
+            prepare_script = tmpdir_path / "prepare_thor_jp72_assets.sh"
+            prepare_script.write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -eu",
+                        f'touch "{prepare_marker}"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            prepare_script.chmod(0o755)
+
+            (fake_bin / "docker").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+            (fake_bin / "docker").chmod(0o755)
+            (fake_bin / "id").write_text("#!/usr/bin/env bash\necho 'adm sudo'\n", encoding="utf-8")
+            (fake_bin / "id").chmod(0o755)
+            (fake_bin / "getent").write_text(
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "set -eu",
+                        'if [[ "${1:-}" == "group" && "${2:-}" == "docker" ]]; then',
+                        '  echo "docker:x:998:${USER}"',
+                        "  exit 0",
+                        "fi",
+                        "exit 2",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "getent").chmod(0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["USER"] = "thoruser"
+            env["EDGE_VLM_INSTALL_DEPENDENCIES_SCRIPT"] = str(install_script)
+            env["EDGE_VLM_PREPARE_THOR_ASSETS_SCRIPT"] = str(prepare_script)
+
+            result = subprocess.run(
+                [str(TOP_LEVEL_SETUP_SCRIPT), "--skip-rosbag-download"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(install_marker.exists())
+            self.assertFalse(prepare_marker.exists())
+            self.assertIn("Docker group membership was configured", result.stderr)
+            self.assertIn("Log out and back in", result.stderr)
+
+
 class InstallDependenciesGuardTests(unittest.TestCase):
     def test_guard_rejects_protected_nvidia_removal(self) -> None:
         env = os.environ.copy()
