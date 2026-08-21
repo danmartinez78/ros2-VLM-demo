@@ -8,6 +8,7 @@
   "edge_llm": {
     "repo_url": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
     "commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
+    "host_cuda_family": "13.2",
     "cuda_ctk_version": "13.0",
     "default_root": "${HOME}/TensorRT-Edge-LLM",
     "default_build_dir": "${HOME}/TensorRT-Edge-LLM/build",

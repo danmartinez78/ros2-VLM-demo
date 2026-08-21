@@ -245,7 +245,8 @@ detect_cuda_ctk_version() {
 
 validate_thor_build_inputs() {
   local edge_root="$1"
-  local expected_cuda_ctk="$2"
+  local profile_cuda_ctk="$2"
+  local host_cuda_family="$3"
   local detected_cuda_ctk=""
 
   if command -v nvcc >/dev/null 2>&1; then
@@ -255,7 +256,8 @@ validate_thor_build_inputs() {
   if [[ "${dry_run}" -eq 1 ]]; then
     printf 'DRY-RUN  validate Thor build inputs (nvcc, TensorRT headers, toolchain file)\n'
     if [[ -n "${detected_cuda_ctk}" ]]; then
-      printf 'DRY-RUN  detected CUDA toolkit: %s (configure target: %s)\n' "${detected_cuda_ctk}" "${expected_cuda_ctk}"
+      printf 'DRY-RUN  detected host CUDA toolkit: %s (supported host family: %s, configure target: %s)\n' \
+        "${detected_cuda_ctk}" "${host_cuda_family}" "${profile_cuda_ctk}"
     else
       printf 'DRY-RUN  CUDA toolkit detection deferred to runtime host\n'
     fi
@@ -264,12 +266,17 @@ validate_thor_build_inputs() {
 
   command -v nvcc >/dev/null 2>&1 || fail "nvcc not found. Install the JP7.2 CUDA toolkit components before building Edge-LLM."
   [[ -n "${detected_cuda_ctk}" ]] || fail "Unable to detect CUDA toolkit version from nvcc."
-  [[ "${detected_cuda_ctk}" == "${expected_cuda_ctk}" ]] || fail \
-    "Detected CUDA toolkit ${detected_cuda_ctk}, but Thor profile requires ${expected_cuda_ctk}. Use the JP7.2-supported stack on this host (no auto-upgrade is performed by this script)."
+  [[ "${detected_cuda_ctk}" == "${host_cuda_family}" ]] || fail \
+    "Detected host CUDA toolkit ${detected_cuda_ctk}, but supported JP7.2 host CUDA family is ${host_cuda_family}. Thor profile still configures CUDA_CTK_VERSION=${profile_cuda_ctk}; no host CUDA downgrade is performed by this script."
   [[ -f "${edge_root}/cmake/aarch64_linux_toolchain.cmake" ]] || fail \
     "Missing TensorRT-Edge-LLM toolchain file: ${edge_root}/cmake/aarch64_linux_toolchain.cmake"
-  [[ -f /usr/include/NvInfer.h || -f /usr/include/aarch64-linux-gnu/NvInfer.h ]] || fail \
-    "TensorRT development headers not found under /usr/include. Install JP7.2 TensorRT dev packages before building."
+  if [[ -n "${EDGE_VLM_TRT_HEADER_FOR_TEST:-}" ]]; then
+    [[ -f "${EDGE_VLM_TRT_HEADER_FOR_TEST}" ]] || fail \
+      "TensorRT development header not found at EDGE_VLM_TRT_HEADER_FOR_TEST=${EDGE_VLM_TRT_HEADER_FOR_TEST}."
+  else
+    [[ -f /usr/include/NvInfer.h || -f /usr/include/aarch64-linux-gnu/NvInfer.h ]] || fail \
+      "TensorRT development headers not found under /usr/include. Install JP7.2 TensorRT dev packages before building."
+  fi
 }
 
 prepare_edge_llm() {
@@ -277,6 +284,13 @@ prepare_edge_llm() {
   local edge_commit="$2"
   local edge_build="$3"
   local cuda_ctk_version="$4"
+  local host_cuda_family="$5"
+
+  if [[ "${EDGE_VLM_VALIDATE_THOR_BUILD_INPUTS_TEST_MODE:-0}" == "1" ]]; then
+    validate_thor_build_inputs "${edge_root}" "${cuda_ctk_version}" "${host_cuda_family}"
+    echo "Thor build input validation test passed."
+    return
+  fi
 
   if [[ -d "${edge_root}/.git" ]]; then
     run_cmd git -C "${edge_root}" fetch --tags --prune origin
@@ -289,7 +303,7 @@ prepare_edge_llm() {
   run_cmd mkdir -p "${edge_build}"
 
   if ! validate_edge_artifacts "${edge_build}"; then
-    validate_thor_build_inputs "${edge_root}" "${cuda_ctk_version}"
+    validate_thor_build_inputs "${edge_root}" "${cuda_ctk_version}" "${host_cuda_family}"
     run_cmd cmake -S "${edge_root}" -B "${edge_build}" \
       -GNinja \
       -DCMAKE_BUILD_TYPE=Release \
@@ -724,6 +738,7 @@ default_edge_root="$(manifest_value edge_llm.default_root)"
 default_edge_build="$(manifest_value edge_llm.default_build_dir)"
 default_workspace="$(manifest_value default_workspace)"
 cuda_ctk_version="${EDGE_VLM_CUDA_CTK_VERSION:-$(manifest_value edge_llm.cuda_ctk_version)}"
+host_cuda_family="${EDGE_VLM_HOST_CUDA_FAMILY:-$(manifest_value edge_llm.host_cuda_family)}"
 
 edge_root="${TENSORRT_EDGE_LLM_ROOT:-${default_edge_root}}"
 edge_root="${edge_root/\$\{HOME\}/${HOME}}"
@@ -742,13 +757,19 @@ printf '  ISAAC_ROS_WS: %s\n' "${isaac_ros_ws}"
 printf '  Edge-LLM root: %s\n' "${edge_root}"
 printf '  Edge-LLM build: %s\n' "${edge_build}"
 printf '  Edge-LLM commit: %s\n' "$(manifest_value edge_llm.commit)"
+printf '  Supported host CUDA toolkit family: %s\n' "${host_cuda_family}"
 printf '  Thor CUDA_CTK_VERSION: %s\n' "${cuda_ctk_version}"
 printf '  Model: %s\n' "${model_name}"
 printf '  Model workspace: %s\n' "${workspace_dir}"
 printf '  Env file: %s\n' "${env_file}"
 
 if [[ "${skip_edge_llm}" -eq 0 ]]; then
-  prepare_edge_llm "${edge_root}" "$(manifest_value edge_llm.commit)" "${edge_build}" "${cuda_ctk_version}"
+  prepare_edge_llm \
+    "${edge_root}" \
+    "$(manifest_value edge_llm.commit)" \
+    "${edge_build}" \
+    "${cuda_ctk_version}" \
+    "${host_cuda_family}"
 fi
 
 if [[ "${skip_model}" -eq 0 ]]; then

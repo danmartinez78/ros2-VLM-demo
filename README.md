@@ -45,7 +45,7 @@ for the investigation and evidence.
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
 | JetPack / Jetson Linux | JetPack 7.2.x / R39.2.x (target baseline; pending fresh-flash validation) |
-| CUDA | 13.0 (Thor profile) |
+| CUDA | Host toolkit: 13.2 (JP7.2.x baseline); Thor Edge-LLM CMake profile: `CUDA_CTK_VERSION=13.0` |
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
 | Model | Cosmos-Reason2-8B, NVFP4 |

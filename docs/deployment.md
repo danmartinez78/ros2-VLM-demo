@@ -9,7 +9,7 @@ hardware-validated until that rerun passes on the exact PR head.
 
 - Ubuntu 24.04, aarch64
 - JetPack 7.2.x / Jetson Linux R39.2.x
-- CUDA 13.0 (Thor TensorRT-Edge-LLM build profile)
+- Host CUDA toolkit 13.2 on JP7.2.x, with Thor TensorRT-Edge-LLM CMake profile `CUDA_CTK_VERSION=13.0`
 - ROS 2 Jazzy
 - TensorRT Edge-LLM built on the target Thor for `sm_110a`
 - Cosmos-Reason2-8B NVFP4 engine bundle (model-specific)
@@ -65,7 +65,7 @@ the same command before continuing.
 This performs deterministic path generation and setup for:
 
 - TensorRT-Edge-LLM clone pinned to `71dd1bae032e70771265917ec74d3ff4cad07a10` (v0.10.0);
-- Thor-targeted Edge-LLM build outputs (`jetson-thor`, CUDA_CTK_VERSION=13.0) including `libNvInfer_edgellm_plugin.so`;
+- Thor-targeted Edge-LLM build outputs (`jetson-thor`, host CUDA toolkit 13.2, `CUDA_CTK_VERSION=13.0`) including `libNvInfer_edgellm_plugin.so`;
 - first-class Cosmos-Reason2-8B preparation stages (HF preflight, NVFP4 quantize with ModelOpt 0.45.0, ONNX export, native `llm_build` + `visual_build`);
 - RT-DETR package + model installer path;
 - rosbag and dataset preparation wrappers.

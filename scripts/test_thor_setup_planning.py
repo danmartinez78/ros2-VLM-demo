@@ -36,6 +36,7 @@ class ThorSetupManifestTests(unittest.TestCase):
         with MANIFEST_PATH.open("r", encoding="utf-8") as handle:
             manifest = json.load(handle)
         self.assertEqual(manifest["edge_llm"]["cuda_ctk_version"], "13.0")
+        self.assertEqual(manifest["edge_llm"]["host_cuda_family"], "13.2")
         self.assertEqual(
             manifest["models"]["Cosmos-Reason2-8B"]["pytorch_container"],
             "nvcr.io/nvidia/pytorch:26.05-py3",
@@ -706,6 +707,105 @@ class PrepareThorRtdetrGuardTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, msg=second.stderr)
             self.assertIn("RT-DETR models installer already completed", second.stdout)
             self.assertEqual(ros2_log.read_text(encoding="utf-8").splitlines(), [expected_isaac_ws])
+
+
+class ThorCudaVersionModelingTests(unittest.TestCase):
+    @staticmethod
+    def _write_executable(path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+
+    def test_host_cuda_13_2_with_profile_13_0_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-cuda-model-pass-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake_bin = tmpdir_path / "bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+
+            self._write_executable(
+                fake_bin / "nvcc",
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "cat <<'EOF'",
+                        "Cuda compilation tools, release 13.2, V13.2.52",
+                        "EOF",
+                    ]
+                )
+                + "\n",
+            )
+
+            edge_root = tmpdir_path / "TensorRT-Edge-LLM"
+            (edge_root / "cmake").mkdir(parents=True, exist_ok=True)
+            (edge_root / "cmake" / "aarch64_linux_toolchain.cmake").write_text(
+                "# test toolchain\n", encoding="utf-8"
+            )
+            trt_header = tmpdir_path / "NvInfer.h"
+            trt_header.write_text("// test header\n", encoding="utf-8")
+            env_file = tmpdir_path / "edge_vlm_env.sh"
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["TENSORRT_EDGE_LLM_ROOT"] = str(edge_root)
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+            env["EDGE_VLM_VALIDATE_THOR_BUILD_INPUTS_TEST_MODE"] = "1"
+            env["EDGE_VLM_TRT_HEADER_FOR_TEST"] = str(trt_header)
+
+            result = subprocess.run(
+                [str(SETUP_SCRIPT), "--skip-model", "--skip-rtdetr", "--skip-data"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertIn("Thor build input validation test passed.", result.stdout)
+
+    def test_unsupported_host_cuda_family_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-cuda-model-fail-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake_bin = tmpdir_path / "bin"
+            fake_bin.mkdir(parents=True, exist_ok=True)
+
+            self._write_executable(
+                fake_bin / "nvcc",
+                "\n".join(
+                    [
+                        "#!/usr/bin/env bash",
+                        "cat <<'EOF'",
+                        "Cuda compilation tools, release 12.6, V12.6.85",
+                        "EOF",
+                    ]
+                )
+                + "\n",
+            )
+
+            edge_root = tmpdir_path / "TensorRT-Edge-LLM"
+            (edge_root / "cmake").mkdir(parents=True, exist_ok=True)
+            (edge_root / "cmake" / "aarch64_linux_toolchain.cmake").write_text(
+                "# test toolchain\n", encoding="utf-8"
+            )
+            trt_header = tmpdir_path / "NvInfer.h"
+            trt_header.write_text("// test header\n", encoding="utf-8")
+            env_file = tmpdir_path / "edge_vlm_env.sh"
+
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+            env["TENSORRT_EDGE_LLM_ROOT"] = str(edge_root)
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+            env["EDGE_VLM_VALIDATE_THOR_BUILD_INPUTS_TEST_MODE"] = "1"
+            env["EDGE_VLM_TRT_HEADER_FOR_TEST"] = str(trt_header)
+
+            result = subprocess.run(
+                [str(SETUP_SCRIPT), "--skip-model", "--skip-rtdetr", "--skip-data"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("supported JP7.2 host CUDA family is 13.2", result.stderr)
 
 
 class RosdepGuardTests(unittest.TestCase):
