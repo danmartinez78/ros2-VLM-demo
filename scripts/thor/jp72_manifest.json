@@ -3,7 +3,7 @@
     "os": "ubuntu",
     "version": "24.04",
     "arch": "aarch64",
-    "l4t": "# R39 (release), REVISION: 2.0"
+    "l4t": "# R39 (release), REVISION: 2.x"
   },
   "edge_llm": {
     "repo_url": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",

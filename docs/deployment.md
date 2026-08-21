@@ -8,7 +8,7 @@ hardware-validated until that rerun passes on the exact PR head.
 ## Supported target baseline
 
 - Ubuntu 24.04, aarch64
-- JetPack 7.2 / Jetson Linux R39.2
+- JetPack 7.2.x / Jetson Linux R39.2.x
 - CUDA 13.0 (Thor TensorRT-Edge-LLM build profile)
 - ROS 2 Jazzy
 - TensorRT Edge-LLM built on the target Thor for `sm_110a`
@@ -28,7 +28,8 @@ free -h
 df -h /
 ```
 
-Expected key values are R39.2 and `aarch64`.
+Expected key values are R39 release with REVISION 2.x and `aarch64`.
+Current fresh-flash preflight baseline observed on Thor: `REVISION: 2.1`.
 
 A fresh flash may contain the BSP without the complete developer toolchain.
 Install the JetPack metapackage if `nvcc` and TensorRT headers are absent:

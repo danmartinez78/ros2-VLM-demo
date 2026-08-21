@@ -5,7 +5,7 @@ runs a TensorRT Edge-LLM VLM through a model-neutral IPC worker, and publishes
 structured vision-language results. Supported model configurations include
 NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
-The hardware path is retargeted to JetPack 7.2 / Jetson Linux R39.2 with a
+The hardware path is retargeted to JetPack 7.2.x / Jetson Linux R39.2.x with a
 Cosmos-Reason2-8B NVFP4 engine and NVIDIA Isaac ROS assets, pending fresh-flash
 hardware validation on the exact PR head.
 
@@ -44,7 +44,7 @@ for the investigation and evidence.
 | --- | --- |
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
-| JetPack / Jetson Linux | JetPack 7.2 / R39.2 (target baseline; pending fresh-flash validation) |
+| JetPack / Jetson Linux | JetPack 7.2.x / R39.2.x (target baseline; pending fresh-flash validation) |
 | CUDA | 13.0 (Thor profile) |
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
@@ -52,6 +52,7 @@ for the investigation and evidence.
 | Isaac ROS | 4.6 Docker tooling optional (RT-DETR path) |
 
 Other compatible models may work, but they have not yet been hardware-verified here.
+Latest fresh-flash preflight observation on Thor: `# R39 (release), REVISION: 2.1`.
 Model portability and optimization are tracked in
 [#9](https://github.com/danmartinez78/ros2-VLM-demo/issues/9).
 

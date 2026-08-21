@@ -15,7 +15,7 @@ usage() {
   cat <<'EOF'
 Usage: ./scripts/setup_thor_jp72.sh [--desktop] [--force] [--dry-run] [--skip-rosbag-download]
 
-Fresh-machine bootstrap for Jetson AGX Thor on JetPack 7.2 / R39.2.
+Fresh-machine bootstrap for Jetson AGX Thor on JetPack 7.2.x / R39.2.x.
 Runs dependency installation, environment bootstrap, optional test-data download,
 workspace build, and deployment verification.
 

@@ -40,6 +40,11 @@ check() {
   fi
 }
 
+is_supported_l4t_release() {
+  local release_line="${1:-}"
+  [[ "${release_line}" =~ ^#\ R39\ \(release\),\ REVISION:\ 2\.[0-9]+([[:space:],].*)?$ ]]
+}
+
 ros_distro="${ROS_DISTRO:-jazzy}"
 edge_root="${TENSORRT_EDGE_LLM_ROOT:-${HOME}/TensorRT-Edge-LLM}"
 edge_build="${TENSORRT_EDGE_LLM_BUILD_DIR:-${edge_root}/build}"
@@ -50,9 +55,19 @@ multimodal_engine="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-${edge_vlm_workspace}/${mod
 plugin_path="${EDGELLM_PLUGIN_PATH:-${edge_build}/libNvInfer_edgellm_plugin.so}"
 l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 
+if [[ "${EDGE_VLM_L4T_GATE_TEST_MODE:-0}" == "1" ]]; then
+  test_release="${EDGE_VLM_L4T_GATE_RELEASE:-${l4t_release}}"
+  if is_supported_l4t_release "${test_release}"; then
+    echo "L4T gate accepted release: ${test_release}"
+    exit 0
+  fi
+  echo "L4T gate rejected release: ${test_release}" >&2
+  exit 1
+fi
+
 check "Ubuntu 24.04" bash -c 'source /etc/os-release && [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]]'
 check "aarch64 architecture" bash -c '[[ "$(uname -m)" == aarch64 ]]'
-check "Jetson Linux R39.2 (JetPack 7.2)" grep -q '# R39 (release), REVISION: 2.0' /etc/nv_tegra_release
+check "Jetson Linux R39.2.x (JetPack 7.2.x)" is_supported_l4t_release "${l4t_release}"
 check "JetPack metapackage" dpkg-query -W nvidia-jetpack
 check "JetPack developer metapackage" dpkg-query -W nvidia-jetpack-dev
 check "CUDA compiler" bash -c 'export PATH=/usr/local/cuda/bin:$PATH; command -v nvcc && nvcc --version'
@@ -74,8 +89,8 @@ if [[ "${VERIFY_ISAAC_ROS}" -eq 1 ]]; then
   check "Docker service" systemctl is-active --quiet docker
   check "Docker CLI" command -v docker
 
-  if [[ "${l4t_release:-}" != *"# R39 (release), REVISION: 2.0"* ]]; then
-    printf 'WARN  Isaac ROS Thor support expects JetPack 7.2 / R39.2.\n'
+  if ! is_supported_l4t_release "${l4t_release:-}"; then
+    printf 'WARN  Isaac ROS Thor support expects JetPack 7.2.x / R39.2.x.\n'
     printf '      This host reports: %s\n' "${l4t_release:-unknown}"
   fi
 fi

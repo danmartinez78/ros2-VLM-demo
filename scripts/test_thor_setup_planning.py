@@ -14,6 +14,7 @@ MANIFEST_PATH = REPO_ROOT / "scripts" / "thor" / "jp72_manifest.json"
 SETUP_SCRIPT = REPO_ROOT / "scripts" / "prepare_thor_jp72_assets.sh"
 TOP_LEVEL_SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_thor_jp72.sh"
 INSTALL_DEPENDENCIES_SCRIPT = REPO_ROOT / "scripts" / "install_dependencies.sh"
+VERIFY_DEPLOYMENT_SCRIPT = REPO_ROOT / "scripts" / "verify_deployment.sh"
 APT_GUARD_SCRIPT = REPO_ROOT / "scripts" / "apt_transaction_guard.sh"
 ROS_SETUP_GUARD_SCRIPT = REPO_ROOT / "scripts" / "ros_setup_guard.sh"
 ASSETS_MANIFEST_PATH = REPO_ROOT / "scripts" / "test_data" / "manifests" / "assets_manifest.json"
@@ -29,6 +30,7 @@ class ThorSetupManifestTests(unittest.TestCase):
             "71dd1bae032e70771265917ec74d3ff4cad07a10",
         )
         self.assertEqual(manifest["models"]["Cosmos-Reason2-8B"]["modelopt_version"], "0.45.0")
+        self.assertEqual(manifest["supported_target"]["l4t"], "# R39 (release), REVISION: 2.x")
 
     def test_manifest_declares_required_cosmos_artifacts(self) -> None:
         with MANIFEST_PATH.open("r", encoding="utf-8") as handle:
@@ -514,6 +516,50 @@ class InstallDependenciesGuardTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Unable to simulate APT transaction", result.stderr)
+
+
+class L4TGateTests(unittest.TestCase):
+    @staticmethod
+    def _run_l4t_gate(
+        script_path: Path, release_line: str, *script_args: str
+    ) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["EDGE_VLM_L4T_GATE_TEST_MODE"] = "1"
+        env["EDGE_VLM_L4T_GATE_RELEASE"] = release_line
+        return subprocess.run(
+            ["bash", str(script_path), *script_args],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_install_gate_accepts_r39_2_1(self) -> None:
+        result = self._run_l4t_gate(
+            INSTALL_DEPENDENCIES_SCRIPT,
+            "# R39 (release), REVISION: 2.1, GCID: 46758480, BOARD: generic, EABI: aarch64",
+            "--force",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("accepted release", result.stdout)
+
+    def test_verify_gate_accepts_r39_2_1(self) -> None:
+        result = self._run_l4t_gate(
+            VERIFY_DEPLOYMENT_SCRIPT,
+            "# R39 (release), REVISION: 2.1, GCID: 46758480, BOARD: generic, EABI: aarch64",
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("accepted release", result.stdout)
+
+    def test_install_gate_rejects_non_2_x_revision(self) -> None:
+        result = self._run_l4t_gate(
+            INSTALL_DEPENDENCIES_SCRIPT,
+            "# R39 (release), REVISION: 3.0, GCID: 46758480, BOARD: generic, EABI: aarch64",
+            "--force",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("rejected release", result.stderr)
 
 
 class PrepareThorRtdetrGuardTests(unittest.TestCase):

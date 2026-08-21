@@ -15,6 +15,11 @@ fail() {
   exit 1
 }
 
+is_supported_l4t_release() {
+  local release_line="${1:-}"
+  [[ "${release_line}" =~ ^#\ R39\ \(release\),\ REVISION:\ 2\.[0-9]+([[:space:],].*)?$ ]]
+}
+
 source "${script_dir}/apt_transaction_guard.sh"
 
 collect_isaac_ros_pref_files() {
@@ -67,13 +72,13 @@ usage() {
   cat <<'EOF'
 Usage: sudo -v && ./scripts/install_dependencies.sh [--desktop] [--isaac-ros] [--force] [--dry-run]
 
-Installs the JetPack 7.2 development stack, ROS 2 Jazzy, rosdep/colcon,
+Installs the JetPack 7.2.x development stack, ROS 2 Jazzy, rosdep/colcon,
 OpenCV, rosbag2, and all system packages needed by this repository.
 
 Options:
   --desktop   Install ros-jazzy-desktop instead of the headless ros-base variant.
   --isaac-ros Configure NVIDIA Isaac ROS 4.6 using its recommended Docker mode.
-              This repository's supported Thor path targets JetPack 7.2 / R39.2.
+              This repository's supported Thor path targets JetPack 7.2.x / R39.2.x.
   --force    Continue on an unsupported OS, architecture, or Jetson Linux release.
   --dry-run  Print planned installation actions without mutating the system.
 EOF
@@ -102,14 +107,14 @@ l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 unsupported=0
 [[ "${ID}" == "ubuntu" && "${VERSION_ID}" == "24.04" ]] || unsupported=1
 [[ "${machine_arch}" == "aarch64" ]] || unsupported=1
-[[ "${l4t_release}" == *"# R39 (release), REVISION: 2.0"* ]] || unsupported=1
+is_supported_l4t_release "${l4t_release}" || unsupported=1
 
 if [[ "${unsupported}" -ne 0 && "${FORCE_UNSUPPORTED}" -ne 1 ]]; then
   cat >&2 <<EOF
 Unsupported deployment target.
-Expected: Ubuntu 24.04, aarch64, Jetson Linux R39.2 (JetPack 7.2)
+Expected: Ubuntu 24.04, aarch64, Jetson Linux R39.2.x (JetPack 7.2.x)
 Detected: ${PRETTY_NAME:-unknown}, ${machine_arch}, ${l4t_release:-no /etc/nv_tegra_release}
-Use --force only if you understand that this repository targets JetPack 7.2.
+Use --force only if you understand that this repository targets JetPack 7.2.x.
 EOF
   exit 1
 fi
@@ -122,7 +127,7 @@ fi
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   cat <<EOF
 DRY-RUN  install_dependencies plan:
-  Supported target baseline: Ubuntu 24.04, aarch64, Jetson Linux R39.2
+  Supported target baseline: Ubuntu 24.04, aarch64, Jetson Linux R39.2.x
   Selected ROS variant: ${ros_variant}
   Isaac ROS setup requested: ${INSTALL_ISAAC_ROS}
   Planned actions:
@@ -140,6 +145,16 @@ DRY-RUN  install_dependencies plan:
     - initialize/update rosdep
 EOF
   exit 0
+fi
+
+if [[ "${EDGE_VLM_L4T_GATE_TEST_MODE:-0}" == "1" ]]; then
+  test_release="${EDGE_VLM_L4T_GATE_RELEASE:-${l4t_release}}"
+  if is_supported_l4t_release "${test_release}"; then
+    echo "L4T gate accepted release: ${test_release}"
+    exit 0
+  fi
+  echo "L4T gate rejected release: ${test_release}" >&2
+  exit 1
 fi
 
 if [[ "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" == "1" ]]; then
