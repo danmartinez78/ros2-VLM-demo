@@ -72,7 +72,7 @@ OpenCV, rosbag2, and all system packages needed by this repository.
 
 Options:
   --desktop   Install ros-jazzy-desktop instead of the headless ros-base variant.
-  --isaac-ros Configure NVIDIA Isaac ROS 4.5 using its recommended Docker mode.
+  --isaac-ros Configure NVIDIA Isaac ROS 4.6 using its recommended Docker mode.
               This repository's supported Thor path targets JetPack 7.2 / R39.2.
   --force    Continue on an unsupported OS, architecture, or Jetson Linux release.
   --dry-run  Print planned installation actions without mutating the system.
@@ -241,7 +241,7 @@ sudo apt-get install -y "${ros_and_build_packages[@]}"
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
   isaac_keyring="/usr/share/keyrings/nvidia-isaac-ros.gpg"
   isaac_source_file="/etc/apt/sources.list.d/nvidia-isaac-ros.list"
-  isaac_source="deb [signed-by=${isaac_keyring}] https://isaac.download.nvidia.com/isaac-ros/release-4.5 noble-jetpack main"
+  isaac_source="deb [signed-by=${isaac_keyring}] https://isaac.download.nvidia.com/isaac-ros/release-4.6 noble-jetpack main"
 
   curl -fsSL https://isaac.download.nvidia.com/isaac-ros/repos.key |
     sudo gpg --dearmor --yes -o "${isaac_keyring}"

@@ -462,7 +462,7 @@ class PrepareThorRtdetrGuardTests(unittest.TestCase):
     def test_rtdetr_guard_accepts_safe_transaction(self) -> None:
         env = os.environ.copy()
         env["EDGE_VLM_APT_GUARD_TEST_MODE"] = "1"
-        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst ros-jazzy-isaac-ros-rtdetr (4.5.0)"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst ros-jazzy-isaac-ros-rtdetr (4.6.0)"
 
         result = subprocess.run(
             [
@@ -503,7 +503,7 @@ class PrepareThorRtdetrGuardTests(unittest.TestCase):
                         "#!/usr/bin/env bash",
                         "set -eu",
                         'if [[ \"${1:-}\" == \"-s\" ]]; then',
-                        '  echo \"Inst ros-jazzy-isaac-ros-rtdetr (4.5.0)\"',
+                        '  echo \"Inst ros-jazzy-isaac-ros-rtdetr (4.6.0)\"',
                         "fi",
                     ]
                 )
@@ -853,7 +853,7 @@ class DownloadRosbagsArchiveFormatTests(unittest.TestCase):
                     "  exit 0",
                     "fi",
                     'if [[ "${url}" == */versions ]]; then',
-                    '  printf \'%s\\n\' \'{"recipeVersions":[{"versionId":"4.0.0"}]}\'',
+                    '  printf \'%s\\n\' \'{"recipeVersions":[{"versionId":"4.0.0"},{"versionId":"4.6.0"},{"versionId":"4.7.0"}]}\'',
                     "  exit 0",
                     "fi",
                     'echo "Unexpected curl URL: ${url}" >&2',
@@ -902,7 +902,7 @@ class DownloadRosbagsArchiveFormatTests(unittest.TestCase):
             self.assertEqual(first.returncode, 0, msg=first.stderr)
             target = output_root / "nvblox"
             self.assertTrue((target / ".ngc-version").exists())
-            self.assertEqual((target / ".ngc-version").read_text(encoding="utf-8").strip(), "4.0.0")
+            self.assertEqual((target / ".ngc-version").read_text(encoding="utf-8").strip(), "4.6.0")
             self.assertTrue((target / "isaac_ros_nvblox" / "quickstart" / "metadata.yaml").exists())
 
             second = subprocess.run(

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ISAAC_ROS_MAJOR=4
-ISAAC_ROS_MINOR=5
+ISAAC_ROS_MINOR=6
 NGC_ORG="nvidia"
 NGC_TEAM="isaac"
 
@@ -16,7 +16,7 @@ Usage: download_rosbags.sh list
        download_rosbags.sh download <image-proc|h264|nvblox|rtdetr>
        download_rosbags.sh all
 
-Downloads version-matched NVIDIA Isaac ROS 4.5 quickstart assets from NGC.
+Downloads version-matched NVIDIA Isaac ROS 4.6 quickstart assets from NGC.
 Set ROSBAG_DIR to override the default test_data/rosbags directory.
 EOF
 }

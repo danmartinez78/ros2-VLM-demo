@@ -49,7 +49,7 @@ for the investigation and evidence.
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
 | Model | Cosmos-Reason2-8B, NVFP4 |
-| Isaac ROS | 4.5 Docker tooling optional (RT-DETR path) |
+| Isaac ROS | 4.6 Docker tooling optional (RT-DETR path) |
 
 Other compatible models may work, but they have not yet been hardware-verified here.
 Model portability and optimization are tracked in

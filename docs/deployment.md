@@ -135,7 +135,7 @@ bash scripts/setup_thor_jp72.sh --desktop
 bash scripts/install_dependencies.sh --isaac-ros
 ```
 
-Isaac ROS is optional. Version 4.5 is configured in Docker mode with APT
+Isaac ROS is optional. Version 4.6 is configured in Docker mode with APT
 transaction simulation guards that fail safely if host transactions would remove
 `nvidia-jetpack`, `nvidia-jetpack-dev`, or `nvidia-opencv-dev`.
 

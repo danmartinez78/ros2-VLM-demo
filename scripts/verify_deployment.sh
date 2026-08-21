@@ -65,8 +65,8 @@ check "TensorRT candidate matches installed version" \
 check "ROS 2 Jazzy setup" test -f "/opt/ros/${ros_distro}/setup.bash"
 
 if [[ "${VERIFY_ISAAC_ROS}" -eq 1 ]]; then
-  check "Isaac ROS 4.5 Thor APT source" grep -Fxq \
-    "deb [signed-by=/usr/share/keyrings/nvidia-isaac-ros.gpg] https://isaac.download.nvidia.com/isaac-ros/release-4.5 noble-jetpack main" \
+  check "Isaac ROS 4.6 Thor APT source" grep -Fxq \
+    "deb [signed-by=/usr/share/keyrings/nvidia-isaac-ros.gpg] https://isaac.download.nvidia.com/isaac-ros/release-4.6 noble-jetpack main" \
     /etc/apt/sources.list.d/nvidia-isaac-ros.list
   check "Isaac ROS CLI package" dpkg-query -W isaac-ros-cli
   check "Isaac ROS CLI" isaac-ros --help
