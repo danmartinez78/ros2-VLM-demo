@@ -9,6 +9,7 @@ INSTALL_ISAAC_ROS=0
 FORCE_UNSUPPORTED=0
 DRY_RUN=0
 APT_PREFERENCES_DIR="${EDGE_VLM_APT_PREFERENCES_DIR:-/etc/apt/preferences.d}"
+ISAAC_ROS_OPENCV_PREF_DISABLE_SUFFIX=".edge-vlm-disabled"
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -29,6 +30,78 @@ collect_isaac_ros_pref_files() {
   printf '%s\n' "${pref_files[@]}"
 }
 
+is_incompatible_isaac_ros_opencv_pref() {
+  local pref_file="$1"
+  [[ -f "${pref_file}" ]] || return 1
+  grep -Eq '^[[:space:]]*Package:[[:space:]]*libopencv\*([[:space:]]*)$' "${pref_file}" &&
+    grep -Eq '^[[:space:]]*Pin:[[:space:]]*version[[:space:]]*4\.6\.0\*([[:space:]]*)$' "${pref_file}"
+}
+
+libopencv_candidate_diverges_from_installed() {
+  local policy_output
+  local installed_version
+  local candidate_version
+
+  policy_output="$(package_policy_output libopencv-dev 2>&1)"
+  installed_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Installed:/{print $2; exit}')"
+  candidate_version="$(printf '%s\n' "${policy_output}" | awk '/^[[:space:]]*Candidate:/{print $2; exit}')"
+
+  [[ -n "${installed_version}" && "${installed_version}" != "(none)" ]] || return 1
+  [[ -n "${candidate_version}" && "${candidate_version}" != "(none)" ]] || return 1
+  [[ "${installed_version}" != "${candidate_version}" ]]
+}
+
+disable_isaac_ros_pref_file() {
+  local pref_file="$1"
+  local disabled_file="${pref_file}${ISAAC_ROS_OPENCV_PREF_DISABLE_SUFFIX}"
+
+  if [[ -e "${disabled_file}" ]]; then
+    if [[ -f "${pref_file}" ]]; then
+      if [[ -w "${disabled_file}" && -w "$(dirname -- "${disabled_file}")" ]]; then
+        rm -f -- "${disabled_file}"
+      else
+        sudo rm -f -- "${disabled_file}"
+      fi
+    else
+      echo "Isaac ROS host preference already neutralized: ${pref_file} -> ${disabled_file}"
+      return 0
+    fi
+  fi
+
+  if [[ -w "${pref_file}" && -w "$(dirname -- "${pref_file}")" ]]; then
+    mv -- "${pref_file}" "${disabled_file}"
+  else
+    sudo mv -- "${pref_file}" "${disabled_file}"
+  fi
+  echo "Neutralized incompatible Isaac ROS host OpenCV pin: ${pref_file} -> ${disabled_file}"
+}
+
+reconcile_isaac_ros_opencv_host_pin() {
+  local pref_file
+  local pref_files=()
+  local neutralized_any=0
+
+  while IFS= read -r pref_file; do
+    [[ -n "${pref_file}" ]] || continue
+    pref_files+=("${pref_file}")
+  done < <(collect_isaac_ros_pref_files)
+
+  [[ "${#pref_files[@]}" -gt 0 ]] || return 0
+  libopencv_candidate_diverges_from_installed || return 0
+
+  for pref_file in "${pref_files[@]}"; do
+    is_incompatible_isaac_ros_opencv_pref "${pref_file}" || continue
+    disable_isaac_ros_pref_file "${pref_file}"
+    neutralized_any=1
+  done
+
+  if [[ "${neutralized_any}" -eq 1 ]]; then
+    if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" != "1" ]]; then
+      sudo apt-get update
+    fi
+  fi
+}
+
 assert_isaac_ros_preferences_compatible() {
   local stage="$1"
   local stack_phase="${2:-post-jetpack-install}"
@@ -43,6 +116,8 @@ assert_isaac_ros_preferences_compatible() {
     echo "Detected Isaac ROS host APT preference files during ${stage}:"
     printf '  %s\n' "${pref_files[@]}"
   fi
+
+  reconcile_isaac_ros_opencv_host_pin
 
   if ! assert_host_jetpack_stack_safe "${stack_phase}"; then
     fail \
@@ -158,8 +233,9 @@ DRY-RUN  install_dependencies plan:
         block protected-package downgrade/removal pressure on a fresh host
       - after "isaac-ros init docker", verify host CUDA/TensorRT/NVIDIA OpenCV package candidates
         remain aligned with installed JP7.2 packages and protected NVIDIA metapackages
-      - if Isaac ROS host preference files are present, fail safely when candidate simulation indicates
-        downgrade/removal pressure instead of mutating supported JP7.2 pin files
+      - if an Isaac ROS OpenCV 4.6 host pin misaligns libopencv candidate policy, neutralize only that
+        incompatible pin and keep remaining Isaac ROS preference files untouched
+      - continue to fail safely when candidate simulation still indicates protected-package downgrade/removal
     - initialize/update rosdep
 EOF
   exit 0
@@ -247,6 +323,9 @@ sudo dpkg -i "${setup_tmp_dir}/${ros_source_deb}"
 sudo apt-get update
 # JetPack installs NVIDIA's OpenCV development packages (nvidia-opencv-dev),
 # so avoid pulling Ubuntu's generic libopencv-dev on Thor.
+if [[ "${INSTALL_ISAAC_ROS}" -eq 1 || -f /etc/apt/sources.list.d/nvidia-isaac-ros.list ]]; then
+  assert_isaac_ros_preferences_compatible "pre-ROS dependency host check" "post-jetpack-install"
+fi
 ros_and_build_packages=(
   "${ros_variant}"
   ros-dev-tools

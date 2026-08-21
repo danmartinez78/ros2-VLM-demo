@@ -958,6 +958,89 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Candidate version for TensorRT development package", result.stderr)
 
+    def test_isaac_ros_pref_guard_neutralizes_incompatible_opencv_pin(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-neutralize-") as tmpdir:
+            prefs_dir = Path(tmpdir) / "preferences.d"
+            prefs_dir.mkdir(parents=True, exist_ok=True)
+            opencv_pref = prefs_dir / "isaac-ros-opencv-4-6.pref"
+            trt_pref = prefs_dir / "isaac-ros-tensorrt-13-0.pref"
+            opencv_pref.write_text(
+                "Package: libopencv*\nPin: version 4.6.0*\nPin-Priority: 1001\n",
+                encoding="utf-8",
+            )
+            trt_pref.write_text(
+                "Package: libnvinfer*\nPin: version 10.16.*\nPin-Priority: 1001\n",
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst nvidia-opencv-dev (7.2.1-b49)"
+            self._set_stack_policy_env(env)
+            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
+                "libopencv-dev:\n"
+                "  Installed: 4.8.0-4-g18251aa\n"
+                "  Candidate: 4.6.0+dfsg-13.1ubuntu1\n"
+            )
+
+            result = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertFalse(opencv_pref.exists())
+            self.assertTrue((prefs_dir / "isaac-ros-opencv-4-6.pref.edge-vlm-disabled").exists())
+            self.assertTrue(trt_pref.exists())
+            self.assertIn("Neutralized incompatible Isaac ROS host OpenCV pin", result.stdout)
+
+    def test_isaac_ros_pref_guard_neutralization_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-idempotent-") as tmpdir:
+            prefs_dir = Path(tmpdir) / "preferences.d"
+            prefs_dir.mkdir(parents=True, exist_ok=True)
+            disabled_pref = prefs_dir / "isaac-ros-opencv-4-6.pref.edge-vlm-disabled"
+            disabled_pref.write_text(
+                "Package: libopencv*\nPin: version 4.6.0*\nPin-Priority: 1001\n",
+                encoding="utf-8",
+            )
+
+            env = os.environ.copy()
+            env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+            env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst nvidia-opencv-dev (7.2.1-b49)"
+            self._set_stack_policy_env(env)
+            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
+                "libopencv-dev:\n"
+                "  Installed: 4.8.0-4-g18251aa\n"
+                "  Candidate: 4.8.0-4-g18251aa\n"
+            )
+
+            first = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            second = subprocess.run(
+                ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(first.returncode, 0, msg=first.stderr)
+            self.assertEqual(second.returncode, 0, msg=second.stderr)
+            self.assertTrue(disabled_pref.exists())
+            self.assertNotIn("Neutralized incompatible Isaac ROS host OpenCV pin", second.stdout)
+
     def test_isaac_ros_pref_guard_pre_jetpack_allows_missing_opencv_stack(self) -> None:
         env = os.environ.copy()
         env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"

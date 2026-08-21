@@ -143,6 +143,10 @@ bash scripts/install_dependencies.sh --isaac-ros
 Isaac ROS is optional. Version 4.6 is configured in Docker mode with APT
 transaction simulation guards that fail safely if host transactions would remove
 `nvidia-jetpack`, `nvidia-jetpack-dev`, or `nvidia-opencv-dev`.
+If `isaac-ros init docker` writes an OpenCV 4.6 host pin that misaligns the
+installed JP7.2.x OpenCV candidate policy, setup neutralizes only that specific
+pin (`isaac-ros-opencv-4-6.pref`) and leaves compatible Isaac ROS pins in
+place. Do not use `--allow-downgrades` or remove JetPack metapackages manually.
 
 If Docker group membership changes, log out and back in before continuing.
 

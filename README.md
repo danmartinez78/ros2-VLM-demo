@@ -497,6 +497,10 @@ Do not install Ubuntu/ROS image packages when APT proposes removing
 `nvidia-jetpack`, `nvidia-jetpack-dev`, or `nvidia-opencv-dev`. The production
 node intentionally avoids `cv_bridge` so ROS OpenCV 4.6 and NVIDIA OpenCV 4.8
 are not loaded into the same process.
+In the Docker-mode Isaac ROS path, setup neutralizes only the incompatible
+`isaac-ros-opencv-4-6.pref` host pin when it drives an OpenCV downgrade plan,
+and keeps other compatible Isaac ROS preference pins active. Do not bypass this
+with `--allow-downgrades`.
 
 ### No camera messages
 
