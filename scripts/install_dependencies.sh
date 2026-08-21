@@ -17,61 +17,30 @@ fail() {
 
 source "${script_dir}/apt_transaction_guard.sh"
 
-is_isaac_pref_hazard() {
-  local pref_file="$1"
-  local pref_name
-  local pin_priority=""
-  pref_name="$(basename -- "${pref_file}")"
-
-  [[ "${pref_name}" == isaac-ros-*.pref ]] || return 1
-
-  case "${pref_name}" in
-    isaac-ros-opencv-4-6.pref|isaac-ros-cuda-13-0.pref|isaac-ros-tensorrt-13-0.pref|isaac-ros-dgx-spark.pref)
-      return 0
-      ;;
-  esac
-
-  pin_priority="$(awk 'tolower($1)=="pin-priority:"{print $2; exit}' "${pref_file}")"
-  if [[ "${pin_priority}" =~ ^[0-9]+$ ]] && (( pin_priority >= 1000 )); then
-    return 0
-  fi
-
-  grep -Eq '^[[:space:]]*Package:[[:space:]]*(libopencv[^[:space:]]*|cuda[^[:space:]]*|libnvinfer[^[:space:]]*|tensorrt[^[:space:]]*|nvidia-jetpack|nvidia-jetpack-dev|nvidia-opencv-dev)' "${pref_file}"
-}
-
-neutralize_isaac_ros_host_preferences() {
-  local changed=0
-  local pref_file
-
+collect_isaac_ros_pref_files() {
   shopt -s nullglob
   local pref_files=("${APT_PREFERENCES_DIR}"/isaac-ros-*.pref)
   shopt -u nullglob
+  printf '%s\n' "${pref_files[@]}"
+}
 
-  for pref_file in "${pref_files[@]}"; do
-    [[ -f "${pref_file}" ]] || continue
-    if ! is_isaac_pref_hazard "${pref_file}"; then
-      continue
-    fi
+assert_isaac_ros_preferences_compatible() {
+  local stage="$1"
+  local pref_file
+  local pref_files=()
+  while IFS= read -r pref_file; do
+    [[ -n "${pref_file}" ]] || continue
+    pref_files+=("${pref_file}")
+  done < <(collect_isaac_ros_pref_files)
 
-    local disabled_file="${pref_file}.disabled-by-edge-vlm"
-    if [[ "${DRY_RUN}" -eq 1 ]]; then
-      echo "DRY-RUN  disable Isaac ROS host APT preference ${pref_file} (move to ${disabled_file})"
-      continue
-    fi
+  if [[ "${#pref_files[@]}" -gt 0 ]]; then
+    echo "Detected Isaac ROS host APT preference files during ${stage}:"
+    printf '  %s\n' "${pref_files[@]}"
+  fi
 
-    if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
-      mv -f -- "${pref_file}" "${disabled_file}" || fail \
-        "Failed to disable Isaac ROS host APT preference ${pref_file}."
-    else
-      sudo mv -f -- "${pref_file}" "${disabled_file}" || fail \
-        "Failed to disable Isaac ROS host APT preference ${pref_file}."
-    fi
-    changed=1
-    echo "Neutralized Isaac ROS host APT preference: ${pref_file}"
-  done
-
-  if [[ "${changed}" -eq 1 ]]; then
-    [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]] || sudo apt-get update
+  if ! assert_host_jetpack_stack_safe; then
+    fail \
+      "APT candidate simulation indicates incompatible host package pinning during ${stage}. Review Isaac ROS host preferences under ${APT_PREFERENCES_DIR} and ensure they do not downgrade or remove protected JetPack packages (${PROTECTED_NVIDIA_PACKAGES[*]})."
   fi
 }
 
@@ -88,7 +57,7 @@ assert_host_jetpack_stack_safe() {
     cuda_owner_pkg="$(resolve_nvcc_owner_package || true)"
   fi
   [[ -n "${cuda_owner_pkg}" ]] || fail \
-    "Unable to resolve the installed CUDA package owning nvcc. Ensure the JP7.1 CUDA toolkit is installed before enabling Isaac ROS Docker mode."
+    "Unable to resolve the installed CUDA package owning nvcc. Ensure the JP7.2 CUDA toolkit is installed before enabling Isaac ROS Docker mode."
 
   assert_safe_apt_transaction "host CUDA safety check (${cuda_owner_pkg})" "${cuda_owner_pkg}"
   assert_package_candidate_matches_installed "${cuda_owner_pkg}" "CUDA compiler package"
@@ -98,13 +67,13 @@ usage() {
   cat <<'EOF'
 Usage: sudo -v && ./scripts/install_dependencies.sh [--desktop] [--isaac-ros] [--force] [--dry-run]
 
-Installs the JetPack 7.1 development stack, ROS 2 Jazzy, rosdep/colcon,
+Installs the JetPack 7.2 development stack, ROS 2 Jazzy, rosdep/colcon,
 OpenCV, rosbag2, and all system packages needed by this repository.
 
 Options:
   --desktop   Install ros-jazzy-desktop instead of the headless ros-base variant.
   --isaac-ros Configure NVIDIA Isaac ROS 4.5 using its recommended Docker mode.
-              This repository's supported Thor path targets JetPack 7.1 / R38.4.
+              This repository's supported Thor path targets JetPack 7.2 / R39.2.
   --force    Continue on an unsupported OS, architecture, or Jetson Linux release.
   --dry-run  Print planned installation actions without mutating the system.
 EOF
@@ -133,14 +102,14 @@ l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 unsupported=0
 [[ "${ID}" == "ubuntu" && "${VERSION_ID}" == "24.04" ]] || unsupported=1
 [[ "${machine_arch}" == "aarch64" ]] || unsupported=1
-[[ "${l4t_release}" == *"# R38 (release), REVISION: 4"* ]] || unsupported=1
+[[ "${l4t_release}" == *"# R39 (release), REVISION: 2.0"* ]] || unsupported=1
 
 if [[ "${unsupported}" -ne 0 && "${FORCE_UNSUPPORTED}" -ne 1 ]]; then
   cat >&2 <<EOF
 Unsupported deployment target.
-Expected: Ubuntu 24.04, aarch64, Jetson Linux R38.4 (JetPack 7.1)
+Expected: Ubuntu 24.04, aarch64, Jetson Linux R39.2 (JetPack 7.2)
 Detected: ${PRETTY_NAME:-unknown}, ${machine_arch}, ${l4t_release:-no /etc/nv_tegra_release}
-Use --force only if you understand that this repository targets JetPack 7.1.
+Use --force only if you understand that this repository targets JetPack 7.2.
 EOF
   exit 1
 fi
@@ -153,7 +122,7 @@ fi
 if [[ "${DRY_RUN}" -eq 1 ]]; then
   cat <<EOF
 DRY-RUN  install_dependencies plan:
-  Supported target baseline: Ubuntu 24.04, aarch64, Jetson Linux R38.4
+  Supported target baseline: Ubuntu 24.04, aarch64, Jetson Linux R39.2
   Selected ROS variant: ${ros_variant}
   Isaac ROS setup requested: ${INSTALL_ISAAC_ROS}
   Planned actions:
@@ -164,11 +133,10 @@ DRY-RUN  install_dependencies plan:
     - install ROS apt source + ${ros_variant}
     - install build/rosdep dependencies
     - optionally configure Isaac ROS Docker mode (if --isaac-ros)
-      - before the first host APT transaction, neutralize stale Isaac ROS host APT preferences from previous runs
-        that can pin CUDA/TensorRT/OpenCV package resolution and refresh apt metadata if files changed
-      - after "isaac-ros init docker", neutralize any newly created Isaac ROS host APT preferences
-        that can pin host CUDA/TensorRT/OpenCV package resolution
-      - verify CUDA/TensorRT/OpenCV install candidates remain aligned with installed JP7.1 host packages
+      - before and after "isaac-ros init docker", verify host CUDA/TensorRT/OpenCV package candidates
+        remain aligned with installed JP7.2 packages and protected NVIDIA metapackages
+      - if Isaac ROS host preference files are present, fail safely when candidate simulation indicates
+        downgrade/removal pressure instead of mutating supported JP7.2 pin files
     - initialize/update rosdep
 EOF
   exit 0
@@ -183,15 +151,14 @@ if [[ "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" == "1" ]]; then
 fi
 
 if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
-  neutralize_isaac_ros_host_preferences
-  assert_host_jetpack_stack_safe
+  assert_isaac_ros_preferences_compatible "Isaac preference guard test mode"
   echo "Isaac ROS host preference guard test passed."
   exit 0
 fi
 
 sudo -v
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
-  neutralize_isaac_ros_host_preferences
+  assert_isaac_ros_preferences_compatible "pre-Isaac initialization host check"
 fi
 sudo apt-get update
 bootstrap_packages=(
@@ -272,13 +239,6 @@ assert_safe_apt_transaction "ROS and build dependencies" "${ros_and_build_packag
 sudo apt-get install -y "${ros_and_build_packages[@]}"
 
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
-  cat >&2 <<'EOF'
-
-WARNING: NVIDIA Isaac ROS 4.5 currently validates Jetson Thor on JetPack 7.1
-(Jetson Linux R38.4). Isaac ROS is being configured in Docker isolation mode to
-avoid replacing the host CUDA, TensorRT, or OpenCV packages.
-EOF
-
   isaac_keyring="/usr/share/keyrings/nvidia-isaac-ros.gpg"
   isaac_source_file="/etc/apt/sources.list.d/nvidia-isaac-ros.list"
   isaac_source="deb [signed-by=${isaac_keyring}] https://isaac.download.nvidia.com/isaac-ros/release-4.5 noble-jetpack main"
@@ -299,8 +259,7 @@ EOF
   # host-side TensorRT Edge-LLM stack from Isaac ROS package version pins.
   # Initialization writes system configuration and therefore requires root.
   sudo isaac-ros init docker
-  neutralize_isaac_ros_host_preferences
-  assert_host_jetpack_stack_safe
+  assert_isaac_ros_preferences_compatible "post-isaac-ros init docker host check"
 
   echo
   echo "Isaac ROS Docker mode initialized."
@@ -317,8 +276,8 @@ echo "Dependency installation complete."
 echo "Open a new shell or run:"
 echo "  source /opt/ros/${ROS_DISTRO}/setup.bash"
 echo "Next:"
-echo "  ./scripts/setup_thor_jp71.sh"
+echo "  ./scripts/setup_thor_jp72.sh"
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
   echo "Isaac ROS verification:"
-  echo "  ./scripts/verify_thor_jp71.sh --isaac-ros"
+  echo "  ./scripts/verify_thor_jp72.sh --isaac-ros"
 fi

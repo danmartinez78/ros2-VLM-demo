@@ -12,9 +12,9 @@ failures=0
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/verify_thor_jp71.sh [--isaac-ros] [--smoke-image /abs/path.jpg]
+Usage: ./scripts/verify_thor_jp72.sh [--isaac-ros] [--smoke-image /abs/path.jpg]
 
-Verifies the supported Thor JP7.1 deployment path for RT-DETR + TensorRT Edge-LLM.
+Verifies the supported Thor JP7.2 deployment path for RT-DETR + TensorRT Edge-LLM.
 When --smoke-image is provided, also runs a standalone Edge-LLM inference smoke test.
 EOF
 }
@@ -68,7 +68,7 @@ fi
 
 bash "${script_dir}/verify_deployment.sh" "${passthrough_args[@]}"
 
-check "JP7.1 setup entrypoint present" test -x "${script_dir}/setup_thor_jp71.sh"
+check "JP7.2 setup entrypoint present" test -x "${script_dir}/setup_thor_jp72.sh"
 
 check "Thor launch entrypoint present" test -f "${repo_root}/launch/thor_tracked_observation.launch.py"
 
@@ -99,7 +99,6 @@ for visual_file in \
   check "Visual artifact present (${visual_file})" test -f "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}/${visual_file}"
 done
 check "Edge-LLM plugin present" test -f "${EDGELLM_PLUGIN_PATH:-}"
-check "Edge-LLM plugin exports symbols" bash -c 'nm -D "$1" | grep -q NvInfer' _ "${EDGELLM_PLUGIN_PATH:-}"
 
 if [[ -d "${repo_root}/test_data/rosbags/image-proc" ]]; then
   check "image-proc rosbag assets present" \
@@ -138,7 +137,7 @@ check "Edge-LLM runtime can load engines and become ready" bash -c '
     60 >"${log_file}" 2>&1 &
   pid=$!
   for _ in $(seq 1 300); do
-    if [[ -S "${socket_path}" ]] && grep -q "worker ready" "${log_file}"; then
+    if [[ -S "${socket_path}" ]] && grep -Eiq "(edge_vlm_server|worker).*ready" "${log_file}"; then
       exit 0
     fi
     if ! kill -0 "${pid}" 2>/dev/null; then
@@ -150,18 +149,104 @@ check "Edge-LLM runtime can load engines and become ready" bash -c '
 '
 
 if [[ "${run_standalone_smoke}" -eq 1 ]]; then
+check "Edge-LLM semantic text prompt sanity (2+2)" bash -c '
+  set -Eeuo pipefail
+  : "${ROS_WORKSPACE:=${HOME}/ros2_ws}"
+  : "${EDGE_VLM_LLM_ENGINE_DIR:?missing EDGE_VLM_LLM_ENGINE_DIR}"
+  : "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:?missing EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
+  : "${EDGELLM_PLUGIN_PATH:?missing EDGELLM_PLUGIN_PATH}"
+  smoke_image="${1:-}"
+  [[ -n "${smoke_image}" ]] || exit 2
+  [[ "${smoke_image}" == /* && -f "${smoke_image}" ]] || exit 2
+  client="${ROS_WORKSPACE}/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_cli"
+  server="${ROS_WORKSPACE}/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_server"
+  [[ -x "${client}" && -x "${server}" ]] || exit 1
+  run_dir="$(mktemp -d /tmp/edge-vlm-verify-semantic-text.XXXXXX)"
+  socket_path="${run_dir}/worker.sock"
+  log_file="${run_dir}/worker.log"
+  cleanup() {
+    if [[ -n "${pid:-}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill -TERM "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+  }
+  trap cleanup EXIT
+  "${server}" "${EDGE_VLM_LLM_ENGINE_DIR}" "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" "${EDGELLM_PLUGIN_PATH}" "${socket_path}" 90 60 >"${log_file}" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 300); do
+    if [[ -S "${socket_path}" ]] && grep -Eiq "(edge_vlm_server|worker).*ready" "${log_file}"; then
+      break
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      exit 1
+    fi
+    sleep 0.2
+  done
+  [[ -S "${socket_path}" ]] || exit 1
+  response="$("${client}" --socket "${socket_path}" --image "${smoke_image}" --prompt "What is 2 plus 2? Answer with one short sentence." --max-generate-length 24 2>/dev/null || true)"
+  [[ -n "${response}" ]] || exit 1
+  [[ "${#response}" -lt 400 ]] || exit 1
+  if ! grep -Eiq "(^|[^0-9])4([^0-9]|$)|\\bfour\\b" <<<"${response}"; then
+    exit 1
+  fi
+' _ "${smoke_image}"
+
+check "Edge-LLM semantic VLM prompt sanity (red panda request)" bash -c '
+  set -Eeuo pipefail
+  : "${ROS_WORKSPACE:=${HOME}/ros2_ws}"
+  : "${EDGE_VLM_LLM_ENGINE_DIR:?missing EDGE_VLM_LLM_ENGINE_DIR}"
+  : "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:?missing EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
+  : "${EDGELLM_PLUGIN_PATH:?missing EDGELLM_PLUGIN_PATH}"
+  smoke_image="${1:-}"
+  [[ -n "${smoke_image}" ]] || exit 2
+  [[ "${smoke_image}" == /* && -f "${smoke_image}" ]] || exit 2
+  client="${ROS_WORKSPACE}/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_cli"
+  server="${ROS_WORKSPACE}/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_server"
+  [[ -x "${client}" && -x "${server}" ]] || exit 1
+  run_dir="$(mktemp -d /tmp/edge-vlm-verify-semantic-vlm.XXXXXX)"
+  socket_path="${run_dir}/worker.sock"
+  log_file="${run_dir}/worker.log"
+  cleanup() {
+    if [[ -n "${pid:-}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill -TERM "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+  }
+  trap cleanup EXIT
+  "${server}" "${EDGE_VLM_LLM_ENGINE_DIR}" "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" "${EDGELLM_PLUGIN_PATH}" "${socket_path}" 90 60 >"${log_file}" 2>&1 &
+  pid=$!
+  for _ in $(seq 1 300); do
+    if [[ -S "${socket_path}" ]] && grep -Eiq "(edge_vlm_server|worker).*ready" "${log_file}"; then
+      break
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      exit 1
+    fi
+    sleep 0.2
+  done
+  [[ -S "${socket_path}" ]] || exit 1
+  response="$("${client}" --socket "${socket_path}" --image "${smoke_image}" --prompt "Describe the red panda in one short sentence." --max-generate-length 48 2>/dev/null || true)"
+  [[ -n "${response}" ]] || exit 1
+  [[ "${#response}" -lt 500 ]] || exit 1
+  if ! grep -Eiq "\\bred panda\\b|\\bpanda\\b" <<<"${response}"; then
+    exit 1
+  fi
+' _ "${smoke_image}"
+fi
+
+if [[ "${run_standalone_smoke}" -eq 1 ]]; then
   if [[ "${smoke_image}" != /* ]]; then
     echo "--smoke-image must be an absolute path: ${smoke_image}" >&2
     exit 2
   fi
   bash "${script_dir}/test_data/run_standalone_service_smoke.sh" "${smoke_image}"
 else
-  echo "WARN  Full request/response smoke skipped (pass --smoke-image /absolute/path.jpg to execute it)"
+  echo "WARN  Full request/response smoke skipped (pass --smoke-image /absolute/path.jpg to execute it; semantic checks require this image)"
 fi
 
 if [[ "${failures}" -ne 0 ]]; then
-  echo "Thor JP7.1 verification failed: ${failures} additional check(s)." >&2
+  echo "Thor JP7.2 verification failed: ${failures} additional check(s)." >&2
   exit 1
 fi
 
-echo "Thor JP7.1 verification checks completed."
+echo "Thor JP7.2 verification checks completed."

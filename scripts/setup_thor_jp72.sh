@@ -9,9 +9,9 @@ dry_run=0
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/setup_thor_jp71.sh [--desktop] [--force] [--dry-run] [--skip-rosbag-download]
+Usage: ./scripts/setup_thor_jp72.sh [--desktop] [--force] [--dry-run] [--skip-rosbag-download]
 
-Fresh-machine bootstrap for Jetson AGX Thor on JetPack 7.1 / R38.4.
+Fresh-machine bootstrap for Jetson AGX Thor on JetPack 7.2 / R39.2.
 Runs dependency installation, environment bootstrap, optional test-data download,
 workspace build, and deployment verification.
 
@@ -40,7 +40,7 @@ if [[ "${download_rosbags}" -eq 0 ]]; then
   prepare_args+=(--skip-data)
 fi
 
-bash "${script_dir}/prepare_thor_jp71_assets.sh" "${prepare_args[@]}"
+bash "${script_dir}/prepare_thor_jp72_assets.sh" "${prepare_args[@]}"
 
 if [[ "${dry_run}" -eq 1 ]]; then
   echo "Dry-run mode requested; skipping environment source, build, and verification."
@@ -51,4 +51,4 @@ fi
 source "${script_dir}/edge_vlm_env.sh"
 
 bash "${script_dir}/build_workspace.sh"
-bash "${script_dir}/verify_thor_jp71.sh" --isaac-ros
+bash "${script_dir}/verify_thor_jp72.sh" --isaac-ros

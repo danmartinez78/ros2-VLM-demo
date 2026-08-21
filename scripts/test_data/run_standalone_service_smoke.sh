@@ -51,7 +51,7 @@ echo "Standalone service PID: $service_pid"
 echo "Service log: $service_log"
 
 for _ in $(seq 1 600); do
-  if [[ -S "$socket_path" ]] && grep -q "worker ready" "$service_log"; then
+  if [[ -S "$socket_path" ]] && grep -Eiq "(edge_vlm_server|worker).*ready" "$service_log"; then
     break
   fi
   if ! kill -0 "$service_pid" 2>/dev/null; then

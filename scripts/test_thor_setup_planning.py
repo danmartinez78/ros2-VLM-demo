@@ -10,9 +10,9 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MANIFEST_PATH = REPO_ROOT / "scripts" / "thor" / "jp71_manifest.json"
-SETUP_SCRIPT = REPO_ROOT / "scripts" / "prepare_thor_jp71_assets.sh"
-TOP_LEVEL_SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_thor_jp71.sh"
+MANIFEST_PATH = REPO_ROOT / "scripts" / "thor" / "jp72_manifest.json"
+SETUP_SCRIPT = REPO_ROOT / "scripts" / "prepare_thor_jp72_assets.sh"
+TOP_LEVEL_SETUP_SCRIPT = REPO_ROOT / "scripts" / "setup_thor_jp72.sh"
 INSTALL_DEPENDENCIES_SCRIPT = REPO_ROOT / "scripts" / "install_dependencies.sh"
 APT_GUARD_SCRIPT = REPO_ROOT / "scripts" / "apt_transaction_guard.sh"
 ROS_SETUP_GUARD_SCRIPT = REPO_ROOT / "scripts" / "ros_setup_guard.sh"
@@ -26,8 +26,9 @@ class ThorSetupManifestTests(unittest.TestCase):
             manifest = json.load(handle)
         self.assertEqual(
             manifest["edge_llm"]["commit"],
-            "7f061f21f0a581ba234a1e233c9315b89d8e47d6",
+            "71dd1bae032e70771265917ec74d3ff4cad07a10",
         )
+        self.assertEqual(manifest["models"]["Cosmos-Reason2-8B"]["modelopt_version"], "0.45.0")
 
     def test_manifest_declares_required_cosmos_artifacts(self) -> None:
         with MANIFEST_PATH.open("r", encoding="utf-8") as handle:
@@ -153,8 +154,9 @@ class ThorSetupDryRunTests(unittest.TestCase):
                 capture_output=True,
                 check=True,
             )
-            self.assertIn("Thor JP7.1 setup plan:", result.stdout)
+            self.assertIn("Thor JP7.2 setup plan:", result.stdout)
             self.assertIn("planned stage: docker pull nvcr.io/nvidia/pytorch:26.05-py3", result.stdout)
+            self.assertIn("ensure nvidia-modelopt==0.45.0", result.stdout)
             self.assertIn("tensorrt-edgellm-quantize llm", result.stdout)
             self.assertIn("tensorrt-edgellm-export", result.stdout)
             self.assertIn("native Thor llm_build", result.stdout)
@@ -181,7 +183,7 @@ class ThorSetupDryRunTests(unittest.TestCase):
             )
             self.assertIn("DRY-RUN  install_dependencies plan:", result.stdout)
             self.assertIn(
-                "before the first host APT transaction, neutralize stale Isaac ROS host APT preferences from previous runs",
+                "before and after \"isaac-ros init docker\", verify host CUDA/TensorRT/OpenCV package candidates",
                 result.stdout,
             )
             self.assertIn(
@@ -641,7 +643,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             "  Candidate: 13.0.0-1\n"
         )
 
-    def test_isaac_ros_opencv_pref_is_neutralized(self) -> None:
+    def test_isaac_ros_pref_guard_keeps_supported_pref_files_when_stack_is_safe(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-") as tmpdir:
             prefs_dir = Path(tmpdir) / "preferences.d"
             prefs_dir.mkdir(parents=True, exist_ok=True)
@@ -666,11 +668,10 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
-            self.assertFalse(pref_file.exists())
-            self.assertTrue((prefs_dir / "isaac-ros-opencv-4-6.pref.disabled-by-edge-vlm").exists())
+            self.assertTrue(pref_file.exists())
             self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
 
-    def test_isaac_ros_thor_stack_pref_files_are_neutralized(self) -> None:
+    def test_isaac_ros_pref_guard_keeps_thor_pref_set_when_stack_is_safe(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-thor-prefs-") as tmpdir:
             prefs_dir = Path(tmpdir) / "preferences.d"
             prefs_dir.mkdir(parents=True, exist_ok=True)
@@ -699,11 +700,10 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             for pref_name in pref_contents:
-                self.assertFalse((prefs_dir / pref_name).exists())
-                self.assertTrue((prefs_dir / f"{pref_name}.disabled-by-edge-vlm").exists())
+                self.assertTrue((prefs_dir / pref_name).exists())
             self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
 
-    def test_stale_isaac_prefs_are_neutralized_before_first_simulated_transaction(self) -> None:
+    def test_stale_isaac_pref_set_fails_if_simulated_plan_is_unsafe(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-order-") as tmpdir:
             tmpdir_path = Path(tmpdir)
             prefs_dir = tmpdir_path / "preferences.d"
@@ -749,11 +749,10 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
                 capture_output=True,
                 check=False,
             )
-            self.assertEqual(result.returncode, 0, msg=result.stderr)
+            self.assertNotEqual(result.returncode, 0)
             for pref_name in pref_contents:
-                self.assertFalse((prefs_dir / pref_name).exists())
-                self.assertTrue((prefs_dir / f"{pref_name}.disabled-by-edge-vlm").exists())
-            self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
+                self.assertTrue((prefs_dir / pref_name).exists())
+            self.assertIn("removes protected package 'nvidia-opencv-dev'", result.stderr)
 
     def test_isaac_ros_pref_guard_rejects_protected_package_removal_plan(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-removal-") as tmpdir:

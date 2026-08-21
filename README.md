@@ -5,8 +5,9 @@ runs a TensorRT Edge-LLM VLM through a model-neutral IPC worker, and publishes
 structured vision-language results. Supported model configurations include
 NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
-The hardware path targets JetPack 7.1 / Jetson Linux R38.4 with a
-Cosmos-Reason2-8B NVFP4 engine and NVIDIA Isaac ROS assets.
+The hardware path is retargeted to JetPack 7.2 / Jetson Linux R39.2 with a
+Cosmos-Reason2-8B NVFP4 engine and NVIDIA Isaac ROS assets, pending fresh-flash
+hardware validation on the exact PR head.
 
 ## Architecture
 
@@ -43,7 +44,7 @@ for the investigation and evidence.
 | --- | --- |
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
-| JetPack / Jetson Linux | JetPack 7.1 / R38.4 |
+| JetPack / Jetson Linux | JetPack 7.2 / R39.2 (target baseline; pending fresh-flash validation) |
 | CUDA | 13.0 (Thor profile) |
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
@@ -54,6 +55,10 @@ Other compatible models may work, but they have not yet been hardware-verified h
 Model portability and optimization are tracked in
 [#9](https://github.com/danmartinez78/ros2-VLM-demo/issues/9).
 
+The prior JP7.1 path is intentionally abandoned for this PR branch because native
+Edge-LLM semantic inference was not reliable there, and current Isaac ROS Thor
+support targets JP7.2.
+
 ## Quick start on a fresh Thor
 
 ```bash
@@ -62,7 +67,7 @@ cd "$HOME/ros2_ws/src"
 git clone https://github.com/danmartinez78/ros2-VLM-demo.git
 cd ros2-VLM-demo
 
-bash scripts/setup_thor_jp71.sh
+bash scripts/setup_thor_jp72.sh
 ```
 
 Setup installs dependencies, pins/builds TensorRT Edge-LLM, prepares model/data
@@ -75,13 +80,13 @@ The deployment verifier can be re-run independently:
 ```bash
 source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
-bash scripts/verify_thor_jp71.sh --isaac-ros
+bash scripts/verify_thor_jp72.sh --isaac-ros
 ```
 
 Optional standalone Edge-LLM smoke check:
 
 ```bash
-bash scripts/verify_thor_jp71.sh --isaac-ros --smoke-image /absolute/path/to/image.jpg
+bash scripts/verify_thor_jp72.sh --isaac-ros --smoke-image /absolute/path/to/image.jpg
 ```
 
 The verifier confirms both executables are installed and enforces the process

@@ -156,10 +156,10 @@ jobs:
           bash -n scripts/benchmark/run_observation_history_experiment.sh
           bash -n scripts/test_data/run_image_proc_test.sh
           bash -n scripts/test_data/prepare_datasets.sh
-          bash -n scripts/prepare_thor_jp71_assets.sh
+          bash -n scripts/prepare_thor_jp72_assets.sh
           bash -n scripts/experiment_stack.sh
-          bash -n scripts/setup_thor_jp71.sh
-          bash -n scripts/verify_thor_jp71.sh
+          bash -n scripts/setup_thor_jp72.sh
+          bash -n scripts/verify_thor_jp72.sh
 
   web-console-tests:
     runs-on: ubuntu-24.04

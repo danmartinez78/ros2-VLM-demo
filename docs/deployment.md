@@ -1,12 +1,14 @@
 # Jetson AGX Thor deployment recipe
 
 This is the canonical deployment and validation recipe for
-`edge_vlm_ros` on NVIDIA Jetson AGX Thor.
+`edge_vlm_ros` on NVIDIA Jetson AGX Thor. The JP7.2 baseline below is the
+current target for a fresh-flash hardware rerun; do not treat this branch as
+hardware-validated until that rerun passes on the exact PR head.
 
 ## Supported target baseline
 
 - Ubuntu 24.04, aarch64
-- JetPack 7.1 / Jetson Linux R38.4
+- JetPack 7.2 / Jetson Linux R39.2
 - CUDA 13.0 (Thor TensorRT-Edge-LLM build profile)
 - ROS 2 Jazzy
 - TensorRT Edge-LLM built on the target Thor for `sm_110a`
@@ -26,7 +28,7 @@ free -h
 df -h /
 ```
 
-Expected key values are R38.4 and `aarch64`.
+Expected key values are R39.2 and `aarch64`.
 
 A fresh flash may contain the BSP without the complete developer toolchain.
 Install the JetPack metapackage if `nvcc` and TensorRT headers are absent:
@@ -52,14 +54,14 @@ variant.
 Run the repo-owned setup wrapper:
 
 ```bash
-bash scripts/setup_thor_jp71.sh
+bash scripts/setup_thor_jp72.sh
 ```
 
 This performs deterministic path generation and setup for:
 
-- TensorRT-Edge-LLM clone pinned to `7f061f21f0a581ba234a1e233c9315b89d8e47d6`;
+- TensorRT-Edge-LLM clone pinned to `71dd1bae032e70771265917ec74d3ff4cad07a10` (v0.10.0);
 - Thor-targeted Edge-LLM build outputs (`jetson-thor`, CUDA_CTK_VERSION=13.0) including `libNvInfer_edgellm_plugin.so`;
-- first-class Cosmos-Reason2-8B preparation stages (HF preflight, NVFP4 quantize, ONNX export, native `llm_build` + `visual_build`);
+- first-class Cosmos-Reason2-8B preparation stages (HF preflight, NVFP4 quantize with ModelOpt 0.45.0, ONNX export, native `llm_build` + `visual_build`);
 - RT-DETR package + model installer path;
 - rosbag and dataset preparation wrappers.
 
@@ -90,7 +92,7 @@ export JAAD_CLIPS_ARCHIVE=/absolute/path/or/url/to/jaad_clips_archive
 export NUSCENES_MINI_ARCHIVE=/absolute/path/or/url/to/nuscenes_mini_archive
 ```
 
-Use `bash scripts/prepare_thor_jp71_assets.sh --dry-run` to inspect the full
+Use `bash scripts/prepare_thor_jp72_assets.sh --dry-run` to inspect the full
 Cosmos stage plan without mutating the host.
 
 ## 3. Verify native inference first
@@ -129,12 +131,13 @@ cd ros2-VLM-demo
 Options:
 
 ```bash
-bash scripts/setup_thor_jp71.sh --desktop
+bash scripts/setup_thor_jp72.sh --desktop
 bash scripts/install_dependencies.sh --isaac-ros
 ```
 
-Isaac ROS is optional. Version 4.5 is configured in Docker mode to avoid
-replacing the host CUDA, TensorRT, or NVIDIA OpenCV packages.
+Isaac ROS is optional. Version 4.5 is configured in Docker mode with APT
+transaction simulation guards that fail safely if host transactions would remove
+`nvidia-jetpack`, `nvidia-jetpack-dev`, or `nvidia-opencv-dev`.
 
 If Docker group membership changes, log out and back in before continuing.
 
@@ -162,16 +165,18 @@ export EDGELLM_PLUGIN_PATH="$TENSORRT_EDGE_LLM_BUILD_DIR/libNvInfer_edgellm_plug
 cd "$HOME/ros2_ws/src/ros2-VLM-demo"
 source scripts/edge_vlm_env.sh
 source "$ROS_WORKSPACE/install/setup.bash"
-bash scripts/verify_thor_jp71.sh --isaac-ros
+bash scripts/verify_thor_jp72.sh --isaac-ros
 ```
 
 The verifier checks artifacts, engine/plugin loadability, ROS executables, and
-the required process isolation.
+the required process isolation. With `--smoke-image`, it additionally runs
+hardware-only semantic checks (deterministic `2+2` prompt + red-panda prompt)
+so mechanically healthy-but-semantic-garbage outputs fail validation.
 
 To confirm standalone Edge-LLM request/response behavior with a known image:
 
 ```bash
-bash scripts/verify_thor_jp71.sh --isaac-ros --smoke-image /absolute/path/to/image.jpg
+bash scripts/verify_thor_jp72.sh --isaac-ros --smoke-image /absolute/path/to/image.jpg
 ```
 
 Confirm Thor CUDA images if diagnosing architecture errors:

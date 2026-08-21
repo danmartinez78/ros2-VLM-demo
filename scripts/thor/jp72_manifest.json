@@ -3,11 +3,11 @@
     "os": "ubuntu",
     "version": "24.04",
     "arch": "aarch64",
-    "l4t": "# R38 (release), REVISION: 4"
+    "l4t": "# R39 (release), REVISION: 2.0"
   },
   "edge_llm": {
     "repo_url": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
-    "commit": "7f061f21f0a581ba234a1e233c9315b89d8e47d6",
+    "commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
     "cuda_ctk_version": "13.0",
     "default_root": "${HOME}/TensorRT-Edge-LLM",
     "default_build_dir": "${HOME}/TensorRT-Edge-LLM/build",
@@ -22,6 +22,7 @@
       "hf_model_id": "nvidia/Cosmos-Reason2-8B",
       "quantization": "nvfp4",
       "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
+      "modelopt_version": "0.45.0",
       "required_llm_artifacts": [
         "llm.engine",
         "embedding.safetensors",
