@@ -185,7 +185,11 @@ class ThorSetupDryRunTests(unittest.TestCase):
             )
             self.assertIn("DRY-RUN  install_dependencies plan:", result.stdout)
             self.assertIn(
-                "before and after \"isaac-ros init docker\", verify host CUDA/TensorRT/OpenCV package candidates",
+                "before \"isaac-ros init docker\", simulate CUDA/TensorRT/NVIDIA OpenCV transactions",
+                result.stdout,
+            )
+            self.assertIn(
+                "after \"isaac-ros init docker\", verify host CUDA/TensorRT/NVIDIA OpenCV package candidates",
                 result.stdout,
             )
             self.assertIn(
@@ -753,8 +757,8 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
     @staticmethod
     def _set_stack_policy_env(env: dict[str, str]) -> None:
         env["EDGE_VLM_CUDA_PACKAGE_FOR_TEST"] = "cuda-compiler-13-0"
-        env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
-            "libopencv-dev:\n"
+        env["EDGE_VLM_APT_POLICY_NVIDIA_OPENCV_DEV_OUTPUT"] = (
+            "nvidia-opencv-dev:\n"
             "  Installed: 4.8.0-3-g6ef37b4\n"
             "  Candidate: 4.8.0-3-g6ef37b4\n"
         )
@@ -782,7 +786,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             env = os.environ.copy()
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
-            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst nvidia-opencv-dev (4.8.0-3-g6ef37b4)"
             self._set_stack_policy_env(env)
 
             result = subprocess.run(
@@ -813,7 +817,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             env = os.environ.copy()
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(prefs_dir)
-            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst nvidia-opencv-dev (4.8.0-3-g6ef37b4)"
             self._set_stack_policy_env(env)
 
             result = subprocess.run(
@@ -852,7 +856,7 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
                         'if compgen -G "${EDGE_VLM_APT_PREFERENCES_DIR}/isaac-ros-*.pref" >/dev/null; then',
                         '  echo "Remv nvidia-opencv-dev [7.1-b112]"',
                         "else",
-                        '  echo "Inst libopencv-dev (4.8.0-3-g6ef37b4)"',
+                        '  echo "Inst nvidia-opencv-dev (4.8.0-3-g6ef37b4)"',
                         "fi",
                     ]
                 )
@@ -911,10 +915,10 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             env = os.environ.copy()
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(Path(tmpdir) / "preferences.d")
-            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst nvidia-opencv-dev (4.8.0-3-g6ef37b4)"
             self._set_stack_policy_env(env)
-            env["EDGE_VLM_APT_POLICY_LIBOPENCV_DEV_OUTPUT"] = (
-                "libopencv-dev:\n"
+            env["EDGE_VLM_APT_POLICY_NVIDIA_OPENCV_DEV_OUTPUT"] = (
+                "nvidia-opencv-dev:\n"
                 "  Installed: 4.8.0-3-g6ef37b4\n"
                 "  Candidate: 4.6.0+dfsg-12\n"
             )
@@ -928,14 +932,14 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Candidate version for OpenCV development package", result.stderr)
+            self.assertIn("Candidate version for NVIDIA OpenCV development package", result.stderr)
 
     def test_isaac_ros_pref_guard_rejects_tensorrt_candidate_downgrade(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-isaac-prefs-trt-candidate-") as tmpdir:
             env = os.environ.copy()
             env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
             env["EDGE_VLM_APT_PREFERENCES_DIR"] = str(Path(tmpdir) / "preferences.d")
-            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst libopencv-dev (4.8.0-3-g6ef37b4)"
+            env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst nvidia-opencv-dev (4.8.0-3-g6ef37b4)"
             self._set_stack_policy_env(env)
             env["EDGE_VLM_APT_POLICY_LIBNVINFER_DEV_OUTPUT"] = (
                 "libnvinfer-dev:\n"
@@ -953,6 +957,33 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Candidate version for TensorRT development package", result.stderr)
+
+    def test_isaac_ros_pref_guard_pre_jetpack_allows_missing_opencv_stack(self) -> None:
+        env = os.environ.copy()
+        env["EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE"] = "1"
+        env["EDGE_VLM_ISAAC_PREF_GUARD_PHASE"] = "pre-jetpack-install"
+        env["EDGE_VLM_APT_SIMULATION_OUTPUT"] = "Inst nvidia-opencv-dev (4.8.0-3-g6ef37b4)"
+        env["EDGE_VLM_APT_POLICY_NVIDIA_OPENCV_DEV_OUTPUT"] = (
+            "nvidia-opencv-dev:\n"
+            "  Installed: (none)\n"
+            "  Candidate: 4.8.0-3-g6ef37b4\n"
+        )
+        env["EDGE_VLM_APT_POLICY_LIBNVINFER_DEV_OUTPUT"] = (
+            "libnvinfer-dev:\n"
+            "  Installed: (none)\n"
+            "  Candidate: 10.0.1-1+cuda13.0\n"
+        )
+
+        result = subprocess.run(
+            ["bash", str(INSTALL_DEPENDENCIES_SCRIPT), "--force"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
 
 
 class DownloadRosbagsArchiveFormatTests(unittest.TestCase):

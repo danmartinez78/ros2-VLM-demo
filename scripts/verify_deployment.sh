@@ -97,11 +97,15 @@ fi
 
 check "rosdep" command -v rosdep
 check "colcon" command -v colcon
-check "OpenCV development package" dpkg-query -W libopencv-dev
 check "NVIDIA OpenCV development package" dpkg-query -W nvidia-opencv-dev
+if dpkg-query -W libopencv-dev >/dev/null 2>&1; then
+  printf 'PASS  Optional Ubuntu OpenCV development package\n'
+else
+  printf 'INFO  Optional Ubuntu OpenCV development package is not installed (expected on Thor JP7.2.x path)\n'
+fi
 check "OpenCV transaction preserves protected NVIDIA packages" \
-  assert_safe_apt_transaction "deployment verification OpenCV safety" libopencv-dev
-check "OpenCV candidate matches installed version" assert_libopencv_candidate_matches_installed
+  assert_safe_apt_transaction "deployment verification OpenCV safety" nvidia-opencv-dev
+check "NVIDIA OpenCV candidate matches installed version" assert_nvidia_opencv_candidate_matches_installed
 if cuda_owner_pkg="$(resolve_nvcc_owner_package 2>/dev/null)"; then
   check "CUDA transaction preserves protected NVIDIA packages (${cuda_owner_pkg})" \
     assert_safe_apt_transaction "deployment verification CUDA safety" "${cuda_owner_pkg}"

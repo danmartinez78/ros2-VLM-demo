@@ -108,6 +108,10 @@ assert_libopencv_candidate_matches_installed() {
   assert_package_candidate_matches_installed "libopencv-dev" "OpenCV development package"
 }
 
+assert_nvidia_opencv_candidate_matches_installed() {
+  assert_package_candidate_matches_installed "nvidia-opencv-dev" "NVIDIA OpenCV development package"
+}
+
 resolve_nvcc_owner_package() {
   local nvcc_bin=""
   local nvcc_path

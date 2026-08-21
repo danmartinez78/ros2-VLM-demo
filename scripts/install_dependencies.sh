@@ -31,6 +31,7 @@ collect_isaac_ros_pref_files() {
 
 assert_isaac_ros_preferences_compatible() {
   local stage="$1"
+  local stack_phase="${2:-post-jetpack-install}"
   local pref_file
   local pref_files=()
   while IFS= read -r pref_file; do
@@ -43,29 +44,44 @@ assert_isaac_ros_preferences_compatible() {
     printf '  %s\n' "${pref_files[@]}"
   fi
 
-  if ! assert_host_jetpack_stack_safe; then
+  if ! assert_host_jetpack_stack_safe "${stack_phase}"; then
     fail \
       "APT candidate simulation indicates incompatible host package pinning during ${stage}. Review Isaac ROS host preferences under ${APT_PREFERENCES_DIR} and ensure they do not downgrade or remove protected JetPack packages (${PROTECTED_NVIDIA_PACKAGES[*]})."
   fi
 }
 
 assert_host_jetpack_stack_safe() {
+  local stack_phase="${1:-post-jetpack-install}"
   local cuda_owner_pkg="${EDGE_VLM_CUDA_PACKAGE_FOR_TEST:-}"
+  local require_installed_stack=1
+  if [[ "${stack_phase}" == "pre-jetpack-install" ]]; then
+    require_installed_stack=0
+  fi
 
-  assert_safe_apt_transaction "host OpenCV safety check" libopencv-dev
-  assert_package_candidate_matches_installed libopencv-dev "OpenCV development package"
+  assert_safe_apt_transaction "host NVIDIA OpenCV safety check" nvidia-opencv-dev
+  if [[ "${require_installed_stack}" -eq 1 ]]; then
+    assert_package_candidate_matches_installed nvidia-opencv-dev "NVIDIA OpenCV development package"
+  fi
 
   assert_safe_apt_transaction "host TensorRT safety check" libnvinfer-dev
-  assert_package_candidate_matches_installed libnvinfer-dev "TensorRT development package"
+  if [[ "${require_installed_stack}" -eq 1 ]]; then
+    assert_package_candidate_matches_installed libnvinfer-dev "TensorRT development package"
+  fi
 
   if [[ -z "${cuda_owner_pkg}" ]]; then
     cuda_owner_pkg="$(resolve_nvcc_owner_package || true)"
   fi
-  [[ -n "${cuda_owner_pkg}" ]] || fail \
-    "Unable to resolve the installed CUDA package owning nvcc. Ensure the JP7.2 CUDA toolkit is installed before enabling Isaac ROS Docker mode."
+  if [[ -z "${cuda_owner_pkg}" ]]; then
+    if [[ "${require_installed_stack}" -eq 1 ]]; then
+      fail "Unable to resolve the installed CUDA package owning nvcc. Ensure the JP7.2 CUDA toolkit is installed before enabling Isaac ROS Docker mode."
+    fi
+    return 0
+  fi
 
   assert_safe_apt_transaction "host CUDA safety check (${cuda_owner_pkg})" "${cuda_owner_pkg}"
-  assert_package_candidate_matches_installed "${cuda_owner_pkg}" "CUDA compiler package"
+  if [[ "${require_installed_stack}" -eq 1 ]]; then
+    assert_package_candidate_matches_installed "${cuda_owner_pkg}" "CUDA compiler package"
+  fi
 }
 
 usage() {
@@ -138,7 +154,9 @@ DRY-RUN  install_dependencies plan:
     - install ROS apt source + ${ros_variant}
     - install build/rosdep dependencies
     - optionally configure Isaac ROS Docker mode (if --isaac-ros)
-      - before and after "isaac-ros init docker", verify host CUDA/TensorRT/OpenCV package candidates
+      - before "isaac-ros init docker", simulate CUDA/TensorRT/NVIDIA OpenCV transactions and
+        block protected-package downgrade/removal pressure on a fresh host
+      - after "isaac-ros init docker", verify host CUDA/TensorRT/NVIDIA OpenCV package candidates
         remain aligned with installed JP7.2 packages and protected NVIDIA metapackages
       - if Isaac ROS host preference files are present, fail safely when candidate simulation indicates
         downgrade/removal pressure instead of mutating supported JP7.2 pin files
@@ -166,14 +184,15 @@ if [[ "${EDGE_VLM_APT_GUARD_TEST_MODE:-0}" == "1" ]]; then
 fi
 
 if [[ "${EDGE_VLM_ISAAC_PREF_GUARD_TEST_MODE:-0}" == "1" ]]; then
-  assert_isaac_ros_preferences_compatible "Isaac preference guard test mode"
+  guard_phase="${EDGE_VLM_ISAAC_PREF_GUARD_PHASE:-post-jetpack-install}"
+  assert_isaac_ros_preferences_compatible "Isaac preference guard test mode" "${guard_phase}"
   echo "Isaac ROS host preference guard test passed."
   exit 0
 fi
 
 sudo -v
 if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
-  assert_isaac_ros_preferences_compatible "pre-Isaac initialization host check"
+  assert_isaac_ros_preferences_compatible "pre-Isaac initialization host check" "pre-jetpack-install"
 fi
 sudo apt-get update
 bootstrap_packages=(
@@ -274,7 +293,7 @@ if [[ "${INSTALL_ISAAC_ROS}" -eq 1 ]]; then
   # host-side TensorRT Edge-LLM stack from Isaac ROS package version pins.
   # Initialization writes system configuration and therefore requires root.
   sudo isaac-ros init docker
-  assert_isaac_ros_preferences_compatible "post-isaac-ros init docker host check"
+  assert_isaac_ros_preferences_compatible "post-isaac-ros init docker host check" "post-jetpack-install"
 
   echo
   echo "Isaac ROS Docker mode initialized."
