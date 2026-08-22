@@ -113,7 +113,7 @@ def _build_rtdetr_launch(context, *args, **kwargs):
                 SetRemap(src='/detections_output', dst=LaunchConfiguration('detections_topic')),
                 rtdetr_launch,
             ],
-            scoped=True,
+            scoped=False,
         )
     ]
 
