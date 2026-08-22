@@ -69,15 +69,17 @@ class ThorSetupManifestTests(unittest.TestCase):
 
 
 class ThorLaunchWiringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.launch_source = THOR_TRACKED_OBSERVATION_LAUNCH.read_text(encoding="utf-8")
+
     def test_rtdetr_launch_passes_model_and_engine_paths(self) -> None:
-        launch_source = THOR_TRACKED_OBSERVATION_LAUNCH.read_text(encoding="utf-8")
-        self.assertIn("'model_file_path': LaunchConfiguration('rtdetr_model_file_path')", launch_source)
-        self.assertIn("'engine_file_path': LaunchConfiguration('rtdetr_engine_file_path')", launch_source)
+        self.assertIn("'model_file_path': LaunchConfiguration('rtdetr_model_file_path')", self.launch_source)
+        self.assertIn("'engine_file_path': LaunchConfiguration('rtdetr_engine_file_path')", self.launch_source)
 
     def test_rtdetr_launch_remaps_native_isaac_topics(self) -> None:
-        launch_source = THOR_TRACKED_OBSERVATION_LAUNCH.read_text(encoding="utf-8")
-        self.assertIn("SetRemap(src='/image', dst=LaunchConfiguration('image_topic'))", launch_source)
-        self.assertIn("SetRemap(src='/detections_output', dst=LaunchConfiguration('detections_topic'))", launch_source)
+        self.assertIn("SetRemap(src='/image', dst=LaunchConfiguration('image_topic'))", self.launch_source)
+        self.assertIn("SetRemap(src='/detections_output', dst=LaunchConfiguration('detections_topic'))", self.launch_source)
 
 
 class RosSetupGuardTests(unittest.TestCase):
