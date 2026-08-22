@@ -43,7 +43,7 @@ specific low-level root-cause claim would be speculation.
 | Jetson Linux / JetPack | R39.2 / 7.2 |
 | CUDA / driver | 13.2 / 595.78 |
 | ROS 2 | Jazzy |
-| Isaac ROS | 4.5 tooling; JetPack 7.2 combination outside the listed validation matrix |
+| Isaac ROS | 4.5 tooling at incident time (current JP7.2 bootstrap targets Isaac ROS 4.6) |
 | Model | Cosmos-Reason2-8B, NVFP4 |
 | Engine limits | 1024-token input, 4096-token KV capacity |
 

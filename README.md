@@ -2,11 +2,13 @@
 
 ROS 2 Jazzy pipeline for NVIDIA Jetson AGX Thor that samples raw camera frames,
 runs a TensorRT Edge-LLM VLM through a model-neutral IPC worker, and publishes
-structured vision-language results. Validated model configurations include
+structured vision-language results. Supported model configurations include
 NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
-The hardware path has been validated on JetPack 7.2 / Jetson Linux R39.2 with a
-Cosmos-Reason2-8B NVFP4 engine and an NVIDIA Isaac ROS image-proc rosbag.
+The hardware path is retargeted to JetPack 7.2.x / Jetson Linux R39.2.x with a
+Cosmos-Reason2-8B NVFP4 engine and NVIDIA Isaac ROS assets, and has now been
+hardware-validated end-to-end on AGX Thor at
+`38106dd43c25aa0eccc66be5b5cdd997d221c1fa`.
 
 ## Architecture
 
@@ -37,27 +39,29 @@ See [docs/architecture.md](docs/architecture.md) for the detailed design and
 [docs/thor-edge-llm-prefill-stall-rca.md](docs/thor-edge-llm-prefill-stall-rca.md)
 for the investigation and evidence.
 
-## Validated platform
+## Supported target baseline
 
-| Component | Validated configuration |
+| Component | Target configuration |
 | --- | --- |
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
-| JetPack / Jetson Linux | JetPack 7.2 / R39.2 |
-| CUDA | 13.2 |
+| JetPack / Jetson Linux | JetPack 7.2.x / R39.2.x (hardware-validated target baseline) |
+| CUDA | Host toolkit: 13.2 (JP7.2.x baseline); Thor Edge-LLM CMake profile: `CUDA_CTK_VERSION=13.0` |
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
 | Model | Cosmos-Reason2-8B, NVFP4 |
-| Isaac ROS | 4.5 Docker tooling optional; JetPack 7.2 combination remains outside NVIDIA's listed validation matrix |
+| Isaac ROS | 4.6 Docker tooling optional (RT-DETR path) |
 
-Other compatible models may work, but they have not yet been validated here.
+Other compatible models may work, but they have not yet been hardware-verified here.
+Latest fresh-flash preflight observation on Thor: `# R39 (release), REVISION: 2.1`.
 Model portability and optimization are tracked in
 [#9](https://github.com/danmartinez78/ros2-VLM-demo/issues/9).
 
-## Quick start on a prepared Thor
+The prior JP7.1 path is intentionally abandoned for this PR branch because native
+Edge-LLM semantic inference was not reliable there, and current Isaac ROS Thor
+support targets JP7.2.
 
-This assumes TensorRT Edge-LLM and the Cosmos engine bundle are already built
-on the Thor.
+## Quick start on a fresh Thor
 
 ```bash
 mkdir -p "$HOME/ros2_ws/src"
@@ -65,22 +69,29 @@ cd "$HOME/ros2_ws/src"
 git clone https://github.com/danmartinez78/ros2-VLM-demo.git
 cd ros2-VLM-demo
 
-bash scripts/setup_deployment.sh
+bash scripts/setup_thor_jp72.sh
 ```
 
-On its first run, setup installs the system dependencies and creates:
+Setup installs dependencies, pins/builds TensorRT Edge-LLM, prepares model/data
+layout, installs RT-DETR model assets, and generates `scripts/edge_vlm_env.sh`.
+On a fresh flash, if setup reports that Docker group membership is newly
+configured but not active in the current shell, log out/in and rerun the same
+setup command.
+Before first run, accept the gated Cosmos license and authenticate with
+Hugging Face (`huggingface-cli login`) on the Thor host.
 
-```text
-scripts/edge_vlm_env.sh
-```
-
-Review the paths in that file, then run:
+The deployment verifier can be re-run independently:
 
 ```bash
 source scripts/edge_vlm_env.sh
-bash scripts/build_workspace.sh
 source "$ROS_WORKSPACE/install/setup.bash"
-bash scripts/verify_deployment.sh
+bash scripts/verify_thor_jp72.sh --isaac-ros
+```
+
+Optional standalone Edge-LLM smoke check:
+
+```bash
+bash scripts/verify_thor_jp72.sh --isaac-ros --smoke-image /absolute/path/to/image.jpg
 ```
 
 The verifier confirms both executables are installed and enforces the process
@@ -171,18 +182,22 @@ Optional overrides:
 - `detections_topic:=...`
 - `tracked_observation_topic:=...`
 - `start_rtdetr:=true`
+- `rtdetr_model_file_path:=/absolute/path/to/sdetr_grasp.onnx`
+- `rtdetr_engine_file_path:=/absolute/path/to/sdetr_grasp.plan`
 - `enable_rviz:=false`
 - `use_sim_time:=false`
 
 Set `start_rtdetr:=true` to launch the repository-owned Isaac ROS RT-DETR
-backend directly from this entrypoint. When enabled, the launch wires
-`/camera0/color/image_raw` (or your `image_topic`) into RT-DETR and remaps its
-`vision_msgs/msg/Detection2DArray` output to `/detections`.
+backend directly from this entrypoint. When enabled, the launch remaps the
+Isaac ROS 4.6 native RT-DETR topics (`/image` input and `/detections_output`
+output) to your configured `image_topic` / `detections_topic`, and passes
+`model_file_path` + `engine_file_path` to the Isaac sublaunch. Defaults point
+to `${ISAAC_ROS_WS:-$HOME/ros2_ws}/isaac_ros_assets/models/synthetica_detr/`.
 
 The launch fails early with a clear error if RViz2, the RViz config, or any
 required engine/plugin path is missing. When `start_rtdetr:=true`, it also
-fails early if the supported Isaac ROS RT-DETR packages or launch files are not
-installed.
+fails early if the supported Isaac ROS RT-DETR packages/launch files or
+RT-DETR model/engine files are missing.
 
 ## NVIDIA test data
 
@@ -487,6 +502,10 @@ Do not install Ubuntu/ROS image packages when APT proposes removing
 `nvidia-jetpack`, `nvidia-jetpack-dev`, or `nvidia-opencv-dev`. The production
 node intentionally avoids `cv_bridge` so ROS OpenCV 4.6 and NVIDIA OpenCV 4.8
 are not loaded into the same process.
+In the Docker-mode Isaac ROS path, setup neutralizes only the incompatible
+`isaac-ros-opencv-4-6.pref` host pin when it drives an OpenCV downgrade plan,
+and keeps other compatible Isaac ROS preference pins active. Do not bypass this
+with `--allow-downgrades`.
 
 ### No camera messages
 

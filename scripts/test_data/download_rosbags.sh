@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ISAAC_ROS_MAJOR=4
-ISAAC_ROS_MINOR=5
+ISAAC_ROS_MINOR=6
 NGC_ORG="nvidia"
 NGC_TEAM="isaac"
 
@@ -13,10 +13,10 @@ output_root="${ROSBAG_DIR:-${repo_root}/test_data/rosbags}"
 usage() {
   cat <<'EOF'
 Usage: download_rosbags.sh list
-       download_rosbags.sh download <image-proc|h264>
+       download_rosbags.sh download <image-proc|h264|nvblox|rtdetr>
        download_rosbags.sh all
 
-Downloads version-matched NVIDIA Isaac ROS 4.5 quickstart assets from NGC.
+Downloads version-matched NVIDIA Isaac ROS 4.6 quickstart assets from NGC.
 Set ROSBAG_DIR to override the default test_data/rosbags directory.
 EOF
 }
@@ -33,6 +33,8 @@ asset_resource() {
   case "$1" in
     image-proc) echo "isaac_ros_image_proc_assets" ;;
     h264) echo "isaac_ros_h264_decoder_assets" ;;
+    nvblox) echo "isaac_ros_nvblox_assets" ;;
+    rtdetr) echo "isaac_ros_rtdetr_assets" ;;
     *) return 1 ;;
   esac
 }
@@ -41,6 +43,8 @@ asset_description() {
   case "$1" in
     image-proc) echo "Raw RGB + camera info; directly usable by the Cosmos node" ;;
     h264) echo "Dual H.264 CompressedImage streams; requires the Isaac ROS decoder" ;;
+    nvblox) echo "RGB-D bag used by the Isaac ROS nvblox quickstart and tracker demos" ;;
+    rtdetr) echo "RT-DETR quickstart bag (expects isaac_ros_rtdetr/quickstart.bag)" ;;
     *) return 1 ;;
   esac
 }
@@ -108,9 +112,9 @@ download_asset() {
   trap 'if [[ -n "${staging:-}" && -d "${staging}" ]]; then rm -rf -- "${staging}"; fi' ERR
   echo "Downloading ${key} (NGC ${resource} ${version})..."
   curl -fL --retry 3 --retry-delay 2 -C - -o "${archive}" "${download_url}"
-  tar -tzf "${archive}" >/dev/null
+  tar -tf "${archive}" >/dev/null
   mkdir "${staging}"
-  tar -xzf "${archive}" -C "${staging}"
+  tar -xf "${archive}" -C "${staging}"
   printf '%s\n' "${version}" >"${staging}/.ngc-version"
   mv "${staging}" "${target}"
   trap - ERR
@@ -128,7 +132,7 @@ main() {
   case "${1:-}" in
     list)
       printf '%-12s %s\n' "DATASET" "DESCRIPTION"
-      for key in image-proc h264; do
+      for key in image-proc h264 nvblox rtdetr; do
         printf '%-12s %s\n' "${key}" "$(asset_description "${key}")"
       done
       ;;
@@ -139,6 +143,8 @@ main() {
     all)
       download_asset image-proc
       download_asset h264
+      download_asset nvblox
+      download_asset rtdetr
       ;;
     -h|--help|"")
       usage

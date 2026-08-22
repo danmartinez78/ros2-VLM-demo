@@ -20,6 +20,8 @@ fi
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
+source "${script_dir}/apt_transaction_guard.sh"
+source "${script_dir}/ros_setup_guard.sh"
 
 if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090
@@ -38,6 +40,11 @@ check() {
   fi
 }
 
+is_supported_l4t_release() {
+  local release_line="${1:-}"
+  [[ "${release_line}" =~ ^#\ R39\ \(release\),\ REVISION:\ 2\.[0-9]+([[:space:],].*)?$ ]]
+}
+
 ros_distro="${ROS_DISTRO:-jazzy}"
 edge_root="${TENSORRT_EDGE_LLM_ROOT:-${HOME}/TensorRT-Edge-LLM}"
 edge_build="${TENSORRT_EDGE_LLM_BUILD_DIR:-${edge_root}/build}"
@@ -48,17 +55,33 @@ multimodal_engine="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-${edge_vlm_workspace}/${mod
 plugin_path="${EDGELLM_PLUGIN_PATH:-${edge_build}/libNvInfer_edgellm_plugin.so}"
 l4t_release="$(sed -n '1p' /etc/nv_tegra_release 2>/dev/null || true)"
 
+if [[ "${EDGE_VLM_L4T_GATE_TEST_MODE:-0}" == "1" ]]; then
+  test_release="${EDGE_VLM_L4T_GATE_RELEASE:-${l4t_release}}"
+  if is_supported_l4t_release "${test_release}"; then
+    echo "L4T gate accepted release: ${test_release}"
+    exit 0
+  fi
+  echo "L4T gate rejected release: ${test_release}" >&2
+  exit 1
+fi
+
 check "Ubuntu 24.04" bash -c 'source /etc/os-release && [[ "$ID" == ubuntu && "$VERSION_ID" == 24.04 ]]'
 check "aarch64 architecture" bash -c '[[ "$(uname -m)" == aarch64 ]]'
-check "Jetson Linux R39.2" grep -q '# R39 (release), REVISION: 2' /etc/nv_tegra_release
+check "Jetson Linux R39.2.x (JetPack 7.2.x)" is_supported_l4t_release "${l4t_release}"
 check "JetPack metapackage" dpkg-query -W nvidia-jetpack
+check "JetPack developer metapackage" dpkg-query -W nvidia-jetpack-dev
 check "CUDA compiler" bash -c 'export PATH=/usr/local/cuda/bin:$PATH; command -v nvcc && nvcc --version'
 check "TensorRT development headers" bash -c 'test -f /usr/include/NvInfer.h || test -f /usr/include/aarch64-linux-gnu/NvInfer.h'
+check "TensorRT development package" dpkg-query -W libnvinfer-dev
+check "TensorRT transaction preserves protected NVIDIA packages" \
+  assert_safe_apt_transaction "deployment verification TensorRT safety" libnvinfer-dev
+check "TensorRT candidate matches installed version" \
+  assert_package_candidate_matches_installed libnvinfer-dev "TensorRT development package"
 check "ROS 2 Jazzy setup" test -f "/opt/ros/${ros_distro}/setup.bash"
 
 if [[ "${VERIFY_ISAAC_ROS}" -eq 1 ]]; then
-  check "Isaac ROS 4.5 Thor APT source" grep -Fxq \
-    "deb [signed-by=/usr/share/keyrings/nvidia-isaac-ros.gpg] https://isaac.download.nvidia.com/isaac-ros/release-4.5 noble-jetpack main" \
+  check "Isaac ROS 4.6 Thor APT source" grep -Fxq \
+    "deb [signed-by=/usr/share/keyrings/nvidia-isaac-ros.gpg] https://isaac.download.nvidia.com/isaac-ros/release-4.6 noble-jetpack main" \
     /etc/apt/sources.list.d/nvidia-isaac-ros.list
   check "Isaac ROS CLI package" dpkg-query -W isaac-ros-cli
   check "Isaac ROS CLI" isaac-ros --help
@@ -66,15 +89,31 @@ if [[ "${VERIFY_ISAAC_ROS}" -eq 1 ]]; then
   check "Docker service" systemctl is-active --quiet docker
   check "Docker CLI" command -v docker
 
-  if [[ "${l4t_release:-}" == *"# R39 (release), REVISION: 2"* ]]; then
-    printf 'WARN  Isaac ROS 4.5 is not yet officially validated on JetPack 7.2 / R39.2\n'
-    printf '      NVIDIA currently lists JetPack 7.1 / R38.4 for Jetson Thor.\n'
+  if ! is_supported_l4t_release "${l4t_release:-}"; then
+    printf 'WARN  Isaac ROS Thor support expects JetPack 7.2.x / R39.2.x.\n'
+    printf '      This host reports: %s\n' "${l4t_release:-unknown}"
   fi
 fi
 
 check "rosdep" command -v rosdep
 check "colcon" command -v colcon
-check "OpenCV development package" dpkg-query -W libopencv-dev
+check "NVIDIA OpenCV development package" dpkg-query -W nvidia-opencv-dev
+if dpkg-query -W libopencv-dev >/dev/null 2>&1; then
+  printf 'PASS  Optional Ubuntu OpenCV development package\n'
+else
+  printf 'INFO  Optional Ubuntu OpenCV development package is not installed (expected on Thor JP7.2.x path)\n'
+fi
+check "OpenCV transaction preserves protected NVIDIA packages" \
+  assert_safe_apt_transaction "deployment verification OpenCV safety" nvidia-opencv-dev
+check "NVIDIA OpenCV candidate matches installed version" assert_nvidia_opencv_candidate_matches_installed
+if cuda_owner_pkg="$(resolve_nvcc_owner_package 2>/dev/null)"; then
+  check "CUDA transaction preserves protected NVIDIA packages (${cuda_owner_pkg})" \
+    assert_safe_apt_transaction "deployment verification CUDA safety" "${cuda_owner_pkg}"
+  check "CUDA package candidate matches installed version (${cuda_owner_pkg})" \
+    assert_package_candidate_matches_installed "${cuda_owner_pkg}" "CUDA compiler package"
+else
+  check "CUDA compiler package ownership" false
+fi
 check "Edge-LLM runtime header" test -f "${edge_root}/cpp/runtime/llmInferenceRuntime.h"
 check "Edge-LLM core archive" bash -c 'find "$1" -name libedgellmCore.a -print -quit | grep -q .' _ "${edge_build}"
 check "Edge-LLM plugin" test -f "${plugin_path}"
@@ -90,13 +129,14 @@ else
 fi
 
 if [[ -n "${ros_workspace}" && -f "${ros_workspace}/install/setup.bash" ]]; then
-  # ROS-generated setup scripts may read optional variables without defaults.
-  set +u
-  # shellcheck disable=SC1090
-  source "/opt/ros/${ros_distro}/setup.bash"
-  # shellcheck disable=SC1090
-  source "${ros_workspace}/install/setup.bash"
-  set -u
+  source_ros_setup_nounset_safe "/opt/ros/${ros_distro}/setup.bash" || {
+    printf 'FAIL  Source ROS distro setup\n'
+    failures=$((failures + 1))
+  }
+  source_ros_setup_nounset_safe "${ros_workspace}/install/setup.bash" || {
+    printf 'FAIL  Source ROS workspace setup\n'
+    failures=$((failures + 1))
+  }
 
   check "Installed ROS package" ros2 pkg prefix edge_vlm_ros
   check "Installed reasoner executable" bash -c \

@@ -19,11 +19,11 @@ import os
 
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node, SetRemap
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -84,8 +84,66 @@ def _validate_thor_launch(context, *args, **kwargs):
             raise RuntimeError(f'rviz2 executable not found: {rviz_executable}')
 
     if _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
-        _resolve_isaac_rtdetr_launch()
+        image_topic = LaunchConfiguration('image_topic').perform(context)
+        detections_topic = LaunchConfiguration('detections_topic').perform(context)
+        if not image_topic:
+            raise RuntimeError('image_topic must be non-empty when start_rtdetr:=true')
+        if not detections_topic:
+            raise RuntimeError('detections_topic must be non-empty when start_rtdetr:=true')
+        rtdetr_model_file_path = LaunchConfiguration('rtdetr_model_file_path').perform(context)
+        rtdetr_engine_file_path = LaunchConfiguration('rtdetr_engine_file_path').perform(context)
+        if not os.path.isabs(rtdetr_model_file_path):
+            raise RuntimeError(
+                'rtdetr_model_file_path must be an absolute path. '
+                f'Got: {rtdetr_model_file_path}.'
+            )
+        if not os.path.exists(rtdetr_model_file_path):
+            raise RuntimeError(
+                'rtdetr_model_file_path does not exist. '
+                f'Got: {rtdetr_model_file_path}. '
+                'Run scripts/prepare_thor_jp72_assets.sh or pass '
+                'rtdetr_model_file_path:=/absolute/path/to/sdetr_grasp.onnx'
+            )
+        if not os.path.isabs(rtdetr_engine_file_path):
+            raise RuntimeError(
+                'rtdetr_engine_file_path must be an absolute path. '
+                f'Got: {rtdetr_engine_file_path}.'
+            )
+        if not os.path.exists(rtdetr_engine_file_path):
+            raise RuntimeError(
+                'rtdetr_engine_file_path does not exist. '
+                f'Got: {rtdetr_engine_file_path}. '
+                'Run scripts/prepare_thor_jp72_assets.sh or pass '
+                'rtdetr_engine_file_path:=/absolute/path/to/sdetr_grasp.plan'
+            )
     return []
+
+
+def _build_rtdetr_launch(context, *args, **kwargs):
+    if not _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
+        return []
+    image_topic = LaunchConfiguration('image_topic').perform(context)
+    detections_topic = LaunchConfiguration('detections_topic').perform(context)
+
+    rtdetr_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(_resolve_isaac_rtdetr_launch()),
+        launch_arguments={
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'model_file_path': LaunchConfiguration('rtdetr_model_file_path'),
+            'engine_file_path': LaunchConfiguration('rtdetr_engine_file_path'),
+        }.items(),
+    )
+
+    return [
+        GroupAction(
+            actions=[
+                SetRemap(src='/image', dst=image_topic),
+                SetRemap(src='/detections_output', dst=detections_topic),
+                rtdetr_launch,
+            ],
+            scoped=True,
+        )
+    ]
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -101,11 +159,14 @@ def generate_launch_description() -> LaunchDescription:
     multimodal_engine_dir = LaunchConfiguration('multimodal_engine_dir')
     edge_llm_plugin_path = LaunchConfiguration('edge_llm_plugin_path')
     enable_rviz = LaunchConfiguration('enable_rviz')
-    start_rtdetr = LaunchConfiguration('start_rtdetr')
 
     rviz_config = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'rviz', 'vision_reasoning_results.rviz'
     ])
+    default_isaac_ros_ws = EnvironmentVariable(
+        'ISAAC_ROS_WS',
+        default_value=os.path.join(os.path.expanduser('~'), 'ros2_ws'),
+    )
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
@@ -120,7 +181,28 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('llm_engine_dir', default_value=''),
         DeclareLaunchArgument('multimodal_engine_dir', default_value=''),
         DeclareLaunchArgument('edge_llm_plugin_path', default_value=''),
+        DeclareLaunchArgument(
+            'rtdetr_model_file_path',
+            default_value=PathJoinSubstitution([
+                default_isaac_ros_ws,
+                'isaac_ros_assets',
+                'models',
+                'synthetica_detr',
+                'sdetr_grasp.onnx',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'rtdetr_engine_file_path',
+            default_value=PathJoinSubstitution([
+                default_isaac_ros_ws,
+                'isaac_ros_assets',
+                'models',
+                'synthetica_detr',
+                'sdetr_grasp.plan',
+            ]),
+        ),
         OpaqueFunction(function=_validate_thor_launch),
+        OpaqueFunction(function=_build_rtdetr_launch),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(base_launch),
             launch_arguments={
@@ -135,19 +217,6 @@ def generate_launch_description() -> LaunchDescription:
                 'multimodal_engine_dir': multimodal_engine_dir,
                 'edge_llm_plugin_path': edge_llm_plugin_path,
             }.items(),
-        ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(_resolve_isaac_rtdetr_launch()),
-            launch_arguments={
-                'use_sim_time': use_sim_time,
-                'image_topic': image_topic,
-                'input_image_topic': image_topic,
-                'camera_image_topic': image_topic,
-                'detections_topic': detections_topic,
-                'output_detections_topic': detections_topic,
-                'detection2_d_array_topic': detections_topic,
-            }.items(),
-            condition=IfCondition(start_rtdetr),
         ),
         Node(
             package='edge_vlm_ros',

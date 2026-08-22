@@ -4,6 +4,8 @@ set -Eeuo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/.." && pwd)"
 env_file="${EDGE_VLM_ENV_FILE:-${script_dir}/edge_vlm_env.sh}"
+source "${script_dir}/apt_transaction_guard.sh"
+source "${script_dir}/ros_setup_guard.sh"
 
 if [[ -f "${env_file}" ]]; then
   # shellcheck disable=SC1090
@@ -16,11 +18,7 @@ if [[ ! -f "${ros_setup}" ]]; then
   echo "ROS 2 ${ros_distro} is not installed. Run scripts/install_dependencies.sh first." >&2
   exit 1
 fi
-# ROS-generated setup scripts may read optional variables without defaults.
-set +u
-# shellcheck disable=SC1090
-source "${ros_setup}"
-set -u
+source_ros_setup_nounset_safe "${ros_setup}" || exit 1
 
 edge_root="${TENSORRT_EDGE_LLM_ROOT:-${HOME}/TensorRT-Edge-LLM}"
 edge_build="${TENSORRT_EDGE_LLM_BUILD_DIR:-${edge_root}/build}"
@@ -55,6 +53,7 @@ if [[ ! -d "${ros_workspace}/src" ]]; then
   exit 1
 fi
 
+assert_safe_rosdep_install_plan "${repo_root}" "${ros_distro}"
 rosdep install \
   --from-paths "${repo_root}" \
   --ignore-src \
