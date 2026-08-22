@@ -10,6 +10,7 @@ output_dir=""
 modes_csv="A,B,C,D,E,F"
 duration_seconds=90
 tegrastats_interval_ms=1000
+startup_wait_seconds=12
 enable_rviz=false
 manual_trigger_command=""
 dry_run=false
@@ -23,6 +24,7 @@ Options:
   --modes CSV                   Modes to run (default: A,B,C,D,E,F)
   --duration-seconds N          Per-run benchmark duration (default: 90)
   --tegrastats-interval-ms N    tegrastats polling interval (default: 1000)
+  --startup-wait-seconds N      Wait after launch before measurements (default: 12)
   --manual-trigger-command CMD  Optional command for mode F manual trigger
   --enable-rviz                 Enable RViz in launched stacks (default: disabled)
   --dry-run                     Print commands without executing
@@ -45,6 +47,7 @@ while (($#)); do
     --modes) modes_csv="$2"; shift 2 ;;
     --duration-seconds) duration_seconds="$2"; shift 2 ;;
     --tegrastats-interval-ms) tegrastats_interval_ms="$2"; shift 2 ;;
+    --startup-wait-seconds) startup_wait_seconds="$2"; shift 2 ;;
     --manual-trigger-command) manual_trigger_command="$2"; shift 2 ;;
     --enable-rviz) enable_rviz=true; shift ;;
     --dry-run) dry_run=true; shift ;;
@@ -56,6 +59,7 @@ done
 [[ -n "${rosbag_path}" ]] || { echo "--rosbag-path is required" >&2; exit 2; }
 [[ "${duration_seconds}" =~ ^[1-9][0-9]*$ ]] || { echo "duration must be positive integer" >&2; exit 2; }
 [[ "${tegrastats_interval_ms}" =~ ^[1-9][0-9]*$ ]] || { echo "tegrastats interval must be positive integer" >&2; exit 2; }
+[[ "${startup_wait_seconds}" =~ ^[1-9][0-9]*$ ]] || { echo "startup wait must be positive integer" >&2; exit 2; }
 
 if [[ -z "${output_dir}" ]]; then
   output_dir="/tmp/thor_pipeline_bench_$(date -u +%Y%m%d_%H%M%S)"
@@ -148,29 +152,35 @@ mode_description() {
   esac
 }
 
-launch_command_for_mode() {
+build_launch_args_for_mode() {
   local mode="$1"
   local bench_file="$2"
-  local common="use_sim_time:=true llm_engine_dir:=${EDGE_VLM_LLM_ENGINE_DIR} multimodal_engine_dir:=${EDGE_VLM_MULTIMODAL_ENGINE_DIR} edge_llm_plugin_path:=${EDGELLM_PLUGIN_PATH} benchmark_output_file:=${bench_file}"
-  local thor_common="enable_rviz:=${enable_rviz} ${common}"
+  local common=(
+    "use_sim_time:=true"
+    "llm_engine_dir:=${EDGE_VLM_LLM_ENGINE_DIR}"
+    "multimodal_engine_dir:=${EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
+    "edge_llm_plugin_path:=${EDGELLM_PLUGIN_PATH}"
+    "benchmark_output_file:=${bench_file}"
+  )
+  local thor_common=("enable_rviz:=${enable_rviz}" "${common[@]}")
   case "${mode}" in
     A)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     B)
-      echo "ros2 launch edge_vlm_ros edge_vlm.launch.py image_topic:=/camera0/color/image_raw result_topic:=/vlm/result sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 ${common}"
+      launch_args=(ros2 launch edge_vlm_ros edge_vlm.launch.py image_topic:=/camera0/color/image_raw result_topic:=/vlm/result sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 "${common[@]}")
       ;;
     C)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     D)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=1.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=1.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     E)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=2.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=2.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     F)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     *)
       return 1
@@ -183,6 +193,8 @@ IFS=',' read -r -a modes <<< "${modes_csv}"
 echo "Thor pipeline benchmark root: ${output_dir}"
 echo "Modes: ${modes_csv}"
 
+git_sha="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
+
 for mode in "${modes[@]}"; do
   mode="$(echo "${mode}" | xargs)"
   [[ -n "${mode}" ]] || continue
@@ -193,13 +205,19 @@ for mode in "${modes[@]}"; do
   tegra_log="${run_dir}/tegrastats.log"
   bench_file="${run_dir}/benchmark.jsonl"
 
-  launch_cmd="$(launch_command_for_mode "${mode}" "${bench_file}")" || {
+  launch_args=()
+  build_launch_args_for_mode "${mode}" "${bench_file}" || {
     echo "Skipping unknown mode '${mode}'" >&2
     continue
   }
 
-  git_sha="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
-  manual_trigger_json="$(python3 -c 'import json,sys; v=sys.argv[1]; print("null" if v == "" else json.dumps(v))' "${manual_trigger_command}")"
+  manual_trigger_json="$(MANUAL_TRIGGER_COMMAND="${manual_trigger_command}" python3 - <<'PY'
+import json
+import os
+value = os.environ.get("MANUAL_TRIGGER_COMMAND", "")
+print("null" if value == "" else json.dumps(value))
+PY
+)"
   cat > "${run_dir}/run_config.json" <<EOF
 {
   "run_id": "run_${mode}",
@@ -214,7 +232,9 @@ for mode in "${modes[@]}"; do
 EOF
 
   echo "==> Mode ${mode}: $(mode_description "${mode}")"
-  echo "    Launch: ${launch_cmd}"
+  printf "    Launch: "
+  printf "%q " "${launch_args[@]}"
+  echo
 
   cleanup_pids=()
 
@@ -223,17 +243,17 @@ EOF
     (tegrastats --interval "${tegrastats_interval_ms}" > "${tegra_log}" 2>&1) &
     cleanup_pids+=("$!")
 
-    bash -lc "exec ${launch_cmd}" > "${launch_log}" 2>&1 &
+    "${launch_args[@]}" > "${launch_log}" 2>&1 &
     launch_pid=$!
     cleanup_pids+=("${launch_pid}")
 
-    sleep 12
+    sleep "${startup_wait_seconds}"
 
-    timeout "${duration_seconds}" ros2 topic hz /detections > "${run_dir}/detections_hz.log" 2>&1 &
+    ros2 topic hz /detections > "${run_dir}/detections_hz.log" 2>&1 &
     cleanup_pids+=("$!")
-    timeout "${duration_seconds}" ros2 topic hz /tracked_observation > "${run_dir}/tracked_observation_hz.log" 2>&1 &
+    ros2 topic hz /tracked_observation > "${run_dir}/tracked_observation_hz.log" 2>&1 &
     cleanup_pids+=("$!")
-    timeout "${duration_seconds}" ros2 topic hz /vlm/result > "${run_dir}/vlm_result_hz.log" 2>&1 &
+    ros2 topic hz /vlm/result > "${run_dir}/vlm_result_hz.log" 2>&1 &
     cleanup_pids+=("$!")
 
     if [[ "${mode}" == "F" && -n "${manual_trigger_command}" ]]; then
@@ -241,9 +261,9 @@ EOF
       run_shell "${manual_trigger_command}" > "${run_dir}/manual_trigger.log" 2>&1 || true
     fi
 
-    timeout --signal=INT --kill-after=5 "${duration_seconds}" ros2 bag play "${rosbag_path}" --clock > "${run_dir}/bag_play.log" 2>&1 || true
+    timeout --signal=INT --kill-after=5 "${duration_seconds}" ros2 bag play "${rosbag_path}" --clock --loop > "${run_dir}/bag_play.log" 2>&1 || true
 
-    sleep 5
+    sleep 2
     cleanup
     cleanup_pids=()
 
@@ -255,11 +275,13 @@ EOF
     fi
   else
     echo "[DRY RUN] tegrastats --interval ${tegrastats_interval_ms} > ${tegra_log}"
-    echo "[DRY RUN] ${launch_cmd} > ${launch_log}"
-    echo "[DRY RUN] timeout ${duration_seconds} ros2 bag play ${rosbag_path} --clock"
-    echo "[DRY RUN] timeout ${duration_seconds} ros2 topic hz /detections > ${run_dir}/detections_hz.log"
-    echo "[DRY RUN] timeout ${duration_seconds} ros2 topic hz /tracked_observation > ${run_dir}/tracked_observation_hz.log"
-    echo "[DRY RUN] timeout ${duration_seconds} ros2 topic hz /vlm/result > ${run_dir}/vlm_result_hz.log"
+    printf "[DRY RUN] "
+    printf "%q " "${launch_args[@]}"
+    echo "> ${launch_log}"
+    echo "[DRY RUN] timeout ${duration_seconds} ros2 bag play ${rosbag_path} --clock --loop"
+    echo "[DRY RUN] ros2 topic hz /detections > ${run_dir}/detections_hz.log"
+    echo "[DRY RUN] ros2 topic hz /tracked_observation > ${run_dir}/tracked_observation_hz.log"
+    echo "[DRY RUN] ros2 topic hz /vlm/result > ${run_dir}/vlm_result_hz.log"
     if [[ "${mode}" == "F" && -n "${manual_trigger_command}" ]]; then
       echo "[DRY RUN] ${manual_trigger_command} > ${run_dir}/manual_trigger.log"
     fi

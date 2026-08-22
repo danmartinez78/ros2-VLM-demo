@@ -98,9 +98,9 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
 def parse_topic_hz_log(path: Path) -> float | None:
     if not path.exists():
         return None
-    # ros2 topic hz prints rolling estimates; use the final sample as the
-    # most settled value once publishers/subscribers have warmed up.
-    # Precondition: this log should be a complete capture (not a truncated tail).
+    # ros2 topic hz prints a cumulative rolling average; use the final value as
+    # the run-level average emitted at the end of capture.
+    # Precondition: this log should be complete (not truncated).
     rates = [float(match.group(1)) for match in _RE_TOPIC_HZ.finditer(path.read_text(encoding="utf-8", errors="replace"))]
     return rates[-1] if rates else None
 
