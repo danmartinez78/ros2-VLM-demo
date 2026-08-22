@@ -100,6 +100,7 @@ def parse_topic_hz_log(path: Path) -> float | None:
         return None
     # ros2 topic hz prints rolling estimates; use the final sample as the
     # most settled value once publishers/subscribers have warmed up.
+    # Precondition: this log should be a complete capture (not a truncated tail).
     rates = [float(match.group(1)) for match in _RE_TOPIC_HZ.finditer(path.read_text(encoding="utf-8", errors="replace"))]
     return rates[-1] if rates else None
 

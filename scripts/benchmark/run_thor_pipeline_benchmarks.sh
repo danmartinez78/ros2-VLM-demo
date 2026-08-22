@@ -119,13 +119,16 @@ run_shell() {
 
 cleanup_pids=()
 cleanup() {
-  for pid in "${cleanup_pids[@]:-}"; do
+  if [[ "${#cleanup_pids[@]}" -eq 0 ]]; then
+    return
+  fi
+  for pid in "${cleanup_pids[@]}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill -TERM "${pid}" 2>/dev/null || true
     fi
   done
   sleep 1
-  for pid in "${cleanup_pids[@]:-}"; do
+  for pid in "${cleanup_pids[@]}"; do
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill -KILL "${pid}" 2>/dev/null || true
     fi
@@ -148,25 +151,26 @@ mode_description() {
 launch_command_for_mode() {
   local mode="$1"
   local bench_file="$2"
-  local common="use_sim_time:=true enable_rviz:=${enable_rviz} llm_engine_dir:=${EDGE_VLM_LLM_ENGINE_DIR} multimodal_engine_dir:=${EDGE_VLM_MULTIMODAL_ENGINE_DIR} edge_llm_plugin_path:=${EDGELLM_PLUGIN_PATH} benchmark_output_file:=${bench_file}"
+  local common="use_sim_time:=true llm_engine_dir:=${EDGE_VLM_LLM_ENGINE_DIR} multimodal_engine_dir:=${EDGE_VLM_MULTIMODAL_ENGINE_DIR} edge_llm_plugin_path:=${EDGELLM_PLUGIN_PATH} benchmark_output_file:=${bench_file}"
+  local thor_common="enable_rviz:=${enable_rviz} ${common}"
   case "${mode}" in
     A)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 ${common}"
+      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
       ;;
     B)
-      echo "ros2 launch edge_vlm_ros edge_vlm.launch.py image_topic:=/camera0/color/image_raw result_topic:=/vlm/result sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 llm_engine_dir:=${EDGE_VLM_LLM_ENGINE_DIR} multimodal_engine_dir:=${EDGE_VLM_MULTIMODAL_ENGINE_DIR} edge_llm_plugin_path:=${EDGELLM_PLUGIN_PATH} benchmark_output_file:=${bench_file} use_sim_time:=true"
+      echo "ros2 launch edge_vlm_ros edge_vlm.launch.py image_topic:=/camera0/color/image_raw result_topic:=/vlm/result sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 ${common}"
       ;;
     C)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 ${common}"
+      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
       ;;
     D)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=1.0 min_vlm_interval_seconds:=0.0 ${common}"
+      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=1.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
       ;;
     E)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=2.0 min_vlm_interval_seconds:=0.0 ${common}"
+      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=2.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
       ;;
     F)
-      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 ${common}"
+      echo "ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 ${thor_common}"
       ;;
     *)
       return 1
@@ -219,7 +223,7 @@ EOF
     (tegrastats --interval "${tegrastats_interval_ms}" > "${tegra_log}" 2>&1) &
     cleanup_pids+=("$!")
 
-    run_shell "${launch_cmd} > \"${launch_log}\" 2>&1" &
+    bash -lc "exec ${launch_cmd}" > "${launch_log}" 2>&1 &
     launch_pid=$!
     cleanup_pids+=("${launch_pid}")
 
