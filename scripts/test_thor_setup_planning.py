@@ -19,6 +19,7 @@ APT_GUARD_SCRIPT = REPO_ROOT / "scripts" / "apt_transaction_guard.sh"
 ROS_SETUP_GUARD_SCRIPT = REPO_ROOT / "scripts" / "ros_setup_guard.sh"
 ASSETS_MANIFEST_PATH = REPO_ROOT / "scripts" / "test_data" / "manifests" / "assets_manifest.json"
 DOWNLOAD_ROSBAGS_SCRIPT = REPO_ROOT / "scripts" / "test_data" / "download_rosbags.sh"
+THOR_TRACKED_OBSERVATION_LAUNCH = REPO_ROOT / "launch" / "thor_tracked_observation.launch.py"
 
 
 class ThorSetupManifestTests(unittest.TestCase):
@@ -65,6 +66,18 @@ class ThorSetupManifestTests(unittest.TestCase):
         setup_script = SETUP_SCRIPT.read_text(encoding="utf-8")
         self.assertIn('run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${llm_builder}"', setup_script)
         self.assertIn('run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${visual_builder}"', setup_script)
+
+
+class ThorLaunchWiringTests(unittest.TestCase):
+    def test_rtdetr_launch_passes_model_and_engine_paths(self) -> None:
+        launch_source = THOR_TRACKED_OBSERVATION_LAUNCH.read_text(encoding="utf-8")
+        self.assertIn("'model_file_path': LaunchConfiguration('rtdetr_model_file_path')", launch_source)
+        self.assertIn("'engine_file_path': LaunchConfiguration('rtdetr_engine_file_path')", launch_source)
+
+    def test_rtdetr_launch_remaps_native_isaac_topics(self) -> None:
+        launch_source = THOR_TRACKED_OBSERVATION_LAUNCH.read_text(encoding="utf-8")
+        self.assertIn("SetRemap(src='/image', dst=LaunchConfiguration('image_topic'))", launch_source)
+        self.assertIn("SetRemap(src='/detections_output', dst=LaunchConfiguration('detections_topic'))", launch_source)
 
 
 class RosSetupGuardTests(unittest.TestCase):

@@ -19,11 +19,11 @@ import os
 
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -38,6 +38,33 @@ def _require_existing_path(label: str, path: str) -> None:
         raise RuntimeError(f'{label} must be an absolute path: {path}')
     if not os.path.exists(path):
         raise RuntimeError(f'{label} does not exist: {path}')
+
+
+def _default_isaac_ros_ws() -> str:
+    isaac_ros_ws = os.environ.get('ISAAC_ROS_WS', '')
+    if isaac_ros_ws:
+        return isaac_ros_ws
+    return os.path.join(os.path.expanduser('~'), 'ros2_ws')
+
+
+def _default_rtdetr_model_file_path() -> str:
+    return os.path.join(
+        _default_isaac_ros_ws(),
+        'isaac_ros_assets',
+        'models',
+        'synthetica_detr',
+        'sdetr_grasp.onnx',
+    )
+
+
+def _default_rtdetr_engine_file_path() -> str:
+    return os.path.join(
+        _default_isaac_ros_ws(),
+        'isaac_ros_assets',
+        'models',
+        'synthetica_detr',
+        'sdetr_grasp.plan',
+    )
 
 
 def _resolve_isaac_rtdetr_launch() -> str:
@@ -85,7 +112,36 @@ def _validate_thor_launch(context, *args, **kwargs):
 
     if _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
         _resolve_isaac_rtdetr_launch()
+        rtdetr_model_file_path = LaunchConfiguration('rtdetr_model_file_path').perform(context)
+        rtdetr_engine_file_path = LaunchConfiguration('rtdetr_engine_file_path').perform(context)
+        _require_existing_path('rtdetr_model_file_path', rtdetr_model_file_path)
+        _require_existing_path('rtdetr_engine_file_path', rtdetr_engine_file_path)
     return []
+
+
+def _build_rtdetr_launch(context, *args, **kwargs):
+    if not _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
+        return []
+
+    rtdetr_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(_resolve_isaac_rtdetr_launch()),
+        launch_arguments={
+            'use_sim_time': LaunchConfiguration('use_sim_time'),
+            'model_file_path': LaunchConfiguration('rtdetr_model_file_path'),
+            'engine_file_path': LaunchConfiguration('rtdetr_engine_file_path'),
+        }.items(),
+    )
+
+    return [
+        GroupAction(
+            actions=[
+                SetRemap(src='/image', dst=LaunchConfiguration('image_topic')),
+                SetRemap(src='/detections_output', dst=LaunchConfiguration('detections_topic')),
+                rtdetr_launch,
+            ],
+            scoped=True,
+        )
+    ]
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -101,7 +157,6 @@ def generate_launch_description() -> LaunchDescription:
     multimodal_engine_dir = LaunchConfiguration('multimodal_engine_dir')
     edge_llm_plugin_path = LaunchConfiguration('edge_llm_plugin_path')
     enable_rviz = LaunchConfiguration('enable_rviz')
-    start_rtdetr = LaunchConfiguration('start_rtdetr')
 
     rviz_config = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'rviz', 'vision_reasoning_results.rviz'
@@ -120,7 +175,10 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('llm_engine_dir', default_value=''),
         DeclareLaunchArgument('multimodal_engine_dir', default_value=''),
         DeclareLaunchArgument('edge_llm_plugin_path', default_value=''),
+        DeclareLaunchArgument('rtdetr_model_file_path', default_value=_default_rtdetr_model_file_path()),
+        DeclareLaunchArgument('rtdetr_engine_file_path', default_value=_default_rtdetr_engine_file_path()),
         OpaqueFunction(function=_validate_thor_launch),
+        OpaqueFunction(function=_build_rtdetr_launch),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(base_launch),
             launch_arguments={
@@ -135,19 +193,6 @@ def generate_launch_description() -> LaunchDescription:
                 'multimodal_engine_dir': multimodal_engine_dir,
                 'edge_llm_plugin_path': edge_llm_plugin_path,
             }.items(),
-        ),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(_resolve_isaac_rtdetr_launch()),
-            launch_arguments={
-                'use_sim_time': use_sim_time,
-                'image_topic': image_topic,
-                'input_image_topic': image_topic,
-                'camera_image_topic': image_topic,
-                'detections_topic': detections_topic,
-                'output_detections_topic': detections_topic,
-                'detection2_d_array_topic': detections_topic,
-            }.items(),
-            condition=IfCondition(start_rtdetr),
         ),
         Node(
             package='edge_vlm_ros',

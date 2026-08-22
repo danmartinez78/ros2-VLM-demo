@@ -73,7 +73,7 @@ check "JP7.2 setup entrypoint present" test -x "${script_dir}/setup_thor_jp72.sh
 check "Thor launch entrypoint present" test -f "${repo_root}/launch/thor_tracked_observation.launch.py"
 
 check "RT-DETR launch wiring present" bash -c \
-  'grep -q "_resolve_isaac_rtdetr_launch" "$1" && grep -q "detection2_d_array_topic" "$1"' \
+  'grep -q "_resolve_isaac_rtdetr_launch" "$1" && grep -q "model_file_path" "$1" && grep -q "/detections_output" "$1" && grep -q "/image" "$1"' \
   _ "${repo_root}/launch/thor_tracked_observation.launch.py"
 
 check "Detection timestamp behavior covered by unit test" test -f "${repo_root}/test/test_tracked_observation_adapter.cpp"

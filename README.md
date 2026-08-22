@@ -181,18 +181,22 @@ Optional overrides:
 - `detections_topic:=...`
 - `tracked_observation_topic:=...`
 - `start_rtdetr:=true`
+- `rtdetr_model_file_path:=/absolute/path/to/sdetr_grasp.onnx`
+- `rtdetr_engine_file_path:=/absolute/path/to/sdetr_grasp.plan`
 - `enable_rviz:=false`
 - `use_sim_time:=false`
 
 Set `start_rtdetr:=true` to launch the repository-owned Isaac ROS RT-DETR
-backend directly from this entrypoint. When enabled, the launch wires
-`/camera0/color/image_raw` (or your `image_topic`) into RT-DETR and remaps its
-`vision_msgs/msg/Detection2DArray` output to `/detections`.
+backend directly from this entrypoint. When enabled, the launch remaps the
+Isaac ROS 4.6 native RT-DETR topics (`/image` input and `/detections_output`
+output) to your configured `image_topic` / `detections_topic`, and passes
+`model_file_path` + `engine_file_path` to the Isaac sublaunch. Defaults point
+to `${ISAAC_ROS_WS:-$HOME/ros2_ws}/isaac_ros_assets/models/synthetica_detr/`.
 
 The launch fails early with a clear error if RViz2, the RViz config, or any
 required engine/plugin path is missing. When `start_rtdetr:=true`, it also
-fails early if the supported Isaac ROS RT-DETR packages or launch files are not
-installed.
+fails early if the supported Isaac ROS RT-DETR packages/launch files or
+RT-DETR model/engine files are missing.
 
 ## NVIDIA test data
 
