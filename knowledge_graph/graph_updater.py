@@ -9,7 +9,9 @@ knowledge graph:
                                objects.
 2. ``GraphUpdater.apply``    – validate each proposed mutation, reconcile it
                                with current graph state, and commit accepted
-                               updates atomically (holding the store lock).
+                               updates individually in order (best-effort
+                               reconciliation: one rejected update does not
+                               prevent subsequent updates from being applied).
 
 Design invariants
 -----------------
@@ -195,8 +197,10 @@ class GraphUpdater:
     def apply(self, update_set: GraphUpdateSet) -> ApplyResult:
         """Apply all proposed updates and return an aggregate result.
 
-        Updates are applied in order.  A failure on one update does not
-        prevent subsequent updates from being processed.
+        Updates are applied individually in order (best-effort reconciliation).
+        A failure on one update does not prevent subsequent updates from being
+        processed.  This is *not* an all-or-nothing transaction: each accepted
+        update is committed immediately and independently.
         """
         result = ApplyResult(total=len(update_set.updates))
         for update in update_set.updates:

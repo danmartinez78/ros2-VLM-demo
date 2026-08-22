@@ -54,10 +54,14 @@ from .inference_client import (
     InferenceResult,
     run_inference,
 )
+from knowledge_graph.context_retrieval import RetrievalConfig, retrieve_salient_subgraph
+from knowledge_graph.graph_store import GraphStore
+from knowledge_graph.graph_updater import GraphUpdater, ApplyResult, parse_graph_updates
+from knowledge_graph.prompt_serializer import build_update_instructions, serialize_subgraph
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-_VALID_STRATEGIES = frozenset({"single_frame", "single_frame_observation_history"})
+_VALID_STRATEGIES = frozenset({"single_frame", "single_frame_observation_history", "single_frame_knowledge_graph"})
 _MAX_HISTORY_ENTRIES: int = 256
 _MAX_HISTORY_CHARS: int = 1_000_000
 _MAX_IMAGES: int = 10_000
@@ -165,6 +169,13 @@ class FrameResult:
 
     source_timestamp_ns: Optional[int] = None
     """Timestamp of the source frame in nanoseconds."""
+
+    # ── knowledge-graph integration ───────────────────────────────────────────
+    graph_updates_accepted: int = 0
+    """Number of graph-update proposals accepted and committed for this frame."""
+
+    graph_updates_rejected: int = 0
+    """Number of graph-update proposals rejected (malformed/low-confidence)."""
 
 
 @dataclass
@@ -332,6 +343,7 @@ def run_experiment(
     inference_fn: Optional[InferenceFn] = None,
     cancel_fn: Optional[Callable[[], bool]] = None,
     on_frame: Optional[Callable[[int, "FrameResult"], None]] = None,
+    graph_store: Optional[GraphStore] = None,
 ) -> List[FrameResult]:
     """Execute the experiment described by *defn* and return per-frame results.
 
@@ -349,6 +361,10 @@ def run_experiment(
         Callable with the same signature as
         ``inference_client.run_inference``.  Defaults to
         ``run_inference`` from ``inference_client``.
+    graph_store:
+        A ``GraphStore`` instance to use with the ``single_frame_knowledge_graph``
+        strategy.  When ``None`` and the strategy requires a store, a new
+        empty store is created automatically.
 
     Returns
     -------
@@ -389,6 +405,19 @@ def run_experiment(
             inference_fn=inference_fn,
             cancel_fn=cancel_fn,
             on_frame=on_frame,
+        )
+    elif defn.strategy == "single_frame_knowledge_graph":
+        if graph_store is None:
+            graph_store = GraphStore()
+        return _run_knowledge_graph(
+            defn,
+            cli_path=cli_path,
+            socket_path=socket_path,
+            artifact_dir=artifact_dir,
+            inference_fn=inference_fn,
+            cancel_fn=cancel_fn,
+            on_frame=on_frame,
+            graph_store=graph_store,
         )
     else:
         # Unreachable after validate_definition, but defensive.
@@ -552,6 +581,115 @@ def _run_observation_history(
     return results
 
 
+def _run_knowledge_graph(
+    defn: ExperimentDefinition,
+    *,
+    cli_path: str,
+    socket_path: str,
+    artifact_dir: Optional[Path],
+    inference_fn: InferenceFn,
+    cancel_fn: Optional[Callable[[], bool]] = None,
+    on_frame: Optional[Callable[[int, "FrameResult"], None]] = None,
+    graph_store: GraphStore,
+) -> List[FrameResult]:
+    """Strategy: single_frame_knowledge_graph — full knowledge-graph round-trip.
+
+    For each frame:
+
+    1. Retrieve a bounded salient subgraph from *graph_store* and serialise it
+       into the prompt so the VLM receives structured world-model context.
+    2. Invoke the VLM.
+    3. Parse any structured ``<<GRAPH_UPDATES_START/END>>`` block from the
+       response and pass the proposals through ``GraphUpdater`` validation and
+       reconciliation before committing accepted changes.
+
+    A malformed or rejected graph-update block never causes the frame result to
+    be marked as failed.  Normal task output is always preserved.
+    """
+    update_instructions = build_update_instructions()
+    updater = GraphUpdater(graph_store)
+    results: List[FrameResult] = []
+    jsonl_records: List[Dict[str, Any]] = []
+
+    for idx, image_path in enumerate(defn.image_paths):
+        if cancel_fn is not None and cancel_fn():
+            break
+
+        # ── 1. Retrieve salient subgraph and build the knowledge-graph prompt ──
+        subgraph = retrieve_salient_subgraph(graph_store)
+        graph_context_block = serialize_subgraph(subgraph)
+
+        prompt = _build_prompt(
+            defn.task_prompt,
+            defn.system_instruction,
+            [],
+            0,
+        )
+        # Prepend graph context and update instructions to the full prompt.
+        prompt = "\n\n".join([graph_context_block, update_instructions, prompt])
+
+        # ── 2. VLM invocation ─────────────────────────────────────────────────
+        t0 = time.monotonic()
+        infer_result = inference_fn(
+            cli_path=cli_path,
+            socket_path=socket_path,
+            image_path=image_path,
+            prompt=prompt,
+            max_generate_length=defn.max_generate_length,
+            temperature=defn.temperature,
+            top_p=defn.top_p,
+            top_k=defn.top_k,
+            timeout_seconds=defn.timeout_seconds,
+        )
+        elapsed_ms = (time.monotonic() - t0) * 1000.0
+
+        # ── 3. Parse and apply graph updates (never fails the frame result) ───
+        accepted = 0
+        rejected = 0
+        if infer_result.success and infer_result.text:
+            try:
+                update_set = parse_graph_updates(infer_result.text)
+                apply_result = updater.apply(update_set)
+                accepted = apply_result.accepted
+                rejected = apply_result.rejected
+            except Exception:
+                pass  # Defensive: graph errors must not surface as task failures.
+
+        src_rec = (
+            defn.source_frame_records[idx]
+            if defn.source_frame_records and idx < len(defn.source_frame_records)
+            else None
+        )
+        fr = FrameResult(
+            frame_index=idx,
+            image_path=image_path,
+            prompt_used=prompt,
+            success=infer_result.success,
+            text=infer_result.text,
+            error=infer_result.error,
+            latency_ms=round(elapsed_ms, 2),
+            history_entries_used=0,
+            source_dataset_id=defn.source_dataset_id,
+            source_frame_index=src_rec.get("frame_index") if src_rec else None,
+            source_timestamp_ns=src_rec.get("timestamp_ns") if src_rec else None,
+            graph_updates_accepted=accepted,
+            graph_updates_rejected=rejected,
+        )
+        results.append(fr)
+        if artifact_dir is not None:
+            jsonl_records.append(
+                _frame_result_to_record(fr, defn, record_type="frame")
+            )
+        if on_frame is not None:
+            on_frame(idx, fr)
+
+    if artifact_dir is not None:
+        _write_artifact_jsonl(artifact_dir, "experiment.jsonl", jsonl_records)
+        _write_manifest(artifact_dir, defn, results)
+
+    return results
+
+
 def _frame_result_to_record(
     fr: FrameResult,
     defn: ExperimentDefinition,
@@ -578,6 +716,9 @@ def _frame_result_to_record(
         rec["source_frame_index"] = fr.source_frame_index
     if fr.source_timestamp_ns is not None:
         rec["source_timestamp_ns"] = fr.source_timestamp_ns
+    if fr.graph_updates_accepted or fr.graph_updates_rejected:
+        rec["graph_updates_accepted"] = fr.graph_updates_accepted
+        rec["graph_updates_rejected"] = fr.graph_updates_rejected
     return rec
 
 

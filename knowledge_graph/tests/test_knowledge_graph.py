@@ -829,5 +829,253 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(facts[0].provenance, "detected in frame 42")
 
 
+# ---------------------------------------------------------------------------
+# Integration tests: experiment_engine knowledge_graph strategy
+# ---------------------------------------------------------------------------
+
+import sys as _sys
+_REPO_ROOT_EE = Path(__file__).resolve().parents[3]
+if str(_REPO_ROOT_EE) not in _sys.path:
+    _sys.path.insert(0, str(_REPO_ROOT_EE))
+
+from web_console.experiment_engine import (
+    ExperimentDefinition,
+    FrameResult,
+    run_experiment,
+    validate_definition,
+)
+from web_console.inference_client import InferenceResult
+
+
+def _make_vlm_fn_with_updates(task_text: str, update_json: str):
+    """Return a fake inference_fn that appends a graph-update block to the response."""
+    from knowledge_graph.prompt_serializer import GRAPH_UPDATES_END, GRAPH_UPDATES_START
+
+    def _fn(**kwargs):
+        response = f"{task_text}\n{GRAPH_UPDATES_START}\n{update_json}\n{GRAPH_UPDATES_END}"
+        return InferenceResult(success=True, text=response)
+
+    return _fn
+
+
+def _make_vlm_fn_plain(task_text: str):
+    """Return a fake inference_fn that returns only plain text (no graph block)."""
+    def _fn(**kwargs):
+        return InferenceResult(success=True, text=task_text)
+    return _fn
+
+
+def _make_vlm_fn_failing():
+    """Return a fake inference_fn that always fails."""
+    def _fn(**kwargs):
+        return InferenceResult(success=False, error="simulated failure")
+    return _fn
+
+
+class TestExperimentEngineKnowledgeGraphStrategy(unittest.TestCase):
+    """Integration tests for the single_frame_knowledge_graph experiment strategy."""
+
+    def _defn(self, **kwargs) -> ExperimentDefinition:
+        defaults = dict(
+            strategy="single_frame_knowledge_graph",
+            image_paths=["frame.jpg"],
+            task_prompt="What do you see?",
+        )
+        defaults.update(kwargs)
+        return ExperimentDefinition(**defaults)
+
+    def test_validate_definition_accepts_new_strategy(self):
+        defn = self._defn()
+        error = validate_definition(defn)
+        self.assertIsNone(error)
+
+    def test_full_round_trip_existing_entity_updated_in_graph(self):
+        """Existing entity -> retrieved context in prompt -> VLM proposes update -> graph updated."""
+        store = GraphStore()
+        store.add_entity(Entity(entity_id="dog_17", entity_type="dog"))
+
+        update_payload = json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "graph_updates": [{
+                "op": "set_attribute",
+                "entity_id": "dog_17",
+                "attribute": "last_seen_location",
+                "value": "parking_lot_1",
+                "confidence": 0.91,
+                "source": "vlm",
+            }]
+        })
+        inference_fn = _make_vlm_fn_with_updates("A brown dog near a truck.", update_payload)
+
+        defn = self._defn()
+        results = run_experiment(defn, inference_fn=inference_fn, graph_store=store)
+
+        self.assertEqual(len(results), 1)
+        fr = results[0]
+        # Normal task output succeeds.
+        self.assertTrue(fr.success)
+        self.assertIn("dog", fr.text)
+        # Graph was updated.
+        self.assertEqual(fr.graph_updates_accepted, 1)
+        self.assertEqual(fr.graph_updates_rejected, 0)
+        entity = store.get_entity("dog_17")
+        self.assertEqual(entity.attributes.get("last_seen_location"), "parking_lot_1")
+
+    def test_graph_context_is_included_in_prompt(self):
+        """The serialised subgraph context block must appear in the prompt."""
+        from knowledge_graph.prompt_serializer import GRAPH_CONTEXT_START
+
+        store = GraphStore()
+        store.add_entity(Entity(entity_id="vehicle_5", entity_type="car"))
+
+        seen_prompts = []
+
+        def _fn(**kwargs):
+            seen_prompts.append(kwargs["prompt"])
+            return InferenceResult(success=True, text="A car.")
+
+        defn = self._defn()
+        run_experiment(defn, inference_fn=_fn, graph_store=store)
+
+        self.assertTrue(seen_prompts, "inference_fn was not called")
+        self.assertIn(GRAPH_CONTEXT_START, seen_prompts[0])
+        self.assertIn("vehicle_5", seen_prompts[0])
+
+    def test_malformed_update_block_does_not_fail_inference(self):
+        """A structurally broken update block must not mark the frame as failed."""
+        store = GraphStore()
+
+        from knowledge_graph.prompt_serializer import GRAPH_UPDATES_END, GRAPH_UPDATES_START
+        bad_response = f"Scene description.\n{GRAPH_UPDATES_START}\n{{NOT VALID JSON\n{GRAPH_UPDATES_END}"
+
+        def _fn(**kwargs):
+            return InferenceResult(success=True, text=bad_response)
+
+        defn = self._defn()
+        results = run_experiment(defn, inference_fn=_fn, graph_store=store)
+
+        fr = results[0]
+        self.assertTrue(fr.success)
+        self.assertIn("Scene description", fr.text)
+        self.assertEqual(fr.graph_updates_accepted, 0)
+
+    def test_low_confidence_updates_rejected_graph_unchanged(self):
+        """Updates below the confidence gate are rejected; the store is unchanged."""
+        store = GraphStore()
+        store.add_entity(Entity(entity_id="obj_1", entity_type="box"))
+
+        update_payload = json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "graph_updates": [{
+                "op": "set_attribute",
+                "entity_id": "obj_1",
+                "attribute": "color",
+                "value": "red",
+                "confidence": 0.1,  # below default threshold 0.5
+                "source": "vlm",
+            }]
+        })
+        inference_fn = _make_vlm_fn_with_updates("A box.", update_payload)
+
+        defn = self._defn()
+        results = run_experiment(defn, inference_fn=inference_fn, graph_store=store)
+
+        fr = results[0]
+        self.assertTrue(fr.success)
+        self.assertEqual(fr.graph_updates_rejected, 1)
+        # Graph attribute was NOT written.
+        entity = store.get_entity("obj_1")
+        self.assertNotIn("color", entity.attributes)
+
+    def test_vlm_failure_does_not_touch_graph(self):
+        """A failing inference call leaves the graph unchanged."""
+        store = GraphStore()
+        store.add_entity(Entity(entity_id="robot_0", entity_type="robot"))
+
+        defn = self._defn()
+        results = run_experiment(defn, inference_fn=_make_vlm_fn_failing(), graph_store=store)
+
+        fr = results[0]
+        self.assertFalse(fr.success)
+        self.assertEqual(fr.graph_updates_accepted, 0)
+        entities, facts = store.snapshot()
+        self.assertEqual(len(entities), 1)
+        self.assertEqual(len(facts), 0)
+
+    def test_no_update_block_normal_task_output_still_succeeds(self):
+        """A response without a graph-update block is fully accepted."""
+        store = GraphStore()
+        inference_fn = _make_vlm_fn_plain("A clear scene with a dog and a truck.")
+
+        defn = self._defn()
+        results = run_experiment(defn, inference_fn=inference_fn, graph_store=store)
+
+        fr = results[0]
+        self.assertTrue(fr.success)
+        self.assertIn("dog", fr.text)
+        self.assertEqual(fr.graph_updates_accepted, 0)
+
+    def test_auto_created_store_when_none_provided(self):
+        """run_experiment creates a fresh GraphStore when graph_store=None."""
+        update_payload = json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "graph_updates": [{
+                "op": "add_entity",
+                "entity_id": "new_entity_1",
+                "entity_type": "unknown",
+                "confidence": 0.8,
+                "source": "vlm",
+            }]
+        })
+        inference_fn = _make_vlm_fn_with_updates("Something in the scene.", update_payload)
+
+        defn = self._defn()
+        # Passing graph_store=None triggers auto-creation of a fresh store.
+        results = run_experiment(defn, inference_fn=inference_fn, graph_store=None)
+
+        fr = results[0]
+        self.assertTrue(fr.success)
+        self.assertEqual(fr.graph_updates_accepted, 1)
+
+    def test_per_update_reconciliation_not_all_or_nothing(self):
+        """A failed update does not prevent subsequent updates from being applied."""
+        store = GraphStore()
+        store.add_entity(Entity(entity_id="car_3", entity_type="car"))
+
+        update_payload = json.dumps({
+            "schema_version": SCHEMA_VERSION,
+            "graph_updates": [
+                {
+                    "op": "set_attribute",
+                    "entity_id": "car_3",
+                    "attribute": "status",
+                    "value": "moving",
+                    "confidence": 0.1,   # rejected: below threshold
+                    "source": "vlm",
+                },
+                {
+                    "op": "set_attribute",
+                    "entity_id": "car_3",
+                    "attribute": "color",
+                    "value": "blue",
+                    "confidence": 0.9,   # accepted
+                    "source": "vlm",
+                },
+            ]
+        })
+        inference_fn = _make_vlm_fn_with_updates("A blue car.", update_payload)
+
+        defn = self._defn()
+        results = run_experiment(defn, inference_fn=inference_fn, graph_store=store)
+
+        fr = results[0]
+        self.assertEqual(fr.graph_updates_accepted, 1)
+        self.assertEqual(fr.graph_updates_rejected, 1)
+        # The accepted update was committed despite the preceding rejection.
+        entity = store.get_entity("car_3")
+        self.assertEqual(entity.attributes.get("color"), "blue")
+        self.assertNotIn("status", entity.attributes)
+
+
 if __name__ == "__main__":
     unittest.main()
