@@ -67,12 +67,13 @@ def _validate_thor_launch(context, *args, **kwargs):
     rviz_config = os.path.join(share_dir, 'rviz', 'vision_reasoning_results.rviz')
     _require_existing_path('RViz config', rviz_config)
 
-    llm_engine_dir = LaunchConfiguration('llm_engine_dir').perform(context)
-    multimodal_engine_dir = LaunchConfiguration('multimodal_engine_dir').perform(context)
-    edge_llm_plugin_path = LaunchConfiguration('edge_llm_plugin_path').perform(context)
-    _require_existing_path('llm_engine_dir', llm_engine_dir)
-    _require_existing_path('multimodal_engine_dir', multimodal_engine_dir)
-    _require_existing_path('edge_llm_plugin_path', edge_llm_plugin_path)
+    if _truthy(LaunchConfiguration('start_vlm').perform(context)):
+        llm_engine_dir = LaunchConfiguration('llm_engine_dir').perform(context)
+        multimodal_engine_dir = LaunchConfiguration('multimodal_engine_dir').perform(context)
+        edge_llm_plugin_path = LaunchConfiguration('edge_llm_plugin_path').perform(context)
+        _require_existing_path('llm_engine_dir', llm_engine_dir)
+        _require_existing_path('multimodal_engine_dir', multimodal_engine_dir)
+        _require_existing_path('edge_llm_plugin_path', edge_llm_plugin_path)
 
     if _truthy(LaunchConfiguration('enable_rviz').perform(context)):
         try:
@@ -175,9 +176,13 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('tracked_observation_topic', default_value='/tracked_observation'),
         DeclareLaunchArgument('result_topic', default_value='/vlm/result'),
         DeclareLaunchArgument('start_rtdetr', default_value='false'),
+        DeclareLaunchArgument('start_vlm', default_value='true'),
         DeclareLaunchArgument('detector_id', default_value='isaac_ros_rtdetr'),
         DeclareLaunchArgument('tracker_id', default_value='iou_tracker'),
         DeclareLaunchArgument('enable_rviz', default_value='true'),
+        DeclareLaunchArgument('sample_period_seconds', default_value='0.0'),
+        DeclareLaunchArgument('min_vlm_interval_seconds', default_value='0.0'),
+        DeclareLaunchArgument('benchmark_output_file', default_value=''),
         DeclareLaunchArgument('llm_engine_dir', default_value=''),
         DeclareLaunchArgument('multimodal_engine_dir', default_value=''),
         DeclareLaunchArgument('edge_llm_plugin_path', default_value=''),
@@ -205,14 +210,16 @@ def generate_launch_description() -> LaunchDescription:
         OpaqueFunction(function=_build_rtdetr_launch),
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(base_launch),
+            condition=IfCondition(LaunchConfiguration('start_vlm')),
             launch_arguments={
                 'use_sim_time': use_sim_time,
                 'enable_tracked_observation_input': 'true',
                 'tracked_observation_topic': tracked_observation_topic,
                 'image_topic': image_topic,
                 'result_topic': LaunchConfiguration('result_topic'),
-                'sample_period_seconds': '0.0',
-                'min_vlm_interval_seconds': '0.0',
+                'sample_period_seconds': LaunchConfiguration('sample_period_seconds'),
+                'min_vlm_interval_seconds': LaunchConfiguration('min_vlm_interval_seconds'),
+                'benchmark_output_file': LaunchConfiguration('benchmark_output_file'),
                 'llm_engine_dir': llm_engine_dir,
                 'multimodal_engine_dir': multimodal_engine_dir,
                 'edge_llm_plugin_path': edge_llm_plugin_path,

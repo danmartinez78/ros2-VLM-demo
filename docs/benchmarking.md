@@ -292,6 +292,58 @@ python3 scripts/benchmark/test_benchmark_parsers.py -v
 
 ---
 
+## 7. Thor full-pipeline contention benchmark (RT-DETR + adapter + VLM)
+
+Use this when benchmarking the complete Thor perception/reasoning path:
+
+`rosbag -> Isaac ROS RT-DETR -> tracked_observation_adapter -> TensorRT Edge-LLM/VLM -> /vlm/result`
+
+The runner executes the A-F benchmark matrix and records synchronized:
+- `tegrastats` telemetry (`tegrastats.log`)
+- topic-rate logs for `/detections`, `/tracked_observation`, and `/vlm/result`
+- ROS timing JSONL (`benchmark.jsonl`) plus parsed `ros_metrics.json` when available
+- per-run manifest with mode, config, and git SHA
+- cross-run `comparison_report.json` and `comparison_report.txt`
+
+```bash
+cd "$HOME/ros2_ws/src/ros2-VLM-demo"
+source scripts/edge_vlm_env.sh
+source "$ROS_WORKSPACE/install/setup.bash"
+
+bash scripts/benchmark/run_thor_pipeline_benchmarks.sh \
+  --rosbag-path /absolute/path/to/rosbag_dir \
+  --duration-seconds 120
+```
+
+By default, the runner remaps the validated RT-DETR quickstart bag topics:
+
+- `/image_rect -> /camera0/color/image_raw`
+- `/camera_info_rect -> /camera_info`
+
+Override with:
+
+- `--bag-image-topic` / `--pipeline-image-topic`
+- `--bag-camera-info-topic` / `--pipeline-camera-info-topic`
+
+### Matrix implemented by the runner
+
+| Mode | RT-DETR | VLM cadence |
+|------|---------|-------------|
+| A | on | disabled (detector/tracker-only baseline) |
+| B | off | continuous (VLM baseline) |
+| C | on | continuous/current (`sample_period_seconds=0`) |
+| D | on | 1 Hz (`sample_period_seconds=1`) |
+| E | on | 0.5 Hz (`sample_period_seconds=2`) |
+| F | on | event/manual baseline (`sample_period_seconds=3600`, optional `--manual-trigger-command`) |
+
+> Notes:
+> - `--enable-rviz` is optional and disabled by default for cleaner measurements.
+> - `--dry-run` prints the exact commands without launching workloads.
+> - The runner attempts `sudo -n tegrastats` when available. Without privilege, Thor may omit `EMC_FREQ`/`GR3D_FREQ`; runs are marked telemetry-degraded.
+> - Runs with missing required workload signals are marked invalid and excluded from cadence recommendations.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Action |
