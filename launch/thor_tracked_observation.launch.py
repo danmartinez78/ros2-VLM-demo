@@ -88,14 +88,28 @@ def _validate_thor_launch(context, *args, **kwargs):
         _resolve_isaac_rtdetr_launch()
         rtdetr_model_file_path = LaunchConfiguration('rtdetr_model_file_path').perform(context)
         rtdetr_engine_file_path = LaunchConfiguration('rtdetr_engine_file_path').perform(context)
-        _require_existing_path('rtdetr_model_file_path', rtdetr_model_file_path)
-        _require_existing_path('rtdetr_engine_file_path', rtdetr_engine_file_path)
+        if not os.path.isabs(rtdetr_model_file_path) or not os.path.exists(rtdetr_model_file_path):
+            raise RuntimeError(
+                'rtdetr_model_file_path must be an existing absolute path. '
+                f'Got: {rtdetr_model_file_path}. '
+                'Run scripts/prepare_thor_jp72_assets.sh or pass '
+                'rtdetr_model_file_path:=/absolute/path/to/sdetr_grasp.onnx'
+            )
+        if not os.path.isabs(rtdetr_engine_file_path) or not os.path.exists(rtdetr_engine_file_path):
+            raise RuntimeError(
+                'rtdetr_engine_file_path must be an existing absolute path. '
+                f'Got: {rtdetr_engine_file_path}. '
+                'Run scripts/prepare_thor_jp72_assets.sh or pass '
+                'rtdetr_engine_file_path:=/absolute/path/to/sdetr_grasp.plan'
+            )
     return []
 
 
 def _build_rtdetr_launch(context, *args, **kwargs):
     if not _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
         return []
+    image_topic = LaunchConfiguration('image_topic').perform(context)
+    detections_topic = LaunchConfiguration('detections_topic').perform(context)
 
     rtdetr_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(_resolve_isaac_rtdetr_launch()),
@@ -109,8 +123,8 @@ def _build_rtdetr_launch(context, *args, **kwargs):
     return [
         GroupAction(
             actions=[
-                SetRemap(src='/image', dst=LaunchConfiguration('image_topic')),
-                SetRemap(src='/detections_output', dst=LaunchConfiguration('detections_topic')),
+                SetRemap(src='/image', dst=image_topic),
+                SetRemap(src='/detections_output', dst=detections_topic),
                 rtdetr_launch,
             ],
             scoped=True,

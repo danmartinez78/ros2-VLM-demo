@@ -78,8 +78,8 @@ class ThorLaunchWiringTests(unittest.TestCase):
         self.assertIn("'engine_file_path': LaunchConfiguration('rtdetr_engine_file_path')", self.launch_source)
 
     def test_rtdetr_launch_remaps_native_isaac_topics(self) -> None:
-        self.assertIn("SetRemap(src='/image', dst=LaunchConfiguration('image_topic'))", self.launch_source)
-        self.assertIn("SetRemap(src='/detections_output', dst=LaunchConfiguration('detections_topic'))", self.launch_source)
+        self.assertIn("SetRemap(src='/image', dst=image_topic)", self.launch_source)
+        self.assertIn("SetRemap(src='/detections_output', dst=detections_topic)", self.launch_source)
 
 
 class RosSetupGuardTests(unittest.TestCase):
