@@ -112,6 +112,33 @@ class TestSummarizeAndCompare(unittest.TestCase):
         self.assertEqual(recommendation["recommended_mode"], "E")
         self.assertIn("D", recommendation["unavailable_modes"])
 
+    def test_recommendation_withholds_when_gr3d_units_mixed(self):
+        runs = [
+            {
+                "mode": "D",
+                "description": "D",
+                "tegrastats": {
+                    "emc_pct": {"mean": 50.0},
+                    "gr3d_pct": {"mean": 80.0},
+                    "gr3d_mhz": {"mean": 1600.0},
+                    "cpu_hottest_core_p95_pct": 85.0,
+                },
+            },
+            {
+                "mode": "E",
+                "description": "E",
+                "tegrastats": {
+                    "emc_pct": {"mean": 45.0},
+                    "gr3d_pct": {"mean": None},
+                    "gr3d_mhz": {"mean": 1574.0},
+                    "cpu_hottest_core_p95_pct": 80.0,
+                },
+            },
+        ]
+        recommendation = compare_runs(runs)["recommendation"]
+        self.assertIsNone(recommendation["recommended_mode"])
+        self.assertEqual(recommendation["ranked_modes"], [])
+
 
 class TestThorRunnerDryRun(unittest.TestCase):
     def test_dry_run_prints_matrix_commands(self):

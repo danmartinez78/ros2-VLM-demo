@@ -63,11 +63,16 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
                 clocks = [float(value.strip()) for value in clocks_raw.split(",") if value.strip()]
                 if clocks:
                     gr3d_mhz.append(fmean(clocks))
+        line_rails: dict[str, float] = {}
         for rail_match in _RE_POWER_RAIL.finditer(line):
             rail = rail_match.group(1)
-            value_w = float(rail_match.group(2)) / 1000.0
+            line_rails[rail] = float(rail_match.group(2)) / 1000.0
+        if "VDD_IN" in line_rails:
+            vdd_in_w.append(line_rails["VDD_IN"])
+        elif "VIN" in line_rails:
+            vdd_in_w.append(line_rails["VIN"])
+        for rail, value_w in line_rails.items():
             if rail in {"VIN", "VDD_IN"}:
-                vdd_in_w.append(value_w)
                 continue
             rail_power_w.setdefault(rail, []).append(value_w)
         if match := _RE_TEMP.search(line):
@@ -150,12 +155,13 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
     return summary
 
 
-def _score_contention(run: dict[str, Any]) -> float:
+def _score_contention(run: dict[str, Any], *, use_gr3d_mhz: bool) -> float:
     tegra = run.get("tegrastats", {})
     emc = ((tegra.get("emc_pct") or {}).get("mean"))
-    gr3d = ((tegra.get("gr3d_pct") or {}).get("mean"))
-    if gr3d is None:
+    if use_gr3d_mhz:
         gr3d = ((tegra.get("gr3d_mhz") or {}).get("mean"))
+    else:
+        gr3d = ((tegra.get("gr3d_pct") or {}).get("mean"))
     cpu = tegra.get("cpu_hottest_core_p95_pct")
     if emc is None or gr3d is None or cpu is None:
         return float("inf")
@@ -169,23 +175,42 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
     cadence_modes = [mode for mode in ("D", "E", "F") if mode in by_mode]
     recommendation = None
     if cadence_modes:
-        ranked = sorted(cadence_modes, key=lambda mode: _score_contention(by_mode[mode]))
-        ranked_available = [mode for mode in ranked if math.isfinite(_score_contention(by_mode[mode]))]
-        unavailable = [mode for mode in ranked if mode not in ranked_available]
-        if ranked_available:
-            recommendation = {
-                "recommended_mode": ranked_available[0],
-                "reason": "Lowest combined EMC/GR3D/CPU contention score among tested cadence modes.",
-                "ranked_modes": ranked_available,
-                "unavailable_modes": unavailable,
-            }
-        else:
+        has_gr3d_pct = any(((by_mode[mode].get("tegrastats", {}).get("gr3d_pct") or {}).get("mean")) is not None for mode in cadence_modes)
+        has_gr3d_mhz_only = any(
+            ((by_mode[mode].get("tegrastats", {}).get("gr3d_pct") or {}).get("mean")) is None
+            and ((by_mode[mode].get("tegrastats", {}).get("gr3d_mhz") or {}).get("mean")) is not None
+            for mode in cadence_modes
+        )
+        if has_gr3d_pct and has_gr3d_mhz_only:
             recommendation = {
                 "recommended_mode": None,
-                "reason": "No cadence mode had complete EMC/GR3D/CPU metrics for contention scoring.",
+                "reason": "Cadence modes reported mixed GR3D units (percent and MHz); recommendation withheld.",
                 "ranked_modes": [],
-                "unavailable_modes": unavailable,
+                "unavailable_modes": cadence_modes,
             }
+        else:
+            use_gr3d_mhz = not has_gr3d_pct
+            ranked = sorted(cadence_modes, key=lambda mode: _score_contention(by_mode[mode], use_gr3d_mhz=use_gr3d_mhz))
+            ranked_available = [
+                mode for mode in ranked
+                if math.isfinite(_score_contention(by_mode[mode], use_gr3d_mhz=use_gr3d_mhz))
+            ]
+            unavailable = [mode for mode in ranked if mode not in ranked_available]
+            if ranked_available:
+                basis = "GR3D MHz" if use_gr3d_mhz else "GR3D percent"
+                recommendation = {
+                    "recommended_mode": ranked_available[0],
+                    "reason": f"Lowest combined EMC/{basis}/CPU contention score among tested cadence modes.",
+                    "ranked_modes": ranked_available,
+                    "unavailable_modes": unavailable,
+                }
+            else:
+                recommendation = {
+                    "recommended_mode": None,
+                    "reason": "No cadence mode had complete EMC/GR3D/CPU metrics for contention scoring.",
+                    "ranked_modes": [],
+                    "unavailable_modes": unavailable,
+                }
 
     findings = {
         "rtdetr_only_mode": by_mode.get("A", {}).get("tegrastats"),
