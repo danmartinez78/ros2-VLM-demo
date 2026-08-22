@@ -84,20 +84,28 @@ def _validate_thor_launch(context, *args, **kwargs):
             raise RuntimeError(f'rviz2 executable not found: {rviz_executable}')
 
     if _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
-        # Validate package/launch availability here so launch fails before starting other nodes.
-        _resolve_isaac_rtdetr_launch()
         rtdetr_model_file_path = LaunchConfiguration('rtdetr_model_file_path').perform(context)
         rtdetr_engine_file_path = LaunchConfiguration('rtdetr_engine_file_path').perform(context)
-        if not os.path.isabs(rtdetr_model_file_path) or not os.path.exists(rtdetr_model_file_path):
+        if not os.path.isabs(rtdetr_model_file_path):
             raise RuntimeError(
-                'rtdetr_model_file_path must be an existing absolute path. '
+                'rtdetr_model_file_path must be an absolute path. '
+                f'Got: {rtdetr_model_file_path}.'
+            )
+        if not os.path.exists(rtdetr_model_file_path):
+            raise RuntimeError(
+                'rtdetr_model_file_path does not exist. '
                 f'Got: {rtdetr_model_file_path}. '
                 'Run scripts/prepare_thor_jp72_assets.sh or pass '
                 'rtdetr_model_file_path:=/absolute/path/to/sdetr_grasp.onnx'
             )
-        if not os.path.isabs(rtdetr_engine_file_path) or not os.path.exists(rtdetr_engine_file_path):
+        if not os.path.isabs(rtdetr_engine_file_path):
             raise RuntimeError(
-                'rtdetr_engine_file_path must be an existing absolute path. '
+                'rtdetr_engine_file_path must be an absolute path. '
+                f'Got: {rtdetr_engine_file_path}.'
+            )
+        if not os.path.exists(rtdetr_engine_file_path):
+            raise RuntimeError(
+                'rtdetr_engine_file_path does not exist. '
                 f'Got: {rtdetr_engine_file_path}. '
                 'Run scripts/prepare_thor_jp72_assets.sh or pass '
                 'rtdetr_engine_file_path:=/absolute/path/to/sdetr_grasp.plan'
