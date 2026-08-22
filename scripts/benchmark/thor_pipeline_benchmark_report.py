@@ -14,10 +14,8 @@ from typing import Any
 
 _RE_RAM = re.compile(r"RAM\s+(\d+)/(\d+)MB")
 _RE_EMC = re.compile(r"EMC_FREQ\s+(\d+)%@([0-9]+)")
-_RE_GR3D_PCT = re.compile(r"GR3D_FREQ\s+(\d+)%@(?:\[([0-9,\s]+)\]|([0-9]+))")
-_RE_GR3D_ARRAY = re.compile(r"GR3D_FREQ\s+@\[([0-9,\s]+)\]")
-_RE_MODULE_POWER = re.compile(r"\b(?:VDD_IN|VIN)\s+([0-9]+)mW")
-_RE_POWER_RAIL = re.compile(r"\b([A-Z0-9_]+)\s+([0-9]+)mW(?:/[0-9]+mW/[0-9]+mW)?")
+_RE_GR3D = re.compile(r"GR3D_FREQ\s+(?:(\d+)%@)?(?:@?\[([0-9,\s]+)\]|([0-9]+))")
+_RE_POWER_RAIL = re.compile(r"\b((?:VDD|VIN)[A-Z0-9_]*)\s+([0-9]+)mW(?:/[0-9]+mW/[0-9]+mW)?")
 _RE_TEMP = re.compile(r"(?:GPU|gpu)@([0-9]+(?:\.[0-9]+)?)C")
 _RE_TJ = re.compile(r"(?:Tj|tj|Tboard|AO)@([0-9]+(?:\.[0-9]+)?)C")
 _RE_CPU = re.compile(r"CPU\s*\[([^\]]+)\]")
@@ -57,24 +55,21 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
         if match := _RE_EMC.search(line):
             emc_pct.append(float(match.group(1)))
             emc_mhz.append(float(match.group(2)))
-        if match := _RE_GR3D_PCT.search(line):
-            gr3d_pct.append(float(match.group(1)))
+        if match := _RE_GR3D.search(line):
+            if match.group(1):
+                gr3d_pct.append(float(match.group(1)))
             clocks_raw = match.group(2) or match.group(3)
             if clocks_raw:
                 clocks = [float(value.strip()) for value in clocks_raw.split(",") if value.strip()]
                 if clocks:
                     gr3d_mhz.append(fmean(clocks))
-        elif match := _RE_GR3D_ARRAY.search(line):
-            clocks = [float(value.strip()) for value in match.group(1).split(",") if value.strip()]
-            if clocks:
-                gr3d_mhz.append(fmean(clocks))
-        if match := _RE_MODULE_POWER.search(line):
-            vdd_in_w.append(float(match.group(1)) / 1000.0)
         for rail_match in _RE_POWER_RAIL.finditer(line):
             rail = rail_match.group(1)
+            value_w = float(rail_match.group(2)) / 1000.0
             if rail in {"VIN", "VDD_IN"}:
+                vdd_in_w.append(value_w)
                 continue
-            rail_power_w.setdefault(rail, []).append(float(rail_match.group(2)) / 1000.0)
+            rail_power_w.setdefault(rail, []).append(value_w)
         if match := _RE_TEMP.search(line):
             gpu_temp_c.append(float(match.group(1)))
         if match := _RE_TJ.search(line):
@@ -97,7 +92,7 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
             ram_pct.append((used / total) * 100.0)
 
     return {
-        "samples": len(cpu_core_samples) or len(emc_pct) or len(gr3d_pct) or len(gr3d_mhz),
+        "samples": max(len(cpu_core_samples), len(emc_pct), len(gr3d_pct), len(gr3d_mhz), len(vdd_in_w), len(ram_used_mb)),
         "emc_pct": _stats(emc_pct),
         "emc_mhz": _stats(emc_mhz),
         "gr3d_pct": _stats(gr3d_pct),
