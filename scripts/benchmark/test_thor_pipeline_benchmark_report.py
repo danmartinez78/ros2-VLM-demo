@@ -77,6 +77,8 @@ class TestSummarizeAndCompare(unittest.TestCase):
                     f"RAM 1000/8000MB CPU [{cpu}%@2000,10%@2000] EMC_FREQ {emc}%@4266 GR3D_FREQ {gr3d}%@1574 VDD_IN 80000mW GPU@55C tj@58C\n",
                     encoding="utf-8",
                 )
+                (run_dir / "detections_hz.log").write_text("average rate: 8.0\n", encoding="utf-8")
+                (run_dir / "tracked_observation_hz.log").write_text("average rate: 8.0\n", encoding="utf-8")
                 (run_dir / "vlm_result_hz.log").write_text("average rate: 1.0\n", encoding="utf-8")
 
             runs = [summarize_run(root / "run_D"), summarize_run(root / "run_E"), summarize_run(root / "run_F")]
@@ -140,6 +142,73 @@ class TestSummarizeAndCompare(unittest.TestCase):
         self.assertIsNone(recommendation["recommended_mode"])
         self.assertEqual(recommendation["ranked_modes"], [])
 
+    def test_invalid_modes_excluded_from_recommendation(self):
+        runs = [
+            {
+                "mode": "D",
+                "description": "D",
+                "tegrastats": {
+                    "emc_pct": {"mean": 40.0},
+                    "gr3d_pct": {"mean": 65.0},
+                    "cpu_hottest_core_p95_pct": 70.0,
+                },
+                "rates_hz": {"detections": 8.0, "tracked_observation": 8.0, "vlm_result": 2.0},
+                "vlm": {"result_frames": 10},
+                "validation": {"is_valid": True},
+            },
+            {
+                "mode": "E",
+                "description": "E",
+                "tegrastats": {
+                    "emc_pct": {"mean": 38.0},
+                    "gr3d_pct": {"mean": 60.0},
+                    "cpu_hottest_core_p95_pct": 68.0,
+                },
+                "rates_hz": {"detections": None, "tracked_observation": None, "vlm_result": None},
+                "vlm": {"result_frames": 0},
+                "validation": {"is_valid": False},
+            },
+            {
+                "mode": "F",
+                "description": "F",
+                "tegrastats": {
+                    "emc_pct": {"mean": 35.0},
+                    "gr3d_pct": {"mean": 55.0},
+                    "cpu_hottest_core_p95_pct": 65.0,
+                },
+                "rates_hz": {"detections": 8.0, "tracked_observation": 8.0, "vlm_result": 1.0},
+                "vlm": {"result_frames": 8},
+                "validation": {"is_valid": True},
+            },
+        ]
+        recommendation = compare_runs(runs)["recommendation"]
+        self.assertEqual(recommendation["recommended_mode"], "F")
+        self.assertNotIn("E", recommendation["ranked_modes"])
+        self.assertIn("E", recommendation["invalid_modes"])
+
+    def test_summarize_marks_full_pipeline_run_invalid_when_signals_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_dir = Path(tmpdir) / "run_C"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "run_config.json").write_text(
+                json.dumps({"mode": "C", "description": "C", "run_id": "run_C"}) + "\n",
+                encoding="utf-8",
+            )
+            (run_dir / "tegrastats.log").write_text(
+                "RAM 1000/8000MB CPU [10%@2000] VIN 90000mW GPU@50C\n",
+                encoding="utf-8",
+            )
+            (run_dir / "ros_metrics.json").write_text(
+                json.dumps({"aggregate": {"successful_frames": 0, "failed_frames": 0, "total_dropped": 0}}) + "\n",
+                encoding="utf-8",
+            )
+            summary = summarize_run(run_dir)
+            self.assertFalse(summary["validation"]["is_valid"])
+            self.assertIn("detections", summary["validation"]["missing_signals"])
+            self.assertIn("tracked_observation", summary["validation"]["missing_signals"])
+            self.assertIn("vlm_output", summary["validation"]["missing_signals"])
+            self.assertTrue(summary["telemetry"]["degraded"])
+
 
 class TestThorRunnerDryRun(unittest.TestCase):
     def test_dry_run_prints_matrix_commands(self):
@@ -162,7 +231,10 @@ class TestThorRunnerDryRun(unittest.TestCase):
         self.assertIn("Mode F", combined)
         self.assertIn("start_vlm:=false", combined)
         self.assertIn("/image_rect:=/camera0/color/image_raw", combined)
-        self.assertIn("/camera_info_rect:=/camera0/color/camera_info", combined)
+        self.assertIn("/camera_info_rect:=/camera_info", combined)
+        remap_lines = [line for line in combined.splitlines() if "ros2 bag play" in line]
+        self.assertTrue(remap_lines, combined)
+        self.assertEqual(remap_lines[0].count("--remap"), 1, remap_lines[0])
         self.assertIn("comparison_report.json", combined)
 
 

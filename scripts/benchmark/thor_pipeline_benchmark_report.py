@@ -22,6 +22,10 @@ _RE_CPU = re.compile(r"CPU\s*\[([^\]]+)\]")
 _RE_CPU_PCT = re.compile(r"(\d+)%@")
 _RE_TOPIC_HZ = re.compile(r"average rate:\s*([0-9]+(?:\.[0-9]+)?)")
 
+_RTDETR_ENABLED_MODES = {"A", "C", "D", "E", "F"}
+_VLM_ENABLED_MODES = {"B", "C", "D", "E", "F"}
+_FULL_PIPELINE_MODES = {"C", "D", "E", "F"}
+
 
 def _stats(values: list[float]) -> dict[str, float | None]:
     if not values:
@@ -128,6 +132,42 @@ def _load_json(path: Path) -> dict[str, Any] | None:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _run_validation(summary: dict[str, Any]) -> dict[str, Any]:
+    mode = summary.get("mode")
+    rates = summary.get("rates_hz") or {}
+    vlm = summary.get("vlm") or {}
+
+    detections_present = (rates.get("detections") or 0.0) > 0.0
+    tracked_present = (rates.get("tracked_observation") or 0.0) > 0.0
+    vlm_rate_present = (rates.get("vlm_result") or 0.0) > 0.0
+    vlm_frame_present = (vlm.get("result_frames") or 0) > 0
+    vlm_present = vlm_rate_present or vlm_frame_present
+
+    missing_signals: list[str] = []
+    reasons: list[str] = []
+
+    if mode in _RTDETR_ENABLED_MODES and not detections_present:
+        missing_signals.append("detections")
+        reasons.append("RT-DETR-enabled mode has no /detections observations.")
+    if mode in _VLM_ENABLED_MODES and not vlm_present:
+        missing_signals.append("vlm_output")
+        reasons.append("VLM-enabled mode has no /vlm/result observations or benchmark frames.")
+    if mode in _FULL_PIPELINE_MODES:
+        if not tracked_present:
+            missing_signals.append("tracked_observation")
+            reasons.append("Full-pipeline mode has no /tracked_observation observations.")
+
+    return {
+        "is_valid": not missing_signals,
+        "missing_signals": missing_signals,
+        "reasons": reasons,
+        "detections_observed": detections_present,
+        "tracked_observation_observed": tracked_present,
+        "vlm_result_observed": vlm_rate_present,
+        "benchmark_frame_observed": vlm_frame_present,
+    }
+
+
 def summarize_run(run_dir: Path) -> dict[str, Any]:
     config = _load_json(run_dir / "run_config.json") or {}
     ros_metrics = _load_json(run_dir / "ros_metrics.json") or {}
@@ -152,6 +192,19 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
             "dropped_frames": aggregate.get("total_dropped"),
         },
     }
+    tegra = summary["tegrastats"]
+    emc_available = ((tegra.get("emc_pct") or {}).get("mean")) is not None
+    gr3d_available = (
+        ((tegra.get("gr3d_pct") or {}).get("mean")) is not None
+        or ((tegra.get("gr3d_mhz") or {}).get("mean")) is not None
+    )
+    summary["telemetry"] = {
+        "emc_available": emc_available,
+        "gr3d_available": gr3d_available,
+        "degraded": not (emc_available and gr3d_available),
+        "tegrastats_capture": config.get("tegrastats_capture", {}),
+    }
+    summary["validation"] = _run_validation(summary)
     return summary
 
 
@@ -170,11 +223,25 @@ def _score_contention(run: dict[str, Any], *, use_gr3d_mhz: bool) -> float:
 
 def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
     by_mode = {run.get("mode"): run for run in run_summaries}
+    valid_by_mode = {
+        mode: run
+        for mode, run in by_mode.items()
+        if (run.get("validation") or {}).get("is_valid", True)
+    }
 
     contention_baseline = by_mode.get("C")
-    cadence_modes = [mode for mode in ("D", "E", "F") if mode in by_mode]
+    cadence_modes = [mode for mode in ("D", "E", "F") if mode in valid_by_mode]
+    invalid_cadence_modes = [mode for mode in ("D", "E", "F") if mode in by_mode and mode not in valid_by_mode]
     recommendation = None
-    if cadence_modes:
+    if invalid_cadence_modes and not cadence_modes:
+        recommendation = {
+            "recommended_mode": None,
+            "reason": "All cadence modes were invalid and excluded from scheduling recommendations.",
+            "ranked_modes": [],
+            "unavailable_modes": [],
+            "invalid_modes": invalid_cadence_modes,
+        }
+    elif cadence_modes:
         has_gr3d_pct = any(((by_mode[mode].get("tegrastats", {}).get("gr3d_pct") or {}).get("mean")) is not None for mode in cadence_modes)
         has_gr3d_mhz_only = any(
             ((by_mode[mode].get("tegrastats", {}).get("gr3d_pct") or {}).get("mean")) is None
@@ -187,6 +254,7 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
                 "reason": "Cadence modes reported mixed GR3D units (percent and MHz); recommendation withheld.",
                 "ranked_modes": [],
                 "unavailable_modes": cadence_modes,
+                "invalid_modes": invalid_cadence_modes,
             }
         else:
             use_gr3d_mhz = not has_gr3d_pct
@@ -204,6 +272,7 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
                     "reason": f"Lowest combined EMC/{basis}/CPU contention score among tested cadence modes.",
                     "ranked_modes": ranked_available,
                     "unavailable_modes": unavailable,
+                    "invalid_modes": invalid_cadence_modes,
                 }
             else:
                 recommendation = {
@@ -211,6 +280,7 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
                     "reason": "No cadence mode had complete EMC/GR3D/CPU metrics for contention scoring.",
                     "ranked_modes": [],
                     "unavailable_modes": unavailable,
+                    "invalid_modes": invalid_cadence_modes,
                 }
 
     findings = {
@@ -226,6 +296,7 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "run_count": len(run_summaries),
+        "invalid_runs": [run.get("mode") for run in run_summaries if not (run.get("validation") or {}).get("is_valid", True)],
         "runs": run_summaries,
         "findings": findings,
         "recommendation": recommendation,
@@ -258,6 +329,8 @@ def format_text(report: dict[str, Any]) -> str:
             f"  Tracked-observation Hz: {_fmt((run.get('rates_hz') or {}).get('tracked_observation'))}",
             f"  VLM result Hz: {_fmt((run.get('rates_hz') or {}).get('vlm_result'))}",
             f"  VLM inference mean ms: {_fmt((run.get('vlm') or {}).get('inference_ms_mean'))}",
+            f"  Workload valid: {_fmt(((run.get('validation') or {}).get('is_valid')))}",
+            f"  Telemetry degraded: {_fmt(((run.get('telemetry') or {}).get('degraded')))}",
             "",
         ]
 
@@ -269,6 +342,7 @@ def format_text(report: dict[str, Any]) -> str:
             f"Mode {recommendation.get('recommended_mode')}: {recommendation.get('reason')}",
             f"Ranking: {', '.join(recommendation.get('ranked_modes', [])) or 'unavailable'}",
             f"Unavailable for scoring: {', '.join(recommendation.get('unavailable_modes', [])) or 'none'}",
+            f"Invalid cadence modes: {', '.join(recommendation.get('invalid_modes', [])) or 'none'}",
             "",
         ]
 
@@ -276,6 +350,7 @@ def format_text(report: dict[str, Any]) -> str:
     lines += [
         "Key Findings",
         "------------",
+        f"Invalid runs: {', '.join(report.get('invalid_runs', [])) or 'none'}",
         f"CPU single-core hotspot observed: {findings.get('cpu_single_core_hotspot_present')}",
         "================================================================",
         "",

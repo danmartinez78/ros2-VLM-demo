@@ -318,7 +318,7 @@ bash scripts/benchmark/run_thor_pipeline_benchmarks.sh \
 By default, the runner remaps the validated RT-DETR quickstart bag topics:
 
 - `/image_rect -> /camera0/color/image_raw`
-- `/camera_info_rect -> /camera0/color/camera_info`
+- `/camera_info_rect -> /camera_info`
 
 Override with:
 
@@ -339,6 +339,8 @@ Override with:
 > Notes:
 > - `--enable-rviz` is optional and disabled by default for cleaner measurements.
 > - `--dry-run` prints the exact commands without launching workloads.
+> - The runner attempts `sudo -n tegrastats` when available. Without privilege, Thor may omit `EMC_FREQ`/`GR3D_FREQ`; runs are marked telemetry-degraded.
+> - Runs with missing required workload signals are marked invalid and excluded from cadence recommendations.
 
 ---
 

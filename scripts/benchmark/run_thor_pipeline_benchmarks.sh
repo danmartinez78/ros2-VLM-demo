@@ -16,8 +16,11 @@ manual_trigger_command=""
 bag_image_topic="/image_rect"
 pipeline_image_topic="/camera0/color/image_raw"
 bag_camera_info_topic="/camera_info_rect"
-pipeline_camera_info_topic="/camera0/color/camera_info"
+pipeline_camera_info_topic="/camera_info"
 dry_run=false
+tegrastats_prefix=(tegrastats)
+tegrastats_privilege_mode="unprivileged"
+tegrastats_privilege_reason="Using unprivileged tegrastats capture."
 
 usage() {
   cat <<'EOF'
@@ -34,7 +37,7 @@ Options:
   --pipeline-image-topic TOPIC   Pipeline image topic (default: /camera0/color/image_raw)
   --bag-camera-info-topic TOPIC  Rosbag camera info topic (default: /camera_info_rect)
   --pipeline-camera-info-topic TOPIC
-                                 Pipeline camera info topic (default: /camera0/color/camera_info)
+                                 Pipeline camera info topic (default: /camera_info)
   --enable-rviz                 Enable RViz in launched stacks (default: disabled)
   --dry-run                     Print commands without executing
   --help                        Show this help
@@ -138,6 +141,45 @@ run_shell() {
   bash -lc "${cmd}"
 }
 
+configure_tegrastats_capture() {
+  if [[ "${dry_run}" == "true" ]]; then
+    tegrastats_prefix=(tegrastats)
+    tegrastats_privilege_mode="dry-run"
+    tegrastats_privilege_reason="Dry run; telemetry capture not executed."
+    return
+  fi
+
+  if ! command -v tegrastats >/dev/null 2>&1; then
+    echo "tegrastats command not found in PATH" >&2
+    exit 1
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    tegrastats_prefix=(tegrastats)
+    tegrastats_privilege_mode="unprivileged"
+    tegrastats_privilege_reason="sudo unavailable; EMC/GR3D may be missing on Thor."
+    return
+  fi
+
+  if sudo -n true >/dev/null 2>&1; then
+    tegrastats_prefix=(sudo -n tegrastats)
+    tegrastats_privilege_mode="sudo-noninteractive"
+    tegrastats_privilege_reason="Using cached sudo credentials for tegrastats."
+    return
+  fi
+
+  if [[ -t 0 ]] && sudo -v >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
+    tegrastats_prefix=(sudo -n tegrastats)
+    tegrastats_privilege_mode="sudo-interactive"
+    tegrastats_privilege_reason="sudo -v succeeded; using sudo -n tegrastats."
+    return
+  fi
+
+  tegrastats_prefix=(tegrastats)
+  tegrastats_privilege_mode="unprivileged"
+  tegrastats_privilege_reason="sudo privilege unavailable; EMC/GR3D may be missing on Thor."
+}
+
 cleanup_pids=()
 cleanup() {
   if [[ "${#cleanup_pids[@]}" -eq 0 ]]; then
@@ -208,11 +250,14 @@ build_launch_args_for_mode() {
 IFS=',' read -r -a modes <<< "${modes_csv}"
 bag_play_remap_args=(
   "--remap" "${bag_image_topic}:=${pipeline_image_topic}"
-  "--remap" "${bag_camera_info_topic}:=${pipeline_camera_info_topic}"
+  "${bag_camera_info_topic}:=${pipeline_camera_info_topic}"
 )
+
+configure_tegrastats_capture
 
 echo "Thor pipeline benchmark root: ${output_dir}"
 echo "Modes: ${modes_csv}"
+echo "tegrastats mode: ${tegrastats_privilege_mode} (${tegrastats_privilege_reason})"
 
 git_sha="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
 
@@ -246,6 +291,9 @@ PY
   ROSBAG_PATH="${rosbag_path}" \
   DURATION_SECONDS="${duration_seconds}" \
   TEGRA_INTERVAL_MS="${tegrastats_interval_ms}" \
+  TEGRASTATS_PRIVILEGE_MODE="${tegrastats_privilege_mode}" \
+  TEGRASTATS_PRIVILEGE_REASON="${tegrastats_privilege_reason}" \
+  TEGRASTATS_COMMAND_PREFIX="$(printf "%q " "${tegrastats_prefix[@]}")" \
   MANUAL_TRIGGER_JSON="${manual_trigger_json}" \
   BAG_IMAGE_TOPIC="${bag_image_topic}" \
   PIPELINE_IMAGE_TOPIC="${pipeline_image_topic}" \
@@ -267,6 +315,11 @@ payload = {
     "rosbag_path": os.environ["ROSBAG_PATH"],
     "duration_seconds": int(os.environ["DURATION_SECONDS"]),
     "tegrastats_interval_ms": int(os.environ["TEGRA_INTERVAL_MS"]),
+    "tegrastats_capture": {
+        "privilege_mode": os.environ.get("TEGRASTATS_PRIVILEGE_MODE", "unknown"),
+        "privilege_reason": os.environ.get("TEGRASTATS_PRIVILEGE_REASON", ""),
+        "command_prefix": os.environ.get("TEGRASTATS_COMMAND_PREFIX", "").strip(),
+    },
     "manual_trigger_command": manual,
     "input_mappings": {
         "image": {
@@ -297,7 +350,7 @@ PY
 
   if [[ "${dry_run}" == "false" ]]; then
     : > "${bench_file}"
-    (tegrastats --interval "${tegrastats_interval_ms}" > "${tegra_log}" 2>&1) &
+    ("${tegrastats_prefix[@]}" --interval "${tegrastats_interval_ms}" > "${tegra_log}" 2>&1) &
     cleanup_pids+=("$!")
 
     "${launch_args[@]}" > "${launch_log}" 2>&1 &
@@ -335,7 +388,9 @@ PY
         --output "${run_dir}/ros_metrics.json" || true
     fi
   else
-    echo "[DRY RUN] tegrastats --interval ${tegrastats_interval_ms} > ${tegra_log}"
+    printf "[DRY RUN] "
+    printf "%q " "${tegrastats_prefix[@]}"
+    echo "--interval ${tegrastats_interval_ms} > ${tegra_log}"
     printf "[DRY RUN] "
     printf "%q " "${launch_args[@]}"
     echo "> ${launch_log}"
@@ -357,6 +412,26 @@ run_cmd python3 "${script_dir}/thor_pipeline_benchmark_report.py" \
   --modes "${modes_csv}" \
   --output "${output_dir}/comparison_report.json" \
   --text "${output_dir}/comparison_report.txt"
+
+if [[ "${dry_run}" == "false" ]]; then
+  invalid_modes="$(
+    python3 - "${output_dir}/comparison_report.json" <<'PY'
+import json
+import sys
+
+report_path = sys.argv[1]
+with open(report_path, "r", encoding="utf-8") as stream:
+    report = json.load(stream)
+modes = report.get("invalid_runs") or []
+print(",".join(modes))
+PY
+  )"
+  if [[ -n "${invalid_modes}" ]]; then
+    echo "Benchmark invalid runs detected: ${invalid_modes}" >&2
+    echo "See ${output_dir}/comparison_report.json for validation details." >&2
+    exit 3
+  fi
+fi
 
 echo "Benchmark complete: ${output_dir}"
 echo "Comparison JSON: ${output_dir}/comparison_report.json"
