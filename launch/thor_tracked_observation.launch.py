@@ -84,6 +84,12 @@ def _validate_thor_launch(context, *args, **kwargs):
             raise RuntimeError(f'rviz2 executable not found: {rviz_executable}')
 
     if _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
+        image_topic = LaunchConfiguration('image_topic').perform(context)
+        detections_topic = LaunchConfiguration('detections_topic').perform(context)
+        if not image_topic:
+            raise RuntimeError('image_topic must be non-empty when start_rtdetr:=true')
+        if not detections_topic:
+            raise RuntimeError('detections_topic must be non-empty when start_rtdetr:=true')
         rtdetr_model_file_path = LaunchConfiguration('rtdetr_model_file_path').perform(context)
         rtdetr_engine_file_path = LaunchConfiguration('rtdetr_engine_file_path').perform(context)
         if not os.path.isabs(rtdetr_model_file_path):
