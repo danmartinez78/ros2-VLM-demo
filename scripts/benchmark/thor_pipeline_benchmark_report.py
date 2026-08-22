@@ -14,7 +14,7 @@ from typing import Any
 
 _RE_RAM = re.compile(r"RAM\s+(\d+)/(\d+)MB")
 _RE_EMC = re.compile(r"EMC_FREQ\s+(\d+)%@([0-9]+)")
-_RE_GR3D_PCT = re.compile(r"GR3D_FREQ\s+(\d+)%@\[(.*?)\]|GR3D_FREQ\s+(\d+)%@([0-9]+)")
+_RE_GR3D_PCT = re.compile(r"GR3D_FREQ\s+(\d+)%@(?:\[([0-9,\s]+)\]|([0-9]+))")
 _RE_GR3D_ARRAY = re.compile(r"GR3D_FREQ\s+@\[([0-9,\s]+)\]")
 _RE_MODULE_POWER = re.compile(r"\b(?:VDD_IN|VIN)\s+([0-9]+)mW")
 _RE_POWER_RAIL = re.compile(r"\b([A-Z0-9_]+)\s+([0-9]+)mW(?:/[0-9]+mW/[0-9]+mW)?")
@@ -58,10 +58,8 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
             emc_pct.append(float(match.group(1)))
             emc_mhz.append(float(match.group(2)))
         if match := _RE_GR3D_PCT.search(line):
-            pct = match.group(1) or match.group(3)
-            if pct is not None:
-                gr3d_pct.append(float(pct))
-            clocks_raw = match.group(2) or match.group(4)
+            gr3d_pct.append(float(match.group(1)))
+            clocks_raw = match.group(2) or match.group(3)
             if clocks_raw:
                 clocks = [float(value.strip()) for value in clocks_raw.split(",") if value.strip()]
                 if clocks:
@@ -74,6 +72,8 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
             vdd_in_w.append(float(match.group(1)) / 1000.0)
         for rail_match in _RE_POWER_RAIL.finditer(line):
             rail = rail_match.group(1)
+            if rail in {"VIN", "VDD_IN"}:
+                continue
             rail_power_w.setdefault(rail, []).append(float(rail_match.group(2)) / 1000.0)
         if match := _RE_TEMP.search(line):
             gpu_temp_c.append(float(match.group(1)))
