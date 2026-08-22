@@ -218,18 +218,36 @@ value = os.environ.get("MANUAL_TRIGGER_COMMAND", "")
 print("null" if value == "" else json.dumps(value))
 PY
 )"
-  cat > "${run_dir}/run_config.json" <<EOF
-{
-  "run_id": "run_${mode}",
-  "mode": "${mode}",
-  "description": "$(mode_description "${mode}")",
-  "git_sha": "${git_sha}",
-  "rosbag_path": "${rosbag_path}",
-  "duration_seconds": ${duration_seconds},
-  "tegrastats_interval_ms": ${tegrastats_interval_ms},
-  "manual_trigger_command": ${manual_trigger_json}
+  RUN_ID="run_${mode}" \
+  MODE="${mode}" \
+  DESCRIPTION="$(mode_description "${mode}")" \
+  GIT_SHA="${git_sha}" \
+  ROSBAG_PATH="${rosbag_path}" \
+  DURATION_SECONDS="${duration_seconds}" \
+  TEGRA_INTERVAL_MS="${tegrastats_interval_ms}" \
+  MANUAL_TRIGGER_JSON="${manual_trigger_json}" \
+  python3 - "${run_dir}/run_config.json" <<'PY'
+import json
+import os
+import sys
+
+manual_raw = os.environ.get("MANUAL_TRIGGER_JSON", "null")
+manual = None if manual_raw == "null" else json.loads(manual_raw)
+
+payload = {
+    "run_id": os.environ["RUN_ID"],
+    "mode": os.environ["MODE"],
+    "description": os.environ["DESCRIPTION"],
+    "git_sha": os.environ["GIT_SHA"],
+    "rosbag_path": os.environ["ROSBAG_PATH"],
+    "duration_seconds": int(os.environ["DURATION_SECONDS"]),
+    "tegrastats_interval_ms": int(os.environ["TEGRA_INTERVAL_MS"]),
+    "manual_trigger_command": manual,
 }
-EOF
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, indent=2)
+    stream.write("\n")
+PY
 
   echo "==> Mode ${mode}: $(mode_description "${mode}")"
   printf "    Launch: "
@@ -256,12 +274,16 @@ EOF
     ros2 topic hz /vlm/result > "${run_dir}/vlm_result_hz.log" 2>&1 &
     cleanup_pids+=("$!")
 
+    timeout --signal=INT --kill-after=5 "${duration_seconds}" ros2 bag play "${rosbag_path}" --clock --loop > "${run_dir}/bag_play.log" 2>&1 &
+    bag_pid=$!
+    cleanup_pids+=("${bag_pid}")
+
     if [[ "${mode}" == "F" && -n "${manual_trigger_command}" ]]; then
       echo "Executing manual trigger command for mode F"
       run_shell "${manual_trigger_command}" > "${run_dir}/manual_trigger.log" 2>&1 || true
     fi
 
-    timeout --signal=INT --kill-after=5 "${duration_seconds}" ros2 bag play "${rosbag_path}" --clock --loop > "${run_dir}/bag_play.log" 2>&1 || true
+    wait "${bag_pid}" || true
 
     sleep 2
     cleanup

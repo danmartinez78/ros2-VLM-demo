@@ -27,7 +27,7 @@ def _stats(values: list[float]) -> dict[str, float | None]:
     if not values:
         return {"mean": None, "max": None, "p95": None}
     ordered = sorted(values)
-    idx = int(math.ceil(0.95 * len(ordered)) - 1)
+    idx = max(0, int(math.ceil(0.95 * len(ordered))) - 1)
     idx = max(0, min(idx, len(ordered) - 1))
     return {"mean": fmean(values), "max": max(values), "p95": ordered[idx]}
 
