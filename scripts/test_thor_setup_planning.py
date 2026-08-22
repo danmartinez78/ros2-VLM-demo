@@ -1169,6 +1169,14 @@ class InstallDependenciesIsaacPreferenceGuardTests(unittest.TestCase):
         self.assertIn("Isaac ROS host preference guard test passed.", result.stdout)
 
 
+class ScriptPermissionTests(unittest.TestCase):
+    def test_download_rosbags_script_is_executable(self) -> None:
+        self.assertTrue(
+            os.access(DOWNLOAD_ROSBAGS_SCRIPT, os.X_OK),
+            msg=f"{DOWNLOAD_ROSBAGS_SCRIPT} must keep executable permissions",
+        )
+
+
 class DownloadRosbagsArchiveFormatTests(unittest.TestCase):
     @staticmethod
     def _write_fake_curl(fake_curl_path: Path) -> None:
