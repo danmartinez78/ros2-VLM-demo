@@ -1,0 +1,111 @@
+"""CPU-only tests for Thor full-pipeline benchmark report utilities."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+_BENCH_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(_BENCH_DIR))
+
+from thor_pipeline_benchmark_report import (  # noqa: E402
+    compare_runs,
+    parse_tegrastats_log,
+    parse_topic_hz_log,
+    summarize_run,
+)
+
+
+class TestParseTegraStats(unittest.TestCase):
+    def test_extracts_expected_metrics(self):
+        path = Path("/tmp/test_thor_tegrastats.log")
+        path.write_text(
+            """
+RAM 24300/125700MB CPU [98%@2016,25%@2016,17%@2016] EMC_FREQ 63%@4266 GR3D_FREQ 99%@1574 VDD_IN 92000mW GPU@60C tj@61C
+RAM 24400/125700MB CPU [95%@2016,21%@2016,18%@2016] EMC_FREQ 64%@4266 GR3D_FREQ 97%@1574 VDD_IN 90000mW GPU@61C tj@62C
+""".strip()
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            summary = parse_tegrastats_log(path)
+            self.assertEqual(summary["samples"], 2)
+            self.assertAlmostEqual(summary["emc_pct"]["mean"], 63.5, places=1)
+            self.assertAlmostEqual(summary["gr3d_pct"]["mean"], 98.0, places=1)
+            self.assertGreaterEqual(summary["cpu_hottest_core_p95_pct"], 95.0)
+            self.assertAlmostEqual(summary["module_power_w"]["mean"], 91.0, places=1)
+        finally:
+            path.unlink(missing_ok=True)
+
+
+class TestParseTopicHz(unittest.TestCase):
+    def test_last_average_rate_is_selected(self):
+        path = Path("/tmp/test_topic_hz.log")
+        path.write_text(
+            "average rate: 7.10\naverage rate: 6.90\n",
+            encoding="utf-8",
+        )
+        try:
+            rate = parse_topic_hz_log(path)
+            self.assertAlmostEqual(rate or 0.0, 6.9, places=2)
+        finally:
+            path.unlink(missing_ok=True)
+
+
+class TestSummarizeAndCompare(unittest.TestCase):
+    def test_summarize_run_and_recommendation(self):
+        root = Path("/tmp/test_thor_runs")
+        for mode, emc, gr3d, cpu in (("D", 60, 90, 95), ("E", 45, 70, 80), ("F", 40, 60, 70)):
+            run_dir = root / f"run_{mode}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "run_config.json").write_text(
+                json.dumps({"mode": mode, "description": mode, "run_id": f"run_{mode}"}) + "\n",
+                encoding="utf-8",
+            )
+            (run_dir / "tegrastats.log").write_text(
+                f"RAM 1000/8000MB CPU [{cpu}%@2000,10%@2000] EMC_FREQ {emc}%@4266 GR3D_FREQ {gr3d}%@1574 VDD_IN 80000mW GPU@55C tj@58C\n",
+                encoding="utf-8",
+            )
+            (run_dir / "vlm_result_hz.log").write_text("average rate: 1.0\n", encoding="utf-8")
+
+        try:
+            runs = [summarize_run(root / "run_D"), summarize_run(root / "run_E"), summarize_run(root / "run_F")]
+            report = compare_runs(runs)
+            self.assertEqual(report["recommendation"]["recommended_mode"], "F")
+            self.assertTrue("cpu_single_core_hotspot_present" in report["findings"])
+        finally:
+            for child in root.glob("run_*/*"):
+                child.unlink(missing_ok=True)
+            for run_dir in root.glob("run_*"):
+                run_dir.rmdir()
+            root.rmdir()
+
+
+class TestThorRunnerDryRun(unittest.TestCase):
+    def test_dry_run_prints_matrix_commands(self):
+        script = _BENCH_DIR / "run_thor_pipeline_benchmarks.sh"
+        result = subprocess.run(
+            [
+                "bash",
+                str(script),
+                "--rosbag-path", "/tmp/fake_bag",
+                "--modes", "A,F",
+                "--dry-run",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn("Mode A", combined)
+        self.assertIn("Mode F", combined)
+        self.assertIn("sample_period_seconds:=3600.0", combined)
+        self.assertIn("comparison_report.json", combined)
+
+
+if __name__ == "__main__":
+    unittest.main()
