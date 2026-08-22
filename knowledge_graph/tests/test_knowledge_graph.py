@@ -1076,6 +1076,45 @@ class TestExperimentEngineKnowledgeGraphStrategy(unittest.TestCase):
         self.assertEqual(entity.attributes.get("color"), "blue")
         self.assertNotIn("status", entity.attributes)
 
+    def test_task_relevant_entities_preferentially_included_in_prompt(self):
+        """task_prompt keywords must drive retrieval so task-relevant entities
+        appear in the serialised context block ahead of irrelevant ones.
+
+        The store has two entities:
+        - ``cat_1`` — task-relevant (the task prompt mentions "cat")
+        - ``unrelated_1`` — irrelevant to the task
+
+        A tight character budget (100 chars) means only one entity can fit.
+        The test asserts that ``cat_1`` is present in the prompt and that the
+        real ``run_experiment`` path (not the isolated retrieval helper) is
+        responsible for the selection.
+        """
+        store = GraphStore()
+        # Add the irrelevant entity first so that insertion-order tie-breaking
+        # would include it instead of the task-relevant one if keyword scoring
+        # were not active.
+        store.add_entity(Entity(entity_id="unrelated_1", entity_type="widget"))
+        store.add_entity(Entity(entity_id="cat_1", entity_type="cat"))
+
+        seen_prompts: list[str] = []
+
+        def _fn(**kwargs):
+            seen_prompts.append(kwargs["prompt"])
+            return InferenceResult(success=True, text="A cat.")
+
+        # Very tight budget: only enough bytes for one entity representation.
+        retrieval_config = RetrievalConfig(context_budget=100, max_entities=1)
+
+        defn = self._defn(task_prompt="Describe the cat in the scene.")
+        run_experiment(defn, inference_fn=_fn, graph_store=store, retrieval_config=retrieval_config)
+
+        self.assertTrue(seen_prompts, "inference_fn was not called")
+        prompt = seen_prompts[0]
+        self.assertIn(GRAPH_CONTEXT_START, prompt)
+        # The task-relevant entity must be present; the irrelevant one must not.
+        self.assertIn("cat_1", prompt)
+        self.assertNotIn("unrelated_1", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

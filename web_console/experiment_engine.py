@@ -71,6 +71,20 @@ _REPETITION_WINDOW: int = 3
 _REPETITION_THRESHOLD: float = 0.8
 _SCHEMA_VERSION: int = 1
 
+# Common English stop-words excluded from task-keyword extraction so that only
+# content-bearing tokens are forwarded to the retrieval scorer.
+_STOPWORDS: frozenset[str] = frozenset({
+    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for",
+    "of", "with", "by", "from", "is", "are", "was", "were", "be", "been",
+    "do", "does", "did", "have", "has", "had", "will", "would", "can",
+    "could", "should", "may", "might", "shall", "what", "which", "who",
+    "whom", "this", "that", "these", "those", "you", "your", "it", "its",
+    "i", "me", "my", "we", "our", "they", "their", "he", "she", "him",
+    "her", "not", "no", "any", "all", "how", "when", "where", "there",
+    "here", "if", "then", "than", "as", "so", "up", "out", "about",
+    "see", "describe", "tell", "explain",
+})
+
 
 # ── type alias ────────────────────────────────────────────────────────────────
 
@@ -587,6 +601,17 @@ def _run_observation_history(
     return results
 
 
+def _keywords_from_prompt(prompt: str) -> list[str]:
+    """Return content-bearing tokens from *prompt* for retrieval scoring.
+
+    Splits on non-word characters, lower-cases, and strips common stop-words so
+    that only semantically meaningful tokens are forwarded to the retrieval
+    scorer as ``task_keywords``.
+    """
+    tokens = re.split(r"\W+", prompt.lower())
+    return [t for t in tokens if t and t not in _STOPWORDS]
+
+
 def _run_knowledge_graph(
     defn: ExperimentDefinition,
     *,
@@ -625,7 +650,12 @@ def _run_knowledge_graph(
             break
 
         # ── 1. Retrieve salient subgraph and build the knowledge-graph prompt ──
-        subgraph = retrieve_salient_subgraph(graph_store, config=retrieval_config)
+        task_keywords = _keywords_from_prompt(defn.task_prompt)
+        subgraph = retrieve_salient_subgraph(
+            graph_store,
+            task_keywords=task_keywords,
+            config=retrieval_config,
+        )
         graph_context_block = serialize_subgraph(subgraph)
 
         prompt = _build_prompt(
