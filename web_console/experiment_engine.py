@@ -344,6 +344,7 @@ def run_experiment(
     cancel_fn: Optional[Callable[[], bool]] = None,
     on_frame: Optional[Callable[[int, "FrameResult"], None]] = None,
     graph_store: Optional[GraphStore] = None,
+    retrieval_config: Optional[RetrievalConfig] = None,
 ) -> List[FrameResult]:
     """Execute the experiment described by *defn* and return per-frame results.
 
@@ -365,6 +366,10 @@ def run_experiment(
         A ``GraphStore`` instance to use with the ``single_frame_knowledge_graph``
         strategy.  When ``None`` and the strategy requires a store, a new
         empty store is created automatically.
+    retrieval_config:
+        Controls subgraph retrieval for the ``single_frame_knowledge_graph``
+        strategy (e.g. context budget, salience weights, max entities).
+        Defaults to ``RetrievalConfig()`` when ``None``.
 
     Returns
     -------
@@ -418,6 +423,7 @@ def run_experiment(
             cancel_fn=cancel_fn,
             on_frame=on_frame,
             graph_store=graph_store,
+            retrieval_config=retrieval_config,
         )
     else:
         # Unreachable after validate_definition, but defensive.
@@ -591,6 +597,7 @@ def _run_knowledge_graph(
     cancel_fn: Optional[Callable[[], bool]] = None,
     on_frame: Optional[Callable[[int, "FrameResult"], None]] = None,
     graph_store: GraphStore,
+    retrieval_config: Optional[RetrievalConfig] = None,
 ) -> List[FrameResult]:
     """Strategy: single_frame_knowledge_graph — full knowledge-graph round-trip.
 
@@ -598,6 +605,8 @@ def _run_knowledge_graph(
 
     1. Retrieve a bounded salient subgraph from *graph_store* and serialise it
        into the prompt so the VLM receives structured world-model context.
+       Retrieval bounds (budget, weights, max entities) are controlled by
+       *retrieval_config*; defaults to ``RetrievalConfig()`` when ``None``.
     2. Invoke the VLM.
     3. Parse any structured ``<<GRAPH_UPDATES_START/END>>`` block from the
        response and pass the proposals through ``GraphUpdater`` validation and
@@ -616,7 +625,7 @@ def _run_knowledge_graph(
             break
 
         # ── 1. Retrieve salient subgraph and build the knowledge-graph prompt ──
-        subgraph = retrieve_salient_subgraph(graph_store)
+        subgraph = retrieve_salient_subgraph(graph_store, config=retrieval_config)
         graph_context_block = serialize_subgraph(subgraph)
 
         prompt = _build_prompt(
@@ -716,7 +725,7 @@ def _frame_result_to_record(
         rec["source_frame_index"] = fr.source_frame_index
     if fr.source_timestamp_ns is not None:
         rec["source_timestamp_ns"] = fr.source_timestamp_ns
-    if fr.graph_updates_accepted or fr.graph_updates_rejected:
+    if defn.strategy == "single_frame_knowledge_graph":
         rec["graph_updates_accepted"] = fr.graph_updates_accepted
         rec["graph_updates_rejected"] = fr.graph_updates_rejected
     return rec
