@@ -110,6 +110,7 @@ class TestSummarizeAndCompare(unittest.TestCase):
         report = compare_runs(runs)
         recommendation = report["recommendation"]
         self.assertEqual(recommendation["recommended_mode"], "E")
+        self.assertIn("E", recommendation["ranked_modes"])
         self.assertIn("D", recommendation["unavailable_modes"])
 
     def test_recommendation_withholds_when_gr3d_units_mixed(self):

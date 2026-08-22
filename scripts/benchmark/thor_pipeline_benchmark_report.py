@@ -190,11 +190,12 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
             }
         else:
             use_gr3d_mhz = not has_gr3d_pct
-            ranked = sorted(cadence_modes, key=lambda mode: _score_contention(by_mode[mode], use_gr3d_mhz=use_gr3d_mhz))
-            ranked_available = [
-                mode for mode in ranked
-                if math.isfinite(_score_contention(by_mode[mode], use_gr3d_mhz=use_gr3d_mhz))
-            ]
+            scored_modes = {
+                mode: _score_contention(by_mode[mode], use_gr3d_mhz=use_gr3d_mhz)
+                for mode in cadence_modes
+            }
+            ranked = sorted(cadence_modes, key=lambda mode: scored_modes[mode])
+            ranked_available = [mode for mode in ranked if math.isfinite(scored_modes[mode])]
             unavailable = [mode for mode in ranked if mode not in ranked_available]
             if ranked_available:
                 basis = "GR3D MHz" if use_gr3d_mhz else "GR3D percent"
