@@ -1,9 +1,11 @@
 # Jetson AGX Thor deployment recipe
 
 This is the canonical deployment and validation recipe for
-`edge_vlm_ros` on NVIDIA Jetson AGX Thor. The JP7.2 baseline below is the
-current target for a fresh-flash hardware rerun; do not treat this branch as
-hardware-validated until that rerun passes on the exact PR head.
+`edge_vlm_ros` on NVIDIA Jetson AGX Thor. The JP7.2.x / R39.2.x baseline below
+has been hardware-validated end-to-end on AGX Thor at
+`38106dd43c25aa0eccc66be5b5cdd997d221c1fa` (rosbag → Isaac ROS RT-DETR
+including `/tensor_rt` → tracked_observation_adapter → TensorRT Edge-LLM/VLM
+→ `/vlm/result` with `success: true`).
 
 ## Supported target baseline
 

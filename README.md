@@ -6,8 +6,9 @@ structured vision-language results. Supported model configurations include
 NVIDIA Cosmos-Reason2 and Qwen3-VL.
 
 The hardware path is retargeted to JetPack 7.2.x / Jetson Linux R39.2.x with a
-Cosmos-Reason2-8B NVFP4 engine and NVIDIA Isaac ROS assets, pending fresh-flash
-hardware validation on the exact PR head.
+Cosmos-Reason2-8B NVFP4 engine and NVIDIA Isaac ROS assets, and has now been
+hardware-validated end-to-end on AGX Thor at
+`38106dd43c25aa0eccc66be5b5cdd997d221c1fa`.
 
 ## Architecture
 
@@ -44,7 +45,7 @@ for the investigation and evidence.
 | --- | --- |
 | Hardware | NVIDIA Jetson AGX Thor |
 | OS | Ubuntu 24.04, aarch64 |
-| JetPack / Jetson Linux | JetPack 7.2.x / R39.2.x (target baseline; pending fresh-flash validation) |
+| JetPack / Jetson Linux | JetPack 7.2.x / R39.2.x (hardware-validated target baseline) |
 | CUDA | Host toolkit: 13.2 (JP7.2.x baseline); Thor Edge-LLM CMake profile: `CUDA_CTK_VERSION=13.0` |
 | ROS 2 | Jazzy |
 | TensorRT Edge-LLM | Thor build containing `sm_110a` CUDA images |
