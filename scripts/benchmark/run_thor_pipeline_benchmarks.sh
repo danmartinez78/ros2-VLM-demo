@@ -13,6 +13,10 @@ tegrastats_interval_ms=1000
 startup_wait_seconds=12
 enable_rviz=false
 manual_trigger_command=""
+bag_image_topic="/image_rect"
+pipeline_image_topic="/camera0/color/image_raw"
+bag_camera_info_topic="/camera_info_rect"
+pipeline_camera_info_topic="/camera0/color/camera_info"
 dry_run=false
 
 usage() {
@@ -26,12 +30,17 @@ Options:
   --tegrastats-interval-ms N    tegrastats polling interval (default: 1000)
   --startup-wait-seconds N      Wait after launch before measurements (default: 12)
   --manual-trigger-command CMD  Optional command for mode F manual trigger
+  --bag-image-topic TOPIC        Rosbag image topic (default: /image_rect)
+  --pipeline-image-topic TOPIC   Pipeline image topic (default: /camera0/color/image_raw)
+  --bag-camera-info-topic TOPIC  Rosbag camera info topic (default: /camera_info_rect)
+  --pipeline-camera-info-topic TOPIC
+                                 Pipeline camera info topic (default: /camera0/color/camera_info)
   --enable-rviz                 Enable RViz in launched stacks (default: disabled)
   --dry-run                     Print commands without executing
   --help                        Show this help
 
 Benchmark matrix:
-  A: RT-DETR on, VLM off-like (sample_period_seconds=3600)
+  A: RT-DETR + adapter only baseline (VLM disabled)
   B: RT-DETR off, VLM on (edge_vlm.launch baseline)
   C: RT-DETR on, VLM continuous (sample_period_seconds=0)
   D: RT-DETR on, VLM 1 Hz (sample_period_seconds=1)
@@ -49,6 +58,10 @@ while (($#)); do
     --tegrastats-interval-ms) tegrastats_interval_ms="$2"; shift 2 ;;
     --startup-wait-seconds) startup_wait_seconds="$2"; shift 2 ;;
     --manual-trigger-command) manual_trigger_command="$2"; shift 2 ;;
+    --bag-image-topic) bag_image_topic="$2"; shift 2 ;;
+    --pipeline-image-topic) pipeline_image_topic="$2"; shift 2 ;;
+    --bag-camera-info-topic) bag_camera_info_topic="$2"; shift 2 ;;
+    --pipeline-camera-info-topic) pipeline_camera_info_topic="$2"; shift 2 ;;
     --enable-rviz) enable_rviz=true; shift ;;
     --dry-run) dry_run=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -60,6 +73,10 @@ done
 [[ "${duration_seconds}" =~ ^[1-9][0-9]*$ ]] || { echo "duration must be positive integer" >&2; exit 2; }
 [[ "${tegrastats_interval_ms}" =~ ^[1-9][0-9]*$ ]] || { echo "tegrastats interval must be positive integer" >&2; exit 2; }
 [[ "${startup_wait_seconds}" =~ ^[1-9][0-9]*$ ]] || { echo "startup wait must be positive integer" >&2; exit 2; }
+[[ -n "${bag_image_topic}" ]] || { echo "--bag-image-topic must be non-empty" >&2; exit 2; }
+[[ -n "${pipeline_image_topic}" ]] || { echo "--pipeline-image-topic must be non-empty" >&2; exit 2; }
+[[ -n "${bag_camera_info_topic}" ]] || { echo "--bag-camera-info-topic must be non-empty" >&2; exit 2; }
+[[ -n "${pipeline_camera_info_topic}" ]] || { echo "--pipeline-camera-info-topic must be non-empty" >&2; exit 2; }
 
 if [[ -z "${output_dir}" ]]; then
   output_dir="/tmp/thor_pipeline_bench_$(date -u +%Y%m%d_%H%M%S)"
@@ -142,7 +159,7 @@ trap cleanup EXIT
 
 mode_description() {
   case "$1" in
-    A) echo "RT-DETR on, VLM off-like" ;;
+    A) echo "RT-DETR + adapter baseline (VLM disabled)" ;;
     B) echo "RT-DETR off, VLM baseline" ;;
     C) echo "RT-DETR on, VLM continuous" ;;
     D) echo "RT-DETR on, VLM 1 Hz" ;;
@@ -165,22 +182,22 @@ build_launch_args_for_mode() {
   local thor_common=("enable_rviz:=${enable_rviz}" "${common[@]}")
   case "${mode}" in
     A)
-      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true start_vlm:=false image_topic:="${pipeline_image_topic}" sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     B)
-      launch_args=(ros2 launch edge_vlm_ros edge_vlm.launch.py image_topic:=/camera0/color/image_raw result_topic:=/vlm/result sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 "${common[@]}")
+      launch_args=(ros2 launch edge_vlm_ros edge_vlm.launch.py image_topic:="${pipeline_image_topic}" result_topic:=/vlm/result sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 "${common[@]}")
       ;;
     C)
-      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true image_topic:="${pipeline_image_topic}" sample_period_seconds:=0.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     D)
-      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=1.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true image_topic:="${pipeline_image_topic}" sample_period_seconds:=1.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     E)
-      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=2.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true image_topic:="${pipeline_image_topic}" sample_period_seconds:=2.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     F)
-      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
+      launch_args=(ros2 launch edge_vlm_ros thor_tracked_observation.launch.py start_rtdetr:=true image_topic:="${pipeline_image_topic}" sample_period_seconds:=3600.0 min_vlm_interval_seconds:=0.0 "${thor_common[@]}")
       ;;
     *)
       return 1
@@ -189,6 +206,10 @@ build_launch_args_for_mode() {
 }
 
 IFS=',' read -r -a modes <<< "${modes_csv}"
+bag_play_remap_args=(
+  "--remap" "${bag_image_topic}:=${pipeline_image_topic}"
+  "--remap" "${bag_camera_info_topic}:=${pipeline_camera_info_topic}"
+)
 
 echo "Thor pipeline benchmark root: ${output_dir}"
 echo "Modes: ${modes_csv}"
@@ -226,6 +247,10 @@ PY
   DURATION_SECONDS="${duration_seconds}" \
   TEGRA_INTERVAL_MS="${tegrastats_interval_ms}" \
   MANUAL_TRIGGER_JSON="${manual_trigger_json}" \
+  BAG_IMAGE_TOPIC="${bag_image_topic}" \
+  PIPELINE_IMAGE_TOPIC="${pipeline_image_topic}" \
+  BAG_CAMERA_INFO_TOPIC="${bag_camera_info_topic}" \
+  PIPELINE_CAMERA_INFO_TOPIC="${pipeline_camera_info_topic}" \
   python3 - "${run_dir}/run_config.json" <<'PY'
 import json
 import os
@@ -243,6 +268,20 @@ payload = {
     "duration_seconds": int(os.environ["DURATION_SECONDS"]),
     "tegrastats_interval_ms": int(os.environ["TEGRA_INTERVAL_MS"]),
     "manual_trigger_command": manual,
+    "input_mappings": {
+        "image": {
+            "bag_topic": os.environ["BAG_IMAGE_TOPIC"],
+            "pipeline_topic": os.environ["PIPELINE_IMAGE_TOPIC"],
+        },
+        "camera_info": {
+            "bag_topic": os.environ["BAG_CAMERA_INFO_TOPIC"],
+            "pipeline_topic": os.environ["PIPELINE_CAMERA_INFO_TOPIC"],
+        },
+    },
+    "bag_play_remaps": [
+        f"{os.environ['BAG_IMAGE_TOPIC']}:={os.environ['PIPELINE_IMAGE_TOPIC']}",
+        f"{os.environ['BAG_CAMERA_INFO_TOPIC']}:={os.environ['PIPELINE_CAMERA_INFO_TOPIC']}",
+    ],
 }
 with open(sys.argv[1], "w", encoding="utf-8") as stream:
     json.dump(payload, stream, indent=2)
@@ -274,7 +313,7 @@ PY
     ros2 topic hz /vlm/result > "${run_dir}/vlm_result_hz.log" 2>&1 &
     cleanup_pids+=("$!")
 
-    timeout --signal=INT --kill-after=5 "${duration_seconds}" ros2 bag play "${rosbag_path}" --clock --loop > "${run_dir}/bag_play.log" 2>&1 &
+    timeout --signal=INT --kill-after=5 "${duration_seconds}" ros2 bag play "${rosbag_path}" --clock --loop "${bag_play_remap_args[@]}" > "${run_dir}/bag_play.log" 2>&1 &
     bag_pid=$!
     cleanup_pids+=("${bag_pid}")
 
@@ -300,7 +339,9 @@ PY
     printf "[DRY RUN] "
     printf "%q " "${launch_args[@]}"
     echo "> ${launch_log}"
-    echo "[DRY RUN] timeout ${duration_seconds} ros2 bag play ${rosbag_path} --clock --loop"
+    printf "[DRY RUN] timeout %q ros2 bag play %q --clock --loop " "${duration_seconds}" "${rosbag_path}"
+    printf "%q " "${bag_play_remap_args[@]}"
+    echo
     echo "[DRY RUN] ros2 topic hz /detections > ${run_dir}/detections_hz.log"
     echo "[DRY RUN] ros2 topic hz /tracked_observation > ${run_dir}/tracked_observation_hz.log"
     echo "[DRY RUN] ros2 topic hz /vlm/result > ${run_dir}/vlm_result_hz.log"

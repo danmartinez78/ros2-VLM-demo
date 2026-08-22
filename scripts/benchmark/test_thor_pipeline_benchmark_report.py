@@ -21,7 +21,7 @@ from thor_pipeline_benchmark_report import (  # noqa: E402
 
 
 class TestParseTegraStats(unittest.TestCase):
-    def test_extracts_expected_metrics(self):
+    def test_extracts_expected_metrics_desktop_style(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "tegrastats.log"
             path.write_text(
@@ -38,6 +38,16 @@ RAM 24400/125700MB CPU [95%@2016,21%@2016,18%@2016] EMC_FREQ 64%@4266 GR3D_FREQ 
             self.assertAlmostEqual(summary["gr3d_pct"]["mean"], 98.0, places=1)
             self.assertGreaterEqual(summary["cpu_hottest_core_p95_pct"], 95.0)
             self.assertAlmostEqual(summary["module_power_w"]["mean"], 91.0, places=1)
+
+    def test_extracts_expected_metrics_thor_style(self):
+        fixture = _BENCH_DIR / "test_fixtures" / "tegrastats_thor_sample.log"
+        summary = parse_tegrastats_log(fixture)
+        self.assertEqual(summary["samples"], 2)
+        self.assertIsNone(summary["gr3d_pct"]["mean"])
+        self.assertAlmostEqual(summary["gr3d_mhz"]["mean"], 1574.0, places=1)
+        self.assertAlmostEqual(summary["module_power_w"]["mean"], 94.064, places=3)
+        self.assertAlmostEqual(summary["power_rails_w"]["VDD_GPU"]["mean"], 2.65, places=2)
+        self.assertAlmostEqual(summary["power_rails_w"]["VIN_SYS_5V0"]["mean"], 1.35, places=2)
 
 
 class TestParseTopicHz(unittest.TestCase):
@@ -74,6 +84,34 @@ class TestSummarizeAndCompare(unittest.TestCase):
             self.assertEqual(report["recommendation"]["recommended_mode"], "F")
             self.assertTrue("cpu_single_core_hotspot_present" in report["findings"])
 
+    def test_recommendation_marks_unavailable_metrics(self):
+        runs = [
+            {
+                "mode": "D",
+                "description": "D",
+                "tegrastats": {
+                    "emc_pct": {"mean": 55.0},
+                    "gr3d_pct": {"mean": None},
+                    "gr3d_mhz": {"mean": None},
+                    "cpu_hottest_core_p95_pct": 90.0,
+                },
+            },
+            {
+                "mode": "E",
+                "description": "E",
+                "tegrastats": {
+                    "emc_pct": {"mean": 50.0},
+                    "gr3d_pct": {"mean": 70.0},
+                    "gr3d_mhz": {"mean": 1500.0},
+                    "cpu_hottest_core_p95_pct": 80.0,
+                },
+            },
+        ]
+        report = compare_runs(runs)
+        recommendation = report["recommendation"]
+        self.assertEqual(recommendation["recommended_mode"], "E")
+        self.assertIn("D", recommendation["unavailable_modes"])
+
 
 class TestThorRunnerDryRun(unittest.TestCase):
     def test_dry_run_prints_matrix_commands(self):
@@ -94,7 +132,9 @@ class TestThorRunnerDryRun(unittest.TestCase):
         self.assertEqual(result.returncode, 0, combined)
         self.assertIn("Mode A", combined)
         self.assertIn("Mode F", combined)
-        self.assertIn("sample_period_seconds:=3600.0", combined)
+        self.assertIn("start_vlm:=false", combined)
+        self.assertIn("/image_rect:=/camera0/color/image_raw", combined)
+        self.assertIn("/camera_info_rect:=/camera0/color/camera_info", combined)
         self.assertIn("comparison_report.json", combined)
 
 

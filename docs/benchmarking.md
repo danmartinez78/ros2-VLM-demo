@@ -315,11 +315,21 @@ bash scripts/benchmark/run_thor_pipeline_benchmarks.sh \
   --duration-seconds 120
 ```
 
+By default, the runner remaps the validated RT-DETR quickstart bag topics:
+
+- `/image_rect -> /camera0/color/image_raw`
+- `/camera_info_rect -> /camera0/color/camera_info`
+
+Override with:
+
+- `--bag-image-topic` / `--pipeline-image-topic`
+- `--bag-camera-info-topic` / `--pipeline-camera-info-topic`
+
 ### Matrix implemented by the runner
 
 | Mode | RT-DETR | VLM cadence |
 |------|---------|-------------|
-| A | on | off-like (`sample_period_seconds=3600`) |
+| A | on | disabled (detector/tracker-only baseline) |
 | B | off | continuous (VLM baseline) |
 | C | on | continuous/current (`sample_period_seconds=0`) |
 | D | on | 1 Hz (`sample_period_seconds=1`) |

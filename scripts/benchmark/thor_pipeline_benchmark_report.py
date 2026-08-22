@@ -14,8 +14,10 @@ from typing import Any
 
 _RE_RAM = re.compile(r"RAM\s+(\d+)/(\d+)MB")
 _RE_EMC = re.compile(r"EMC_FREQ\s+(\d+)%@([0-9]+)")
-_RE_GR3D = re.compile(r"GR3D_FREQ\s+(\d+)%@\[?([0-9]+)")
-_RE_VDD_IN = re.compile(r"VDD_IN\s+([0-9]+)mW")
+_RE_GR3D_PCT = re.compile(r"GR3D_FREQ\s+(\d+)%@\[(.*?)\]|GR3D_FREQ\s+(\d+)%@([0-9]+)")
+_RE_GR3D_ARRAY = re.compile(r"GR3D_FREQ\s+@\[([0-9,\s]+)\]")
+_RE_MODULE_POWER = re.compile(r"\b(?:VDD_IN|VIN)\s+([0-9]+)mW")
+_RE_POWER_RAIL = re.compile(r"\b([A-Z0-9_]+)\s+([0-9]+)mW(?:/[0-9]+mW/[0-9]+mW)?")
 _RE_TEMP = re.compile(r"(?:GPU|gpu)@([0-9]+(?:\.[0-9]+)?)C")
 _RE_TJ = re.compile(r"(?:Tj|tj|Tboard|AO)@([0-9]+(?:\.[0-9]+)?)C")
 _RE_CPU = re.compile(r"CPU\s*\[([^\]]+)\]")
@@ -40,6 +42,7 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
     ram_used_mb: list[float] = []
     ram_total_mb: list[float] = []
     vdd_in_w: list[float] = []
+    rail_power_w: dict[str, list[float]] = {}
     gpu_temp_c: list[float] = []
     tj_temp_c: list[float] = []
     cpu_core_samples: list[list[float]] = []
@@ -54,11 +57,24 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
         if match := _RE_EMC.search(line):
             emc_pct.append(float(match.group(1)))
             emc_mhz.append(float(match.group(2)))
-        if match := _RE_GR3D.search(line):
-            gr3d_pct.append(float(match.group(1)))
-            gr3d_mhz.append(float(match.group(2)))
-        if match := _RE_VDD_IN.search(line):
+        if match := _RE_GR3D_PCT.search(line):
+            pct = match.group(1) or match.group(3)
+            if pct is not None:
+                gr3d_pct.append(float(pct))
+            clocks_raw = match.group(2) or match.group(4)
+            if clocks_raw:
+                clocks = [float(value.strip()) for value in clocks_raw.split(",") if value.strip()]
+                if clocks:
+                    gr3d_mhz.append(fmean(clocks))
+        elif match := _RE_GR3D_ARRAY.search(line):
+            clocks = [float(value.strip()) for value in match.group(1).split(",") if value.strip()]
+            if clocks:
+                gr3d_mhz.append(fmean(clocks))
+        if match := _RE_MODULE_POWER.search(line):
             vdd_in_w.append(float(match.group(1)) / 1000.0)
+        for rail_match in _RE_POWER_RAIL.finditer(line):
+            rail = rail_match.group(1)
+            rail_power_w.setdefault(rail, []).append(float(rail_match.group(2)) / 1000.0)
         if match := _RE_TEMP.search(line):
             gpu_temp_c.append(float(match.group(1)))
         if match := _RE_TJ.search(line):
@@ -81,7 +97,7 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
             ram_pct.append((used / total) * 100.0)
 
     return {
-        "samples": len(cpu_core_samples) or len(emc_pct) or len(gr3d_pct),
+        "samples": len(cpu_core_samples) or len(emc_pct) or len(gr3d_pct) or len(gr3d_mhz),
         "emc_pct": _stats(emc_pct),
         "emc_mhz": _stats(emc_mhz),
         "gr3d_pct": _stats(gr3d_pct),
@@ -89,6 +105,7 @@ def parse_tegrastats_log(path: Path) -> dict[str, Any]:
         "ram_used_mb": _stats(ram_used_mb),
         "ram_pct": _stats(ram_pct),
         "module_power_w": _stats(vdd_in_w),
+        "power_rails_w": {rail: _stats(values) for rail, values in sorted(rail_power_w.items())},
         "gpu_temp_c": _stats(gpu_temp_c),
         "junction_temp_c": _stats(tj_temp_c),
         "cpu_hottest_core_p95_pct": hottest_core_p95,
@@ -140,9 +157,13 @@ def summarize_run(run_dir: Path) -> dict[str, Any]:
 
 def _score_contention(run: dict[str, Any]) -> float:
     tegra = run.get("tegrastats", {})
-    emc = ((tegra.get("emc_pct") or {}).get("mean") or 0.0)
-    gr3d = ((tegra.get("gr3d_pct") or {}).get("mean") or 0.0)
-    cpu = tegra.get("cpu_hottest_core_p95_pct") or 0.0
+    emc = ((tegra.get("emc_pct") or {}).get("mean"))
+    gr3d = ((tegra.get("gr3d_pct") or {}).get("mean"))
+    if gr3d is None:
+        gr3d = ((tegra.get("gr3d_mhz") or {}).get("mean"))
+    cpu = tegra.get("cpu_hottest_core_p95_pct")
+    if emc is None or gr3d is None or cpu is None:
+        return float("inf")
     return emc + gr3d + 0.5 * cpu
 
 
@@ -154,11 +175,22 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
     recommendation = None
     if cadence_modes:
         ranked = sorted(cadence_modes, key=lambda mode: _score_contention(by_mode[mode]))
-        recommendation = {
-            "recommended_mode": ranked[0],
-            "reason": "Lowest combined EMC/GR3D/CPU contention score among tested cadence modes.",
-            "ranked_modes": ranked,
-        }
+        ranked_available = [mode for mode in ranked if math.isfinite(_score_contention(by_mode[mode]))]
+        unavailable = [mode for mode in ranked if mode not in ranked_available]
+        if ranked_available:
+            recommendation = {
+                "recommended_mode": ranked_available[0],
+                "reason": "Lowest combined EMC/GR3D/CPU contention score among tested cadence modes.",
+                "ranked_modes": ranked_available,
+                "unavailable_modes": unavailable,
+            }
+        else:
+            recommendation = {
+                "recommended_mode": None,
+                "reason": "No cadence mode had complete EMC/GR3D/CPU metrics for contention scoring.",
+                "ranked_modes": [],
+                "unavailable_modes": unavailable,
+            }
 
     findings = {
         "rtdetr_only_mode": by_mode.get("A", {}).get("tegrastats"),
@@ -180,6 +212,11 @@ def compare_runs(run_summaries: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def format_text(report: dict[str, Any]) -> str:
+    def _fmt(value: Any) -> str:
+        if value is None:
+            return "unavailable"
+        return str(value)
+
     lines = [
         "================================================================",
         " Thor Full-Pipeline Benchmark Summary",
@@ -191,13 +228,15 @@ def format_text(report: dict[str, Any]) -> str:
         tegra = run.get("tegrastats", {})
         lines += [
             f"[{run.get('mode')}] {run.get('description', '')}",
-            f"  EMC mean: {((tegra.get('emc_pct') or {}).get('mean'))}",
-            f"  GR3D mean: {((tegra.get('gr3d_pct') or {}).get('mean'))}",
-            f"  CPU hottest-core p95: {tegra.get('cpu_hottest_core_p95_pct')}",
-            f"  Detections Hz: {(run.get('rates_hz') or {}).get('detections')}",
-            f"  Tracked-observation Hz: {(run.get('rates_hz') or {}).get('tracked_observation')}",
-            f"  VLM result Hz: {(run.get('rates_hz') or {}).get('vlm_result')}",
-            f"  VLM inference mean ms: {(run.get('vlm') or {}).get('inference_ms_mean')}",
+            f"  EMC mean: {_fmt(((tegra.get('emc_pct') or {}).get('mean')))}",
+            f"  GR3D mean (%): {_fmt(((tegra.get('gr3d_pct') or {}).get('mean')))}",
+            f"  GR3D mean (MHz): {_fmt(((tegra.get('gr3d_mhz') or {}).get('mean')))}",
+            f"  Module power mean (W): {_fmt(((tegra.get('module_power_w') or {}).get('mean')))}",
+            f"  CPU hottest-core p95: {_fmt(tegra.get('cpu_hottest_core_p95_pct'))}",
+            f"  Detections Hz: {_fmt((run.get('rates_hz') or {}).get('detections'))}",
+            f"  Tracked-observation Hz: {_fmt((run.get('rates_hz') or {}).get('tracked_observation'))}",
+            f"  VLM result Hz: {_fmt((run.get('rates_hz') or {}).get('vlm_result'))}",
+            f"  VLM inference mean ms: {_fmt((run.get('vlm') or {}).get('inference_ms_mean'))}",
             "",
         ]
 
@@ -207,7 +246,8 @@ def format_text(report: dict[str, Any]) -> str:
             "Recommendation",
             "--------------",
             f"Mode {recommendation.get('recommended_mode')}: {recommendation.get('reason')}",
-            f"Ranking: {', '.join(recommendation.get('ranked_modes', []))}",
+            f"Ranking: {', '.join(recommendation.get('ranked_modes', [])) or 'unavailable'}",
+            f"Unavailable for scoring: {', '.join(recommendation.get('unavailable_modes', [])) or 'none'}",
             "",
         ]
 
