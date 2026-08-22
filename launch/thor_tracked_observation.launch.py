@@ -22,7 +22,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node, SetRemap
 from launch_ros.substitutions import FindPackageShare
 
@@ -38,33 +38,6 @@ def _require_existing_path(label: str, path: str) -> None:
         raise RuntimeError(f'{label} must be an absolute path: {path}')
     if not os.path.exists(path):
         raise RuntimeError(f'{label} does not exist: {path}')
-
-
-def _default_isaac_ros_ws() -> str:
-    isaac_ros_ws = os.environ.get('ISAAC_ROS_WS', '')
-    if isaac_ros_ws:
-        return isaac_ros_ws
-    return os.path.join(os.path.expanduser('~'), 'ros2_ws')
-
-
-def _default_rtdetr_model_file_path() -> str:
-    return os.path.join(
-        _default_isaac_ros_ws(),
-        'isaac_ros_assets',
-        'models',
-        'synthetica_detr',
-        'sdetr_grasp.onnx',
-    )
-
-
-def _default_rtdetr_engine_file_path() -> str:
-    return os.path.join(
-        _default_isaac_ros_ws(),
-        'isaac_ros_assets',
-        'models',
-        'synthetica_detr',
-        'sdetr_grasp.plan',
-    )
 
 
 def _resolve_isaac_rtdetr_launch() -> str:
@@ -111,6 +84,7 @@ def _validate_thor_launch(context, *args, **kwargs):
             raise RuntimeError(f'rviz2 executable not found: {rviz_executable}')
 
     if _truthy(LaunchConfiguration('start_rtdetr').perform(context)):
+        # Validate package/launch availability here so launch fails before starting other nodes.
         _resolve_isaac_rtdetr_launch()
         rtdetr_model_file_path = LaunchConfiguration('rtdetr_model_file_path').perform(context)
         rtdetr_engine_file_path = LaunchConfiguration('rtdetr_engine_file_path').perform(context)
@@ -161,6 +135,10 @@ def generate_launch_description() -> LaunchDescription:
     rviz_config = PathJoinSubstitution([
         FindPackageShare('edge_vlm_ros'), 'rviz', 'vision_reasoning_results.rviz'
     ])
+    default_isaac_ros_ws = EnvironmentVariable(
+        'ISAAC_ROS_WS',
+        default_value=os.path.join(os.path.expanduser('~'), 'ros2_ws'),
+    )
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
@@ -175,8 +153,26 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument('llm_engine_dir', default_value=''),
         DeclareLaunchArgument('multimodal_engine_dir', default_value=''),
         DeclareLaunchArgument('edge_llm_plugin_path', default_value=''),
-        DeclareLaunchArgument('rtdetr_model_file_path', default_value=_default_rtdetr_model_file_path()),
-        DeclareLaunchArgument('rtdetr_engine_file_path', default_value=_default_rtdetr_engine_file_path()),
+        DeclareLaunchArgument(
+            'rtdetr_model_file_path',
+            default_value=PathJoinSubstitution([
+                default_isaac_ros_ws,
+                'isaac_ros_assets',
+                'models',
+                'synthetica_detr',
+                'sdetr_grasp.onnx',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'rtdetr_engine_file_path',
+            default_value=PathJoinSubstitution([
+                default_isaac_ros_ws,
+                'isaac_ros_assets',
+                'models',
+                'synthetica_detr',
+                'sdetr_grasp.plan',
+            ]),
+        ),
         OpaqueFunction(function=_validate_thor_launch),
         OpaqueFunction(function=_build_rtdetr_launch),
         IncludeLaunchDescription(
