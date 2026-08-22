@@ -195,7 +195,7 @@ for mode in "${modes[@]}"; do
   }
 
   git_sha="$(git -C "${repo_root}" rev-parse HEAD 2>/dev/null || true)"
-  manual_trigger_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "${manual_trigger_command}")"
+  manual_trigger_json="$(python3 -c 'import json,sys; v=sys.argv[1]; print("null" if v == "" else json.dumps(v))' "${manual_trigger_command}")"
   cat > "${run_dir}/run_config.json" <<EOF
 {
   "run_id": "run_${mode}",
@@ -219,7 +219,7 @@ EOF
     (tegrastats --interval "${tegrastats_interval_ms}" > "${tegra_log}" 2>&1) &
     cleanup_pids+=("$!")
 
-    run_shell "${launch_cmd} > '${launch_log}' 2>&1" &
+    run_shell "${launch_cmd} > \"${launch_log}\" 2>&1" &
     launch_pid=$!
     cleanup_pids+=("${launch_pid}")
 
