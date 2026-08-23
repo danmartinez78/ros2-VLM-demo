@@ -704,17 +704,32 @@ print(json.dumps({
                 ipc_error_msg="\"ipc client exited with code ${ipc_exit_code}\""
             fi
 
-            # Parse IPC result artifact.
+            # Parse IPC result artifact — single python3 invocation to avoid
+            # four separate interpreter start-ups and file reads per iteration.
             local ipc_output_text="null"
             local ipc_output_words="null"
             local ipc_inference_seconds="null"
             local ipc_actual_latency_ms
             if [[ "${ipc_success}" == "true" && "${DRY_RUN}" != "true" && -f "${result_json_path}" ]]; then
-                ipc_output_text=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r.get('output_text')))" "${result_json_path}" 2>/dev/null || echo "null")
-                ipc_output_words=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r.get('output_words')))" "${result_json_path}" 2>/dev/null || echo "null")
-                ipc_inference_seconds=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); v=r.get('inference_seconds'); print(json.dumps(float(v) if v is not None else None))" "${result_json_path}" 2>/dev/null || echo "null")
-                # Prefer client_latency_ms from result artifact over our shell measurement.
-                ipc_actual_latency_ms=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); v=r.get('client_latency_ms'); print(v if v is not None else ${total_latency_ms})" "${result_json_path}" 2>/dev/null || echo "${total_latency_ms}")
+                local ipc_fields
+                ipc_fields=$(python3 - "${result_json_path}" "${total_latency_ms}" <<'PYEOF'
+import json, sys
+path, fallback_ms = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        r = json.load(f)
+    ot = json.dumps(r.get("output_text"))
+    ow = json.dumps(r.get("output_words"))
+    iv = r.get("inference_seconds")
+    inf = json.dumps(float(iv) if iv is not None else None)
+    cv = r.get("client_latency_ms")
+    lms = str(int(cv)) if cv is not None else fallback_ms
+except Exception:
+    ot, ow, inf, lms = "null", "null", "null", fallback_ms
+print(f"{ot}\t{ow}\t{inf}\t{lms}")
+PYEOF
+                2>/dev/null || printf 'null\tnull\tnull\t%s' "${total_latency_ms}")
+                IFS=$'\t' read -r ipc_output_text ipc_output_words ipc_inference_seconds ipc_actual_latency_ms <<< "${ipc_fields}"
             else
                 ipc_actual_latency_ms="${total_latency_ms}"
             fi

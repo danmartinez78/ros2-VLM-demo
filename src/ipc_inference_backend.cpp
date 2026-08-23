@@ -108,14 +108,19 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   // Pack extra images and validate.
   std::vector<cv::Mat> packed_extra;
   packed_extra.reserve(request.extra_images.size());
-  for (const auto & img : request.extra_images) {
+  for (size_t ei = 0; ei < request.extra_images.size(); ++ei) {
+    const auto & img = request.extra_images[ei];
     if (img.empty() || img.type() != CV_8UC3) {
-      throw std::runtime_error("IPC backend: all extra images must be non-empty CV_8UC3 BGR");
+      throw std::runtime_error(
+              "IPC backend: extra image " + std::to_string(ei) +
+              " must be non-empty CV_8UC3 BGR");
     }
     packed_extra.push_back(img.isContinuous() ? img : img.clone());
     const size_t sz = packed_extra.back().total() * packed_extra.back().elemSize();
     if (sz > max_image_bytes) {
-      throw std::runtime_error("IPC request exceeds protocol limits");
+      throw std::runtime_error(
+              "IPC request: extra image " + std::to_string(ei) +
+              " exceeds protocol limits (" + std::to_string(sz) + " bytes)");
     }
   }
 
