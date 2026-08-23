@@ -198,31 +198,30 @@ def build_multiframe_request(
     max_output_tokens: int = MAX_OUTPUT_TOKENS,
 ) -> dict[str, Any]:
     """
-    Build a TensorRT Edge-LLM VLM request JSON for multiple image frames.
+    Build the Thor-validated TensorRT Edge-LLM VLM request JSON for multiple image frames.
 
-    Uses the pinned request shape:
+    Uses the pinned Thor request shape:
       requests -> messages -> content[]
     with role: user.
 
-    Multiple image content items are placed in temporal order, followed by
-    one text prompt.  Each image entry records its path and SHA-256 hash.
+    Multiple image content items (``{"type":"image","image":path}``) are placed
+    in temporal order, followed by one text prompt.  This is the exact shape
+    used by ``tests/test_cases/vlm_basic.json`` in the TensorRT Edge-LLM checkout
+    and validated by the single-frame benchmark.
 
-    This shape is validated and used on the Thor platform.
+    ``max_output_tokens`` is NOT embedded in the request payload; it is passed
+    to the runtime via ``--maxGenerateLength``.
+
+    SHA-256 content hashes are stored in benchmark metadata (JSONL
+    ``frame_paths`` field), not inside the model message payload.
     """
-    content: list[dict[str, Any]] = []
-    for img_path in frame_paths:
-        content.append(
-            {
-                "type": "image_url",
-                "image_url": {"url": img_path},
-                "source_path": img_path,
-                "content_hash": file_sha256(img_path),
-            }
-        )
+    content: list[dict[str, Any]] = [
+        {"type": "image", "image": img_path}
+        for img_path in frame_paths
+    ]
     content.append({"type": "text", "text": prompt_text})
 
     return {
-        "max_new_tokens": max_output_tokens,
         "requests": [
             {
                 "messages": [

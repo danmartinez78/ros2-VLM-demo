@@ -12,13 +12,12 @@
 # ---------------------------
 #   direct : launches a fresh llm_inference process per inference — includes
 #            cold-start (process init, engine load, tokenizer init).
-#            cold_start_total_ms is recorded; it is NOT comparable to IPC
-#            steady-state latency.
-#   ipc    : sends requests to an already-running, warmed edge_vlm_server via
-#            IPC socket (vlm_single_shot_client → edge_vlm_cli). This is
-#            steady-state (persistent server) latency.
-#   cold_start_total_ms (direct) and total_latency_ms (ipc) measure different
-#   lifecycle phases and are kept separate throughout.
+#            cold_start_total_ms is recorded separately from model/runtime
+#            stage timings.
+#
+# IPC path is NOT included in this benchmark because vlm_single_shot_client
+# accepts a single --image argument and cannot submit a multi-image request.
+# Extend the IPC client separately before adding multi-frame IPC support.
 #
 # This script does NOT:
 #   - Change power mode, clock caps, model size, quantization, or engines.
@@ -36,35 +35,39 @@
 #
 # Input request shape
 # -------------------
-# Uses the pinned TensorRT Edge-LLM VLM request shape:
+# Uses the Thor-validated TensorRT Edge-LLM VLM request shape:
 #   requests -> messages -> content[]   (role: user)
-# Multiple image content items are placed in temporal order, followed by
-# one text prompt.  Frame paths and SHA-256 content hashes are recorded per
-# inference for reproducibility.
+# Multiple image content items {"type":"image","image":path} are placed in
+# temporal order, followed by one text item.  SHA-256 content hashes are
+# stored in JSONL benchmark metadata (frame_paths field), not in the model
+# message payload.
 #
 # Native profiling
 # ----------------
-# For direct-path runs, llm_inference is invoked with --dumpProfile
-# --profileOutputFile.  cold_start_total_ms (shell wall time) is recorded
-# separately from NVIDIA-emitted stage metrics.
+# Uses the same validated CLI contract as run_vlm_latency_benchmark.sh:
+#   --engineDir  --multimodalEngineDir  --maxGenerateLength
+#   --inputFile  --outputFile  --warmup 0
+#   --dumpProfile  --profileOutputFile
 #
-# Profile fields parsed (only fields actually emitted by the runtime):
-#   multimodal.total_image_tokens   — total visual token count (when present)
-#   vision_encoder_ms               — vision encoder timing
-#   prefill_ms                      — prefill timing
-#   generation.generated_tokens     — generated token count
-#   generation.tokens_per_second    — generation tokens/sec
-#   generation.total_gpu_time_ms    — generation total GPU time
-#   finish_reason                   — finish reason
+# Profile fields parsed (exact Thor profile schema from PR #64):
+#   multimodal.total_image_tokens                        — visual token count
+#   stages[stage_id=vision_encoder].average_time_per_run_ms
+#   prefill.average_time_per_run_ms
+#   generation.generated_tokens / tokens_per_second / total_time_ms
+#   stages[stage_id=llm_generation].total_gpu_time_ms
 # TTFT remains null unless explicitly emitted by the runtime.
+#
+# Artifact naming
+# ---------------
+# Warmup and measured iterations use distinct sub-directories:
+#   warmup_iter_N  / measured_iter_N
+# so that artifacts from different phases never collide.
 #
 # Required environment (source scripts/edge_vlm_env.sh before running):
 #   TENSORRT_EDGE_LLM_ROOT         root of TensorRT Edge-LLM checkout
 #   EDGE_VLM_LLM_ENGINE_DIR        path to LLM engine directory
 #   EDGE_VLM_MULTIMODAL_ENGINE_DIR path to multimodal engine directory
 #   EDGE_VLM_MODEL_NAME            model identifier string (for metadata)
-#   EDGE_VLM_WORKER_SOCKET         IPC socket for edge_vlm_server
-#                                  (default: /tmp/edge_vlm.sock)
 #
 # Usage
 # -----
@@ -83,11 +86,8 @@
 #   --max-output-tokens N    Maximum output tokens (default: 32)
 #   --output-dir DIR         Directory for all output artifacts
 #                            (default: /tmp/vlm_multiframe_bench_TIMESTAMP)
-#   --paths LIST             Comma-separated paths: direct,ipc (default: direct,ipc)
 #   --warmup N               Warmup iterations per condition (default: 1)
 #   --iterations N           Measured iterations per condition (default: 3)
-#   --skip-ipc               Alias for --paths direct
-#   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
 
 set -euo pipefail
@@ -98,7 +98,6 @@ TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 OUTPUT_DIR="/tmp/vlm_multiframe_bench_${TIMESTAMP}"
 FRAME_COUNTS="1,2,4,8"
 MAX_OUTPUT_TOKENS=32
-PATHS="direct,ipc"
 WARMUP=1
 ITERATIONS=3
 SEQUENCE_DIR=""
@@ -115,11 +114,8 @@ while [[ $# -gt 0 ]]; do
         --frame-counts)     FRAME_COUNTS="$2";         shift 2 ;;
         --max-output-tokens) MAX_OUTPUT_TOKENS="$2";   shift 2 ;;
         --output-dir)       OUTPUT_DIR="$2";           shift 2 ;;
-        --paths)            PATHS="$2";                shift 2 ;;
         --warmup)           WARMUP="$2";               shift 2 ;;
         --iterations)       ITERATIONS="$2";           shift 2 ;;
-        --skip-ipc)         PATHS="direct";            shift ;;
-        --skip-direct)      PATHS="ipc";               shift ;;
         --dry-run)          DRY_RUN=true;              shift ;;
         *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
     esac
@@ -271,19 +267,18 @@ _select_frames() {
 # ── request JSON construction ─────────────────────────────────────────────────
 
 _build_request_json() {
-    # Build TensorRT Edge-LLM VLM request JSON for multiple frames.
-    # Outputs the JSON to stdout.
-    # Arguments: frame_path1 [frame_path2 ...] -- (frames are passed as positional args)
-    local max_tokens="$1"; shift
+    # Build the Thor-validated TensorRT Edge-LLM VLM request JSON for multiple frames.
+    # Shape: requests -> messages -> content[]  (role: user)
+    # Image items: {"type":"image","image":path} in temporal order, then text prompt.
+    # max_output_tokens is NOT embedded in the payload; it is passed via --maxGenerateLength.
+    # SHA-256 content hashes go in JSONL metadata (frame_paths), not in the model payload.
     local frames=("$@")
 
     # Build content array: image items in temporal order, then text prompt.
     local content_items=""
     local sep=""
     for img_path in "${frames[@]}"; do
-        local img_hash
-        img_hash=$(_sha256_file "${img_path}")
-        content_items="${content_items}${sep}{\"type\":\"image_url\",\"image_url\":{\"url\":\"${img_path}\"},\"source_path\":\"${img_path}\",\"content_hash\":\"${img_hash}\"}"
+        content_items="${content_items}${sep}{\"type\":\"image\",\"image\":\"${img_path}\"}"
         sep=","
     done
     # Append text prompt
@@ -291,8 +286,8 @@ _build_request_json() {
     escaped_prompt=$(printf '%s' "${PROMPT_TEXT}" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
     content_items="${content_items},{\"type\":\"text\",\"text\":${escaped_prompt}}"
 
-    printf '{"max_new_tokens":%d,"requests":[{"messages":[{"role":"user","content":[%s]}]}]}' \
-        "${max_tokens}" "${content_items}"
+    printf '{"requests":[{"messages":[{"role":"user","content":[%s]}]}]}' \
+        "${content_items}"
 }
 
 # ── direct (native) inference ─────────────────────────────────────────────────
@@ -300,8 +295,8 @@ _build_request_json() {
 _run_direct_inference() {
     local frame_condition="$1"
     local frame_count="$2"
-    local iteration="$3"
-    local is_warmup="$4"
+    local phase="$3"        # "warmup" or "measured"
+    local iter_idx="$4"
     local request_json_path="$5"
     local response_path="$6"
     local profile_path="$7"
@@ -316,22 +311,33 @@ _run_direct_inference() {
     local t_start t_end cold_start_ms
     t_start=$(date +%s%3N)
 
+    local exit_code=0
     _run "${llm_bin}" \
-        --engine_dir "${EDGE_VLM_LLM_ENGINE_DIR}" \
-        --multimodal_engine_dir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
-        --input_file "${request_json_path}" \
-        --output_file "${response_path}" \
+        --engineDir "${EDGE_VLM_LLM_ENGINE_DIR:-}" \
+        --multimodalEngineDir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}" \
+        --maxGenerateLength "${MAX_OUTPUT_TOKENS}" \
+        --inputFile "${request_json_path}" \
+        --outputFile "${response_path}" \
+        --warmup 0 \
         --dumpProfile \
         --profileOutputFile "${profile_path}" \
-        2>/dev/null
+        2>"/tmp/vlm_multiframe_stderr_${TIMESTAMP}_${frame_condition}_${phase}_${iter_idx}.log" \
+        || exit_code=$?
 
     t_end=$(date +%s%3N)
     cold_start_ms=$(( t_end - t_start ))
+
+    if [[ ${exit_code} -ne 0 ]]; then
+        echo "llm_inference exited with code ${exit_code}" >&2
+        return 1
+    fi
+
     echo "${cold_start_ms}"
 }
 
 _parse_native_profile() {
-    # Parse NVIDIA profile JSON; emit fields that the runtime actually emits.
+    # Parse NVIDIA Thor profile JSON using the exact schema established by PR #64.
+    # Stages are in stages[] keyed by stage_id; prefill uses average_time_per_run_ms.
     # Outputs a JSON fragment with only the fields present in the profile.
     local profile_path="$1"
     if [[ ! -f "${profile_path}" ]]; then
@@ -356,19 +362,30 @@ mm = p.get("multimodal") or {}
 if "total_image_tokens" in mm:
     out["total_image_tokens"] = mm["total_image_tokens"]
 
-# Vision encoder timing
-ve = p.get("vision_encoder") or p.get("vision_encoder_ms")
-if isinstance(ve, dict):
-    out["vision_encoder_ms"] = ve.get("total_ms") or ve.get("ms")
-elif isinstance(ve, (int, float)):
-    out["vision_encoder_ms"] = ve
+# Vision encoder and LLM generation timings from stages[] (Thor PR #64 schema).
+# stages[stage_id='vision_encoder'].average_time_per_run_ms -> vision_encoder_ms
+# stages[stage_id='llm_generation'].total_gpu_time_ms       -> llm_generation_total_gpu_time_ms
+stages = p.get("stages") if isinstance(p, dict) else None
+if isinstance(stages, list):
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        sid = stage.get("stage_id")
+        if sid == "vision_encoder":
+            v = stage.get("average_time_per_run_ms")
+            if v is not None:
+                out["vision_encoder_ms"] = v
+        elif sid == "llm_generation":
+            v = stage.get("total_gpu_time_ms")
+            if v is not None:
+                out["llm_generation_total_gpu_time_ms"] = v
 
-# Prefill timing
-pf = p.get("prefill") or p.get("prefill_ms")
-if isinstance(pf, dict):
-    out["prefill_ms"] = pf.get("total_ms") or pf.get("ms")
-elif isinstance(pf, (int, float)):
-    out["prefill_ms"] = pf
+# Prefill: prefill.average_time_per_run_ms
+prefill = p.get("prefill") if isinstance(p, dict) else None
+if isinstance(prefill, dict):
+    v = prefill.get("average_time_per_run_ms")
+    if v is not None:
+        out["prefill_ms"] = v
 
 # Generation metrics
 gen = p.get("generation") or {}
@@ -376,8 +393,10 @@ if "generated_tokens" in gen:
     out["actual_output_tokens"] = gen["generated_tokens"]
 if "tokens_per_second" in gen:
     out["decode_tokens_per_sec"] = gen["tokens_per_second"]
-if "total_gpu_time_ms" in gen:
-    out["llm_generation_total_gpu_time_ms"] = gen["total_gpu_time_ms"]
+if "average_time_per_token_ms" in gen:
+    out["average_time_per_token_ms"] = gen["average_time_per_token_ms"]
+if "total_time_ms" in gen:
+    out["decode_ms"] = gen["total_time_ms"]
 
 # Finish reason
 fr = p.get("finish_reason") or gen.get("finish_reason")
@@ -409,83 +428,27 @@ except Exception:
 
 out = {}
 
-# Support top-level or nested outputs
-outputs = r.get("outputs") or r.get("responses") or []
-if isinstance(outputs, list) and outputs:
-    first = outputs[0]
-    if isinstance(first, dict):
-        text = first.get("text") or first.get("output_text")
-        if text:
-            out["output_text"] = text
-        fr = first.get("finish_reason")
-        if fr:
-            out["finish_reason"] = fr
-        toks = first.get("output_token_ids") or first.get("token_ids")
-        if toks:
-            out["actual_output_tokens"] = len(toks)
-
-print(json.dumps(out))
-PYEOF
-}
-
-# ── IPC inference ─────────────────────────────────────────────────────────────
-
-_run_ipc_inference() {
-    local frame_condition="$1"
-    local request_json_path="$2"
-    local ipc_result_path="$3"
-
-    local socket="${EDGE_VLM_WORKER_SOCKET:-/tmp/edge_vlm.sock}"
-    local client_bin
-    client_bin=$(command -v vlm_single_shot_client 2>/dev/null \
-        || command -v edge_vlm_cli 2>/dev/null \
-        || echo "")
-
-    if [[ -z "${client_bin}" ]]; then
-        echo "WARNING: vlm_single_shot_client/edge_vlm_cli not found; skipping IPC run" >&2
-        return 1
-    fi
-
-    local t_start t_end total_ms
-    t_start=$(date +%s%3N)
-
-    _run "${client_bin}" \
-        --socket "${socket}" \
-        --input "${request_json_path}" \
-        --output "${ipc_result_path}" \
-        2>/dev/null
-
-    t_end=$(date +%s%3N)
-    total_ms=$(( t_end - t_start ))
-    echo "${total_ms}"
-}
-
-_parse_ipc_result() {
-    # Parse IPC result JSON; emit only fields actually present.
-    local ipc_result_path="$1"
-    if [[ ! -f "${ipc_result_path}" ]]; then
-        echo "null"
-        return
-    fi
-    python3 - "${ipc_result_path}" <<'PYEOF'
-import json, sys
-
-path = sys.argv[1]
-try:
-    with open(path) as f:
-        r = json.load(f)
-except Exception:
-    print("null")
-    sys.exit(0)
-
-out = {}
-if "inference_seconds" in r:
-    out["inference_seconds"] = r["inference_seconds"]
-if "output_text" in r or "text" in r:
-    text = r.get("output_text") or r.get("text")
-    out["output_text"] = text
+# Thor llm_inference response: {"responses": [{...}]}
+entry = r
+responses_list = r.get("responses") if isinstance(r, dict) else None
+if isinstance(responses_list, list) and responses_list:
+    entry = responses_list[0]
+if isinstance(entry, dict):
+    text = entry.get("outputText") or entry.get("output_text") or entry.get("text")
     if text:
-        out["output_words"] = len(text.split())
+        out["output_text"] = text
+    fr = entry.get("finishReason") or entry.get("finish_reason")
+    if fr:
+        out["finish_reason"] = fr
+    toks_count = entry.get("numOutputTokens")
+    if toks_count is None:
+        toks_list = entry.get("outputTokens") or entry.get("output_tokens")
+        if isinstance(toks_list, list):
+            toks_count = len(toks_list)
+        elif isinstance(toks_list, int):
+            toks_count = toks_list
+    if toks_count is not None:
+        out["actual_output_tokens"] = toks_count
 
 print(json.dumps(out))
 PYEOF
@@ -496,15 +459,14 @@ PYEOF
 _run_condition() {
     local frame_condition="$1"
     local frame_count="$2"
-    local path="$3"
 
     echo ""
-    echo "=== Condition ${frame_condition} | path=${path} | frames=${frame_count} ==="
+    echo "=== Condition ${frame_condition} | path=direct | frames=${frame_count} ==="
 
     _select_frames "${frame_count}"
     local frames=("${SELECTED_FRAMES[@]}")
 
-    echo "[${frame_condition}/${path}] Selected frames (temporal order):"
+    echo "[${frame_condition}/direct] Selected frames (temporal order):"
     for img in "${frames[@]}"; do
         echo "  ${img}"
     done
@@ -525,67 +487,69 @@ _run_condition() {
     local total_iters=$(( WARMUP + ITERATIONS ))
     for (( iter=0; iter<total_iters; iter++ )); do
         local is_warmup=false
+        local phase="measured"
+        local iter_idx
         if [[ ${iter} -lt ${WARMUP} ]]; then
             is_warmup=true
-        fi
-        local iter_idx=$(( iter - WARMUP ))
-        if [[ "${is_warmup}" == "true" ]]; then
+            phase="warmup"
             iter_idx=${iter}
-            echo "[${frame_condition}/${path}] warmup ${iter_idx}"
+            echo "[${frame_condition}/direct] warmup ${iter_idx}"
         else
-            echo "[${frame_condition}/${path}] iteration ${iter_idx}"
+            iter_idx=$(( iter - WARMUP ))
+            echo "[${frame_condition}/direct] iteration ${iter_idx}"
         fi
 
-        local artifact_dir="${OUTPUT_DIR}/artifacts/${frame_condition}/${path}/iter_${iter_idx}"
+        # Use phase in artifact path to prevent warmup/measured collisions.
+        local artifact_dir="${OUTPUT_DIR}/artifacts/${frame_condition}/direct/${phase}_iter_${iter_idx}"
         _run mkdir -p "${artifact_dir}"
 
         local request_json_path="${artifact_dir}/request.json"
         local recorded_at
         recorded_at=$(_now_iso)
 
-        # Build request JSON
+        # Build request JSON (Thor-validated shape, no max_output_tokens in payload)
         if [[ "${DRY_RUN}" != "true" ]]; then
-            _build_request_json "${MAX_OUTPUT_TOKENS}" "${frames[@]}" > "${request_json_path}"
+            _build_request_json "${frames[@]}" > "${request_json_path}"
         fi
 
-        if [[ "${path}" == "direct" ]]; then
-            local response_path="${artifact_dir}/response.json"
-            local profile_path="${artifact_dir}/profile.json"
+        local response_path="${artifact_dir}/response.json"
+        local profile_path="${artifact_dir}/profile.json"
 
-            local cold_start_ms=0
-            local success=true
-            local error_msg="null"
+        local cold_start_ms=0
+        local success=true
+        local error_msg="null"
 
-            if [[ "${DRY_RUN}" != "true" ]]; then
-                cold_start_ms=$(_run_direct_inference \
-                    "${frame_condition}" "${frame_count}" "${iter_idx}" \
-                    "${is_warmup}" "${request_json_path}" \
-                    "${response_path}" "${profile_path}") || {
-                    success=false
-                    error_msg="\"direct inference failed\""
-                }
-            fi
+        if [[ "${DRY_RUN}" != "true" ]]; then
+            cold_start_ms=$(_run_direct_inference \
+                "${frame_condition}" "${frame_count}" "${phase}" "${iter_idx}" \
+                "${request_json_path}" "${response_path}" "${profile_path}") || {
+                success=false
+                error_msg="\"direct inference failed\""
+                cold_start_ms=0
+            }
+        fi
 
-            local profile_fields="null"
-            local response_fields="null"
-            if [[ "${success}" == "true" && "${DRY_RUN}" != "true" ]]; then
-                profile_fields=$(_parse_native_profile "${profile_path}")
-                response_fields=$(_parse_native_response "${response_path}")
-            fi
+        local profile_fields="null"
+        local response_fields="null"
+        if [[ "${success}" == "true" && "${DRY_RUN}" != "true" ]]; then
+            profile_fields=$(_parse_native_profile "${profile_path}")
+            response_fields=$(_parse_native_response "${response_path}")
+        fi
 
-            # Extract parsed fields
-            local total_image_tokens vision_encoder_ms prefill_ms
-            local actual_output_tokens decode_tokens_per_sec llm_gen_gpu_ms finish_reason
-            total_image_tokens=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('total_image_tokens') if p else None))" 2>/dev/null || echo "null")
-            vision_encoder_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('vision_encoder_ms') if p else None))" 2>/dev/null || echo "null")
-            prefill_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('prefill_ms') if p else None))" 2>/dev/null || echo "null")
-            actual_output_tokens=$(python3 -c "import json,sys; p=${profile_fields}; r=${response_fields}; v=(p or {}).get('actual_output_tokens') or (r or {}).get('actual_output_tokens'); print(json.dumps(v))" 2>/dev/null || echo "null")
-            decode_tokens_per_sec=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('decode_tokens_per_sec') if p else None))" 2>/dev/null || echo "null")
-            llm_gen_gpu_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('llm_generation_total_gpu_time_ms') if p else None))" 2>/dev/null || echo "null")
-            finish_reason=$(python3 -c "import json,sys; p=${profile_fields}; r=${response_fields}; v=(p or {}).get('finish_reason') or (r or {}).get('finish_reason'); print(json.dumps(v))" 2>/dev/null || echo "null")
+        # Extract parsed fields
+        local total_image_tokens vision_encoder_ms prefill_ms decode_ms
+        local actual_output_tokens decode_tokens_per_sec llm_gen_gpu_ms finish_reason
+        total_image_tokens=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('total_image_tokens') if p else None))" 2>/dev/null || echo "null")
+        vision_encoder_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('vision_encoder_ms') if p else None))" 2>/dev/null || echo "null")
+        prefill_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('prefill_ms') if p else None))" 2>/dev/null || echo "null")
+        decode_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('decode_ms') if p else None))" 2>/dev/null || echo "null")
+        actual_output_tokens=$(python3 -c "import json,sys; p=${profile_fields}; r=${response_fields}; v=(p or {}).get('actual_output_tokens') or (r or {}).get('actual_output_tokens'); print(json.dumps(v))" 2>/dev/null || echo "null")
+        decode_tokens_per_sec=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('decode_tokens_per_sec') if p else None))" 2>/dev/null || echo "null")
+        llm_gen_gpu_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('llm_generation_total_gpu_time_ms') if p else None))" 2>/dev/null || echo "null")
+        finish_reason=$(python3 -c "import json,sys; p=${profile_fields}; r=${response_fields}; v=(p or {}).get('finish_reason') or (r or {}).get('finish_reason'); print(json.dumps(v))" 2>/dev/null || echo "null")
 
-            local record
-            record=$(python3 -c "
+        local record
+        record=$(python3 -c "
 import json
 print(json.dumps({
     'schema_version': '1',
@@ -608,7 +572,7 @@ print(json.dumps({
     'ttft_ms': null,
     'vision_encoder_ms': ${vision_encoder_ms},
     'prefill_ms': ${prefill_ms},
-    'decode_ms': null,
+    'decode_ms': ${decode_ms},
     'decode_tokens_per_sec': ${decode_tokens_per_sec},
     'llm_generation_total_gpu_time_ms': ${llm_gen_gpu_ms},
     'inference_seconds': null,
@@ -621,73 +585,7 @@ print(json.dumps({
     'iteration': ${iter_idx},
     'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
 }))")
-            _write_record "${record}"
-
-        elif [[ "${path}" == "ipc" ]]; then
-            local ipc_result_path="${artifact_dir}/ipc_result.json"
-
-            local total_ms=0
-            local success=true
-            local error_msg="null"
-
-            if [[ "${DRY_RUN}" != "true" ]]; then
-                total_ms=$(_run_ipc_inference \
-                    "${frame_condition}" "${request_json_path}" \
-                    "${ipc_result_path}") || {
-                    success=false
-                    error_msg="\"ipc inference failed\""
-                }
-            fi
-
-            local ipc_fields="null"
-            if [[ "${success}" == "true" && "${DRY_RUN}" != "true" ]]; then
-                ipc_fields=$(_parse_ipc_result "${ipc_result_path}")
-            fi
-
-            local inference_seconds output_text output_words
-            inference_seconds=$(python3 -c "import json,sys; p=${ipc_fields}; print(json.dumps(p.get('inference_seconds') if p else None))" 2>/dev/null || echo "null")
-            output_text=$(python3 -c "import json,sys; p=${ipc_fields}; print(json.dumps(p.get('output_text') if p else None))" 2>/dev/null || echo "null")
-            output_words=$(python3 -c "import json,sys; p=${ipc_fields}; print(json.dumps(p.get('output_words') if p else None))" 2>/dev/null || echo "null")
-
-            local record
-            record=$(python3 -c "
-import json
-print(json.dumps({
-    'schema_version': '1',
-    'record_type': 'inference',
-    'run_id': '${TIMESTAMP}',
-    'recorded_at': '${recorded_at}',
-    'frame_condition': '${frame_condition}',
-    'frame_count': ${frame_count},
-    'path': 'ipc',
-    'frame_paths': ${frame_hashes_json},
-    'prompt_hash': '${prompt_hash_val}',
-    'max_output_tokens': ${MAX_OUTPUT_TOKENS},
-    'actual_output_tokens': null,
-    'total_image_tokens': null,
-    'finish_reason': null,
-    'success': $([ '${success}' = 'true' ] && echo 'true' || echo 'false'),
-    'error': ${error_msg},
-    'cold_start_total_ms': null,
-    'total_latency_ms': $([ '${DRY_RUN}' != 'true' ] && echo '${total_ms}' || echo 'null'),
-    'ttft_ms': null,
-    'vision_encoder_ms': null,
-    'prefill_ms': null,
-    'decode_ms': null,
-    'decode_tokens_per_sec': null,
-    'llm_generation_total_gpu_time_ms': null,
-    'inference_seconds': ${inference_seconds},
-    'output_text': ${output_text},
-    'output_words': ${output_words},
-    'native_response_path': null,
-    'native_profile_path': null,
-    'ipc_result_path': '${ipc_result_path}',
-    'model_name': '${EDGE_VLM_MODEL_NAME:-unknown}',
-    'iteration': ${iter_idx},
-    'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
-}))")
-            _write_record "${record}"
-        fi
+        _write_record "${record}"
     done
 }
 
@@ -699,7 +597,7 @@ echo "  Timestamp: ${TIMESTAMP}"
 echo "  Sequence dir: ${SEQUENCE_DIR}"
 echo "  Frame counts: ${FRAME_COUNTS}"
 echo "  Max output tokens: ${MAX_OUTPUT_TOKENS}"
-echo "  Paths: ${PATHS}"
+echo "  Path: direct (IPC requires a multi-image client — not yet available)"
 echo "  Warmup: ${WARMUP}  Iterations: ${ITERATIONS}"
 echo "  Output dir: ${OUTPUT_DIR}"
 echo "================================================================"
@@ -710,7 +608,6 @@ _load_sequence
 
 # Validate that enough frames exist for the largest requested count
 IFS=',' read -ra _FRAME_COUNTS <<< "${FRAME_COUNTS}"
-IFS=',' read -ra _PATHS <<< "${PATHS}"
 
 MAX_NEEDED=0
 for fc in "${_FRAME_COUNTS[@]}"; do
@@ -728,12 +625,10 @@ fi
 
 echo "[setup] Frame validation passed: ${#SEQUENCE_FRAMES[@]} >= ${MAX_NEEDED} frames needed"
 
-# Run all conditions
+# Run all conditions (direct path only)
 for fc in "${_FRAME_COUNTS[@]}"; do
     local_fc_label="F${fc}"
-    for p in "${_PATHS[@]}"; do
-        _run_condition "${local_fc_label}" "${fc}" "${p}"
-    done
+    _run_condition "${local_fc_label}" "${fc}"
 done
 
 echo ""

@@ -182,7 +182,8 @@ class TestMultiImageRequestShape(unittest.TestCase):
             self.assertEqual(meta["images"][i]["index"], i)
 
     def test_build_request_with_real_file_uses_sha256(self):
-        """build_multiframe_request (with actual file I/O) records SHA-256 for each frame."""
+        """build_multiframe_request emits Thor-validated shape: type:image, image:path.
+        SHA-256 hashes are NOT in the model payload; they go in JSONL metadata."""
         from vlm_multiframe_report import build_multiframe_request
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
             # Minimal JPEG magic bytes
@@ -196,18 +197,21 @@ class TestMultiImageRequestShape(unittest.TestCase):
             msg = req["requests"][0]["messages"][0]
             self.assertEqual(msg["role"], "user")
             content = msg["content"]
-            # image item first, text item last
-            self.assertEqual(content[0]["type"], "image_url")
+            # image item first (Thor-validated type), text item last
+            self.assertEqual(content[0]["type"], "image")
+            self.assertEqual(content[0]["image"], tmp_path)
             self.assertEqual(content[-1]["type"], "text")
-            # content_hash present and is a 64-char hex SHA-256
-            img_item = content[0]
-            self.assertIn("content_hash", img_item)
-            self.assertEqual(len(img_item["content_hash"]), 64)
+            # max_output_tokens NOT in model payload (passed via --maxGenerateLength)
+            self.assertNotIn("max_new_tokens", req)
+            self.assertNotIn("max_output_tokens", req)
+            # content_hash NOT in model message payload (goes in JSONL metadata)
+            self.assertNotIn("content_hash", content[0])
+            self.assertNotIn("source_path", content[0])
         finally:
             os.unlink(tmp_path)
 
     def test_build_request_multi_frame_content_order(self):
-        """Multi-frame request: images appear before text, in temporal order."""
+        """Multi-frame request: images appear before text, in temporal order (type:image, image:path)."""
         from vlm_multiframe_report import build_multiframe_request
         tmp_paths = []
         try:
@@ -221,8 +225,12 @@ class TestMultiImageRequestShape(unittest.TestCase):
             # 4 image items + 1 text item
             self.assertEqual(len(content), 5)
             for i in range(4):
-                self.assertEqual(content[i]["type"], "image_url")
-                self.assertEqual(content[i]["source_path"], tmp_paths[i])
+                self.assertEqual(content[i]["type"], "image")
+                self.assertEqual(content[i]["image"], tmp_paths[i])
+                # No extra fields in model payload
+                self.assertNotIn("content_hash", content[i])
+                self.assertNotIn("source_path", content[i])
+                self.assertNotIn("image_url", content[i])
             self.assertEqual(content[4]["type"], "text")
         finally:
             for p in tmp_paths:
@@ -353,9 +361,10 @@ class TestContentHashing(unittest.TestCase):
             self.assertIn("sha256", fp)
             self.assertIn(f"frame_{i:03d}", fp["path"])
 
-    def test_all_frames_have_hashes_in_request(self):
-        """build_multiframe_request records content_hash for every image item."""
-        from vlm_multiframe_report import build_multiframe_request
+    def test_all_frames_have_hashes_in_record_metadata(self):
+        """SHA-256 hashes for every frame are recorded in JSONL frame_paths metadata,
+        NOT inside the model message payload."""
+        from vlm_multiframe_report import build_multiframe_request, file_sha256
         tmp_paths = []
         try:
             for k in range(4):
@@ -365,10 +374,14 @@ class TestContentHashing(unittest.TestCase):
                 tmp_paths.append(f.name)
             req = build_multiframe_request(tmp_paths, MULTIFRAME_PROMPT_TEXT)
             content = req["requests"][0]["messages"][0]["content"]
-            image_items = [c for c in content if c.get("type") == "image_url"]
+            image_items = [c for c in content if c.get("type") == "image"]
             self.assertEqual(len(image_items), 4)
-            hashes = [item["content_hash"] for item in image_items]
-            # All hashes should be 64-char hex and unique for distinct content
+            # Model payload has no hash fields — hashes go in JSONL metadata
+            for item in image_items:
+                self.assertNotIn("content_hash", item)
+                self.assertNotIn("source_path", item)
+            # file_sha256 is available and produces unique 64-char hex hashes
+            hashes = [file_sha256(p) for p in tmp_paths]
             self.assertEqual(len(set(hashes)), 4)
             for h in hashes:
                 self.assertRegex(h, r"^[0-9a-f]{64}$")
@@ -694,17 +707,28 @@ class TestNativeProfileParsing(unittest.TestCase):
     """Validate parsing of actual pinned Thor profile fields."""
 
     def _profile_json(self, **kwargs) -> str:
-        """Return a minimal profile JSON matching the Thor runtime schema."""
+        """Return a minimal profile JSON matching the Thor runtime schema (PR #64).
+        stages[] keyed by stage_id; prefill uses average_time_per_run_ms."""
         profile = {
             "multimodal": {"total_image_tokens": kwargs.get("total_image_tokens", 256)},
-            "vision_encoder": {"total_ms": kwargs.get("vision_encoder_ms", 45.5)},
-            "prefill": {"total_ms": kwargs.get("prefill_ms", 36.2)},
+            "prefill": {"average_time_per_run_ms": kwargs.get("prefill_ms", 36.2)},
             "generation": {
                 "generated_tokens": kwargs.get("generated_tokens", 12),
                 "tokens_per_second": kwargs.get("tokens_per_second", 47.3),
-                "total_gpu_time_ms": kwargs.get("total_gpu_time_ms", 253.7),
+                "average_time_per_token_ms": kwargs.get("average_time_per_token_ms", 21.1),
+                "total_time_ms": kwargs.get("total_time_ms", 253.7),
                 "finish_reason": kwargs.get("finish_reason", "eos"),
             },
+            "stages": [
+                {
+                    "stage_id": "vision_encoder",
+                    "average_time_per_run_ms": kwargs.get("vision_encoder_ms", 45.5),
+                },
+                {
+                    "stage_id": "llm_generation",
+                    "total_gpu_time_ms": kwargs.get("total_gpu_time_ms", 253.7),
+                },
+            ],
         }
         return json.dumps(profile)
 
@@ -723,18 +747,23 @@ class TestNativeProfileParsing(unittest.TestCase):
         self.assertAlmostEqual(agg_f4["total_image_tokens"]["mean"], 1024.0)
 
     def test_profile_schema_parsed_inline(self):
-        """Inline profile JSON (Thor schema) is parsed correctly via the Python snippet."""
-        import importlib, textwrap
+        """Inline profile JSON (Thor PR #64 schema) is parsed correctly via the Python snippet.
+        stages[] keyed by stage_id; prefill uses average_time_per_run_ms."""
+        import textwrap
         profile_data = {
             "multimodal": {"total_image_tokens": 1024},
-            "vision_encoder": {"total_ms": 58.1},
-            "prefill": {"total_ms": 38.4},
+            "prefill": {"average_time_per_run_ms": 38.4},
             "generation": {
                 "generated_tokens": 30,
                 "tokens_per_second": 46.8,
-                "total_gpu_time_ms": 640.9,
+                "average_time_per_token_ms": 21.3,
+                "total_time_ms": 639.0,
                 "finish_reason": "max-length",
             },
+            "stages": [
+                {"stage_id": "vision_encoder", "average_time_per_run_ms": 58.1},
+                {"stage_id": "llm_generation", "total_gpu_time_ms": 640.9},
+            ],
         }
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False, encoding="utf-8"
@@ -742,7 +771,8 @@ class TestNativeProfileParsing(unittest.TestCase):
             json.dump(profile_data, f)
             profile_path = f.name
         try:
-            # Run the same inline Python parser used by the shell script
+            # Run the same inline Python parser used by run_vlm_multiframe_benchmark.sh
+            # (exact mirror of the _parse_native_profile heredoc in the shell script).
             parser_code = textwrap.dedent("""
                 import json, sys
                 path = sys.argv[1]
@@ -752,23 +782,34 @@ class TestNativeProfileParsing(unittest.TestCase):
                 mm = p.get("multimodal") or {}
                 if "total_image_tokens" in mm:
                     out["total_image_tokens"] = mm["total_image_tokens"]
-                ve = p.get("vision_encoder") or p.get("vision_encoder_ms")
-                if isinstance(ve, dict):
-                    out["vision_encoder_ms"] = ve.get("total_ms") or ve.get("ms")
-                elif isinstance(ve, (int, float)):
-                    out["vision_encoder_ms"] = ve
-                pf = p.get("prefill") or p.get("prefill_ms")
-                if isinstance(pf, dict):
-                    out["prefill_ms"] = pf.get("total_ms") or pf.get("ms")
-                elif isinstance(pf, (int, float)):
-                    out["prefill_ms"] = pf
+                stages = p.get("stages") if isinstance(p, dict) else None
+                if isinstance(stages, list):
+                    for stage in stages:
+                        if not isinstance(stage, dict):
+                            continue
+                        sid = stage.get("stage_id")
+                        if sid == "vision_encoder":
+                            v = stage.get("average_time_per_run_ms")
+                            if v is not None:
+                                out["vision_encoder_ms"] = v
+                        elif sid == "llm_generation":
+                            v = stage.get("total_gpu_time_ms")
+                            if v is not None:
+                                out["llm_generation_total_gpu_time_ms"] = v
+                prefill = p.get("prefill") if isinstance(p, dict) else None
+                if isinstance(prefill, dict):
+                    v = prefill.get("average_time_per_run_ms")
+                    if v is not None:
+                        out["prefill_ms"] = v
                 gen = p.get("generation") or {}
                 if "generated_tokens" in gen:
                     out["actual_output_tokens"] = gen["generated_tokens"]
                 if "tokens_per_second" in gen:
                     out["decode_tokens_per_sec"] = gen["tokens_per_second"]
-                if "total_gpu_time_ms" in gen:
-                    out["llm_generation_total_gpu_time_ms"] = gen["total_gpu_time_ms"]
+                if "average_time_per_token_ms" in gen:
+                    out["average_time_per_token_ms"] = gen["average_time_per_token_ms"]
+                if "total_time_ms" in gen:
+                    out["decode_ms"] = gen["total_time_ms"]
                 fr = p.get("finish_reason") or gen.get("finish_reason")
                 if fr is not None:
                     out["finish_reason"] = fr
@@ -786,7 +827,54 @@ class TestNativeProfileParsing(unittest.TestCase):
             self.assertEqual(parsed["actual_output_tokens"], 30)
             self.assertAlmostEqual(parsed["decode_tokens_per_sec"], 46.8)
             self.assertAlmostEqual(parsed["llm_generation_total_gpu_time_ms"], 640.9)
+            self.assertAlmostEqual(parsed["decode_ms"], 639.0)
             self.assertEqual(parsed["finish_reason"], "max-length")
+        finally:
+            os.unlink(profile_path)
+
+    def test_stages_without_vision_encoder_leaves_field_absent(self):
+        """If stages[] has no vision_encoder entry, vision_encoder_ms is not emitted."""
+        import textwrap
+        profile_data = {
+            "multimodal": {"total_image_tokens": 512},
+            "prefill": {"average_time_per_run_ms": 30.0},
+            "generation": {"generated_tokens": 10, "tokens_per_second": 45.0},
+            "stages": [
+                {"stage_id": "llm_generation", "total_gpu_time_ms": 200.0},
+            ],
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        ) as f:
+            json.dump(profile_data, f)
+            profile_path = f.name
+        try:
+            parser_code = textwrap.dedent("""
+                import json, sys
+                path = sys.argv[1]
+                with open(path) as f:
+                    p = json.load(f)
+                out = {}
+                stages = p.get("stages") or []
+                for stage in stages:
+                    sid = stage.get("stage_id")
+                    if sid == "vision_encoder":
+                        v = stage.get("average_time_per_run_ms")
+                        if v is not None:
+                            out["vision_encoder_ms"] = v
+                    elif sid == "llm_generation":
+                        v = stage.get("total_gpu_time_ms")
+                        if v is not None:
+                            out["llm_generation_total_gpu_time_ms"] = v
+                print(json.dumps(out))
+            """)
+            result = subprocess.run(
+                [sys.executable, "-c", parser_code, profile_path],
+                capture_output=True, text=True,
+            )
+            parsed = json.loads(result.stdout.strip())
+            self.assertNotIn("vision_encoder_ms", parsed)
+            self.assertIn("llm_generation_total_gpu_time_ms", parsed)
         finally:
             os.unlink(profile_path)
 
@@ -1031,6 +1119,96 @@ class TestShellSyntax(unittest.TestCase):
             self.skipTest(f"Script not found: {script}")
         # Just check the file can be read — executable bit is set separately
         self.assertTrue(script.is_file())
+
+    def test_script_has_no_ipc_client_invocation(self):
+        """Runner must not functionally invoke IPC client binaries for multi-frame
+        (multi-image IPC client does not yet exist). References in comments are OK."""
+        script = _BENCH_DIR / "run_vlm_multiframe_benchmark.sh"
+        if not script.exists():
+            self.skipTest(f"Script not found: {script}")
+        content = script.read_text(encoding="utf-8")
+        # _run_ipc_inference function must have been removed
+        self.assertNotIn("_run_ipc_inference", content)
+        # No IPC client invocation via command -v or direct execution
+        # (presence in a comment explaining why IPC is unsupported is acceptable;
+        #  check that none of the invocation patterns appear)
+        self.assertNotIn("command -v vlm_single_shot_client", content)
+        self.assertNotIn("command -v edge_vlm_cli", content)
+        self.assertNotIn('--socket "${socket}"', content)
+
+    def test_script_uses_camelcase_cli_flags(self):
+        """Runner must use camelCase llm_inference flags (Thor-validated contract)."""
+        script = _BENCH_DIR / "run_vlm_multiframe_benchmark.sh"
+        if not script.exists():
+            self.skipTest(f"Script not found: {script}")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("--engineDir", content)
+        self.assertIn("--multimodalEngineDir", content)
+        self.assertIn("--inputFile", content)
+        self.assertIn("--outputFile", content)
+        self.assertIn("--maxGenerateLength", content)
+        # Snake-case flags must NOT appear
+        self.assertNotIn("--engine_dir", content)
+        self.assertNotIn("--multimodal_engine_dir", content)
+        self.assertNotIn("--input_file", content)
+        self.assertNotIn("--output_file", content)
+        self.assertNotIn("--max_new_tokens", content)
+
+    def test_script_request_uses_image_type(self):
+        """Runner must emit Thor-validated image item type: type:image, image:path."""
+        script = _BENCH_DIR / "run_vlm_multiframe_benchmark.sh"
+        if not script.exists():
+            self.skipTest(f"Script not found: {script}")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn('"type":"image"', content)
+        self.assertIn('"image":', content)
+        # Forbidden: old image_url shape and payload metadata fields
+        self.assertNotIn('"type":"image_url"', content)
+        self.assertNotIn("image_url", content)
+        self.assertNotIn('"content_hash"', content)
+        self.assertNotIn('"source_path"', content)
+        self.assertNotIn("max_new_tokens", content)
+
+    def test_script_artifact_paths_use_phase_prefix(self):
+        """Runner must include warmup/measured phase in artifact directory to prevent collision."""
+        script = _BENCH_DIR / "run_vlm_multiframe_benchmark.sh"
+        if not script.exists():
+            self.skipTest(f"Script not found: {script}")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn("warmup_iter_", content)
+        self.assertIn("measured_iter_", content)
+
+
+# ── warmup/measured artifact uniqueness test ──────────────────────────────────
+
+
+class TestArtifactCollisionPrevention(unittest.TestCase):
+    def test_warmup_and_measured_records_have_distinct_iteration_semantics(self):
+        """Warmup records and measured records must be distinguishable by the warmup flag.
+        The shell runner uses phase-prefixed directories (warmup_iter_N vs measured_iter_N)
+        so artifacts from different phases never collide."""
+        warmup_rec = _make_record(warmup=True, iteration=0, native_profile_path="/bench/F1/direct/warmup_iter_0/profile.json")
+        measured_rec = _make_record(warmup=False, iteration=0, native_profile_path="/bench/F1/direct/measured_iter_0/profile.json")
+        self.assertTrue(warmup_rec["warmup"])
+        self.assertFalse(measured_rec["warmup"])
+        # Paths must differ (no collision)
+        self.assertNotEqual(
+            warmup_rec["native_profile_path"],
+            measured_rec["native_profile_path"],
+        )
+
+    def test_aggregation_excludes_warmup_iterations(self):
+        """Aggregation must exclude warmup records so warmup latency never pollutes stats."""
+        records = [
+            _make_record(warmup=True, cold_start_total_ms=9999.0, iteration=0),
+            _make_record(warmup=False, cold_start_total_ms=500.0, iteration=0),
+            _make_record(warmup=False, cold_start_total_ms=520.0, iteration=1),
+        ]
+        agg = aggregate_frame_condition(records)
+        self.assertEqual(agg["n_warmup"], 1)
+        self.assertEqual(agg["n_measured"], 2)
+        # Warmup 9999ms must not appear in the aggregate
+        self.assertAlmostEqual(agg["cold_start_total_ms"]["mean"], 510.0)
 
 
 # ── insufficient-frame failure test (shell integration) ──────────────────────
