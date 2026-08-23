@@ -8,6 +8,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace
 {
@@ -15,8 +16,9 @@ void usage(char const * program)
 {
   std::cerr
     << "Usage: " << program
-    << " --socket PATH --image PATH [--prompt TEXT]"
-    << " [--max-generate-length N] [--temperature F] [--top-p F] [--top-k N]\n";
+    << " --socket PATH --image PATH [--image PATH ...] [--prompt TEXT]"
+    << " [--max-generate-length N] [--temperature F] [--top-p F] [--top-k N]\n"
+    << "  --image may be specified multiple times for multi-frame requests.\n";
 }
 
 std::string require_value(int argc, char ** argv, int & index)
@@ -38,7 +40,7 @@ int main(int argc, char ** argv)
   request.top_p = 0.9F;
   request.top_k = 20;
 
-  std::string image_path;
+  std::vector<std::string> image_paths;
   try {
     for (int index = 1; index < argc; ++index) {
       const std::string option = argv[index];
@@ -48,7 +50,7 @@ int main(int argc, char ** argv)
       } else if (option == "--socket") {
         config.socket_path = require_value(argc, argv, index);
       } else if (option == "--image") {
-        image_path = require_value(argc, argv, index);
+        image_paths.push_back(require_value(argc, argv, index));
       } else if (option == "--prompt") {
         request.prompt = require_value(argc, argv, index);
       } else if (option == "--max-generate-length") {
@@ -64,7 +66,7 @@ int main(int argc, char ** argv)
       }
     }
 
-    if (image_path.empty()) {
+    if (image_paths.empty()) {
       throw std::runtime_error("--image is required");
     }
     if (config.socket_path.empty()) {
@@ -77,9 +79,19 @@ int main(int argc, char ** argv)
       throw std::runtime_error("--max-generate-length must be positive");
     }
 
-    request.image = cv::imread(image_path, cv::IMREAD_COLOR);
+    // Load primary image.
+    request.image = cv::imread(image_paths[0], cv::IMREAD_COLOR);
     if (request.image.empty()) {
-      throw std::runtime_error("failed to decode image: " + image_path);
+      throw std::runtime_error("failed to decode image: " + image_paths[0]);
+    }
+
+    // Load extra images (multi-frame support).
+    for (size_t i = 1; i < image_paths.size(); ++i) {
+      cv::Mat extra = cv::imread(image_paths[i], cv::IMREAD_COLOR);
+      if (extra.empty()) {
+        throw std::runtime_error("failed to decode image: " + image_paths[i]);
+      }
+      request.extra_images.push_back(std::move(extra));
     }
 
     edge_vlm_ros::IpcInferenceBackend backend(config);

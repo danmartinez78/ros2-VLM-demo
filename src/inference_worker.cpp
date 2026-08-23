@@ -163,12 +163,56 @@ int main(int argc, char ** argv)
         {
           throw std::runtime_error("invalid IPC image payload size");
         }
-  
-        // ── Read image ────────────────────────────────────────────────────────
+
+        // ── Multi-image: validate and read PerImageHeaders ────────────────────
+        const bool is_multi_image =
+          (header.schema_flags & edge_vlm_ros::ipc::kSchemaFlagMultiImage) != 0;
+        const uint32_t image_count = is_multi_image ? header.image_count : 1U;
+        if (is_multi_image &&
+          (image_count < 2U || image_count > edge_vlm_ros::ipc::kMaxExtraImages + 1U))
+        {
+          throw std::runtime_error("invalid IPC multi-image count");
+        }
+        struct ExtraImageInfo
+        {
+          uint32_t width;
+          uint32_t height;
+          uint32_t step;
+          uint32_t image_bytes;
+        };
+        std::vector<ExtraImageInfo> extra_infos;
+        if (is_multi_image) {
+          extra_infos.reserve(image_count - 1U);
+          for (uint32_t ei = 0; ei < image_count - 1U; ++ei) {
+            edge_vlm_ros::ipc::PerImageHeader pih;
+            edge_vlm_ros::ipc::read_all(client_fd, &pih, sizeof(pih));
+            if (pih.width == 0 || pih.height == 0 ||
+              static_cast<uint64_t>(pih.step) != static_cast<uint64_t>(pih.width) * 3U ||
+              static_cast<uint64_t>(pih.step) * pih.height != pih.image_bytes ||
+              pih.image_bytes > edge_vlm_ros::ipc::kMaxImageBytes)
+            {
+              throw std::runtime_error("invalid IPC extra image header");
+            }
+            extra_infos.push_back({pih.width, pih.height, pih.step, pih.image_bytes});
+          }
+        }
+
+        // ── Read primary image ────────────────────────────────────────────────
         std::vector<uint8_t> image_bytes(header.image_bytes);
         edge_vlm_ros::ipc::read_all(
           client_fd, image_bytes.data(), image_bytes.size());
-  
+
+        // ── Read extra images (multi-image path) ──────────────────────────────
+        std::vector<std::vector<uint8_t>> extra_image_bytes;
+        if (is_multi_image) {
+          extra_image_bytes.reserve(extra_infos.size());
+          for (const auto & info : extra_infos) {
+            std::vector<uint8_t> buf(info.image_bytes);
+            edge_vlm_ros::ipc::read_all(client_fd, buf.data(), buf.size());
+            extra_image_bytes.push_back(std::move(buf));
+          }
+        }
+
         // ── Read structured or inline payload ─────────────────────────────────
         const bool is_structured =
           (header.schema_flags & edge_vlm_ros::ipc::kSchemaFlagStructured) != 0;
@@ -217,6 +261,16 @@ int main(int argc, char ** argv)
   
         edge_vlm_ros::InferenceRequest request;
         request.image = view;
+        if (is_multi_image) {
+          request.extra_images.reserve(extra_infos.size());
+          for (size_t ei = 0; ei < extra_infos.size(); ++ei) {
+            const auto & info = extra_infos[ei];
+            cv::Mat extra_view(
+              static_cast<int>(info.height), static_cast<int>(info.width),
+              CV_8UC3, extra_image_bytes[ei].data(), info.step);
+            request.extra_images.push_back(extra_view.clone());
+          }
+        }
         request.prompt = std::move(prompt);
         request.system_message = std::move(system_message);
         request.history = std::move(history);

@@ -450,6 +450,11 @@ install(PROGRAMS scripts/vlm_single_shot_client
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# Installed into lib/${PROJECT_NAME} so `ros2 run edge_vlm_ros vlm_multi_frame_client` works.
+install(PROGRAMS scripts/vlm_multi_frame_client
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(TARGETS vlm_reasoner_node
   EXPORT vlm_reasoner_nodeTargets
   ARCHIVE DESTINATION lib
@@ -542,6 +547,16 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/test
   )
   target_link_libraries(test_ipc_protocol ${OpenCV_LIBRARIES})
+
+  # TensorRT backend multi-frame request construction (CPU-only, no TensorRT/CUDA required)
+  ament_add_gtest(test_tensorrt_backend_multiframe
+    test/test_tensorrt_backend_multiframe.cpp
+  )
+  target_include_directories(test_tensorrt_backend_multiframe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/test
+  )
+  target_link_libraries(test_tensorrt_backend_multiframe ${OpenCV_LIBRARIES})
 
   # IPC backend integration tests with a fake Unix socket worker (no GPU)
   ament_add_gtest(test_ipc_inference_backend
