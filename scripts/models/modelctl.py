@@ -100,6 +100,10 @@ def _expand_path(value: str) -> str:
     return os.path.abspath(os.path.expanduser(value.replace("${HOME}", str(Path.home()))))
 
 
+def _utc_timestamp() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _infer_ros_workspace() -> str:
     env_value = os.environ.get("ROS_WORKSPACE")
     if env_value:
@@ -444,7 +448,7 @@ def _engine_manifest_payload(model: ModelRecord, profile: ProfileRecord, ctx: Ru
     manifest = _load_json(THOR_MANIFEST_PATH)
     return {
         "schema_version": 1,
-        "build_timestamp": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "build_timestamp": _utc_timestamp(),
         "model_id": model.model_id,
         "model_name": model.display_name,
         "checkpoint_id": model.manifest_model.get("hf_model_id"),
@@ -495,7 +499,7 @@ def render_runtime_env(ctx: RuntimeContext, *, include_active_lookup: bool = Tru
         lines.extend(
             [
                 'if [[ "${EDGE_VLM_RUNTIME_STATE_FILE}" == "${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/"* ]] && [[ -f "${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then',
-                '  while IFS=$\'\\t\' read -r _edge_vlm_key _edge_vlm_value; do',
+                '  while IFS= read -r -d \'\' _edge_vlm_key && IFS= read -r -d \'\' _edge_vlm_value; do',
                 '    case "${_edge_vlm_key}" in',
                 '      EDGE_VLM_MODEL_NAME|EDGE_VLM_MODEL_ID|EDGE_VLM_ENGINE_PROFILE_ID|EDGE_VLM_LLM_ENGINE_DIR|EDGE_VLM_MULTIMODAL_ENGINE_DIR|EDGELLM_PLUGIN_PATH)',
                 '        printf -v "${_edge_vlm_key}" "%s" "${_edge_vlm_value}"',
@@ -521,7 +525,7 @@ def _active_state_payload(model: ModelRecord, profile: ProfileRecord, ctx: Runti
     paths = engine_paths(model, profile, ctx)
     return {
         "schema_version": 1,
-        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "updated_at": _utc_timestamp(),
         "model_id": model.model_id,
         "model_name": model.display_name,
         "engine_profile_id": profile.profile_id,
@@ -787,7 +791,10 @@ def cmd_print_env_pairs(args: argparse.Namespace) -> int:
         ("EDGELLM_PLUGIN_PATH", payload["plugin_path"]),
     ]
     for key, value in pairs:
-        sys.stdout.write(f"{key}\t{value}\n")
+        sys.stdout.buffer.write(key.encode("utf-8"))
+        sys.stdout.buffer.write(b"\0")
+        sys.stdout.buffer.write(value.encode("utf-8"))
+        sys.stdout.buffer.write(b"\0")
     return 0
 
 

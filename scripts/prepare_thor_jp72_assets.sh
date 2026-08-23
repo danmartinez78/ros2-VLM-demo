@@ -746,7 +746,7 @@ export ISAAC_ROS_WS="${isaac_ros_ws}"
 export EDGE_VLM_RUNTIME_STATE_FILE="${workspace_dir}/.edge-vlm/active-profile.json"
 export EDGE_VLM_MODELCTL_PATH="${script_dir}/models/modelctl.py"
 if [[ "\${EDGE_VLM_RUNTIME_STATE_FILE}" == "\${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/"* ]] && [[ -f "\${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then
-  while IFS=$'\t' read -r _edge_vlm_key _edge_vlm_value; do
+  while IFS= read -r -d '' _edge_vlm_key && IFS= read -r -d '' _edge_vlm_value; do
     case "\${_edge_vlm_key}" in
       EDGE_VLM_MODEL_NAME|EDGE_VLM_MODEL_ID|EDGE_VLM_ENGINE_PROFILE_ID|EDGE_VLM_LLM_ENGINE_DIR|EDGE_VLM_MULTIMODAL_ENGINE_DIR|EDGELLM_PLUGIN_PATH)
         printf -v "\${_edge_vlm_key}" '%s' "\${_edge_vlm_value}"
