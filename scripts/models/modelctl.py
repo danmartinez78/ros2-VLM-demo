@@ -179,7 +179,7 @@ def load_registries() -> tuple[dict[str, ModelRecord], dict[str, ProfileRecord],
         raise ModelCtlError("Unsupported engine_profiles.json schema_version.")
 
     models: dict[str, ModelRecord] = {}
-    seen_lookup: set[str] = set()
+    seen_lookup: dict[str, str] = {}
     for model_id, data in models_data.get("models", {}).items():
         _validate_registry_id(model_id, "model")
         manifest_key = data["manifest_model_key"]
@@ -198,9 +198,13 @@ def load_registries() -> tuple[dict[str, ModelRecord], dict[str, ProfileRecord],
         models[model_id] = record
         for candidate in (model_id, record.display_name, manifest_key):
             lookup = _normalize_lookup(candidate)
-            if lookup in seen_lookup and lookup != model_id:
-                continue
-            seen_lookup.add(lookup)
+            owner = seen_lookup.get(lookup)
+            if owner is not None and owner != model_id:
+                raise ModelCtlError(
+                    f"Model registry lookup alias collision: '{candidate}' normalizes to '{lookup}', "
+                    f"already owned by '{owner}'."
+                )
+            seen_lookup[lookup] = model_id
 
     profiles: dict[str, ProfileRecord] = {}
     profile_roots: set[str] = set()
@@ -643,7 +647,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         print(f"Prepared artifacts already available for {model.model_id} at {model_root(model, ctx)}")
         return 0
     command = _prepare_command(model, dry_run=args.dry_run)
-    print(shlex.join(command) if args.dry_run else f"Running: {shlex.join(command)}")
+    if args.dry_run:
+        print(shlex.join(command))
+        return 0
+    print(f"Running: {shlex.join(command)}")
     subprocess.run(command, check=True, cwd=str(REPO_ROOT))
     return 0
 

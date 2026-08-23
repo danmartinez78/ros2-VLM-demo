@@ -337,7 +337,7 @@ class ModelCtlWorkspaceTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, msg=result.stderr)
             self.assertIn("--skip-engine-build", result.stdout)
-            self.assertIn("tensorrt-edgellm-quantize llm", result.stdout)
+            self.assertIn("--skip-runtime-config", result.stdout)
             self.assertNotIn("native Thor llm_build", result.stdout)
             self.assertFalse(env_file.exists())
 
