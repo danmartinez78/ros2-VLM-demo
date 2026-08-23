@@ -779,7 +779,7 @@ class TestNativeRequestShape(unittest.TestCase):
         )
 
     def test_requests_schema_roundtrip(self):
-        """Verify a constructed request JSON parses correctly."""
+        """Verify a constructed request JSON parses correctly, including role."""
         import subprocess
         result = subprocess.run(
             [
@@ -793,6 +793,7 @@ obj = {
         {
             'messages': [
                 {
+                    'role': 'user',
                     'content': [
                         {'type': 'image', 'image': image_path},
                         {'type': 'text',  'text':  prompt_text},
@@ -805,7 +806,9 @@ obj = {
 data = json.dumps(obj)
 parsed = json.loads(data)
 req = parsed['requests'][0]
-content = req['messages'][0]['content']
+msg = req['messages'][0]
+assert msg['role'] == 'user', f"Expected role=user, got {msg.get('role')}"
+content = msg['content']
 assert content[0]['type'] == 'image'
 assert content[0]['image'] == image_path
 assert content[1]['type'] == 'text'
@@ -817,6 +820,11 @@ print('ok')
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ok", result.stdout)
+
+    def test_uses_role_user_in_message(self):
+        """The messages entry must include 'role': 'user' as Thor requires."""
+        text = self._script_text()
+        self.assertIn("'role': 'user'", text, "message dict must include 'role': 'user'")
 
 
 # ── finish_reason tests ────────────────────────────────────────────────────────
@@ -957,7 +965,7 @@ _validate_image() {
     size=$(stat -c%s "${path}" 2>/dev/null || stat -f%z "${path}" 2>/dev/null || echo 0)
     if [[ "${size}" -eq 0 ]]; then echo "ERROR: zero bytes" >&2; return 1; fi
     local magic
-    magic=$(xxd -p -l 3 "${path}" 2>/dev/null || od -A n -N 3 -t x1 "${path}" 2>/dev/null | tr -d ' \n')
+    magic=$(xxd -p -l 4 "${path}" 2>/dev/null || od -A n -N 4 -t x1 "${path}" 2>/dev/null | tr -d ' \n')
     case "${magic,,}" in
         ffd8ff*) ;;
         89504e47*) ;;
@@ -1176,6 +1184,242 @@ class TestSymlinkInstallClientLookup(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("ok", result.stdout)
+
+
+# ── responses[] array parsing tests ──────────────────────────────────────────
+
+
+class TestNativeResponseParsing(unittest.TestCase):
+    """The runner must parse finish_reason/output_text from responses[0],
+    matching the actual Thor llm_inference response shape:
+      {"responses": [{"finish_reason": ..., "output_text": ...}]}
+    """
+
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+
+    def test_runner_checks_responses_list_key(self):
+        """The runner must look for a 'responses' list in the response JSON."""
+        text = self._script_text()
+        self.assertIn("responses", text, "Runner must handle responses[] array key from Thor")
+
+    def test_responses_list_parsing_extracts_finish_reason(self):
+        """Verify the inline parser correctly unwraps responses[0]."""
+        import subprocess, json, tempfile, os
+        response = {"responses": [{"finish_reason": "max-length", "output_text": "a cat"}]}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(response, f)
+            resp_path = f.name
+        try:
+            result = subprocess.run(
+                ["python3", "-c", f"""
+import json
+
+def _first_present(d, *keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+with open({resp_path!r}) as f:
+    out = json.load(f)
+
+entry = out
+responses_list = out.get('responses') if isinstance(out, dict) else None
+if isinstance(responses_list, list) and responses_list:
+    entry = responses_list[0]
+
+finish_reason = _first_present(entry, 'finishReason', 'finish_reason')
+output_text = _first_present(entry, 'outputText', 'output_text', 'text', 'response')
+print(json.dumps({{'finish_reason': finish_reason, 'output_text': output_text}}))
+"""],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            parsed = json.loads(result.stdout.strip())
+            self.assertEqual(parsed["finish_reason"], "max-length")
+            self.assertEqual(parsed["output_text"], "a cat")
+        finally:
+            os.unlink(resp_path)
+
+    def test_responses_list_parsing_falls_back_to_flat_dict(self):
+        """A flat top-level response dict (no 'responses' key) must still parse."""
+        import subprocess, json, tempfile, os
+        response = {"finish_reason": "stop", "output_text": "a dog"}
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(response, f)
+            resp_path = f.name
+        try:
+            result = subprocess.run(
+                ["python3", "-c", f"""
+import json
+
+def _first_present(d, *keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+with open({resp_path!r}) as f:
+    out = json.load(f)
+
+entry = out
+responses_list = out.get('responses') if isinstance(out, dict) else None
+if isinstance(responses_list, list) and responses_list:
+    entry = responses_list[0]
+
+finish_reason = _first_present(entry, 'finishReason', 'finish_reason')
+output_text = _first_present(entry, 'outputText', 'output_text', 'text', 'response')
+print(json.dumps({{'finish_reason': finish_reason, 'output_text': output_text}}))
+"""],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            parsed = json.loads(result.stdout.strip())
+            self.assertEqual(parsed["finish_reason"], "stop")
+            self.assertEqual(parsed["output_text"], "a dog")
+        finally:
+            os.unlink(resp_path)
+
+
+# ── artifact naming uniqueness tests ─────────────────────────────────────────
+
+
+class TestArtifactNaming(unittest.TestCase):
+    """Artifact file names must include image_id and warmup/measured phase
+    so that multiple images and warmup iterations do not collide."""
+
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+
+    def test_artifact_name_includes_image_id(self):
+        """artifact_base must incorporate image_id, not just condition+iteration."""
+        text = self._script_text()
+        self.assertIn("${image_id}", text, "artifact_base must include image_id variable")
+
+    def test_artifact_name_includes_warmup_phase(self):
+        """artifact_base must incorporate a warmup/measured phase token."""
+        text = self._script_text()
+        self.assertIn("warmup", text.lower())
+        self.assertIn("measured", text, "artifact_base must include 'measured' phase label")
+
+    def test_artifact_names_are_unique_across_images_and_phases(self):
+        """Demonstrate that two different image_ids produce different artifact bases."""
+        import subprocess
+        result = subprocess.run(
+            ["bash", "-c", r"""
+condition=A; iteration=0; warmup=true
+image_id_1=image_001; image_id_2=image_002
+phase_warmup=warmup
+phase_measured=measured
+
+base1="direct_${condition}_${image_id_1}_${phase_warmup}_iter${iteration}"
+base2="direct_${condition}_${image_id_2}_${phase_warmup}_iter${iteration}"
+base3="direct_${condition}_${image_id_1}_${phase_measured}_iter${iteration}"
+
+[[ "${base1}" != "${base2}" ]] && echo "images_differ: ok" || echo "images_differ: FAIL"
+[[ "${base1}" != "${base3}" ]] && echo "phases_differ: ok" || echo "phases_differ: FAIL"
+[[ "${base2}" != "${base3}" ]] && echo "img2_vs_measured: ok" || echo "img2_vs_measured: FAIL"
+"""],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertIn("images_differ: ok", result.stdout)
+        self.assertIn("phases_differ: ok", result.stdout)
+        self.assertIn("img2_vs_measured: ok", result.stdout)
+        self.assertNotIn("FAIL", result.stdout)
+
+
+# ── fixture discovery path tests ──────────────────────────────────────────────
+
+
+class TestFixtureDiscoveryPath(unittest.TestCase):
+    """The runner must probe examples/multimodal/pics/ first (the verified Thor
+    checkout layout), then fall back to examples/vlm/data/images/."""
+
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+
+    def test_probes_multimodal_pics_first(self):
+        """examples/multimodal/pics must appear before examples/vlm/data/images."""
+        text = self._script_text()
+        pos_multimodal = text.find("examples/multimodal/pics")
+        pos_vlm_data = text.find("examples/vlm/data/images")
+        self.assertGreater(pos_multimodal, 0, "examples/multimodal/pics must be present")
+        self.assertGreater(pos_vlm_data, 0, "examples/vlm/data/images must still be a fallback")
+        self.assertLess(
+            pos_multimodal, pos_vlm_data,
+            "examples/multimodal/pics must be listed before examples/vlm/data/images",
+        )
+
+    def test_probes_both_candidate_paths(self):
+        """Both fixture paths must be present as candidates."""
+        text = self._script_text()
+        self.assertIn("examples/multimodal/pics", text)
+        self.assertIn("examples/vlm/data/images", text)
+
+
+# ── PNG magic-byte validation tests ──────────────────────────────────────────
+
+
+class TestPngValidation(unittest.TestCase):
+    """_validate_image must correctly accept a real PNG by reading 4 bytes
+    (the full 89 50 4E 47 PNG signature), not 3 bytes."""
+
+    def _validate_image_bash(self, content: bytes) -> str:
+        """Run the actual _validate_image function from the script on a temp file."""
+        import subprocess, tempfile, os
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(content)
+            tmp = f.name
+        try:
+            script = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+            # Extract _validate_image function body from the script.
+            start = script.find("\n_validate_image()")
+            end = script.find("\n}", start) + 2
+            validate_fn = script[start:end]
+            result = subprocess.run(
+                ["bash", "-c", f"""
+{validate_fn}
+_validate_image {tmp!r} && echo ACCEPTED || echo REJECTED
+"""],
+                capture_output=True, text=True, timeout=10,
+            )
+            return result.stdout.strip()
+        finally:
+            os.unlink(tmp)
+
+    def test_accepts_valid_png(self):
+        """A file with the correct 4-byte PNG magic (89 50 4E 47) must be accepted."""
+        png_magic = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+        outcome = self._validate_image_bash(png_magic)
+        self.assertIn("ACCEPTED", outcome, f"Valid PNG should be accepted; got: {outcome!r}")
+
+    def test_rejects_truncated_png_3_bytes(self):
+        """A file with only 3 bytes of PNG signature must be rejected."""
+        three_bytes = bytes([0x89, 0x50, 0x4E])
+        outcome = self._validate_image_bash(three_bytes)
+        self.assertIn("REJECTED", outcome, f"3-byte PNG header should be rejected; got: {outcome!r}")
+
+    def test_runner_reads_4_bytes_for_magic(self):
+        """The script must read 4 bytes for PNG magic, not 3."""
+        text = self._script_text()
+        # Must not use -l 3 for the magic-byte read (that misses the 4th PNG byte).
+        # Accept any form that reads >= 4 bytes.
+        import re
+        # Look for xxd -p -l N where N >= 4, or -N 4 for od.
+        xxd_match = re.search(r"xxd\s+-p\s+-l\s+(\d+)", text)
+        od_match = re.search(r"od\s+.*?-N\s+(\d+)", text)
+        if xxd_match:
+            self.assertGreaterEqual(int(xxd_match.group(1)), 4,
+                "xxd must read at least 4 bytes to capture the full PNG signature")
+        elif od_match:
+            self.assertGreaterEqual(int(od_match.group(1)), 4,
+                "od must read at least 4 bytes to capture the full PNG signature")
+        else:
+            self.fail("Could not find xxd or od magic-byte read command in script")
+
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":

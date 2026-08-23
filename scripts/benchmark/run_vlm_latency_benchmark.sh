@@ -43,7 +43,8 @@
 # The benchmark uses BENCHMARK_IMAGE_DIR (default: scripts/benchmark/test_fixtures/images).
 # Images must have neutral names (image_001.jpg, image_002.jpg …).  On the first
 # run, the script tries to copy known-good fixtures from the pinned
-# TensorRT Edge-LLM checkout (${TENSORRT_EDGE_LLM_ROOT}/examples/vlm/data/images)
+# TensorRT Edge-LLM checkout — probing examples/multimodal/pics/ first (the
+# verified Thor layout), then examples/vlm/data/images/ as a fallback —
 # before falling back to a one-time download of the NVIDIA red-panda reference
 # saved as image_001.jpg.
 # Every image is validated (non-zero size, JPEG/PNG magic bytes) before use.
@@ -199,12 +200,13 @@ _validate_image() {
     if [[ "${size}" -eq 0 ]]; then
         echo "ERROR: image is zero bytes (download may have failed): ${path}" >&2; return 1
     fi
-    # Check magic bytes: JPEG = FF D8 FF, PNG = 89 50 4E 47
+    # Check magic bytes: JPEG = FF D8 FF (3 bytes), PNG = 89 50 4E 47 (4 bytes).
+    # Read 4 bytes so the full PNG signature is captured.
     local magic
-    magic=$(xxd -p -l 3 "${path}" 2>/dev/null || od -A n -N 3 -t x1 "${path}" 2>/dev/null | tr -d ' \n')
+    magic=$(xxd -p -l 4 "${path}" 2>/dev/null || od -A n -N 4 -t x1 "${path}" 2>/dev/null | tr -d ' \n')
     case "${magic,,}" in
-        ffd8ff*)  ;;  # JPEG
-        89504e47*) ;;  # PNG prefix
+        ffd8ff*)   ;;  # JPEG (starts with FF D8 FF)
+        89504e47*) ;;  # PNG  (starts with 89 50 4E 47)
         *)
             echo "ERROR: ${path}: not a valid JPEG or PNG (magic=${magic}); " \
                  "file may be an HTML error page or truncated download" >&2
@@ -223,8 +225,20 @@ _setup_images() {
         # Prefer copying known-good fixtures from the pinned TensorRT Edge-LLM checkout
         # (neutral file names image_001.jpg, image_002.jpg, …).
         local copied=0
-        local edgellm_img_dir="${TENSORRT_EDGE_LLM_ROOT:-}/examples/vlm/data/images"
-        if [[ -d "${edgellm_img_dir}" ]]; then
+        # Probe known fixture paths in order of preference:
+        #   1. examples/multimodal/pics/  — path verified on the tested Thor checkout
+        #   2. examples/vlm/data/images/  — alternate layout seen in some releases
+        local edgellm_img_dir=""
+        for _candidate in \
+            "${TENSORRT_EDGE_LLM_ROOT:-}/examples/multimodal/pics" \
+            "${TENSORRT_EDGE_LLM_ROOT:-}/examples/vlm/data/images"
+        do
+            if [[ -d "${_candidate}" ]]; then
+                edgellm_img_dir="${_candidate}"
+                break
+            fi
+        done
+        if [[ -n "${edgellm_img_dir}" ]]; then
             local idx=1
             while IFS= read -r -d '' src; do
                 local dst
@@ -370,6 +384,7 @@ obj = {
         {
             'messages': [
                 {
+                    'role': 'user',
                     'content': [
                         {'type': 'image', 'image': sys.argv[1]},
                         {'type': 'text',  'text':  sys.argv[2]},
@@ -384,7 +399,11 @@ with open(sys.argv[3], 'w') as f:
 " "${image_path}" "${prompt_text}" "${input_json}"
 
     # Named artifacts for this inference (preserved for post-analysis).
-    local artifact_base="${OUTPUT_DIR}/direct_${condition}_iter${iteration}"
+    # Include image_id and warmup/measured phase to avoid collisions across images
+    # and between warmup and measured iterations.
+    local phase="measured"
+    [[ "${warmup}" == "true" ]] && phase="warmup"
+    local artifact_base="${OUTPUT_DIR}/direct_${condition}_${image_id}_${phase}_iter${iteration}"
     local output_json="${artifact_base}_response.json"
     local profile_json="${artifact_base}_profile.json"
 
@@ -468,14 +487,21 @@ if success and response_path:
     try:
         with open(response_path) as f:
             out = json.load(f)
+        # Thor's llm_inference response is {"responses": [{...}]}.
+        # Unwrap the first responses[] entry; also accept a flat top-level dict
+        # as a fallback for alternative runtime shapes.
+        entry = out
+        responses_list = out.get('responses') if isinstance(out, dict) else None
+        if isinstance(responses_list, list) and responses_list:
+            entry = responses_list[0]
         # Scalar response fields
-        actual_output_tokens = _first_present(out, 'outputTokens', 'output_tokens', 'numOutputTokens')
-        finish_reason = _first_present(out, 'finishReason', 'finish_reason')
-        output_text = _first_present(out, 'outputText', 'output_text', 'text', 'response')
+        actual_output_tokens = _first_present(entry, 'outputTokens', 'output_tokens', 'numOutputTokens')
+        finish_reason = _first_present(entry, 'finishReason', 'finish_reason')
+        output_text = _first_present(entry, 'outputText', 'output_text', 'text', 'response')
         # Stage timings from the response JSON (if present)
-        ttft_ms = _first_present(out, 'ttftMs', 'ttft_ms')
-        decode_ms = _first_present(out, 'decodeMs', 'decode_ms')
-        visual_preprocess_ms = _first_present(out, 'visualMs', 'visual_ms', 'visual_preprocess_ms')
+        ttft_ms = _first_present(entry, 'ttftMs', 'ttft_ms')
+        decode_ms = _first_present(entry, 'decodeMs', 'decode_ms')
+        visual_preprocess_ms = _first_present(entry, 'visualMs', 'visual_ms', 'visual_preprocess_ms')
     except Exception:
         pass
 
