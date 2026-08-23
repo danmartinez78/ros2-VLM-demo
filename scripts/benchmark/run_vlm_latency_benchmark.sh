@@ -4,9 +4,21 @@
 # VLM latency characterization benchmark.
 #
 # Sweeps the experiment matrix (conditions A–E) over a fixed image set using
-# both the direct/native Edge-LLM invocation path and the ROS
-# edge_vlm_ros_node path (where available), keeping model, engine, precision,
-# power mode, clocks, image, and prompt text identical between paired runs.
+# both the direct/native Edge-LLM invocation path and the IPC (standalone
+# edge_vlm_server) path, keeping model, engine, precision, power mode, clocks,
+# image, and prompt text identical between paired runs.
+#
+# NOTE on lifecycle semantics
+# ---------------------------
+#   direct : launches a fresh llm_inference process per inference — includes
+#            cold-start (process init, engine load, tokenizer init). This is
+#            per-process cold-start latency.
+#   ipc    : sends requests to an already-running, warmed edge_vlm_server via
+#            IPC socket (vlm_single_shot_client → edge_vlm_cli). This is
+#            steady-state (persistent server) latency.
+#   These two paths are NOT directly comparable as "overhead" because they
+#   measure different lifecycle phases. The report labels them accordingly.
+#   Both paths are recorded so each can be analysed independently.
 #
 # This script does NOT:
 #   - Change power mode, clock caps, model size, quantization, or engines.
@@ -24,7 +36,7 @@
 #
 # Each condition runs through:
 #   - direct  : native llm_inference invocation (requires TENSORRT_EDGE_LLM_ROOT + EDGE_VLM_* env vars)
-#   - ros     : vlm_single_shot_client via edge_vlm_cli IPC path (requires edge_vlm_server running)
+#   - ipc     : vlm_single_shot_client → edge_vlm_cli → running edge_vlm_server IPC socket
 #
 # Fixed image set
 # ---------------
@@ -48,13 +60,13 @@
 #   --output-dir DIR         Directory for all output artifacts
 #                            (default: /tmp/vlm_latency_bench_TIMESTAMP)
 #   --conditions LIST        Comma-separated conditions to run (default: A,B,C,D,E)
-#   --paths LIST             Comma-separated paths: direct,ros (default: direct,ros)
+#   --paths LIST             Comma-separated paths: direct,ipc (default: direct,ipc)
 #   --warmup N               Warmup iterations per condition/image (default: 1)
 #   --iterations N           Measured iterations per condition/image (default: 3)
 #   --image-dir DIR          Directory containing fixed benchmark images
 #   --skip-panda-download    Skip automatic red-panda reference image download
-#   --skip-ros               Alias for --paths direct
-#   --skip-direct            Alias for --paths ros
+#   --skip-ipc               Alias for --paths direct
+#   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
 
 set -euo pipefail
@@ -64,7 +76,7 @@ set -euo pipefail
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
 OUTPUT_DIR="/tmp/vlm_latency_bench_${TIMESTAMP}"
 CONDITIONS="A,B,C,D,E"
-PATHS="direct,ros"
+PATHS="direct,ipc"
 WARMUP=1
 ITERATIONS=3
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,8 +96,8 @@ while [[ $# -gt 0 ]]; do
         --iterations)   ITERATIONS="$2";           shift 2 ;;
         --image-dir)    IMAGE_DIR="$2";            shift 2 ;;
         --skip-panda-download) SKIP_PANDA_DOWNLOAD=true; shift ;;
-        --skip-ros)     PATHS="direct";            shift ;;
-        --skip-direct)  PATHS="ros";               shift ;;
+        --skip-ipc)     PATHS="direct";            shift ;;
+        --skip-direct)  PATHS="ipc";               shift ;;
         --dry-run)      DRY_RUN=true;              shift ;;
         *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
     esac
@@ -229,6 +241,7 @@ print(json.dumps({
     'recorded_at': sys.argv[2],
     'condition': sys.argv[3],
     'path': 'direct',
+    'lifecycle_semantics': 'cold_start',
     'image_id': sys.argv[4],
     'image_path': sys.argv[5],
     'image_width_px': None,
@@ -353,6 +366,7 @@ record = {
     'recorded_at': recorded_at,
     'condition': condition,
     'path': 'direct',
+    'lifecycle_semantics': 'cold_start',
     'image_id': image_id,
     'image_path': image_path,
     'image_width_px': None,
@@ -386,9 +400,9 @@ print(json.dumps(record))
     rm -f "${input_json}" "${output_json}"
 }
 
-# ── ROS path invocation ───────────────────────────────────────────────────────
+# ── IPC path invocation (persistent edge_vlm_server) ─────────────────────────
 
-_run_ros_inference() {
+_run_ipc_inference() {
     local condition="$1"
     local prompt_id="$2"
     local max_tokens="$3"
@@ -405,8 +419,9 @@ _run_ros_inference() {
     local recorded_at
     recorded_at="$(_now_iso)"
 
-    # The ROS path requires a running edge_vlm_ros_node and ros2 topic tools.
-    # When unavailable, record the attempt as a failure with a descriptive error.
+    # The ipc path requires ros2 (to run vlm_single_shot_client) and a running
+    # edge_vlm_server.  When unavailable, record the attempt as a failure with a
+    # descriptive error.  This is a steady-state (persistent server) measurement.
     if ! command -v ros2 &>/dev/null; then
         local record
         record=$(python3 -c "
@@ -417,7 +432,8 @@ print(json.dumps({
     'run_id': sys.argv[1],
     'recorded_at': sys.argv[2],
     'condition': sys.argv[3],
-    'path': 'ros',
+    'path': 'ipc',
+    'lifecycle_semantics': 'persistent',
     'image_id': sys.argv[4],
     'image_path': sys.argv[5],
     'image_width_px': None,
@@ -427,7 +443,7 @@ print(json.dumps({
     'max_output_tokens': int(sys.argv[8]),
     'actual_output_tokens': None,
     'success': False,
-    'error': 'ROS 2 not available in this environment — ros path skipped',
+    'error': 'ros2 not available — ipc path (vlm_single_shot_client) skipped',
     'total_latency_ms': None,
     'visual_preprocess_ms': None,
     'ttft_ms': None,
@@ -445,11 +461,11 @@ print(json.dumps({
         return
     fi
 
-    # Publish the image via the IPC path and capture the result.
-    # vlm_single_shot_client wraps edge_vlm_cli with a structured JSON output.
-    # Wall-clock timing wraps the full round-trip from invocation to result receipt.
+    # Send the request to the already-running edge_vlm_server via IPC and capture
+    # the result.  vlm_single_shot_client wraps edge_vlm_cli with structured JSON
+    # output.  Wall-clock timing wraps the full client round-trip.
     local result_json
-    result_json="$(mktemp /tmp/vlm_bench_ros_result_XXXXXX.json)"
+    result_json="$(mktemp /tmp/vlm_bench_ipc_result_XXXXXX.json)"
 
     local t_start t_end
     t_start=$(date +%s%3N)
@@ -462,7 +478,7 @@ print(json.dumps({
         --max-tokens "${max_tokens}" \
         --output "${result_json}" \
         --timeout 60 \
-        2>"/tmp/vlm_bench_ros_stderr_${run_id}_${condition}_${iteration}.log" \
+        2>"/tmp/vlm_bench_ipc_stderr_${run_id}_${condition}_${iteration}.log" \
         || exit_code=$?
 
     t_end=$(date +%s%3N)
@@ -482,12 +498,14 @@ warmup_str = sys.argv[13]
 result_json_path = sys.argv[14]
 
 success = exit_code == 0
-error = None if success else f'ros client exited with code {exit_code}'
+error = None if success else f'ipc client exited with code {exit_code}'
 model_name = model_name_arg if model_name_arg else None
 warmup = warmup_str == 'true'
 total_ms = float(total_latency_ms) if success else None
 
-# ROS path does not expose stage timings (TTFT, decode, visual) — all null.
+# IPC path does not expose stage timings (TTFT, decode, visual) — all null.
+# actual_output_tokens comes from backend if available; output_tokens in the
+# result artifact is null when the backend does not report a real token count.
 actual_output_tokens = None
 if success and os.path.exists(result_json_path):
     try:
@@ -503,7 +521,8 @@ record = {
     'run_id': run_id,
     'recorded_at': recorded_at,
     'condition': condition,
-    'path': 'ros',
+    'path': 'ipc',
+    'lifecycle_semantics': 'persistent',
     'image_id': image_id,
     'image_path': image_path,
     'image_width_px': None,
@@ -578,8 +597,8 @@ main() {
                         _run_direct_inference \
                             "${condition}" "${prompt_id}" "${max_tokens}" \
                             "${prompt_text}" "${image_path}" "${i}" "true" "${run_id}"
-                    elif [[ "${path}" == "ros" ]]; then
-                        _run_ros_inference \
+                    elif [[ "${path}" == "ipc" ]]; then
+                        _run_ipc_inference \
                             "${condition}" "${prompt_id}" "${max_tokens}" \
                             "${prompt_text}" "${image_path}" "${i}" "true" "${run_id}"
                     fi
@@ -591,8 +610,8 @@ main() {
                         _run_direct_inference \
                             "${condition}" "${prompt_id}" "${max_tokens}" \
                             "${prompt_text}" "${image_path}" "${i}" "false" "${run_id}"
-                    elif [[ "${path}" == "ros" ]]; then
-                        _run_ros_inference \
+                    elif [[ "${path}" == "ipc" ]]; then
+                        _run_ipc_inference \
                             "${condition}" "${prompt_id}" "${max_tokens}" \
                             "${prompt_text}" "${image_path}" "${i}" "false" "${run_id}"
                     fi

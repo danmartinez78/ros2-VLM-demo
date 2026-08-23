@@ -33,7 +33,7 @@ from vlm_latency_report import (  # noqa: E402
     aggregate_condition,
     build_condition_spec,
     build_report,
-    compute_direct_ros_comparison,
+    compute_direct_ipc_comparison,
     compute_token_scaling,
     format_text_report,
     parse_jsonl,
@@ -281,44 +281,46 @@ class TestComputeTokenScaling(unittest.TestCase):
         self.assertAlmostEqual(rows[0]["total_latency_ms_mean"], 500.0, places=1)
 
 
-# ── direct-vs-ROS comparison tests ───────────────────────────────────────────
+# ── direct-vs-IPC comparison tests ───────────────────────────────────────────
 
 
-class TestComputeDirectRosComparison(unittest.TestCase):
-    def test_overhead_computed_correctly(self):
+class TestComputeDirectIpcComparison(unittest.TestCase):
+    def test_table_computed_for_paired_conditions(self):
         by_cp = {
             ("D", "direct"): [_make_record(condition="D", path="direct", total_latency_ms=800.0)],
-            ("D", "ros"): [_make_record(condition="D", path="ros", total_latency_ms=1000.0)],
+            ("D", "ipc"): [_make_record(condition="D", path="ipc", total_latency_ms=1000.0)],
         }
-        rows = compute_direct_ros_comparison(by_cp)
+        rows = compute_direct_ipc_comparison(by_cp)
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["condition"], "D")
-        self.assertAlmostEqual(row["ros_overhead_ms_mean"], 200.0, places=1)
-        self.assertAlmostEqual(row["ros_overhead_pct"], 25.0, places=1)
+        self.assertAlmostEqual(row["direct_total_latency_ms_mean"], 800.0, places=1)
+        self.assertAlmostEqual(row["ipc_total_latency_ms_mean"], 1000.0, places=1)
+        # Must not carry an 'overhead' or comparison delta field — lifecycles differ.
+        self.assertNotIn("overhead_ms", row)
 
     def test_condition_with_only_direct_excluded(self):
         by_cp = {
             ("A", "direct"): [_make_record(condition="A", path="direct")],
         }
-        rows = compute_direct_ros_comparison(by_cp)
+        rows = compute_direct_ipc_comparison(by_cp)
         self.assertEqual(rows, [])
 
-    def test_condition_with_only_ros_excluded(self):
+    def test_condition_with_only_ipc_excluded(self):
         by_cp = {
-            ("B", "ros"): [_make_record(condition="B", path="ros")],
+            ("B", "ipc"): [_make_record(condition="B", path="ipc")],
         }
-        rows = compute_direct_ros_comparison(by_cp)
+        rows = compute_direct_ipc_comparison(by_cp)
         self.assertEqual(rows, [])
 
     def test_multiple_conditions(self):
         by_cp = {
             ("A", "direct"): [_make_record(condition="A", path="direct", total_latency_ms=400.0)],
-            ("A", "ros"): [_make_record(condition="A", path="ros", total_latency_ms=500.0)],
+            ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=500.0)],
             ("E", "direct"): [_make_record(condition="E", path="direct", total_latency_ms=7000.0)],
-            ("E", "ros"): [_make_record(condition="E", path="ros", total_latency_ms=8500.0)],
+            ("E", "ipc"): [_make_record(condition="E", path="ipc", total_latency_ms=8500.0)],
         }
-        rows = compute_direct_ros_comparison(by_cp)
+        rows = compute_direct_ipc_comparison(by_cp)
         self.assertEqual(len(rows), 2)
         conds = {r["condition"] for r in rows}
         self.assertEqual(conds, {"A", "E"})
@@ -331,7 +333,7 @@ class TestBuildReport(unittest.TestCase):
     def _make_full_records(self) -> list[dict[str, Any]]:
         recs: list[dict[str, Any]] = []
         for cond, pid, mtok in [("A", "terse_id", 16), ("D", "scene_description", 128)]:
-            for path in ("direct", "ros"):
+            for path in ("direct", "ipc"):
                 recs.append(
                     _make_record(
                         condition=cond,
@@ -350,7 +352,7 @@ class TestBuildReport(unittest.TestCase):
         self.assertIn("generated_at", report)
         self.assertIn("conditions", report)
         self.assertIn("token_scaling_table", report)
-        self.assertIn("direct_ros_comparison", report)
+        self.assertIn("direct_ipc_comparison", report)
         self.assertIn("raw_records", report)
 
     def test_raw_records_preserved(self):
@@ -384,9 +386,9 @@ class TestFormatTextReport(unittest.TestCase):
     def _make_report(self) -> dict[str, Any]:
         records = [
             _make_record(condition="A", path="direct", total_latency_ms=480.0),
-            _make_record(condition="A", path="ros", total_latency_ms=600.0),
+            _make_record(condition="A", path="ipc", total_latency_ms=600.0),
             _make_record(condition="E", path="direct", max_output_tokens=256, total_latency_ms=8000.0),
-            _make_record(condition="E", path="ros", max_output_tokens=256, total_latency_ms=9500.0),
+            _make_record(condition="E", path="ipc", max_output_tokens=256, total_latency_ms=9500.0),
         ]
         return build_report(records)
 
@@ -394,7 +396,7 @@ class TestFormatTextReport(unittest.TestCase):
         text = format_text_report(self._make_report())
         self.assertIn("VLM Latency Characterization Benchmark Report", text)
         self.assertIn("Latency vs Output-Token Cap", text)
-        self.assertIn("Direct (native) vs ROS Path Overhead", text)
+        self.assertIn("Direct (cold-start, per-process) vs IPC (persistent server, steady-state)", text)
 
     def test_report_mentions_unavailable_stage_timings(self):
         records = [_make_record(ttft_ms=None, decode_ms=None)]
@@ -416,12 +418,12 @@ class TestFormatTextReport(unittest.TestCase):
         text = format_text_report(report)
         self.assertIn("VLM Latency Characterization Benchmark Report", text)
 
-    def test_report_with_no_ros_path(self):
+    def test_report_with_no_ipc_path(self):
         records = [_make_record(path="direct")]
         report = build_report(records)
         text = format_text_report(report)
-        # No direct-vs-ROS section when ROS data absent
-        self.assertNotIn("Direct (native) vs ROS Path Overhead", text)
+        # No direct-vs-IPC section when IPC data absent
+        self.assertNotIn("Direct (cold-start, per-process) vs IPC", text)
 
 
 # ── experiment matrix tests ───────────────────────────────────────────────────
@@ -532,9 +534,9 @@ class TestRoundTrip(unittest.TestCase):
             _make_record(condition=c, path=p, total_latency_ms=lat)
             for c, p, lat in [
                 ("A", "direct", 500.0),
-                ("A", "ros", 650.0),
+                ("A", "ipc", 650.0),
                 ("E", "direct", 7800.0),
-                ("E", "ros", 9200.0),
+                ("E", "ipc", 9200.0),
             ]
         ]
         with tempfile.NamedTemporaryFile(
@@ -548,8 +550,8 @@ class TestRoundTrip(unittest.TestCase):
             report = build_report(parsed, source_path=path)
             self.assertEqual(report["n_total_records"], len(records))
             self.assertGreater(len(report["token_scaling_table"]), 0)
-            # Both direct-vs-ROS conditions with paired runs should appear.
-            comparison_conditions = {r["condition"] for r in report["direct_ros_comparison"]}
+            # Both direct-vs-IPC conditions with paired runs should appear.
+            comparison_conditions = {r["condition"] for r in report["direct_ipc_comparison"]}
             self.assertIn("A", comparison_conditions)
             self.assertIn("E", comparison_conditions)
         finally:
@@ -680,20 +682,45 @@ class TestRosClientInstall(unittest.TestCase):
                 return
         self.fail("No install() block containing vlm_single_shot_client found in CMakeLists.txt")
 
-    def test_ros_path_invokes_vlm_single_shot_client(self):
-        """The benchmark runner ROS path must call vlm_single_shot_client."""
+    def test_ipc_path_invokes_vlm_single_shot_client(self):
+        """The benchmark runner IPC path must call vlm_single_shot_client."""
         text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
         self.assertIn(
             "vlm_single_shot_client",
             text,
-            "ROS path in run_vlm_latency_benchmark.sh must invoke vlm_single_shot_client",
+            "IPC path in run_vlm_latency_benchmark.sh must invoke vlm_single_shot_client",
         )
 
-    def test_ros_path_uses_socket_arg(self):
+    def test_ipc_path_uses_socket_arg(self):
         """vlm_single_shot_client call must forward --socket so edge_vlm_cli can
         connect to edge_vlm_server."""
         text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
         self.assertIn("--socket", text)
+
+    def test_ipc_path_label_is_ipc_not_ros(self):
+        """The path label written into JSONL records must be 'ipc', not 'ros'.
+        This ensures the path cannot silently reduce to a bare IPC call while
+        claiming to exercise edge_vlm_ros_node."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("'ipc'", text, "IPC path records must carry path='ipc'")
+        # 'ros' must not appear as a path value in any record-building block.
+        import re
+        for m in re.finditer(r"'path':\s*'([^']+)'", text):
+            self.assertNotEqual(
+                m.group(1),
+                "ros",
+                "path='ros' must not appear in record-building blocks — use 'ipc'",
+            )
+
+    def test_direct_path_carries_cold_start_lifecycle(self):
+        """Direct records must declare lifecycle_semantics='cold_start'."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("cold_start", text)
+
+    def test_ipc_path_carries_persistent_lifecycle(self):
+        """IPC records must declare lifecycle_semantics='persistent'."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("persistent", text)
 
 
 if __name__ == "__main__":

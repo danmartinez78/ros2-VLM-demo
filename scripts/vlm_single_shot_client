@@ -24,7 +24,8 @@
 #   success            bool     — true if edge_vlm_cli exited 0
 #   error              str|null — error description when success is false
 #   output_text        str|null — inference response text (stdout of edge_vlm_cli)
-#   output_tokens      int|null — approximate token count (whitespace-split words)
+#   output_tokens      int|null — actual output token count from the backend if available; null otherwise
+#   output_words       int|null — whitespace-delimited word count of output_text (not a token count)
 #   inference_seconds  float|null — wall time reported by edge_vlm_cli on stderr
 #   client_latency_ms  int      — end-to-end wall time measured by this script
 
@@ -139,9 +140,11 @@ def main() -> int:
     elapsed_ms = round((time.monotonic() - t_start) * 1000.0)
     success = proc.returncode == 0
     output_text: str | None = proc.stdout.strip() if success else None
-    output_tokens: int | None = (
-        len(output_text.split()) if output_text else None
-    )
+    # output_tokens: real token count from backend when available; null otherwise.
+    # edge_vlm_cli does not currently expose a token count, so this is always null.
+    output_tokens: int | None = None
+    # output_words: whitespace-delimited word count — stored separately, not as token count.
+    output_words: int | None = len(output_text.split()) if output_text else None
     inference_seconds = _parse_inference_seconds(proc.stderr)
 
     error_msg: str | None
@@ -156,6 +159,7 @@ def main() -> int:
         "error": error_msg,
         "output_text": output_text,
         "output_tokens": output_tokens,
+        "output_words": output_words,
         "inference_seconds": inference_seconds,
         "client_latency_ms": elapsed_ms,
     }

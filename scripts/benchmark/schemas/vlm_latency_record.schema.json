@@ -45,8 +45,13 @@
     },
     "path": {
       "type": "string",
-      "enum": ["direct", "ros"],
-      "description": "Invocation path: 'direct' for native Edge-LLM invocation, 'ros' for edge_vlm_ros_node."
+      "enum": ["direct", "ipc"],
+      "description": "Invocation path: 'direct' for native Edge-LLM cold-start invocation, 'ipc' for persistent edge_vlm_server via IPC socket."
+    },
+    "lifecycle_semantics": {
+      "type": ["string", "null"],
+      "enum": ["cold_start", "persistent", null],
+      "description": "Lifecycle phase measured: 'cold_start' for direct (includes per-process init), 'persistent' for ipc (steady-state against running server). Null for records written before this field was introduced."
     },
     "image_id": {
       "type": "string",

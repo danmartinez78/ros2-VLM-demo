@@ -174,40 +174,42 @@ def aggregate_condition(
     }
 
 
-# ── direct-vs-ROS comparison ──────────────────────────────────────────────────
+# ── direct-vs-IPC comparison ──────────────────────────────────────────────────
 
 
-def compute_direct_ros_comparison(
+def compute_direct_ipc_comparison(
     by_condition_path: dict[tuple[str, str], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """
-    For each condition where both 'direct' and 'ros' records exist, compute the
-    overhead introduced by the ROS edge_vlm_ros_node path.
+    For each condition where both 'direct' and 'ipc' records exist, tabulate
+    the mean total latency of each path side by side.
+
+    NOTE: 'direct' measures cold-start latency (fresh process per inference,
+    including engine/tokenizer initialisation).  'ipc' measures steady-state
+    latency against an already-running, warmed edge_vlm_server.  These two
+    quantities are *not* comparable as overhead; the table is provided for
+    independent per-path analysis only.
     """
     rows: list[dict[str, Any]] = []
     conditions = sorted({c for c, _ in by_condition_path})
     for condition in conditions:
         direct_records = by_condition_path.get((condition, "direct"), [])
-        ros_records = by_condition_path.get((condition, "ros"), [])
-        if not direct_records or not ros_records:
+        ipc_records = by_condition_path.get((condition, "ipc"), [])
+        if not direct_records or not ipc_records:
             continue
         direct_agg = aggregate_condition(direct_records)
-        ros_agg = aggregate_condition(ros_records)
+        ipc_agg = aggregate_condition(ipc_records)
         direct_mean = direct_agg["total_latency_ms"].get("mean")
-        ros_mean = ros_agg["total_latency_ms"].get("mean")
-        overhead_mean: float | None = None
-        overhead_pct: float | None = None
-        if direct_mean is not None and ros_mean is not None:
-            overhead_mean = ros_mean - direct_mean
-            if direct_mean > 0:
-                overhead_pct = 100.0 * overhead_mean / direct_mean
+        ipc_mean = ipc_agg["total_latency_ms"].get("mean")
         rows.append(
             {
                 "condition": condition,
                 "direct_total_latency_ms_mean": direct_mean,
-                "ros_total_latency_ms_mean": ros_mean,
-                "ros_overhead_ms_mean": overhead_mean,
-                "ros_overhead_pct": overhead_pct,
+                "ipc_total_latency_ms_mean": ipc_mean,
+                "note": (
+                    "direct=cold_start (per-process init included); "
+                    "ipc=persistent server steady-state; not directly comparable"
+                ),
             }
         )
     return rows
@@ -289,7 +291,7 @@ def build_report(
         ),
         "conditions": conditions_summary,
         "token_scaling_table": compute_token_scaling(by_condition_path),
-        "direct_ros_comparison": compute_direct_ros_comparison(by_condition_path),
+        "direct_ipc_comparison": compute_direct_ipc_comparison(by_condition_path),
         "raw_records": records,
     }
 
@@ -350,24 +352,24 @@ def format_text_report(report: dict[str, Any]) -> str:
                 f"{row.get('n_measured', '?'):>4}"
             )
 
-    # ── Direct vs ROS comparison ──────────────────────────────────────────
-    comparisons = report.get("direct_ros_comparison") or []
+    # ── Direct vs IPC comparison ──────────────────────────────────────────
+    comparisons = report.get("direct_ipc_comparison") or []
     if comparisons:
         lines += [
             "",
-            "Direct (native) vs ROS Path Overhead",
+            "Direct (cold-start, per-process) vs IPC (persistent server, steady-state)",
             "-" * 72,
-            f"  {'Cond':<5} {'Direct mean ms':>14} {'ROS mean ms':>11} "
-            f"{'Overhead ms':>12} {'Overhead':>9}",
-            "  " + "-" * 55,
+            "  NOTE: direct includes process/engine init; ipc connects to a running server.",
+            "  These values reflect different lifecycle phases and are not comparable as overhead.",
+            "-" * 72,
+            f"  {'Cond':<5} {'Direct mean ms':>14} {'IPC mean ms':>11}",
+            "  " + "-" * 34,
         ]
         for row in comparisons:
             lines.append(
                 f"  {row.get('condition', '?'):<5} "
                 f"{_fmt_ms(row.get('direct_total_latency_ms_mean')):>14} "
-                f"{_fmt_ms(row.get('ros_total_latency_ms_mean')):>11} "
-                f"{_fmt_ms(row.get('ros_overhead_ms_mean')):>12} "
-                f"{_fmt_pct(row.get('ros_overhead_pct')):>9}"
+                f"{_fmt_ms(row.get('ipc_total_latency_ms_mean')):>11}"
             )
 
     # ── Stage-timing availability note ───────────────────────────────────
