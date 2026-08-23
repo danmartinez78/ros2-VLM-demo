@@ -23,8 +23,8 @@
 #   Condition E : scene-description prompt           , max 256 tokens
 #
 # Each condition runs through:
-#   - direct  : native llm_inference invocation (requires EDGELLM_* env vars)
-#   - ros     : edge_vlm_ros_node single-shot mode (requires ROS + node running)
+#   - direct  : native llm_inference invocation (requires TENSORRT_EDGE_LLM_ROOT + EDGE_VLM_* env vars)
+#   - ros     : vlm_single_shot_client via edge_vlm_cli IPC path (requires edge_vlm_server running)
 #
 # Fixed image set
 # ---------------
@@ -33,10 +33,11 @@
 # The red-panda image is downloaded automatically if not present and SKIP_PANDA=false.
 #
 # Required environment (source scripts/edge_vlm_env.sh before running):
-#   EDGELLM_LLM_ENGINE_DIR       path to LLM engine for llm_inference
-#   EDGELLM_MULTIMODAL_ENGINE_DIR path to multimodal engine
-#   EDGELLM_BINARY               path to llm_inference binary
+#   TENSORRT_EDGE_LLM_ROOT       root of TensorRT Edge-LLM checkout (binary at build/examples/llm/llm_inference)
+#   EDGE_VLM_LLM_ENGINE_DIR      path to LLM engine directory
+#   EDGE_VLM_MULTIMODAL_ENGINE_DIR path to multimodal engine directory
 #   EDGE_VLM_MODEL_NAME          model identifier string (for metadata)
+#   EDGE_VLM_WORKER_SOCKET       IPC socket for edge_vlm_server (default: /tmp/edge_vlm.sock)
 #
 # Usage
 # -----
@@ -214,7 +215,10 @@ _run_direct_inference() {
     recorded_at="$(_now_iso)"
 
     # Check that required env vars and the binary are available.
-    if [[ -z "${EDGELLM_BINARY:-}" || ! -x "${EDGELLM_BINARY:-}" ]]; then
+    # Use the same canonical path as run_native_benchmarks.sh:
+    #   ${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_inference
+    local llm_inference="${TENSORRT_EDGE_LLM_ROOT:-}/build/examples/llm/llm_inference"
+    if [[ -z "${TENSORRT_EDGE_LLM_ROOT:-}" || ! -x "${llm_inference}" ]]; then
         local record
         record=$(python3 -c "
 import json, sys
@@ -234,7 +238,7 @@ print(json.dumps({
     'max_output_tokens': int(sys.argv[8]),
     'actual_output_tokens': None,
     'success': False,
-    'error': 'EDGELLM_BINARY not set or not executable — hardware path unavailable',
+    'error': 'TENSORRT_EDGE_LLM_ROOT not set or llm_inference not built — hardware path unavailable',
     'total_latency_ms': None,
     'visual_preprocess_ms': None,
     'ttft_ms': None,
@@ -269,13 +273,13 @@ with open(sys.argv[3], 'w') as f:
     t_start=$(date +%s%3N)
 
     local exit_code=0
-    _run "${EDGELLM_BINARY}" \
-        --llmDir "${EDGELLM_LLM_ENGINE_DIR:-}" \
-        --mmDir "${EDGELLM_MULTIMODAL_ENGINE_DIR:-}" \
-        --maxOutputLen "${max_tokens}" \
+    _run "${llm_inference}" \
+        --engineDir "${EDGE_VLM_LLM_ENGINE_DIR:-}" \
+        --multimodalEngineDir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}" \
+        --maxGenerateLength "${max_tokens}" \
         --inputFile "${input_json}" \
         --outputFile "${output_json}" \
-        --warmUp 0 \
+        --warmup 0 \
         2>"/tmp/vlm_bench_stderr_${run_id}_${condition}_${iteration}.log" \
         || exit_code=$?
 
@@ -441,8 +445,9 @@ print(json.dumps({
         return
     fi
 
-    # Publish the image to the camera topic and capture the VlmResult response.
-    # Wall-clock timing wraps the full round-trip from publish to result receipt.
+    # Publish the image via the IPC path and capture the result.
+    # vlm_single_shot_client wraps edge_vlm_cli with a structured JSON output.
+    # Wall-clock timing wraps the full round-trip from invocation to result receipt.
     local result_json
     result_json="$(mktemp /tmp/vlm_bench_ros_result_XXXXXX.json)"
 
@@ -451,6 +456,7 @@ print(json.dumps({
 
     local exit_code=0
     _run ros2 run edge_vlm_ros vlm_single_shot_client \
+        --socket "${EDGE_VLM_WORKER_SOCKET:-/tmp/edge_vlm.sock}" \
         --image "${image_path}" \
         --prompt "${prompt_text}" \
         --max-tokens "${max_tokens}" \

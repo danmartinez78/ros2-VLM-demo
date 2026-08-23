@@ -556,5 +556,142 @@ class TestRoundTrip(unittest.TestCase):
             path.unlink(missing_ok=True)
 
 
+# ── canonical Edge-LLM interface contract tests ───────────────────────────────
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+class TestDirectPathCommandContract(unittest.TestCase):
+    """Validate that run_vlm_latency_benchmark.sh uses the canonical Edge-LLM
+    CLI flags identical to run_native_benchmarks.sh, so a normal Thor env will
+    find the binary and fire the correct invocation."""
+
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+
+    def test_uses_tensorrt_edge_llm_root_not_edgellm_binary(self):
+        text = self._script_text()
+        self.assertIn("TENSORRT_EDGE_LLM_ROOT", text)
+        self.assertNotIn("EDGELLM_BINARY", text)
+
+    def test_uses_edge_vlm_llm_engine_dir(self):
+        text = self._script_text()
+        self.assertIn("EDGE_VLM_LLM_ENGINE_DIR", text)
+        self.assertNotIn("EDGELLM_LLM_ENGINE_DIR", text)
+
+    def test_uses_edge_vlm_multimodal_engine_dir(self):
+        text = self._script_text()
+        self.assertIn("EDGE_VLM_MULTIMODAL_ENGINE_DIR", text)
+        self.assertNotIn("EDGELLM_MULTIMODAL_ENGINE_DIR", text)
+
+    def test_llm_inference_binary_path_matches_native_benchmarks(self):
+        """Binary path must match run_native_benchmarks.sh canonical form."""
+        text = self._script_text()
+        self.assertIn(
+            "build/examples/llm/llm_inference",
+            text,
+            "llm_inference must be resolved from TENSORRT_EDGE_LLM_ROOT/build/examples/llm/",
+        )
+
+    def test_uses_engineDir_flag(self):
+        text = self._script_text()
+        self.assertIn("--engineDir", text)
+        self.assertNotIn("--llmDir", text)
+
+    def test_uses_multimodalEngineDir_flag(self):
+        text = self._script_text()
+        self.assertIn("--multimodalEngineDir", text)
+        self.assertNotIn("--mmDir", text)
+
+    def test_uses_maxGenerateLength_flag(self):
+        text = self._script_text()
+        self.assertIn("--maxGenerateLength", text)
+        self.assertNotIn("--maxOutputLen", text)
+
+    def test_uses_lowercase_warmup_flag(self):
+        """Edge-LLM uses --warmup (lowercase), not --warmUp."""
+        text = self._script_text()
+        self.assertIn("--warmup", text)
+        self.assertNotIn("--warmUp", text)
+
+
+class TestRosClientInstall(unittest.TestCase):
+    """Validate that vlm_single_shot_client is a real repo-owned script and is
+    referenced by the CMakeLists.txt install directive so
+    `ros2 run edge_vlm_ros vlm_single_shot_client` resolves after a normal
+    colcon build."""
+
+    def test_vlm_single_shot_client_script_exists(self):
+        script = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
+        self.assertTrue(
+            script.exists(),
+            f"scripts/vlm_single_shot_client not found at {script}",
+        )
+
+    def test_vlm_single_shot_client_is_executable(self):
+        import os as _os
+        script = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
+        if script.exists():
+            self.assertTrue(
+                _os.access(str(script), _os.X_OK),
+                "scripts/vlm_single_shot_client must be executable",
+            )
+
+    def test_vlm_single_shot_client_is_valid_python(self):
+        """The script must parse without errors under the current Python."""
+        import ast
+        script = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
+        if script.exists():
+            source = script.read_text(encoding="utf-8")
+            try:
+                ast.parse(source)
+            except SyntaxError as exc:
+                self.fail(f"scripts/vlm_single_shot_client has a syntax error: {exc}")
+
+    def test_vlm_single_shot_client_referenced_in_cmake(self):
+        cmake = _REPO_ROOT / "CMakeLists.txt"
+        self.assertTrue(cmake.exists(), "CMakeLists.txt not found")
+        text = cmake.read_text(encoding="utf-8")
+        self.assertIn(
+            "vlm_single_shot_client",
+            text,
+            "CMakeLists.txt must install scripts/vlm_single_shot_client",
+        )
+
+    def test_vlm_single_shot_client_install_uses_programs(self):
+        """Must use install(PROGRAMS ...) not install(FILES ...) so it stays executable."""
+        cmake = _REPO_ROOT / "CMakeLists.txt"
+        text = cmake.read_text(encoding="utf-8")
+        import re
+        for block_match in re.finditer(
+            r"install\s*\(([^)]+)\)", text, re.DOTALL
+        ):
+            block = block_match.group(1)
+            if "vlm_single_shot_client" in block:
+                self.assertIn(
+                    "PROGRAMS",
+                    block,
+                    "install() for vlm_single_shot_client must use PROGRAMS to preserve execute bit",
+                )
+                return
+        self.fail("No install() block containing vlm_single_shot_client found in CMakeLists.txt")
+
+    def test_ros_path_invokes_vlm_single_shot_client(self):
+        """The benchmark runner ROS path must call vlm_single_shot_client."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            "vlm_single_shot_client",
+            text,
+            "ROS path in run_vlm_latency_benchmark.sh must invoke vlm_single_shot_client",
+        )
+
+    def test_ros_path_uses_socket_arg(self):
+        """vlm_single_shot_client call must forward --socket so edge_vlm_cli can
+        connect to edge_vlm_server."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("--socket", text)
+
+
 if __name__ == "__main__":
     unittest.main()
