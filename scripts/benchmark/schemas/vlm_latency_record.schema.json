@@ -154,6 +154,10 @@
       "type": ["string", "null"],
       "description": "Path to the preserved NVIDIA-emitted llm_inference profile JSON artifact (--dumpProfile). Null for ipc path or when profiling was not available."
     },
+    "ipc_result_path": {
+      "type": ["string", "null"],
+      "description": "Path to the preserved vlm_single_shot_client result JSON artifact in OUTPUT_DIR. Null for direct path or when the IPC call did not produce output."
+    },
     "model_name": {
       "type": ["string", "null"],
       "description": "Model identifier (e.g. Cosmos-Reason2-8B)."

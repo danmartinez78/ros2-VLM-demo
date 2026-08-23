@@ -74,6 +74,7 @@ def _make_record(
     llm_generation_total_gpu_time_ms: float | None = None,
     native_response_path: str | None = None,
     native_profile_path: str | None = None,
+    ipc_result_path: str | None = None,
     content_hash: str | None = None,
     iteration: int = 0,
     warmup: bool = False,
@@ -111,6 +112,7 @@ def _make_record(
         "llm_generation_total_gpu_time_ms": llm_generation_total_gpu_time_ms,
         "native_response_path": native_response_path,
         "native_profile_path": native_profile_path,
+        "ipc_result_path": ipc_result_path,
         "model_name": model_name,
         "iteration": iteration,
         "warmup": warmup,
@@ -1571,8 +1573,8 @@ class TestNativeProfileNestedSchema(unittest.TestCase):
       generation.average_time_per_token_ms -> average_time_per_token_ms
       generation.total_time_ms       -> decode_ms
       prefill.average_time_per_run_ms -> prefill_ms
-      stages[name=vision_encoder].average_time_per_run_ms -> vision_encoder_ms
-      llm_generation.total_gpu_time_ms -> llm_generation_total_gpu_time_ms
+      stages[stage_id='vision_encoder'].average_time_per_run_ms -> vision_encoder_ms
+      stages[stage_id='llm_generation'].total_gpu_time_ms -> llm_generation_total_gpu_time_ms
     """
 
     def _parse_profile_fields(self, profile_dict: dict) -> dict:
@@ -1616,13 +1618,17 @@ if isinstance(prefill, dict):
 stages = prof.get('stages') if isinstance(prof, dict) else None
 if isinstance(stages, list):
     for stage in stages:
-        if isinstance(stage, dict) and stage.get('name') == 'vision_encoder':
+        if not isinstance(stage, dict):
+            continue
+        sid = stage.get('stage_id')
+        if sid == 'vision_encoder':
             v = stage.get('average_time_per_run_ms')
             if v is not None:
                 vision_encoder_ms = v
-llm_gen = prof.get('llm_generation') if isinstance(prof, dict) else None
-if isinstance(llm_gen, dict):
-    llm_generation_total_gpu_time_ms = llm_gen.get('total_gpu_time_ms')
+        elif sid == 'llm_generation':
+            v = stage.get('total_gpu_time_ms')
+            if v is not None:
+                llm_generation_total_gpu_time_ms = v
 
 print(json.dumps({{
     'actual_output_tokens': actual_output_tokens,
@@ -1643,7 +1649,7 @@ print(json.dumps({{
             os.unlink(profile_path)
 
     def _thor_profile_a(self) -> dict:
-        """Condition A fixture matching the actual Thor smoke output."""
+        """Condition A fixture matching the actual Thor smoke output (stage_id keys)."""
         return {
             "generation": {
                 "generated_tokens": 16,
@@ -1655,13 +1661,13 @@ print(json.dumps({{
                 "average_time_per_run_ms": 35.7389,
             },
             "stages": [
-                {"name": "vision_encoder", "average_time_per_run_ms": 50.3831},
-                {"name": "other_stage", "average_time_per_run_ms": 1.0},
+                {"stage_id": "vision_encoder", "average_time_per_run_ms": 50.3831},
+                {"stage_id": "other_stage", "average_time_per_run_ms": 1.0},
             ],
         }
 
     def _thor_profile_e(self) -> dict:
-        """Condition E fixture matching the actual Thor smoke output."""
+        """Condition E fixture matching the actual Thor smoke output (stage_id keys)."""
         return {
             "generation": {
                 "generated_tokens": 238,
@@ -1673,11 +1679,9 @@ print(json.dumps({{
                 "average_time_per_run_ms": 36.9019,
             },
             "stages": [
-                {"name": "vision_encoder", "average_time_per_run_ms": 38.5207},
+                {"stage_id": "vision_encoder", "average_time_per_run_ms": 38.5207},
+                {"stage_id": "llm_generation", "total_gpu_time_ms": 5231.897},
             ],
-            "llm_generation": {
-                "total_gpu_time_ms": 5231.897,
-            },
         }
 
     def test_condition_a_generated_tokens(self):
@@ -1713,11 +1717,11 @@ print(json.dumps({{
         self.assertAlmostEqual(parsed["llm_generation_total_gpu_time_ms"], 5231.897, places=1)
 
     def test_vision_encoder_stage_not_confused_with_other_stages(self):
-        """Only the 'vision_encoder' stage should populate vision_encoder_ms."""
+        """Only the 'vision_encoder' stage (by stage_id) should populate vision_encoder_ms."""
         profile = {
             "stages": [
-                {"name": "other_stage", "average_time_per_run_ms": 99.9},
-                {"name": "vision_encoder", "average_time_per_run_ms": 42.1},
+                {"stage_id": "other_stage", "average_time_per_run_ms": 99.9},
+                {"stage_id": "vision_encoder", "average_time_per_run_ms": 42.1},
             ]
         }
         parsed = self._parse_profile_fields(profile)
@@ -1731,6 +1735,20 @@ print(json.dumps({{
         self.assertIn("vision_encoder", text)
         self.assertIn("prefill", text)
         self.assertIn("llm_generation", text)
+
+    def test_runner_script_uses_stage_id_not_name(self):
+        """The shell script must use stage_id (not name) to identify stages."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("stage_id", text)
+        # The old 'name' key lookup pattern must not appear for stage identification
+        self.assertNotIn("stage.get('name')", text)
+
+    def test_runner_script_extracts_llm_generation_from_stages(self):
+        """llm_generation total_gpu_time_ms must be extracted from stages[] by stage_id."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        # Must look for stage_id == 'llm_generation' inside stages loop, not top-level
+        self.assertIn("'llm_generation'", text)
+        self.assertNotIn("prof.get('llm_generation')", text)
 
 
 # ── IPC artifact field preservation tests ────────────────────────────────────
@@ -1779,6 +1797,34 @@ class TestIpcArtifactFieldPreservation(unittest.TestCase):
         props = schema.get("properties", {})
         self.assertIn("inference_seconds", props)
         self.assertIn("null", props["inference_seconds"]["type"])
+
+    def test_ipc_record_has_ipc_result_path_field(self):
+        rec = _make_record(path="ipc", ipc_result_path="/output/ipc_A_image_001_measured_iter0_result.json")
+        self.assertEqual(rec["ipc_result_path"], "/output/ipc_A_image_001_measured_iter0_result.json")
+
+    def test_direct_record_has_null_ipc_result_path(self):
+        rec = _make_record(path="direct")
+        self.assertIsNone(rec["ipc_result_path"])
+
+    def test_runner_script_saves_ipc_result_to_output_dir(self):
+        """IPC result artifact must be written under OUTPUT_DIR, not /tmp."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        # The result_json path must reference OUTPUT_DIR, not mktemp /tmp/
+        self.assertIn("OUTPUT_DIR}/ipc_", text)
+        self.assertNotIn("mktemp /tmp/vlm_bench_ipc_result", text)
+
+    def test_runner_script_does_not_delete_ipc_result(self):
+        """IPC result artifact must be preserved (no rm -f on result_json)."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertNotIn('rm -f "${result_json}"', text)
+
+    def test_schema_defines_ipc_result_path_as_nullable_string(self):
+        schema_path = _BENCH_DIR / "schemas" / "vlm_latency_record.schema.json"
+        with schema_path.open("r", encoding="utf-8") as fh:
+            schema = json.load(fh)
+        props = schema.get("properties", {})
+        self.assertIn("ipc_result_path", props)
+        self.assertIn("null", props["ipc_result_path"]["type"])
 
 
 if __name__ == "__main__":

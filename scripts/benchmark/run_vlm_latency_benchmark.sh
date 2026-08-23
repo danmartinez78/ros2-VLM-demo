@@ -514,8 +514,8 @@ if success and response_path:
 #   generation.average_time_per_token_ms -> average_time_per_token_ms
 #   generation.total_time_ms      -> decode_ms
 #   prefill.average_time_per_run_ms -> prefill_ms
-#   stages[].name == 'vision_encoder' .average_time_per_run_ms -> vision_encoder_ms
-#   llm_generation.total_gpu_time_ms -> llm_generation_total_gpu_time_ms
+#   stages[stage_id='vision_encoder'].average_time_per_run_ms -> vision_encoder_ms
+#   stages[stage_id='llm_generation'].total_gpu_time_ms -> llm_generation_total_gpu_time_ms
 if success and profile_path:
     try:
         with open(profile_path) as f:
@@ -539,13 +539,17 @@ if success and profile_path:
         stages = prof.get('stages') if isinstance(prof, dict) else None
         if isinstance(stages, list):
             for stage in stages:
-                if isinstance(stage, dict) and stage.get('name') == 'vision_encoder':
+                if not isinstance(stage, dict):
+                    continue
+                sid = stage.get('stage_id')
+                if sid == 'vision_encoder':
                     v = stage.get('average_time_per_run_ms')
                     if v is not None:
                         vision_encoder_ms = v
-        llm_gen = prof.get('llm_generation') if isinstance(prof, dict) else None
-        if isinstance(llm_gen, dict):
-            llm_generation_total_gpu_time_ms = llm_gen.get('total_gpu_time_ms')
+                elif sid == 'llm_generation':
+                    v = stage.get('total_gpu_time_ms')
+                    if v is not None:
+                        llm_generation_total_gpu_time_ms = v
     except Exception:
         pass
 
@@ -681,8 +685,10 @@ print(json.dumps({
     # Send the request to the already-running edge_vlm_server via IPC and capture
     # the result.  vlm_single_shot_client wraps edge_vlm_cli with structured JSON
     # output.  Wall-clock timing wraps the full client round-trip.
-    local result_json
-    result_json="$(mktemp /tmp/vlm_bench_ipc_result_XXXXXX.json)"
+    # The result artifact is preserved in OUTPUT_DIR with a collision-safe name.
+    local phase="measured"
+    [[ "${warmup}" == "true" ]] && phase="warmup"
+    local result_json="${OUTPUT_DIR}/ipc_${condition}_${image_id}_${phase}_iter${iteration}_result.json"
 
     local t_start t_end
     t_start=$(date +%s%3N)
@@ -775,6 +781,7 @@ record = {
     'llm_generation_total_gpu_time_ms': None,
     'native_response_path': None,
     'native_profile_path': None,
+    'ipc_result_path': result_json_path if success and os.path.exists(result_json_path) else None,
     'model_name': model_name,
     'iteration': iteration,
     'warmup': warmup,
@@ -789,7 +796,6 @@ print(json.dumps(record))
         "${result_json}" "${content_hash}")
 
     _write_record "${record}"
-    rm -f "${result_json}"
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
