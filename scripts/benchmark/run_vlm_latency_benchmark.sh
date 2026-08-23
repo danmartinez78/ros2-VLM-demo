@@ -419,9 +419,12 @@ _run_ipc_inference() {
     local recorded_at
     recorded_at="$(_now_iso)"
 
-    # The ipc path requires ros2 (to run vlm_single_shot_client) and a running
-    # edge_vlm_server.  When unavailable, record the attempt as a failure with a
-    # descriptive error.  This is a steady-state (persistent server) measurement.
+    # The ipc path invokes vlm_single_shot_client via `ros2 run` because the
+    # script is installed into the ROS lib directory (lib/edge_vlm_ros/).
+    # `ros2` is required only to locate and launch the installed script;
+    # vlm_single_shot_client itself does not depend on ROS at runtime — it
+    # communicates with edge_vlm_server directly via edge_vlm_cli.
+    # A running edge_vlm_server on EDGE_VLM_WORKER_SOCKET is also required.
     if ! command -v ros2 &>/dev/null; then
         local record
         record=$(python3 -c "

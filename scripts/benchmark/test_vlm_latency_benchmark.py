@@ -17,6 +17,9 @@ They validate:
 from __future__ import annotations
 
 import json
+import re
+import ast
+import os
 import subprocess
 import sys
 import tempfile
@@ -635,17 +638,15 @@ class TestRosClientInstall(unittest.TestCase):
         )
 
     def test_vlm_single_shot_client_is_executable(self):
-        import os as _os
         script = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
         self.assertTrue(script.exists(), f"scripts/vlm_single_shot_client not found at {script}")
         self.assertTrue(
-            _os.access(str(script), _os.X_OK),
+            os.access(str(script), os.X_OK),
             "scripts/vlm_single_shot_client must be executable",
         )
 
     def test_vlm_single_shot_client_is_valid_python(self):
         """The script must parse without errors under the current Python."""
-        import ast
         script = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
         self.assertTrue(script.exists(), f"scripts/vlm_single_shot_client not found at {script}")
         source = script.read_text(encoding="utf-8")
@@ -668,7 +669,6 @@ class TestRosClientInstall(unittest.TestCase):
         """Must use install(PROGRAMS ...) not install(FILES ...) so it stays executable."""
         cmake = _REPO_ROOT / "CMakeLists.txt"
         text = cmake.read_text(encoding="utf-8")
-        import re
         for block_match in re.finditer(
             r"install\s*\(([^)]+)\)", text, re.DOTALL
         ):
@@ -704,7 +704,6 @@ class TestRosClientInstall(unittest.TestCase):
         text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
         self.assertIn("'ipc'", text, "IPC path records must carry path='ipc'")
         # 'ros' must not appear as a path value in any record-building block.
-        import re
         for m in re.finditer(r"'path':\s*'([^']+)'", text):
             self.assertNotEqual(
                 m.group(1),
