@@ -370,7 +370,7 @@ def _ensure_profile_supported(profile: ProfileRecord, *, operation: str) -> None
     if not errors:
         return
     raise ModelCtlError(
-        f"Profile {profile.profile_id} cannot be {operation} until its declared build strategy is implemented.\n"
+        f"Profile {profile.profile_id} cannot be {operation} until its declared configuration is implemented.\n"
         + "\n".join(errors)
     )
 
@@ -386,8 +386,12 @@ def check_engine_artifacts(model: ModelRecord, profile: ProfileRecord, paths: En
         candidate = paths.model_root / rel_dir
         if not candidate.is_dir():
             missing.append(str(candidate))
-    for component in profile.components.values():
-        component_dir = paths.runtime_root / component["relative_engine_dir"]
+    for component_name, component in profile.components.items():
+        relative_dir = component.get("relative_engine_dir")
+        if not relative_dir:
+            missing.append(f"{profile.profile_id}:{component_name}:relative_engine_dir")
+            continue
+        component_dir = paths.runtime_root / relative_dir
         if not component_dir.is_dir():
             missing.append(str(component_dir))
     for rel in llm_artifacts:
