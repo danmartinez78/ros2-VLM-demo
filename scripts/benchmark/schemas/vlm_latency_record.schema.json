@@ -1,0 +1,137 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "vlm_latency_record.schema.json",
+  "title": "VLM Latency Characterization Record",
+  "description": "Per-inference record emitted by run_vlm_latency_benchmark.sh and consumed by vlm_latency_report.py. Fields unavailable from the runtime are represented as null — they are never inferred or fabricated.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "run_id",
+    "recorded_at",
+    "condition",
+    "path",
+    "image_id",
+    "prompt_id",
+    "max_output_tokens",
+    "success",
+    "total_latency_ms"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Schema version for forward-compatibility checks."
+    },
+    "record_type": {
+      "type": "string",
+      "enum": ["inference"],
+      "description": "Fixed discriminator field."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier (timestamp-based), shared across all records in one benchmark invocation."
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 wall-clock timestamp when this inference record was written."
+    },
+    "condition": {
+      "type": "string",
+      "description": "Experiment condition label from the matrix (e.g. A, B, C, D, E).",
+      "pattern": "^[A-Z][0-9]?$"
+    },
+    "path": {
+      "type": "string",
+      "enum": ["direct", "ros"],
+      "description": "Invocation path: 'direct' for native Edge-LLM invocation, 'ros' for edge_vlm_ros_node."
+    },
+    "image_id": {
+      "type": "string",
+      "description": "Stable identifier for the input image (filename stem or content hash prefix)."
+    },
+    "image_path": {
+      "type": ["string", "null"],
+      "description": "Absolute or relative path to the input image file used for this inference."
+    },
+    "image_width_px": {
+      "type": ["integer", "null"],
+      "description": "Effective image width in pixels after any resize applied before encoding."
+    },
+    "image_height_px": {
+      "type": ["integer", "null"],
+      "description": "Effective image height in pixels after any resize applied before encoding."
+    },
+    "prompt_id": {
+      "type": "string",
+      "description": "Human-readable prompt style identifier (e.g. 'terse_id', 'compact_odd_json', 'scene_description')."
+    },
+    "prompt_hash": {
+      "type": ["string", "null"],
+      "description": "Short SHA-256 hex prefix of the exact prompt text used, for reproducibility verification."
+    },
+    "max_output_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum number of output tokens requested from the model."
+    },
+    "actual_output_tokens": {
+      "type": ["integer", "null"],
+      "description": "Actual number of output tokens generated. Null if the runtime does not expose this."
+    },
+    "success": {
+      "type": "boolean",
+      "description": "True when inference completed without error."
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "Error message when success is false; null otherwise."
+    },
+    "total_latency_ms": {
+      "type": ["number", "null"],
+      "description": "Measured end-to-end wall-clock latency in milliseconds from inference request to response received. Null on failure."
+    },
+    "visual_preprocess_ms": {
+      "type": ["number", "null"],
+      "description": "Visual preprocessing / encoder time in milliseconds. Null if not exposed by the runtime."
+    },
+    "ttft_ms": {
+      "type": ["number", "null"],
+      "description": "Time-to-first-token (prompt prefill latency) in milliseconds. Null if not exposed by the runtime. Never inferred."
+    },
+    "decode_ms": {
+      "type": ["number", "null"],
+      "description": "Autoregressive decode phase duration in milliseconds. Null if not exposed by the runtime."
+    },
+    "decode_tokens_per_sec": {
+      "type": ["number", "null"],
+      "description": "Decode throughput in tokens per second. Null if actual_output_tokens or decode_ms is unavailable."
+    },
+    "model_name": {
+      "type": ["string", "null"],
+      "description": "Model identifier (e.g. Cosmos-Reason2-8B)."
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Zero-based iteration index within this condition/path/image combination."
+    },
+    "warmup": {
+      "type": "boolean",
+      "description": "True when this record is a warmup iteration that should be excluded from aggregate statistics."
+    },
+    "tegrastats": {
+      "type": ["object", "null"],
+      "description": "Optional synchronized tegrastats snapshot captured during this inference.",
+      "properties": {
+        "emc_pct": {"type": ["number", "null"]},
+        "gr3d_pct": {"type": ["number", "null"]},
+        "module_power_w": {"type": ["number", "null"]},
+        "cpu_hotspot_pct": {"type": ["number", "null"]}
+      },
+      "additionalProperties": false
+    }
+  }
+}
