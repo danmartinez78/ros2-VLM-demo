@@ -605,6 +605,9 @@ class TestDirectPathCommandContract(unittest.TestCase):
         self.assertNotIn("--mmDir", text)
 
     def test_uses_maxGenerateLength_flag(self):
+        """llm_inference (NVIDIA binary) uses camelCase --maxGenerateLength.
+        This is distinct from vlm_single_shot_client's own --max-tokens arg,
+        which edge_vlm_cli accepts as --max-generate-length (kebab-case)."""
         text = self._script_text()
         self.assertIn("--maxGenerateLength", text)
         self.assertNotIn("--maxOutputLen", text)
@@ -632,22 +635,22 @@ class TestRosClientInstall(unittest.TestCase):
     def test_vlm_single_shot_client_is_executable(self):
         import os as _os
         script = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
-        if script.exists():
-            self.assertTrue(
-                _os.access(str(script), _os.X_OK),
-                "scripts/vlm_single_shot_client must be executable",
-            )
+        self.assertTrue(script.exists(), f"scripts/vlm_single_shot_client not found at {script}")
+        self.assertTrue(
+            _os.access(str(script), _os.X_OK),
+            "scripts/vlm_single_shot_client must be executable",
+        )
 
     def test_vlm_single_shot_client_is_valid_python(self):
         """The script must parse without errors under the current Python."""
         import ast
         script = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
-        if script.exists():
-            source = script.read_text(encoding="utf-8")
-            try:
-                ast.parse(source)
-            except SyntaxError as exc:
-                self.fail(f"scripts/vlm_single_shot_client has a syntax error: {exc}")
+        self.assertTrue(script.exists(), f"scripts/vlm_single_shot_client not found at {script}")
+        source = script.read_text(encoding="utf-8")
+        try:
+            ast.parse(source)
+        except SyntaxError as exc:
+            self.fail(f"scripts/vlm_single_shot_client has a syntax error: {exc}")
 
     def test_vlm_single_shot_client_referenced_in_cmake(self):
         cmake = _REPO_ROOT / "CMakeLists.txt"
