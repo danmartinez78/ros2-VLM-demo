@@ -1203,12 +1203,11 @@ class TestNativeResponseParsing(unittest.TestCase):
         text = self._script_text()
         self.assertIn("responses", text, "Runner must handle responses[] array key from Thor")
 
-    def test_responses_list_parsing_extracts_finish_reason(self):
-        """Verify the inline parser correctly unwraps responses[0]."""
+    def _parse_response_fields(self, response_dict: dict) -> dict:
+        """Helper: run the inline response-parsing logic against a temp JSON file."""
         import subprocess, json, tempfile, os
-        response = {"responses": [{"finish_reason": "max-length", "output_text": "a cat"}]}
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(response, f)
+            json.dump(response_dict, f)
             resp_path = f.name
         try:
             result = subprocess.run(
@@ -1235,51 +1234,25 @@ print(json.dumps({{'finish_reason': finish_reason, 'output_text': output_text}})
 """],
                 capture_output=True, text=True, timeout=10,
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            parsed = json.loads(result.stdout.strip())
-            self.assertEqual(parsed["finish_reason"], "max-length")
-            self.assertEqual(parsed["output_text"], "a cat")
+            if result.returncode != 0:
+                raise AssertionError(result.stderr)
+            return json.loads(result.stdout.strip())
         finally:
             os.unlink(resp_path)
+
+    def test_responses_list_parsing_extracts_finish_reason(self):
+        """Verify the inline parser correctly unwraps responses[0]."""
+        response = {"responses": [{"finish_reason": "max-length", "output_text": "a cat"}]}
+        parsed = self._parse_response_fields(response)
+        self.assertEqual(parsed["finish_reason"], "max-length")
+        self.assertEqual(parsed["output_text"], "a cat")
 
     def test_responses_list_parsing_falls_back_to_flat_dict(self):
         """A flat top-level response dict (no 'responses' key) must still parse."""
-        import subprocess, json, tempfile, os
         response = {"finish_reason": "stop", "output_text": "a dog"}
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump(response, f)
-            resp_path = f.name
-        try:
-            result = subprocess.run(
-                ["python3", "-c", f"""
-import json
-
-def _first_present(d, *keys):
-    for k in keys:
-        if k in d and d[k] is not None:
-            return d[k]
-    return None
-
-with open({resp_path!r}) as f:
-    out = json.load(f)
-
-entry = out
-responses_list = out.get('responses') if isinstance(out, dict) else None
-if isinstance(responses_list, list) and responses_list:
-    entry = responses_list[0]
-
-finish_reason = _first_present(entry, 'finishReason', 'finish_reason')
-output_text = _first_present(entry, 'outputText', 'output_text', 'text', 'response')
-print(json.dumps({{'finish_reason': finish_reason, 'output_text': output_text}}))
-"""],
-                capture_output=True, text=True, timeout=10,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            parsed = json.loads(result.stdout.strip())
-            self.assertEqual(parsed["finish_reason"], "stop")
-            self.assertEqual(parsed["output_text"], "a dog")
-        finally:
-            os.unlink(resp_path)
+        parsed = self._parse_response_fields(response)
+        self.assertEqual(parsed["finish_reason"], "stop")
+        self.assertEqual(parsed["output_text"], "a dog")
 
 
 # ── artifact naming uniqueness tests ─────────────────────────────────────────
@@ -1365,6 +1338,9 @@ class TestPngValidation(unittest.TestCase):
     """_validate_image must correctly accept a real PNG by reading 4 bytes
     (the full 89 50 4E 47 PNG signature), not 3 bytes."""
 
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+
     def _validate_image_bash(self, content: bytes) -> str:
         """Run the actual _validate_image function from the script on a temp file."""
         import subprocess, tempfile, os
@@ -1372,7 +1348,7 @@ class TestPngValidation(unittest.TestCase):
             f.write(content)
             tmp = f.name
         try:
-            script = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+            script = self._script_text()
             # Extract _validate_image function body from the script.
             start = script.find("\n_validate_image()")
             end = script.find("\n}", start) + 2
@@ -1417,9 +1393,6 @@ _validate_image {tmp!r} && echo ACCEPTED || echo REJECTED
                 "od must read at least 4 bytes to capture the full PNG signature")
         else:
             self.fail("Could not find xxd or od magic-byte read command in script")
-
-    def _script_text(self) -> str:
-        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
 
 
 if __name__ == "__main__":
