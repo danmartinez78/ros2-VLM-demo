@@ -16,6 +16,7 @@
 
 #include "edge_vlm_ros/inference_backend.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -58,6 +59,14 @@ struct TensorRTEdgeLLMConfig
 /// byte buffer (JPEG/PNG).  This backend encodes the OpenCV Mat to JPEG
 /// bytes with cv::imencode() and passes the result directly to
 /// loadImageFromMemory(), avoiding any temporary file on disk.
+///
+/// Multi-frame support
+/// ────────────────────
+/// When InferenceRequest::extra_images is non-empty the backend encodes
+/// every frame (primary first, then extra_images in temporal order) and
+/// produces one "image" content item + one imageBuffers entry per frame,
+/// followed by the single text content item.  Single-frame behaviour is
+/// unchanged (extra_images is empty).
 class TensorRTEdgeLLMBackend : public InferenceBackend
 {
 public:
@@ -68,7 +77,7 @@ public:
   /// Throws std::runtime_error if any step fails.
   void initialize() override;
 
-  /// Run VLM inference on the supplied image + prompt.
+  /// Run VLM inference on the supplied image(s) + prompt.
   InferenceResponse infer(const InferenceRequest & request) override;
 
 private:
@@ -86,5 +95,26 @@ private:
   // JPEG quality used when encoding frames for the VLM
   int jpeg_quality_{90};
 };
+
+namespace detail
+{
+
+/// Returns the expected number of image content items for a request.
+/// Primary image contributes 1; each extra_image contributes 1 more.
+/// This equals the number of imageBuffers entries the backend will push.
+/// Callable without TensorRT headers — used by CPU-only tests.
+inline std::size_t image_content_count(const InferenceRequest & request) noexcept
+{
+  return 1u + request.extra_images.size();
+}
+
+/// Returns the expected total number of content items in the user message:
+/// one per frame (image items) plus one text item.
+inline std::size_t user_message_content_count(const InferenceRequest & request) noexcept
+{
+  return image_content_count(request) + 1u;  // +1 for the text item
+}
+
+}  // namespace detail
 
 }  // namespace edge_vlm_ros

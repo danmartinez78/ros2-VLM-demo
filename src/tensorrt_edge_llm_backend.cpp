@@ -23,6 +23,7 @@
 #include <chrono>
 #include <dlfcn.h>
 #include <filesystem>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -140,21 +141,53 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   // rt::imageUtils::loadImageFromMemory(), which decodes stbi-compatible
   // formats (JPEG, PNG, BMP …).  We encode with JPEG for speed; quality is
   // controlled by the jpeg_quality_ field.
-  std::vector<uchar> jpeg_buf;
+  //
+  // Build the full ordered frame list: primary image first, then extra_images.
+  // This is used for both content items and imageBuffers below.
   const std::vector<int> encode_params = {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_};
-  if (!cv::imencode(".jpg", request.image, jpeg_buf, encode_params)) {
-    resp.success = false;
-    resp.error = "cv::imencode failed; cannot encode frame to JPEG";
+
+  // Helper lambda: encode one Mat and load into an ImageData, or return error.
+  auto encode_frame =
+    [&](const cv::Mat & frame, std::size_t idx)
+    -> std::pair<bool, trt_edgellm::rt::imageUtils::ImageData>
+  {
+    std::vector<uchar> jpeg_buf;
+    if (!cv::imencode(".jpg", frame, jpeg_buf, encode_params)) {
+      resp.success = false;
+      resp.error = "cv::imencode failed for frame index " + std::to_string(idx);
+      return {false, {}};
+    }
+    auto data = trt_edgellm::rt::imageUtils::loadImageFromMemory(
+      jpeg_buf.data(), jpeg_buf.size());
+    if (!data.buffer) {
+      resp.success = false;
+      resp.error = "loadImageFromMemory returned null buffer for frame index " +
+                   std::to_string(idx);
+      return {false, {}};
+    }
+    return {true, std::move(data)};
+  };
+
+  // Encode the primary image (index 0).
+  auto [ok0, primary_data] = encode_frame(request.image, 0);
+  if (!ok0) {
     return resp;
   }
 
-  // ── Load image into Edge-LLM ImageData ───────────────────────────────
-  auto image_data = trt_edgellm::rt::imageUtils::loadImageFromMemory(
-    jpeg_buf.data(), jpeg_buf.size());
-  if (!image_data.buffer) {
-    resp.success = false;
-    resp.error = "loadImageFromMemory returned null buffer";
-    return resp;
+  // Encode extra images (indices 1 … N) and fail clearly on any invalid input.
+  std::vector<trt_edgellm::rt::imageUtils::ImageData> extra_data;
+  extra_data.reserve(request.extra_images.size());
+  for (std::size_t i = 0; i < request.extra_images.size(); ++i) {
+    if (request.extra_images[i].empty()) {
+      resp.success = false;
+      resp.error = "extra_images[" + std::to_string(i) + "] is an empty Mat";
+      return resp;
+    }
+    auto [ok_i, data_i] = encode_frame(request.extra_images[i], i + 1);
+    if (!ok_i) {
+      return resp;
+    }
+    extra_data.push_back(std::move(data_i));
   }
 
   // ── Build multimodal generation request ──────────────────────────────
@@ -199,14 +232,26 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
     inner_req.messages.push_back(std::move(hist_asst_msg));
   }
 
-  // ── Current user message (image + task text) ──────────────────────────
+  // ── Current user message (all frames in temporal order + task text) ──
+  // One "image" content item per frame, followed by the text prompt item.
+  // imageBuffers are pushed in the same order: primary first, then extras.
+  // This matches the validated Thor multi-image message contract.
   trt_edgellm::rt::Message user_msg;
   user_msg.role = "user";
 
-  trt_edgellm::rt::Message::MessageContent image_content;
-  image_content.type = "image";
-  image_content.content = "<image>";  // placeholder; actual data in imageBuffers
-  user_msg.contents.push_back(image_content);
+  // Helper to append one image placeholder content item.
+  auto push_image_content = [&]() {
+    trt_edgellm::rt::Message::MessageContent c;
+    c.type = "image";
+    c.content = "<image>";  // placeholder; actual data in imageBuffers
+    user_msg.contents.push_back(c);
+  };
+
+  // Primary frame, then extra frames in temporal order.
+  push_image_content();
+  for (std::size_t i = 0; i < request.extra_images.size(); ++i) {
+    push_image_content();
+  }
 
   trt_edgellm::rt::Message::MessageContent text_content;
   text_content.type = "text";
@@ -214,7 +259,13 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   user_msg.contents.push_back(text_content);
 
   inner_req.messages.push_back(std::move(user_msg));
-  inner_req.imageBuffers.push_back(std::move(image_data));
+
+  // imageBuffers: primary first, then extra frames in temporal order.
+  inner_req.imageBuffers.push_back(std::move(primary_data));
+  inner_req.imageBuffers.insert(
+    inner_req.imageBuffers.end(),
+    std::make_move_iterator(extra_data.begin()),
+    std::make_move_iterator(extra_data.end()));
 
   trt_edgellm::rt::LLMGenerationRequest gen_req;
   gen_req.requests.push_back(std::move(inner_req));

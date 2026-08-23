@@ -548,6 +548,16 @@ if(BUILD_TESTING)
   )
   target_link_libraries(test_ipc_protocol ${OpenCV_LIBRARIES})
 
+  # TensorRT backend multi-frame request construction (CPU-only, no TensorRT/CUDA required)
+  ament_add_gtest(test_tensorrt_backend_multiframe
+    test/test_tensorrt_backend_multiframe.cpp
+  )
+  target_include_directories(test_tensorrt_backend_multiframe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/test
+  )
+  target_link_libraries(test_tensorrt_backend_multiframe ${OpenCV_LIBRARIES})
+
   # IPC backend integration tests with a fake Unix socket worker (no GPU)
   ament_add_gtest(test_ipc_inference_backend
     test/test_ipc_inference_backend.cpp
