@@ -69,6 +69,10 @@
       "type": ["integer", "null"],
       "description": "Effective image height in pixels after any resize applied before encoding."
     },
+    "content_hash": {
+      "type": ["string", "null"],
+      "description": "Short SHA-256 hex prefix (12 chars) of the image file content, for reproducibility verification. Null if not computed."
+    },
     "prompt_id": {
       "type": "string",
       "description": "Human-readable prompt style identifier (e.g. 'terse_id', 'compact_odd_json', 'scene_description')."
@@ -86,6 +90,10 @@
       "type": ["integer", "null"],
       "description": "Actual number of output tokens generated. Null if the runtime does not expose this."
     },
+    "finish_reason": {
+      "type": ["string", "null"],
+      "description": "Finish reason from the native response JSON (e.g. 'eos', 'max-length', 'stop'). Null if not available from the runtime. Responses with finish_reason='max-length' are capped and do not represent natural task completion."
+    },
     "success": {
       "type": "boolean",
       "description": "True when inference completed without error."
@@ -94,9 +102,13 @@
       "type": ["string", "null"],
       "description": "Error message when success is false; null otherwise."
     },
+    "cold_start_total_ms": {
+      "type": ["number", "null"],
+      "description": "Shell/process wall time for direct-path invocations in milliseconds (includes process startup, engine load, tokenizer init, and model inference). Null for ipc path. Distinct from model/runtime stage metrics in native_profile_path."
+    },
     "total_latency_ms": {
       "type": ["number", "null"],
-      "description": "Measured end-to-end wall-clock latency in milliseconds from inference request to response received. Null on failure."
+      "description": "Measured end-to-end wall-clock latency in milliseconds from inference request to response received. Null on failure. For direct path this equals cold_start_total_ms."
     },
     "visual_preprocess_ms": {
       "type": ["number", "null"],
@@ -113,6 +125,14 @@
     "decode_tokens_per_sec": {
       "type": ["number", "null"],
       "description": "Decode throughput in tokens per second. Null if actual_output_tokens or decode_ms is unavailable."
+    },
+    "native_response_path": {
+      "type": ["string", "null"],
+      "description": "Path to the preserved raw llm_inference response JSON artifact. Null for ipc path or when the runtime did not produce output."
+    },
+    "native_profile_path": {
+      "type": ["string", "null"],
+      "description": "Path to the preserved NVIDIA-emitted llm_inference profile JSON artifact (--dumpProfile). Null for ipc path or when profiling was not available."
     },
     "model_name": {
       "type": ["string", "null"],

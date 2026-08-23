@@ -7,10 +7,17 @@ run_vlm_latency_benchmark.sh and produces:
 
   - Machine-readable JSON summary (per-condition aggregates, raw records)
   - Human-readable text comparison report (latency vs output tokens,
-    direct-vs-ROS overhead for equivalent conditions)
+    direct (cold-start, per-process) vs IPC (persistent server) side-by-side)
 
 TTFT and stage timings are preserved as null when the runtime does not
 expose them; they are never inferred or fabricated.
+
+NOTE on lifecycle semantics
+---------------------------
+  direct : cold-start, per-process — includes engine/tokenizer init.
+  ipc    : persistent server steady-state — connects to a running server.
+  These two quantities are NOT comparable as "overhead".  The report
+  presents them side-by-side for independent analysis only.
 
 Usage
 -----
@@ -153,6 +160,14 @@ def aggregate_condition(
     decode_available = any(r.get("decode_ms") is not None for r in measured)
     visual_available = any(r.get("visual_preprocess_ms") is not None for r in measured)
 
+    # finish_reason breakdown — count by value; null when not reported.
+    finish_reason_counts: dict[str, int] = {}
+    for r in measured:
+        fr = r.get("finish_reason")
+        key = str(fr) if fr is not None else "null"
+        finish_reason_counts[key] = finish_reason_counts.get(key, 0) + 1
+    n_max_length = finish_reason_counts.get("max-length", 0) + finish_reason_counts.get("max_length", 0)
+
     return {
         "n_total": len(records),
         "n_warmup": warmup_count,
@@ -171,6 +186,8 @@ def aggregate_condition(
             "actual_output_tokens": bool(output_tokens),
             "decode_tokens_per_sec": bool(decode_tps_vals),
         },
+        "finish_reason_counts": finish_reason_counts,
+        "n_max_length": n_max_length,
     }
 
 
@@ -372,8 +389,49 @@ def format_text_report(report: dict[str, Any]) -> str:
                 f"{_fmt_ms(row.get('ipc_total_latency_ms_mean')):>11}"
             )
 
-    # ── Stage-timing availability note ───────────────────────────────────
+    # ── finish_reason / truncation summary ───────────────────────────────────
     conditions_summary = report.get("conditions") or {}
+    has_finish_reason = False
+    for cond_data in conditions_summary.values():
+        for path_data in cond_data.values():
+            if path_data.get("finish_reason_counts"):
+                has_finish_reason = True
+                break
+
+    if has_finish_reason:
+        lines += [
+            "",
+            "Response Finish-Reason Summary  (measured, non-warmup requests only)",
+            "-" * 72,
+            f"  {'Cond':<5} {'Path':<8} {'Total':>5} {'max-length':>10} {'frac':>6}  reasons",
+            "  " + "-" * 68,
+        ]
+        for cond in CONDITION_ORDER:
+            if cond not in conditions_summary:
+                continue
+            for path in ("direct", "ipc"):
+                path_data = conditions_summary[cond].get(path)
+                if not path_data:
+                    continue
+                n_measured = path_data.get("n_measured", 0)
+                n_max_len = path_data.get("n_max_length", 0)
+                fr_counts = path_data.get("finish_reason_counts") or {}
+                frac = f"{n_max_len / n_measured:.2f}" if n_measured > 0 else "n/a"
+                reasons = ", ".join(f"{k}:{v}" for k, v in sorted(fr_counts.items()))
+                lines.append(
+                    f"  {cond:<5} {path:<8} {n_measured:>5} {n_max_len:>10} {frac:>6}  {reasons}"
+                )
+        if any(
+            path_data.get("n_max_length", 0) > 0
+            for cond_data in conditions_summary.values()
+            for path_data in cond_data.values()
+        ):
+            lines += [
+                "  NOTE: requests with finish_reason='max-length' were capped at",
+                "        max_output_tokens; they do not represent natural task completion.",
+            ]
+
+    # ── Stage-timing availability note ───────────────────────────────────
     unavailable_stages: list[str] = []
     for cond_data in conditions_summary.values():
         for path_data in cond_data.values():

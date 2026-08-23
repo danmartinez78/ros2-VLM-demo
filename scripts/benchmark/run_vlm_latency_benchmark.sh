@@ -41,8 +41,21 @@
 # Fixed image set
 # ---------------
 # The benchmark uses BENCHMARK_IMAGE_DIR (default: scripts/benchmark/test_fixtures/images).
-# Place representative camera frames there alongside the red-panda reference image.
-# The red-panda image is downloaded automatically if not present and SKIP_PANDA=false.
+# Images must have neutral names (image_001.jpg, image_002.jpg …).  On the first
+# run, the script tries to copy known-good fixtures from the pinned
+# TensorRT Edge-LLM checkout (${TENSORRT_EDGE_LLM_ROOT}/examples/vlm/data/images)
+# before falling back to a one-time download of the NVIDIA red-panda reference
+# saved as image_001.jpg.
+# Every image is validated (non-zero size, JPEG/PNG magic bytes) before use.
+# Invalid images cause a clear error; they are never silently admitted.
+# A SHA-256 content hash is recorded with each inference for reproducibility.
+#
+# Native llm_inference profiling
+# --------------------------------
+# For direct-path runs, llm_inference is invoked with --dumpProfile
+# --profileOutputFile so the NVIDIA-authoritative profile JSON is preserved as a
+# raw artifact alongside the response JSON.  Shell wall time (cold_start_total_ms)
+# is recorded separately from NVIDIA-emitted stage metrics.
 #
 # Required environment (source scripts/edge_vlm_env.sh before running):
 #   TENSORRT_EDGE_LLM_ROOT       root of TensorRT Edge-LLM checkout (binary at build/examples/llm/llm_inference)
@@ -64,7 +77,8 @@
 #   --warmup N               Warmup iterations per condition/image (default: 1)
 #   --iterations N           Measured iterations per condition/image (default: 3)
 #   --image-dir DIR          Directory containing fixed benchmark images
-#   --skip-panda-download    Skip automatic red-panda reference image download
+#   --skip-image-download    Skip automatic reference image download/copy
+#   --skip-panda-download    Alias for --skip-image-download (backward compat)
 #   --skip-ipc               Alias for --paths direct
 #   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
@@ -95,7 +109,8 @@ while [[ $# -gt 0 ]]; do
         --warmup)       WARMUP="$2";               shift 2 ;;
         --iterations)   ITERATIONS="$2";           shift 2 ;;
         --image-dir)    IMAGE_DIR="$2";            shift 2 ;;
-        --skip-panda-download) SKIP_PANDA_DOWNLOAD=true; shift ;;
+        --skip-image-download) SKIP_PANDA_DOWNLOAD=true; shift ;;
+        --skip-panda-download) SKIP_PANDA_DOWNLOAD=true; shift ;;  # backward compat alias
         --skip-ipc)     PATHS="direct";            shift ;;
         --skip-direct)  PATHS="ipc";               shift ;;
         --dry-run)      DRY_RUN=true;              shift ;;
@@ -167,37 +182,101 @@ _prompt_hash() {
     printf '%s' "${prompt_text}" | sha256sum | cut -c1-12
 }
 
+_image_content_hash() {
+    # Return first 12 hex chars of SHA-256 of the given image file.
+    sha256sum "$1" | cut -c1-12
+}
+
+_validate_image() {
+    # Validate that a file is a non-zero-size JPEG or PNG.
+    # Prints a human-readable error and returns 1 on failure.
+    local path="$1"
+    if [[ ! -f "${path}" ]]; then
+        echo "ERROR: image not found: ${path}" >&2; return 1
+    fi
+    local size
+    size=$(stat -c%s "${path}" 2>/dev/null || stat -f%z "${path}" 2>/dev/null || echo 0)
+    if [[ "${size}" -eq 0 ]]; then
+        echo "ERROR: image is zero bytes (download may have failed): ${path}" >&2; return 1
+    fi
+    # Check magic bytes: JPEG = FF D8 FF, PNG = 89 50 4E 47
+    local magic
+    magic=$(xxd -p -l 3 "${path}" 2>/dev/null || od -A n -N 3 -t x1 "${path}" 2>/dev/null | tr -d ' \n')
+    case "${magic,,}" in
+        ffd8ff*)  ;;  # JPEG
+        89504e47*) ;;  # PNG prefix
+        *)
+            echo "ERROR: ${path}: not a valid JPEG or PNG (magic=${magic}); " \
+                 "file may be an HTML error page or truncated download" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 # ── image set setup ───────────────────────────────────────────────────────────
 
 _setup_images() {
     mkdir -p "${IMAGE_DIR}"
 
-    # Red-panda reference image — used in the original smoke test.
-    local panda_path="${IMAGE_DIR}/red_panda.jpg"
-    if [[ ! -f "${panda_path}" && "${SKIP_PANDA_DOWNLOAD}" == "false" ]]; then
-        echo "[setup] Downloading red-panda reference image..."
-        if command -v wget &>/dev/null; then
-            _run wget -q -O "${panda_path}" \
-                "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e6/Red_Panda_%2816862906955%29.jpg/320px-Red_Panda_%2816862906955%29.jpg" \
-                || echo "WARNING: panda download failed; skipping" >&2
-        elif command -v curl &>/dev/null; then
-            _run curl -fsSL -o "${panda_path}" \
-                "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e6/Red_Panda_%2816862906955%29.jpg/320px-Red_Panda_%2816862906955%29.jpg" \
-                || echo "WARNING: panda download failed; skipping" >&2
-        else
-            echo "WARNING: wget/curl not available; skipping panda download" >&2
+    if [[ "${SKIP_PANDA_DOWNLOAD}" == "false" ]]; then
+        # Prefer copying known-good fixtures from the pinned TensorRT Edge-LLM checkout
+        # (neutral file names image_001.jpg, image_002.jpg, …).
+        local copied=0
+        local edgellm_img_dir="${TENSORRT_EDGE_LLM_ROOT:-}/examples/vlm/data/images"
+        if [[ -d "${edgellm_img_dir}" ]]; then
+            local idx=1
+            while IFS= read -r -d '' src; do
+                local dst
+                dst="${IMAGE_DIR}/$(printf 'image_%03d' "${idx}").${src##*.}"
+                if [[ ! -f "${dst}" ]]; then
+                    cp "${src}" "${dst}"
+                    echo "[setup] Copied $(basename "${src}") → $(basename "${dst}")"
+                fi
+                (( idx++ ))
+                (( copied++ ))
+            done < <(find "${edgellm_img_dir}" -maxdepth 1 -type f \
+                          \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) \
+                          -print0 | sort -z)
+        fi
+
+        # Fall back: download NVIDIA red-panda reference as image_001.jpg.
+        local ref_path="${IMAGE_DIR}/image_001.jpg"
+        if [[ ${copied} -eq 0 && ! -f "${ref_path}" ]]; then
+            echo "[setup] Downloading reference image as image_001.jpg ..."
+            if command -v wget &>/dev/null; then
+                _run wget -q -O "${ref_path}" \
+                    "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e6/Red_Panda_%2816862906955%29.jpg/320px-Red_Panda_%2816862906955%29.jpg" \
+                    || echo "WARNING: reference image download failed; skipping" >&2
+            elif command -v curl &>/dev/null; then
+                _run curl -fsSL -o "${ref_path}" \
+                    "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e6/Red_Panda_%2816862906955%29.jpg/320px-Red_Panda_%2816862906955%29.jpg" \
+                    || echo "WARNING: reference image download failed; skipping" >&2
+            else
+                echo "WARNING: wget/curl not available; skipping reference image download" >&2
+            fi
         fi
     fi
 
-    # Enumerate images actually present.
-    mapfile -t BENCHMARK_IMAGES < <(
+    # Enumerate candidate images.
+    mapfile -t _CANDIDATE_IMAGES < <(
         find "${IMAGE_DIR}" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort
     )
 
+    # Validate each candidate; exclude invalid ones with a clear error.
+    BENCHMARK_IMAGES=()
+    for img in "${_CANDIDATE_IMAGES[@]}"; do
+        if _validate_image "${img}"; then
+            BENCHMARK_IMAGES+=("${img}")
+        else
+            echo "WARNING: excluding invalid image from benchmark: ${img}" >&2
+        fi
+    done
+
     if [[ ${#BENCHMARK_IMAGES[@]} -eq 0 ]]; then
-        echo "ERROR: no images found in ${IMAGE_DIR}." >&2
-        echo "       Add representative camera frames (JPEG/PNG) and optionally" >&2
-        echo "       remove --skip-panda-download to fetch the red-panda reference." >&2
+        echo "ERROR: no valid images found in ${IMAGE_DIR}." >&2
+        echo "       Add JPEG/PNG camera frames with neutral names (image_001.jpg, …)" >&2
+        echo "       or remove --skip-image-download to fetch the reference fixture." >&2
         exit 1
     fi
 
@@ -225,6 +304,8 @@ _run_direct_inference() {
     phash="$(_prompt_hash "${prompt_text}")"
     local recorded_at
     recorded_at="$(_now_iso)"
+    local content_hash
+    content_hash="$(_image_content_hash "${image_path}" 2>/dev/null || echo "null")"
 
     # Check that required env vars and the binary are available.
     # Use the same canonical path as run_native_benchmarks.sh:
@@ -234,6 +315,7 @@ _run_direct_inference() {
         local record
         record=$(python3 -c "
 import json, sys
+ch = sys.argv[12]
 print(json.dumps({
     'schema_version': '1',
     'record_type': 'inference',
@@ -246,17 +328,22 @@ print(json.dumps({
     'image_path': sys.argv[5],
     'image_width_px': None,
     'image_height_px': None,
+    'content_hash': ch if ch != 'null' else None,
     'prompt_id': sys.argv[6],
     'prompt_hash': sys.argv[7],
     'max_output_tokens': int(sys.argv[8]),
     'actual_output_tokens': None,
+    'finish_reason': None,
     'success': False,
     'error': 'TENSORRT_EDGE_LLM_ROOT not set or llm_inference not built — hardware path unavailable',
+    'cold_start_total_ms': None,
     'total_latency_ms': None,
     'visual_preprocess_ms': None,
     'ttft_ms': None,
     'decode_ms': None,
     'decode_tokens_per_sec': None,
+    'native_response_path': None,
+    'native_profile_path': None,
     'model_name': sys.argv[9] if sys.argv[9] else None,
     'iteration': int(sys.argv[10]),
     'warmup': sys.argv[11] == 'true',
@@ -264,23 +351,41 @@ print(json.dumps({
 }))" \
             "${run_id}" "${recorded_at}" "${condition}" "${image_id}" "${image_path}" \
             "${prompt_id}" "${phash}" "${max_tokens}" \
-            "${EDGE_VLM_MODEL_NAME:-}" "${iteration}" "${warmup}")
+            "${EDGE_VLM_MODEL_NAME:-}" "${iteration}" "${warmup}" "${content_hash}")
         _write_record "${record}"
         return
     fi
 
-    # Build a temporary input JSON for llm_inference.
+    # Build a temporary input JSON for llm_inference using the pinned NVIDIA VLM
+    # request schema: requests -> messages -> content[{type,image},{type,text}].
+    # This is the same shape used by tests/test_cases/vlm_basic.json in the
+    # TensorRT Edge-LLM checkout.
     local input_json
     input_json="$(mktemp /tmp/vlm_bench_input_XXXXXX.json)"
     python3 -c "
 import json, sys
-obj = {'image': sys.argv[1], 'text': sys.argv[2]}
+obj = {
+    'requests': [
+        {
+            'messages': [
+                {
+                    'content': [
+                        {'type': 'image', 'image': sys.argv[1]},
+                        {'type': 'text',  'text':  sys.argv[2]},
+                    ]
+                }
+            ]
+        }
+    ]
+}
 with open(sys.argv[3], 'w') as f:
     json.dump(obj, f)
 " "${image_path}" "${prompt_text}" "${input_json}"
 
-    local output_json
-    output_json="$(mktemp /tmp/vlm_bench_output_XXXXXX.json)"
+    # Named artifacts for this inference (preserved for post-analysis).
+    local artifact_base="${OUTPUT_DIR}/direct_${condition}_iter${iteration}"
+    local output_json="${artifact_base}_response.json"
+    local profile_json="${artifact_base}_profile.json"
 
     local t_start t_end
     t_start=$(date +%s%3N)
@@ -293,71 +398,100 @@ with open(sys.argv[3], 'w') as f:
         --inputFile "${input_json}" \
         --outputFile "${output_json}" \
         --warmup 0 \
+        --dumpProfile \
+        --profileOutputFile "${profile_json}" \
         2>"/tmp/vlm_bench_stderr_${run_id}_${condition}_${iteration}.log" \
         || exit_code=$?
 
     t_end=$(date +%s%3N)
-    local total_latency_ms=$(( t_end - t_start ))
+    local cold_start_total_ms=$(( t_end - t_start ))
 
     local error_msg="null"
     local success="true"
+    local cold_start_total_ms_json="${cold_start_total_ms}"
     if [[ ${exit_code} -ne 0 ]]; then
         success="false"
         error_msg="\"llm_inference exited with code ${exit_code}\""
-        total_latency_ms_json="null"
-    else
-        total_latency_ms_json="${total_latency_ms}"
+        cold_start_total_ms_json="null"
     fi
 
-    # Parse output tokens from llm_inference JSON output if available.
-    # Stage timings (TTFT, decode time) are extracted when the runtime exposes them;
-    # otherwise they remain null — never inferred.
+    # Parse output tokens, finish_reason, and NVIDIA-authoritative stage timings
+    # from llm_inference JSON artifacts.  Only fields actually present in the
+    # runtime output are extracted; unknown/unavailable fields remain null.
+    # Shell wall time (cold_start_total_ms) is kept separate from model/runtime
+    # inference metrics.
     local record
     record=$(python3 -c "
 import json, sys, os
 
 run_id, recorded_at, condition, image_path, image_id = sys.argv[1:6]
 prompt_id, phash, max_tokens = sys.argv[6], sys.argv[7], int(sys.argv[8])
-total_latency_ms_str = sys.argv[9]
+cold_start_total_ms_str = sys.argv[9]
 success_str = sys.argv[10]
 error_str = sys.argv[11]
 model_name_arg = sys.argv[12]
 iteration = int(sys.argv[13])
 warmup_str = sys.argv[14]
 output_json_path = sys.argv[15]
+profile_json_path = sys.argv[16]
+content_hash_arg = sys.argv[17]
 
-total_latency_ms = float(total_latency_ms_str) if total_latency_ms_str != 'null' else None
+cold_start_total_ms = float(cold_start_total_ms_str) if cold_start_total_ms_str != 'null' else None
 success = success_str == 'true'
 error = None if error_str == 'null' else error_str.strip('\"')
 model_name = model_name_arg if model_name_arg else None
 warmup = warmup_str == 'true'
+content_hash = content_hash_arg if content_hash_arg != 'null' else None
 
-# Parse native output for actual token count and optional stage timings.
+# Records existence of preserved artifacts for reference.
+response_path = output_json_path if os.path.exists(output_json_path) else None
+profile_path  = profile_json_path if os.path.exists(profile_json_path) else None
+
+# Parse NVIDIA-authoritative fields from native response and profile artifacts.
+# Only fields actually present are extracted; nothing is inferred or fabricated.
 actual_output_tokens = None
+finish_reason = None
 ttft_ms = None
 decode_ms = None
 visual_preprocess_ms = None
 decode_tokens_per_sec = None
+output_text = None
 
-if success and os.path.exists(output_json_path):
+def _first_present(d, *keys):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+if success and response_path:
     try:
-        with open(output_json_path) as f:
+        with open(response_path) as f:
             out = json.load(f)
-        # Edge-LLM output fields vary by version; extract what is available.
-        # Use explicit None checks so zero-valued measurements are not discarded.
-        def _first_present(d, *keys):
-            for k in keys:
-                if k in d and d[k] is not None:
-                    return d[k]
-            return None
-        actual_output_tokens = _first_present(out, 'outputTokens', 'output_tokens')
+        # Scalar response fields
+        actual_output_tokens = _first_present(out, 'outputTokens', 'output_tokens', 'numOutputTokens')
+        finish_reason = _first_present(out, 'finishReason', 'finish_reason')
+        output_text = _first_present(out, 'outputText', 'output_text', 'text', 'response')
+        # Stage timings from the response JSON (if present)
         ttft_ms = _first_present(out, 'ttftMs', 'ttft_ms')
         decode_ms = _first_present(out, 'decodeMs', 'decode_ms')
         visual_preprocess_ms = _first_present(out, 'visualMs', 'visual_ms', 'visual_preprocess_ms')
-        if actual_output_tokens is not None and decode_ms is not None and decode_ms > 0:
-            decode_tokens_per_sec = actual_output_tokens / (decode_ms / 1000.0)
     except Exception:
-        pass  # Output file absent or not JSON; all stage timings remain null.
+        pass
+
+# Prefer NVIDIA-emitted profile data for stage timings (authoritative).
+if success and profile_path:
+    try:
+        with open(profile_path) as f:
+            prof = json.load(f)
+        # Profile fields vary by runtime version; extract only what is present.
+        ttft_ms = _first_present(prof, 'ttftMs', 'ttft_ms', 'prefillMs', 'prefill_ms') or ttft_ms
+        decode_ms = _first_present(prof, 'decodeMs', 'decode_ms') or decode_ms
+        visual_preprocess_ms = _first_present(prof, 'visualMs', 'visual_ms', 'visual_preprocess_ms') or visual_preprocess_ms
+    except Exception:
+        pass
+
+if actual_output_tokens is not None and decode_ms is not None and decode_ms > 0:
+    decode_tokens_per_sec = actual_output_tokens / (decode_ms / 1000.0)
 
 record = {
     'schema_version': '1',
@@ -371,17 +505,22 @@ record = {
     'image_path': image_path,
     'image_width_px': None,
     'image_height_px': None,
+    'content_hash': content_hash,
     'prompt_id': prompt_id,
     'prompt_hash': phash,
     'max_output_tokens': max_tokens,
     'actual_output_tokens': actual_output_tokens,
+    'finish_reason': finish_reason,
     'success': success,
     'error': error,
-    'total_latency_ms': total_latency_ms,
+    'cold_start_total_ms': cold_start_total_ms,
+    'total_latency_ms': cold_start_total_ms,
     'visual_preprocess_ms': visual_preprocess_ms,
     'ttft_ms': ttft_ms,
     'decode_ms': decode_ms,
     'decode_tokens_per_sec': decode_tokens_per_sec,
+    'native_response_path': response_path,
+    'native_profile_path': profile_path,
     'model_name': model_name,
     'iteration': iteration,
     'warmup': warmup,
@@ -391,13 +530,14 @@ print(json.dumps(record))
 " \
         "${run_id}" "${recorded_at}" "${condition}" "${image_path}" "${image_id}" \
         "${prompt_id}" "${phash}" "${max_tokens}" \
-        "${total_latency_ms_json:-null}" "${success}" "${error_msg}" \
+        "${cold_start_total_ms_json:-null}" "${success}" "${error_msg}" \
         "${EDGE_VLM_MODEL_NAME:-}" "${iteration}" "${warmup}" \
-        "${output_json}")
+        "${output_json}" "${profile_json}" "${content_hash}")
 
     _write_record "${record}"
 
-    rm -f "${input_json}" "${output_json}"
+    rm -f "${input_json}"
+    # output_json and profile_json are preserved as named artifacts.
 }
 
 # ── IPC path invocation (persistent edge_vlm_server) ─────────────────────────
@@ -418,6 +558,8 @@ _run_ipc_inference() {
     phash="$(_prompt_hash "${prompt_text}")"
     local recorded_at
     recorded_at="$(_now_iso)"
+    local content_hash
+    content_hash="$(_image_content_hash "${image_path}" 2>/dev/null || echo "null")"
 
     # The ipc path invokes vlm_single_shot_client via `ros2 run` because the
     # script is installed into the ROS lib directory (lib/edge_vlm_ros/).
@@ -429,6 +571,7 @@ _run_ipc_inference() {
         local record
         record=$(python3 -c "
 import json, sys
+ch = sys.argv[12]
 print(json.dumps({
     'schema_version': '1',
     'record_type': 'inference',
@@ -441,17 +584,22 @@ print(json.dumps({
     'image_path': sys.argv[5],
     'image_width_px': None,
     'image_height_px': None,
+    'content_hash': ch if ch != 'null' else None,
     'prompt_id': sys.argv[6],
     'prompt_hash': sys.argv[7],
     'max_output_tokens': int(sys.argv[8]),
     'actual_output_tokens': None,
+    'finish_reason': None,
     'success': False,
     'error': 'ros2 not available — ipc path (vlm_single_shot_client) skipped',
+    'cold_start_total_ms': None,
     'total_latency_ms': None,
     'visual_preprocess_ms': None,
     'ttft_ms': None,
     'decode_ms': None,
     'decode_tokens_per_sec': None,
+    'native_response_path': None,
+    'native_profile_path': None,
     'model_name': sys.argv[9] if sys.argv[9] else None,
     'iteration': int(sys.argv[10]),
     'warmup': sys.argv[11] == 'true',
@@ -459,7 +607,7 @@ print(json.dumps({
 }))" \
             "${run_id}" "${recorded_at}" "${condition}" "${image_id}" "${image_path}" \
             "${prompt_id}" "${phash}" "${max_tokens}" \
-            "${EDGE_VLM_MODEL_NAME:-}" "${iteration}" "${warmup}")
+            "${EDGE_VLM_MODEL_NAME:-}" "${iteration}" "${warmup}" "${content_hash}")
         _write_record "${record}"
         return
     fi
@@ -499,12 +647,14 @@ model_name_arg = sys.argv[11]
 iteration = int(sys.argv[12])
 warmup_str = sys.argv[13]
 result_json_path = sys.argv[14]
+content_hash_arg = sys.argv[15]
 
 success = exit_code == 0
 error = None if success else f'ipc client exited with code {exit_code}'
 model_name = model_name_arg if model_name_arg else None
 warmup = warmup_str == 'true'
 total_ms = float(total_latency_ms) if success else None
+content_hash = content_hash_arg if content_hash_arg != 'null' else None
 
 # IPC path does not expose stage timings (TTFT, decode, visual) — all null.
 # actual_output_tokens comes from backend if available; output_tokens in the
@@ -530,17 +680,22 @@ record = {
     'image_path': image_path,
     'image_width_px': None,
     'image_height_px': None,
+    'content_hash': content_hash,
     'prompt_id': prompt_id,
     'prompt_hash': phash,
     'max_output_tokens': max_tokens,
     'actual_output_tokens': actual_output_tokens,
+    'finish_reason': None,
     'success': success,
     'error': error,
+    'cold_start_total_ms': None,
     'total_latency_ms': total_ms,
     'visual_preprocess_ms': None,
     'ttft_ms': None,
     'decode_ms': None,
     'decode_tokens_per_sec': None,
+    'native_response_path': None,
+    'native_profile_path': None,
     'model_name': model_name,
     'iteration': iteration,
     'warmup': warmup,
@@ -552,7 +707,7 @@ print(json.dumps(record))
         "${prompt_id}" "${phash}" "${max_tokens}" \
         "${total_latency_ms}" "${exit_code}" \
         "${EDGE_VLM_MODEL_NAME:-}" "${iteration}" "${warmup}" \
-        "${result_json}")
+        "${result_json}" "${content_hash}")
 
     _write_record "${record}"
     rm -f "${result_json}"

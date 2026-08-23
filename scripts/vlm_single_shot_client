@@ -41,13 +41,33 @@ from pathlib import Path
 
 
 def _find_edge_vlm_cli() -> str:
-    """Return the path to edge_vlm_cli installed alongside this script."""
-    own_dir = Path(__file__).resolve().parent
-    candidate = own_dir / "edge_vlm_cli"
+    """Return the path to edge_vlm_cli installed alongside this script.
+
+    Under ``colcon build --symlink-install`` the installed script is a symlink
+    pointing back to the source tree.  Using ``Path(__file__).resolve()`` would
+    follow that symlink and look for ``edge_vlm_cli`` in the source directory
+    where it will not be found.
+
+    Instead we look in the directory that *invoked* this script (``sys.argv[0]``
+    before any symlink resolution), which is the install directory when the
+    script is run via ``ros2 run`` or directly from the install tree.  If that
+    does not produce a hit, we fall back to searching PATH so that both
+    ``--symlink-install`` and a plain ``colcon build`` work correctly.
+    """
+    # 1. Prefer the directory of the invocation path (install dir for ros2 run).
+    invocation_dir = Path(os.path.abspath(sys.argv[0])).parent
+    candidate = invocation_dir / "edge_vlm_cli"
     if candidate.is_file() and os.access(str(candidate), os.X_OK):
         return str(candidate)
+
+    # 2. Fall back to PATH-based search (covers --symlink-install and bare invocation).
+    import shutil
+    found = shutil.which("edge_vlm_cli")
+    if found:
+        return found
+
     raise RuntimeError(
-        f"edge_vlm_cli not found in {own_dir}. "
+        f"edge_vlm_cli not found alongside {sys.argv[0]} or on PATH. "
         "Ensure edge_vlm_ros is built and installed (colcon build)."
     )
 

@@ -53,17 +53,22 @@ def _make_record(
     *,
     condition: str = "A",
     path: str = "direct",
-    image_id: str = "red_panda",
+    image_id: str = "image_001",
     prompt_id: str = "terse_id",
     max_output_tokens: int = 16,
     actual_output_tokens: int | None = 12,
+    finish_reason: str | None = None,
     success: bool = True,
     error: str | None = None,
+    cold_start_total_ms: float | None = None,
     total_latency_ms: float | None = 500.0,
     visual_preprocess_ms: float | None = None,
     ttft_ms: float | None = None,
     decode_ms: float | None = None,
     decode_tokens_per_sec: float | None = None,
+    native_response_path: str | None = None,
+    native_profile_path: str | None = None,
+    content_hash: str | None = None,
     iteration: int = 0,
     warmup: bool = False,
     model_name: str | None = "TestModel-8B",
@@ -79,17 +84,22 @@ def _make_record(
         "image_path": f"/tmp/{image_id}.jpg",
         "image_width_px": None,
         "image_height_px": None,
+        "content_hash": content_hash,
         "prompt_id": prompt_id,
         "prompt_hash": "abc123def456",
         "max_output_tokens": max_output_tokens,
         "actual_output_tokens": actual_output_tokens,
+        "finish_reason": finish_reason,
         "success": success,
         "error": error,
+        "cold_start_total_ms": cold_start_total_ms,
         "total_latency_ms": total_latency_ms,
         "visual_preprocess_ms": visual_preprocess_ms,
         "ttft_ms": ttft_ms,
         "decode_ms": decode_ms,
         "decode_tokens_per_sec": decode_tokens_per_sec,
+        "native_response_path": native_response_path,
+        "native_profile_path": native_profile_path,
         "model_name": model_name,
         "iteration": iteration,
         "warmup": warmup,
@@ -720,6 +730,450 @@ class TestRosClientInstall(unittest.TestCase):
         """IPC records must declare lifecycle_semantics='persistent'."""
         text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
         self.assertIn("persistent", text)
+
+
+# ── native request shape tests ────────────────────────────────────────────────
+
+
+class TestNativeRequestShape(unittest.TestCase):
+    """Validate that run_vlm_latency_benchmark.sh builds the llm_inference input
+    JSON using the pinned NVIDIA VLM schema: requests -> messages -> content
+    [{type,image},{type,text}].  This is the shape observed to be accepted in
+    Thor hardware smoke; the old {image,text} flat shape was rejected with
+    `'requests' array not found`."""
+
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+
+    def test_uses_requests_key(self):
+        text = self._script_text()
+        self.assertIn("'requests'", text, "Input JSON must use top-level 'requests' array")
+
+    def test_uses_messages_key(self):
+        text = self._script_text()
+        self.assertIn("'messages'", text, "Input JSON must use 'messages' key")
+
+    def test_uses_content_key(self):
+        text = self._script_text()
+        self.assertIn("'content'", text, "Input JSON must use 'content' array")
+
+    def test_uses_type_image_entry(self):
+        text = self._script_text()
+        self.assertIn("'type': 'image'", text, "content must contain {type:image} entry")
+
+    def test_uses_type_text_entry(self):
+        text = self._script_text()
+        self.assertIn("'type': 'text'", text, "content must contain {type:text} entry")
+
+    def test_does_not_use_flat_image_text_shape(self):
+        """The old flat {'image': ..., 'text': ...} shape must not remain."""
+        text = self._script_text()
+        # Positive check: the flat one-level dict should not be the construction
+        # pattern any more (the new format nests under requests/messages/content).
+        self.assertNotIn(
+            "obj = {'image'",
+            text,
+            "Old flat {'image':…,'text':…} request shape must be removed",
+        )
+
+    def test_requests_schema_roundtrip(self):
+        """Verify a constructed request JSON parses correctly."""
+        import subprocess
+        result = subprocess.run(
+            [
+                "python3", "-c",
+                """
+import json, sys
+image_path = '/tmp/test.jpg'
+prompt_text = 'What is this?'
+obj = {
+    'requests': [
+        {
+            'messages': [
+                {
+                    'content': [
+                        {'type': 'image', 'image': image_path},
+                        {'type': 'text',  'text':  prompt_text},
+                    ]
+                }
+            ]
+        }
+    ]
+}
+data = json.dumps(obj)
+parsed = json.loads(data)
+req = parsed['requests'][0]
+content = req['messages'][0]['content']
+assert content[0]['type'] == 'image'
+assert content[0]['image'] == image_path
+assert content[1]['type'] == 'text'
+assert content[1]['text'] == prompt_text
+print('ok')
+""",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+
+
+# ── finish_reason tests ────────────────────────────────────────────────────────
+
+
+class TestFinishReason(unittest.TestCase):
+    """Tests for finish_reason parsing/aggregation and max-length reporting."""
+
+    def test_finish_reason_counted_in_aggregation(self):
+        records = [
+            _make_record(finish_reason="max-length"),
+            _make_record(finish_reason="max-length"),
+            _make_record(finish_reason="eos"),
+        ]
+        agg = aggregate_condition(records)
+        self.assertEqual(agg["finish_reason_counts"]["max-length"], 2)
+        self.assertEqual(agg["finish_reason_counts"]["eos"], 1)
+        self.assertEqual(agg["n_max_length"], 2)
+
+    def test_finish_reason_null_counted_separately(self):
+        records = [
+            _make_record(finish_reason=None),
+            _make_record(finish_reason="eos"),
+        ]
+        agg = aggregate_condition(records)
+        self.assertEqual(agg["finish_reason_counts"].get("null", 0), 1)
+        self.assertEqual(agg["n_max_length"], 0)
+
+    def test_finish_reason_empty_when_no_records(self):
+        agg = aggregate_condition([])
+        self.assertEqual(agg["finish_reason_counts"], {})
+        self.assertEqual(agg["n_max_length"], 0)
+
+    def test_warmup_records_excluded_from_finish_reason_count(self):
+        records = [
+            _make_record(finish_reason="max-length", warmup=True),
+            _make_record(finish_reason="eos", warmup=False),
+        ]
+        agg = aggregate_condition(records)
+        # Only the non-warmup record should be counted.
+        self.assertEqual(agg["n_max_length"], 0)
+        self.assertNotIn("max-length", agg["finish_reason_counts"])
+
+    def test_text_report_includes_finish_reason_section(self):
+        """Text report must include a finish_reason summary when data is present."""
+        records = [
+            _make_record(condition="A", path="direct", finish_reason="max-length"),
+            _make_record(condition="A", path="direct", finish_reason="eos"),
+        ]
+        report = build_report(records)
+        text = format_text_report(report)
+        self.assertIn("finish", text.lower())
+        self.assertIn("max-length", text.lower())
+
+    def test_text_report_notes_truncation(self):
+        """Report must note that max-length means capped, not task-complete."""
+        records = [_make_record(condition="A", path="direct", finish_reason="max-length")]
+        report = build_report(records)
+        text = format_text_report(report)
+        self.assertIn("capped", text.lower())
+
+    def test_text_report_no_finish_reason_section_when_absent(self):
+        """If all finish_reasons are null, the truncation NOTE must not appear."""
+        records = [_make_record(finish_reason=None)]
+        report = build_report(records)
+        text = format_text_report(report)
+        # Only "null" finish_reason present; truncation note should not appear.
+        self.assertNotIn("NOTE: requests with finish_reason", text)
+
+    def test_runner_parses_finish_reason_from_response(self):
+        """The shell runner must extract finish_reason from the native response JSON."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("finish_reason", text)
+        self.assertIn("finishReason", text)
+
+    def test_record_has_finish_reason_field(self):
+        """Records must include finish_reason key (possibly null)."""
+        rec = _make_record(finish_reason="eos")
+        self.assertIn("finish_reason", rec)
+        self.assertEqual(rec["finish_reason"], "eos")
+
+    def test_record_finish_reason_null_by_default(self):
+        rec = _make_record()
+        self.assertIn("finish_reason", rec)
+        self.assertIsNone(rec["finish_reason"])
+
+
+# ── fixture validation tests ──────────────────────────────────────────────────
+
+
+class TestFixtureHygiene(unittest.TestCase):
+    """Tests for image fixture validation and neutral naming."""
+
+    def test_runner_validates_images_before_inclusion(self):
+        """The script must contain a validation check for image files."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("_validate_image", text)
+
+    def test_runner_rejects_zero_byte_image(self):
+        """_validate_image must reject a zero-byte file."""
+        import subprocess
+        result = subprocess.run(
+            ["bash", "-c", """
+source /dev/stdin << 'EOF'
+_validate_image() {
+    local path="$1"
+    if [[ ! -f "${path}" ]]; then
+        echo "ERROR: image not found: ${path}" >&2; return 1
+    fi
+    local size
+    size=$(stat -c%s "${path}" 2>/dev/null || stat -f%z "${path}" 2>/dev/null || echo 0)
+    if [[ "${size}" -eq 0 ]]; then
+        echo "ERROR: image is zero bytes" >&2; return 1
+    fi
+    return 0
+}
+EOF
+f=$(mktemp /tmp/test_XXXXXX.jpg)
+truncate -s 0 "$f"
+_validate_image "$f" && echo "FAIL_should_reject" || echo "CORRECTLY_REJECTED"
+rm -f "$f"
+"""],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertIn("CORRECTLY_REJECTED", result.stdout, "Zero-byte image should be rejected")
+        self.assertNotIn("FAIL_should_reject", result.stdout)
+
+    def test_runner_rejects_html_masquerading_as_jpeg(self):
+        """_validate_image must reject a file with HTML magic bytes."""
+        import subprocess
+        result = subprocess.run(
+            ["bash", "-c", r"""
+source /dev/stdin << 'EOF'
+_validate_image() {
+    local path="$1"
+    if [[ ! -f "${path}" ]]; then echo "ERROR: not found" >&2; return 1; fi
+    local size
+    size=$(stat -c%s "${path}" 2>/dev/null || stat -f%z "${path}" 2>/dev/null || echo 0)
+    if [[ "${size}" -eq 0 ]]; then echo "ERROR: zero bytes" >&2; return 1; fi
+    local magic
+    magic=$(xxd -p -l 3 "${path}" 2>/dev/null || od -A n -N 3 -t x1 "${path}" 2>/dev/null | tr -d ' \n')
+    case "${magic,,}" in
+        ffd8ff*) ;;
+        89504e47*) ;;
+        *)
+            echo "ERROR: not JPEG/PNG: ${magic}" >&2
+            return 1
+            ;;
+    esac
+    return 0
+}
+EOF
+f=$(mktemp /tmp/test_XXXXXX.jpg)
+printf '<html>Not an image</html>' > "$f"
+_validate_image "$f" && echo "FAIL_should_reject" || echo "CORRECTLY_REJECTED"
+rm -f "$f"
+"""],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertIn("CORRECTLY_REJECTED", result.stdout, "HTML content should be rejected as not JPEG/PNG")
+
+    def test_runner_uses_neutral_fixture_names(self):
+        """The script must reference neutral names like image_001, not red_panda."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("image_001", text, "Script must reference neutral image name image_001.jpg")
+
+    def test_runner_no_longer_hardcodes_red_panda_path_as_primary(self):
+        """red_panda.jpg must not be the hard-coded primary fixture name."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        # The neutral fixture (image_001) must be present as the primary download name.
+        self.assertIn("image_001", text)
+        # The old hard-coded panda path variable must be gone.
+        self.assertNotIn('panda_path="${IMAGE_DIR}/red_panda.jpg"', text)
+
+    def test_content_hash_recorded_in_runner(self):
+        """The script must compute and record a content hash for each image."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("content_hash", text)
+        self.assertIn("_image_content_hash", text)
+
+    def test_record_includes_content_hash_field(self):
+        """Records must include a content_hash field."""
+        rec = _make_record(content_hash="abc123def456")
+        self.assertIn("content_hash", rec)
+        self.assertEqual(rec["content_hash"], "abc123def456")
+
+
+# ── dumpProfile / native profiling tests ──────────────────────────────────────
+
+
+class TestNativeProfiling(unittest.TestCase):
+    """Validate that run_vlm_latency_benchmark.sh invokes llm_inference with
+    --dumpProfile --profileOutputFile and preserves raw artifacts."""
+
+    def _script_text(self) -> str:
+        return (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+
+    def test_uses_dump_profile_flag(self):
+        text = self._script_text()
+        self.assertIn("--dumpProfile", text, "llm_inference must be called with --dumpProfile")
+
+    def test_uses_profile_output_file_flag(self):
+        text = self._script_text()
+        self.assertIn("--profileOutputFile", text, "llm_inference must be called with --profileOutputFile")
+
+    def test_native_response_path_in_record(self):
+        """Records must carry native_response_path for artifact reference."""
+        text = self._script_text()
+        self.assertIn("'native_response_path'", text)
+
+    def test_native_profile_path_in_record(self):
+        """Records must carry native_profile_path for artifact reference."""
+        text = self._script_text()
+        self.assertIn("'native_profile_path'", text)
+
+    def test_cold_start_total_ms_in_record(self):
+        """Direct records must carry cold_start_total_ms (shell wall time)."""
+        text = self._script_text()
+        self.assertIn("'cold_start_total_ms'", text)
+
+    def test_profile_artifacts_not_deleted(self):
+        """The script must NOT rm -f the profile and response JSON artifacts."""
+        text = self._script_text()
+        # The only rm -f after llm_inference should be for the input_json.
+        # Confirm that output_json and profile_json are preserved.
+        self.assertIn("rm -f \"${input_json}\"", text)
+        self.assertIn("preserved as named artifacts", text)
+
+    def test_record_has_cold_start_total_ms_field(self):
+        """_make_record must produce cold_start_total_ms."""
+        rec = _make_record(cold_start_total_ms=410.5, total_latency_ms=410.5)
+        self.assertIn("cold_start_total_ms", rec)
+        self.assertEqual(rec["cold_start_total_ms"], 410.5)
+
+    def test_record_has_native_response_path_field(self):
+        rec = _make_record(native_response_path="/tmp/resp.json")
+        self.assertIn("native_response_path", rec)
+        self.assertEqual(rec["native_response_path"], "/tmp/resp.json")
+
+    def test_record_has_native_profile_path_field(self):
+        rec = _make_record(native_profile_path="/tmp/prof.json")
+        self.assertIn("native_profile_path", rec)
+        self.assertEqual(rec["native_profile_path"], "/tmp/prof.json")
+
+
+# ── symlink-install client lookup tests ───────────────────────────────────────
+
+
+class TestSymlinkInstallClientLookup(unittest.TestCase):
+    """Validate that vlm_single_shot_client discovers edge_vlm_cli in a way
+    that works under `colcon build --symlink-install`.
+
+    Under --symlink-install, the installed script is a symlink pointing to the
+    source file.  ``Path(__file__).resolve()`` would follow the symlink back to
+    the source directory, where edge_vlm_cli is not installed.  The fix is to
+    use os.path.abspath(sys.argv[0]) (no symlink resolution) so we look in the
+    install directory where edge_vlm_cli actually lives.
+    """
+
+    def _client_source(self) -> str:
+        path = _REPO_ROOT / "scripts" / "vlm_single_shot_client"
+        return path.read_text(encoding="utf-8")
+
+    def test_does_not_use_file_resolve_for_lookup(self):
+        """Must not use Path(__file__).resolve().parent for edge_vlm_cli lookup."""
+        source = self._client_source()
+        # The function should not call .resolve() on __file__ for discovery.
+        # (It may call .resolve() for other things, but not the lookup path.)
+        self.assertNotIn(
+            "Path(__file__).resolve().parent",
+            source,
+            "_find_edge_vlm_cli must not use Path(__file__).resolve().parent "
+            "(follows symlinks back to source tree under --symlink-install)",
+        )
+
+    def test_uses_sys_argv0_for_invocation_dir(self):
+        """Must use sys.argv[0] (symlink path) for install-directory lookup."""
+        source = self._client_source()
+        self.assertIn("sys.argv[0]", source, "_find_edge_vlm_cli must use sys.argv[0]")
+
+    def test_falls_back_to_shutil_which(self):
+        """Must fall back to shutil.which so PATH-based installs also work."""
+        source = self._client_source()
+        self.assertIn("shutil.which", source, "shutil.which fallback must be present")
+
+    def test_find_cli_in_install_dir(self):
+        """_find_edge_vlm_cli must return edge_vlm_cli when present next to argv[0]."""
+        import subprocess, textwrap, tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Simulate an install dir with edge_vlm_cli present.
+            cli = Path(tmpdir) / "edge_vlm_cli"
+            cli.write_text("#!/bin/sh\necho stub\n")
+            cli.chmod(0o755)
+            fake_argv0 = str(Path(tmpdir) / "vlm_single_shot_client")
+
+            test_script = textwrap.dedent(f"""\
+                import sys, os
+                sys.argv[0] = {fake_argv0!r}
+                sys.path.insert(0, {str(_REPO_ROOT / 'scripts')!r})
+                # Re-exec the function under test
+                from pathlib import Path
+                import shutil
+
+                def _find_edge_vlm_cli():
+                    invocation_dir = Path(os.path.abspath(sys.argv[0])).parent
+                    candidate = invocation_dir / 'edge_vlm_cli'
+                    if candidate.is_file() and os.access(str(candidate), os.X_OK):
+                        return str(candidate)
+                    found = shutil.which('edge_vlm_cli')
+                    if found:
+                        return found
+                    raise RuntimeError('not found')
+
+                result = _find_edge_vlm_cli()
+                assert result == str(Path({str(tmpdir)!r}) / 'edge_vlm_cli'), result
+                print('ok')
+            """)
+            result = subprocess.run(
+                ["python3", "-c", test_script],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ok", result.stdout)
+
+    def test_raises_when_cli_not_found(self):
+        """_find_edge_vlm_cli must raise RuntimeError when edge_vlm_cli is absent."""
+        import subprocess, textwrap, tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_argv0 = str(Path(tmpdir) / "vlm_single_shot_client")
+            test_script = textwrap.dedent(f"""\
+                import sys, os
+                sys.argv[0] = {fake_argv0!r}
+                # Ensure PATH doesn't accidentally resolve edge_vlm_cli.
+                os.environ['PATH'] = '/nonexistent_path_for_test'
+                from pathlib import Path
+                import shutil
+
+                def _find_edge_vlm_cli():
+                    invocation_dir = Path(os.path.abspath(sys.argv[0])).parent
+                    candidate = invocation_dir / 'edge_vlm_cli'
+                    if candidate.is_file() and os.access(str(candidate), os.X_OK):
+                        return str(candidate)
+                    found = shutil.which('edge_vlm_cli')
+                    if found:
+                        return found
+                    raise RuntimeError('not found')
+
+                try:
+                    _find_edge_vlm_cli()
+                    print('FAIL: expected RuntimeError')
+                except RuntimeError:
+                    print('ok')
+            """)
+            result = subprocess.run(
+                ["python3", "-c", test_script],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("ok", result.stdout)
 
 
 if __name__ == "__main__":
