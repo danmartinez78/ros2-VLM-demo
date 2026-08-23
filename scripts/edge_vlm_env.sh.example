@@ -13,19 +13,15 @@ export EDGE_VLM_RUNTIME_STATE_FILE="${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/active-p
 _edge_vlm_env_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export EDGE_VLM_MODELCTL_PATH="${_edge_vlm_env_script_dir}/models/modelctl.py"
 if [[ "${EDGE_VLM_RUNTIME_STATE_FILE}" == "${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/"* ]] && [[ -f "${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then
-  _edge_vlm_exports="$(python3 "${EDGE_VLM_MODELCTL_PATH}" print-env --state-file "${EDGE_VLM_RUNTIME_STATE_FILE}")"
-  _edge_vlm_exports_valid=1
-  while IFS= read -r _edge_vlm_line; do
-    [[ -n "${_edge_vlm_line}" ]] || continue
-    case "${_edge_vlm_line}" in
-      export\ EDGE_VLM_MODEL_NAME=*|export\ EDGE_VLM_MODEL_ID=*|export\ EDGE_VLM_ENGINE_PROFILE_ID=*|export\ EDGE_VLM_LLM_ENGINE_DIR=*|export\ EDGE_VLM_MULTIMODAL_ENGINE_DIR=*|export\ EDGELLM_PLUGIN_PATH=*) ;;
-      *) _edge_vlm_exports_valid=0; break ;;
+  while IFS=$'\t' read -r _edge_vlm_key _edge_vlm_value; do
+    case "${_edge_vlm_key}" in
+      EDGE_VLM_MODEL_NAME|EDGE_VLM_MODEL_ID|EDGE_VLM_ENGINE_PROFILE_ID|EDGE_VLM_LLM_ENGINE_DIR|EDGE_VLM_MULTIMODAL_ENGINE_DIR|EDGELLM_PLUGIN_PATH)
+        printf -v "${_edge_vlm_key}" '%s' "${_edge_vlm_value}"
+        export "${_edge_vlm_key}"
+        ;;
     esac
-  done <<< "${_edge_vlm_exports}"
-  if [[ "${_edge_vlm_exports_valid}" -eq 1 ]]; then
-    eval "${_edge_vlm_exports}"
-  fi
-  unset _edge_vlm_exports _edge_vlm_exports_valid _edge_vlm_line
+  done < <(python3 "${EDGE_VLM_MODELCTL_PATH}" print-env-pairs --state-file "${EDGE_VLM_RUNTIME_STATE_FILE}")
+  unset _edge_vlm_key _edge_vlm_value
 else
   export EDGE_VLM_MODEL_NAME="Cosmos-Reason2-8B"
   export EDGE_VLM_LLM_ENGINE_DIR="${EDGE_VLM_WORKSPACE_DIR}/${EDGE_VLM_MODEL_NAME}/engine/llm"

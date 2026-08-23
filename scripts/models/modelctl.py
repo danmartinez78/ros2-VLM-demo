@@ -214,6 +214,8 @@ def load_registries() -> tuple[dict[str, ModelRecord], dict[str, ProfileRecord],
         components = data.get("components", {})
         if not components:
             raise ModelCtlError(f"Profile {profile_id} must define at least one component.")
+        if "llm" not in components:
+            raise ModelCtlError(f"Profile {profile_id} must define an 'llm' component.")
         runtime_dirs = [str(component["relative_engine_dir"]) for component in components.values()]
         if len(runtime_dirs) != len(set(runtime_dirs)):
             raise ModelCtlError(f"Profile {profile_id} reuses the same component directory more than once.")
@@ -493,19 +495,15 @@ def render_runtime_env(ctx: RuntimeContext, *, include_active_lookup: bool = Tru
         lines.extend(
             [
                 'if [[ "${EDGE_VLM_RUNTIME_STATE_FILE}" == "${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/"* ]] && [[ -f "${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then',
-                '  _edge_vlm_exports="$(python3 "${EDGE_VLM_MODELCTL_PATH}" print-env --state-file "${EDGE_VLM_RUNTIME_STATE_FILE}")"',
-                '  _edge_vlm_exports_valid=1',
-                '  while IFS= read -r _edge_vlm_line; do',
-                '    [[ -n "${_edge_vlm_line}" ]] || continue',
-                '    case "${_edge_vlm_line}" in',
-                '      export\\ EDGE_VLM_MODEL_NAME=*|export\\ EDGE_VLM_MODEL_ID=*|export\\ EDGE_VLM_ENGINE_PROFILE_ID=*|export\\ EDGE_VLM_LLM_ENGINE_DIR=*|export\\ EDGE_VLM_MULTIMODAL_ENGINE_DIR=*|export\\ EDGELLM_PLUGIN_PATH=*) ;;',
-                '      *) _edge_vlm_exports_valid=0; break ;;',
+                '  while IFS=$\'\\t\' read -r _edge_vlm_key _edge_vlm_value; do',
+                '    case "${_edge_vlm_key}" in',
+                '      EDGE_VLM_MODEL_NAME|EDGE_VLM_MODEL_ID|EDGE_VLM_ENGINE_PROFILE_ID|EDGE_VLM_LLM_ENGINE_DIR|EDGE_VLM_MULTIMODAL_ENGINE_DIR|EDGELLM_PLUGIN_PATH)',
+                '        printf -v "${_edge_vlm_key}" "%s" "${_edge_vlm_value}"',
+                '        export "${_edge_vlm_key}"',
+                '        ;;',
                 '    esac',
-                '  done <<< "${_edge_vlm_exports}"',
-                '  if [[ "${_edge_vlm_exports_valid}" -eq 1 ]]; then',
-                '    eval "${_edge_vlm_exports}"',
-                '  fi',
-                '  unset _edge_vlm_exports _edge_vlm_exports_valid _edge_vlm_line',
+                '  done < <(python3 "${EDGE_VLM_MODELCTL_PATH}" print-env-pairs --state-file "${EDGE_VLM_RUNTIME_STATE_FILE}")',
+                '  unset _edge_vlm_key _edge_vlm_value',
                 "fi",
             ]
         )
@@ -778,6 +776,21 @@ def cmd_print_env(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_print_env_pairs(args: argparse.Namespace) -> int:
+    payload = read_active_state(Path(args.state_file))
+    pairs = [
+        ("EDGE_VLM_MODEL_NAME", payload["model_name"]),
+        ("EDGE_VLM_MODEL_ID", payload["model_id"]),
+        ("EDGE_VLM_ENGINE_PROFILE_ID", payload["engine_profile_id"]),
+        ("EDGE_VLM_LLM_ENGINE_DIR", payload["llm_engine_dir"]),
+        ("EDGE_VLM_MULTIMODAL_ENGINE_DIR", payload["multimodal_engine_dir"]),
+        ("EDGELLM_PLUGIN_PATH", payload["plugin_path"]),
+    ]
+    for key, value in pairs:
+        sys.stdout.write(f"{key}\t{value}\n")
+    return 0
+
+
 def cmd_registry_check(args: argparse.Namespace) -> int:
     models, profiles, manifest = load_registries()
     print(f"models={len(models)} profiles={len(profiles)} manifest_default={manifest.get('default_model', '<unset>')}")
@@ -817,6 +830,9 @@ def build_parser() -> argparse.ArgumentParser:
     print_env = subparsers.add_parser("print-env")
     print_env.add_argument("--state-file", required=True)
 
+    print_env_pairs = subparsers.add_parser("print-env-pairs")
+    print_env_pairs.add_argument("--state-file", required=True)
+
     subparsers.add_parser("registry-check")
     return parser
 
@@ -842,6 +858,8 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_current(args)
             case "print-env":
                 return cmd_print_env(args)
+            case "print-env-pairs":
+                return cmd_print_env_pairs(args)
             case "registry-check":
                 return cmd_registry_check(args)
             case _:
