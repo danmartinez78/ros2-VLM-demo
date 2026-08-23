@@ -94,6 +94,10 @@
       "type": ["string", "null"],
       "description": "Finish reason from the native response JSON (e.g. 'eos', 'max-length', 'stop'). Null if not available from the runtime. Responses with finish_reason='max-length' are capped and do not represent natural task completion."
     },
+    "output_text": {
+      "type": ["string", "null"],
+      "description": "Response text from the native output JSON, preserved for reference. Null for ipc path or when unavailable."
+    },
     "success": {
       "type": "boolean",
       "description": "True when inference completed without error."

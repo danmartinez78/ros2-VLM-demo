@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -61,7 +62,6 @@ def _find_edge_vlm_cli() -> str:
         return str(candidate)
 
     # 2. Fall back to PATH-based search (covers --symlink-install and bare invocation).
-    import shutil
     found = shutil.which("edge_vlm_cli")
     if found:
         return found
