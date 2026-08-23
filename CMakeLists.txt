@@ -450,6 +450,11 @@ install(PROGRAMS scripts/vlm_single_shot_client
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# Installed into lib/${PROJECT_NAME} so `ros2 run edge_vlm_ros vlm_multi_frame_client` works.
+install(PROGRAMS scripts/vlm_multi_frame_client
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(TARGETS vlm_reasoner_node
   EXPORT vlm_reasoner_nodeTargets
   ARCHIVE DESTINATION lib

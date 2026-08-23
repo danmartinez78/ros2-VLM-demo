@@ -14,10 +14,15 @@
 #            cold-start (process init, engine load, tokenizer init).
 #            cold_start_total_ms is recorded separately from model/runtime
 #            stage timings.
+#   ipc    : sends all frames in one request to an already-running, warmed
+#            edge_vlm_server via IPC socket (vlm_multi_frame_client →
+#            edge_vlm_cli → running edge_vlm_server).  This is the persistent-
+#            server steady-state path; total_latency_ms is the outer client
+#            round-trip.  Stage timings are null; TTFT is null.
 #
-# IPC path is NOT included in this benchmark because vlm_single_shot_client
-# accepts a single --image argument and cannot submit a multi-image request.
-# Extend the IPC client separately before adding multi-frame IPC support.
+# Both paths use the same Thor-validated request shape and prompt, so
+# direct cold-start and IPC steady-state measurements are directly comparable
+# within each frame-count condition.
 #
 # This script does NOT:
 #   - Change power mode, clock caps, model size, quantization, or engines.
@@ -68,6 +73,7 @@
 #   EDGE_VLM_LLM_ENGINE_DIR        path to LLM engine directory
 #   EDGE_VLM_MULTIMODAL_ENGINE_DIR path to multimodal engine directory
 #   EDGE_VLM_MODEL_NAME            model identifier string (for metadata)
+#   EDGE_VLM_WORKER_SOCKET         IPC socket for edge_vlm_server (default: /tmp/edge_vlm.sock)
 #
 # Usage
 # -----
@@ -88,6 +94,9 @@
 #                            (default: /tmp/vlm_multiframe_bench_TIMESTAMP)
 #   --warmup N               Warmup iterations per condition (default: 1)
 #   --iterations N           Measured iterations per condition (default: 3)
+#   --paths LIST             Comma-separated paths: direct,ipc (default: direct,ipc)
+#   --skip-ipc               Alias for --paths direct
+#   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
 
 set -euo pipefail
@@ -102,6 +111,7 @@ WARMUP=1
 ITERATIONS=3
 SEQUENCE_DIR=""
 DRY_RUN=false
+PATHS="direct,ipc"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -116,6 +126,9 @@ while [[ $# -gt 0 ]]; do
         --output-dir)       OUTPUT_DIR="$2";           shift 2 ;;
         --warmup)           WARMUP="$2";               shift 2 ;;
         --iterations)       ITERATIONS="$2";           shift 2 ;;
+        --paths)            PATHS="$2";                shift 2 ;;
+        --skip-ipc)         PATHS="direct";            shift ;;
+        --skip-direct)      PATHS="ipc";               shift ;;
         --dry-run)          DRY_RUN=true;              shift ;;
         *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
     esac
@@ -454,6 +467,54 @@ print(json.dumps(out))
 PYEOF
 }
 
+# ── IPC path invocation (persistent edge_vlm_server) ─────────────────────────
+
+_run_ipc_inference() {
+    # Send all selected frames in a single multi-image IPC request to the
+    # already-running edge_vlm_server via vlm_multi_frame_client.
+    # Accepts: frame_condition frame_count phase iter_idx result_json_path frames...
+    local frame_condition="$1"
+    local frame_count="$2"
+    local phase="$3"
+    local iter_idx="$4"
+    local result_json_path="$5"
+    shift 5
+    local frames=("$@")
+
+    # The ipc path invokes vlm_multi_frame_client via `ros2 run` because the
+    # script is installed into the ROS lib directory (lib/edge_vlm_ros/).
+    # `ros2` is required only to locate and launch the installed script;
+    # vlm_multi_frame_client itself does not depend on ROS at runtime — it
+    # communicates with edge_vlm_server directly via edge_vlm_cli using a
+    # single kSchemaFlagMultiImage IPC request carrying all frames together.
+    # A running edge_vlm_server on EDGE_VLM_WORKER_SOCKET is also required.
+    if ! command -v ros2 &>/dev/null; then
+        echo "WARNING: ros2 not available — ipc path (vlm_multi_frame_client) skipped for ${frame_condition} ${phase}_iter_${iter_idx}" >&2
+        echo "skipped_no_ros2"
+        return 0
+    fi
+
+    local exit_code=0
+    # Build --image arguments for each selected frame.
+    local image_args=()
+    local img
+    for img in "${frames[@]}"; do
+        image_args+=(--image "${img}")
+    done
+
+    _run ros2 run edge_vlm_ros vlm_multi_frame_client \
+        --socket "${EDGE_VLM_WORKER_SOCKET:-/tmp/edge_vlm.sock}" \
+        "${image_args[@]}" \
+        --prompt "${PROMPT_TEXT}" \
+        --max-tokens "${MAX_OUTPUT_TOKENS}" \
+        --output "${result_json_path}" \
+        --timeout 120 \
+        2>"/tmp/vlm_multiframe_ipc_stderr_${TIMESTAMP}_${frame_condition}_${phase}_${iter_idx}.log" \
+        || exit_code=$?
+
+    echo "${exit_code}"
+}
+
 # ── inference loop ────────────────────────────────────────────────────────────
 
 _run_condition() {
@@ -461,12 +522,12 @@ _run_condition() {
     local frame_count="$2"
 
     echo ""
-    echo "=== Condition ${frame_condition} | path=direct | frames=${frame_count} ==="
+    echo "=== Condition ${frame_condition} | frames=${frame_count} | paths=${PATHS} ==="
 
     _select_frames "${frame_count}"
     local frames=("${SELECTED_FRAMES[@]}")
 
-    echo "[${frame_condition}/direct] Selected frames (temporal order):"
+    echo "[${frame_condition}] Selected frames (temporal order):"
     for img in "${frames[@]}"; do
         echo "  ${img}"
     done
@@ -484,27 +545,29 @@ _run_condition() {
     local prompt_hash_val
     prompt_hash_val=$(_sha256_string "${PROMPT_TEXT}")
 
-    local total_iters=$(( WARMUP + ITERATIONS ))
-    for (( iter=0; iter<total_iters; iter++ )); do
-        local is_warmup=false
-        local phase="measured"
-        local iter_idx
-        if [[ ${iter} -lt ${WARMUP} ]]; then
-            is_warmup=true
-            phase="warmup"
-            iter_idx=${iter}
-            echo "[${frame_condition}/direct] warmup ${iter_idx}"
-        else
-            iter_idx=$(( iter - WARMUP ))
-            echo "[${frame_condition}/direct] iteration ${iter_idx}"
-        fi
+    # ── direct path ────────────────────────────────────────────────────────────
+    if [[ ",${PATHS}," == *",direct,"* ]]; then
+        local total_iters=$(( WARMUP + ITERATIONS ))
+        for (( iter=0; iter<total_iters; iter++ )); do
+            local is_warmup=false
+            local phase="measured"
+            local iter_idx
+            if [[ ${iter} -lt ${WARMUP} ]]; then
+                is_warmup=true
+                phase="warmup"
+                iter_idx=${iter}
+                echo "[${frame_condition}/direct] warmup ${iter_idx}"
+            else
+                iter_idx=$(( iter - WARMUP ))
+                echo "[${frame_condition}/direct] iteration ${iter_idx}"
+            fi
 
-        # Use phase in artifact path to prevent warmup/measured collisions.
-        local artifact_dir="${OUTPUT_DIR}/artifacts/${frame_condition}/direct/${phase}_iter_${iter_idx}"
-        _run mkdir -p "${artifact_dir}"
+            # Use phase in artifact path to prevent warmup/measured collisions.
+            local artifact_dir="${OUTPUT_DIR}/artifacts/${frame_condition}/direct/${phase}_iter_${iter_idx}"
+            _run mkdir -p "${artifact_dir}"
 
-        local request_json_path="${artifact_dir}/request.json"
-        local recorded_at
+            local request_json_path="${artifact_dir}/request.json"
+            local recorded_at
         recorded_at=$(_now_iso)
 
         # Build request JSON (Thor-validated shape, no max_output_tokens in payload)
@@ -586,7 +649,123 @@ print(json.dumps({
     'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
 }))")
         _write_record "${record}"
-    done
+        done
+    fi
+
+    # ── ipc path ───────────────────────────────────────────────────────────────
+    if [[ ",${PATHS}," == *",ipc,"* ]]; then
+        local total_iters=$(( WARMUP + ITERATIONS ))
+        for (( iter=0; iter<total_iters; iter++ )); do
+            local is_warmup=false
+            local phase="measured"
+            local iter_idx
+            if [[ ${iter} -lt ${WARMUP} ]]; then
+                is_warmup=true
+                phase="warmup"
+                iter_idx=${iter}
+                echo "[${frame_condition}/ipc] warmup ${iter_idx}"
+            else
+                iter_idx=$(( iter - WARMUP ))
+                echo "[${frame_condition}/ipc] iteration ${iter_idx}"
+            fi
+
+            # Use phase in artifact path to prevent warmup/measured collisions.
+            local ipc_artifact_dir="${OUTPUT_DIR}/artifacts/${frame_condition}/ipc/${phase}_iter_${iter_idx}"
+            _run mkdir -p "${ipc_artifact_dir}"
+
+            local result_json_path="${ipc_artifact_dir}/ipc_result.json"
+            local ipc_recorded_at
+            ipc_recorded_at=$(_now_iso)
+
+            local t_start t_end total_latency_ms
+            t_start=$(date +%s%3N)
+
+            local ipc_exit_code
+            if [[ "${DRY_RUN}" != "true" ]]; then
+                ipc_exit_code=$(_run_ipc_inference \
+                    "${frame_condition}" "${frame_count}" "${phase}" "${iter_idx}" \
+                    "${result_json_path}" "${frames[@]}")
+            else
+                ipc_exit_code=0
+                _run echo "[dry-run] vlm_multi_frame_client ${frame_condition} ${phase}_iter_${iter_idx}"
+            fi
+
+            t_end=$(date +%s%3N)
+            total_latency_ms=$(( t_end - t_start ))
+
+            local ipc_success=true
+            local ipc_error_msg="null"
+            if [[ "${ipc_exit_code}" == "skipped_no_ros2" ]]; then
+                ipc_success=false
+                ipc_error_msg='"ros2 not available — ipc path (vlm_multi_frame_client) skipped"'
+                total_latency_ms=0
+            elif [[ "${ipc_exit_code}" != "0" ]]; then
+                ipc_success=false
+                ipc_error_msg="\"ipc client exited with code ${ipc_exit_code}\""
+            fi
+
+            # Parse IPC result artifact.
+            local ipc_output_text="null"
+            local ipc_output_words="null"
+            local ipc_inference_seconds="null"
+            local ipc_actual_latency_ms
+            if [[ "${ipc_success}" == "true" && "${DRY_RUN}" != "true" && -f "${result_json_path}" ]]; then
+                ipc_output_text=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r.get('output_text')))" "${result_json_path}" 2>/dev/null || echo "null")
+                ipc_output_words=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps(r.get('output_words')))" "${result_json_path}" 2>/dev/null || echo "null")
+                ipc_inference_seconds=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); v=r.get('inference_seconds'); print(json.dumps(float(v) if v is not None else None))" "${result_json_path}" 2>/dev/null || echo "null")
+                # Prefer client_latency_ms from result artifact over our shell measurement.
+                ipc_actual_latency_ms=$(python3 -c "import json,sys; r=json.load(open(sys.argv[1])); v=r.get('client_latency_ms'); print(v if v is not None else ${total_latency_ms})" "${result_json_path}" 2>/dev/null || echo "${total_latency_ms}")
+            else
+                ipc_actual_latency_ms="${total_latency_ms}"
+            fi
+
+            local ipc_result_path_json
+            if [[ "${ipc_success}" == "true" && -f "${result_json_path}" ]]; then
+                ipc_result_path_json="\"${result_json_path}\""
+            else
+                ipc_result_path_json="null"
+            fi
+
+            local ipc_record
+            ipc_record=$(python3 -c "
+import json
+print(json.dumps({
+    'schema_version': '1',
+    'record_type': 'inference',
+    'run_id': '${TIMESTAMP}',
+    'recorded_at': '${ipc_recorded_at}',
+    'frame_condition': '${frame_condition}',
+    'frame_count': ${frame_count},
+    'path': 'ipc',
+    'frame_paths': ${frame_hashes_json},
+    'prompt_hash': '${prompt_hash_val}',
+    'max_output_tokens': ${MAX_OUTPUT_TOKENS},
+    'actual_output_tokens': None,
+    'total_image_tokens': None,
+    'finish_reason': None,
+    'success': $([ '${ipc_success}' = 'true' ] && echo 'true' || echo 'false'),
+    'error': ${ipc_error_msg},
+    'cold_start_total_ms': None,
+    'total_latency_ms': $([ '${ipc_success}' = 'true' ] && echo '${ipc_actual_latency_ms}' || echo 'null'),
+    'ttft_ms': None,
+    'vision_encoder_ms': None,
+    'prefill_ms': None,
+    'decode_ms': None,
+    'decode_tokens_per_sec': None,
+    'llm_generation_total_gpu_time_ms': None,
+    'inference_seconds': ${ipc_inference_seconds},
+    'output_text': ${ipc_output_text},
+    'output_words': ${ipc_output_words},
+    'native_response_path': None,
+    'native_profile_path': None,
+    'ipc_result_path': ${ipc_result_path_json},
+    'model_name': '${EDGE_VLM_MODEL_NAME:-unknown}',
+    'iteration': ${iter_idx},
+    'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
+}))")
+            _write_record "${ipc_record}"
+        done
+    fi
 }
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -597,7 +776,7 @@ echo "  Timestamp: ${TIMESTAMP}"
 echo "  Sequence dir: ${SEQUENCE_DIR}"
 echo "  Frame counts: ${FRAME_COUNTS}"
 echo "  Max output tokens: ${MAX_OUTPUT_TOKENS}"
-echo "  Path: direct (IPC requires a multi-image client — not yet available)"
+echo "  Paths: ${PATHS}"
 echo "  Warmup: ${WARMUP}  Iterations: ${ITERATIONS}"
 echo "  Output dir: ${OUTPUT_DIR}"
 echo "================================================================"
@@ -625,7 +804,7 @@ fi
 
 echo "[setup] Frame validation passed: ${#SEQUENCE_FRAMES[@]} >= ${MAX_NEEDED} frames needed"
 
-# Run all conditions (direct path only)
+# Run all conditions
 for fc in "${_FRAME_COUNTS[@]}"; do
     local_fc_label="F${fc}"
     _run_condition "${local_fc_label}" "${fc}"
@@ -649,3 +828,4 @@ echo "  JSON:   ${REPORT_JSON}"
 echo "  Text:   ${REPORT_TXT}"
 echo ""
 echo "Done."
+

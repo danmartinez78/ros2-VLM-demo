@@ -1120,21 +1120,22 @@ class TestShellSyntax(unittest.TestCase):
         # Just check the file can be read — executable bit is set separately
         self.assertTrue(script.is_file())
 
-    def test_script_has_no_ipc_client_invocation(self):
-        """Runner must not functionally invoke IPC client binaries for multi-frame
-        (multi-image IPC client does not yet exist). References in comments are OK."""
+    def test_script_has_ipc_client_invocation(self):
+        """Runner must functionally invoke vlm_multi_frame_client for the IPC path."""
         script = _BENCH_DIR / "run_vlm_multiframe_benchmark.sh"
         if not script.exists():
             self.skipTest(f"Script not found: {script}")
         content = script.read_text(encoding="utf-8")
-        # _run_ipc_inference function must have been removed
-        self.assertNotIn("_run_ipc_inference", content)
-        # No IPC client invocation via command -v or direct execution
-        # (presence in a comment explaining why IPC is unsupported is acceptable;
-        #  check that none of the invocation patterns appear)
-        self.assertNotIn("command -v vlm_single_shot_client", content)
-        self.assertNotIn("command -v edge_vlm_cli", content)
-        self.assertNotIn('--socket "${socket}"', content)
+        # _run_ipc_inference function must be present
+        self.assertIn("_run_ipc_inference", content)
+        # vlm_multi_frame_client must be invoked (not vlm_single_shot_client which is single-image)
+        self.assertIn("vlm_multi_frame_client", content)
+        # Must use --socket for IPC socket path
+        self.assertIn("--socket", content)
+        # Must pass multiple --image arguments for multi-frame support
+        self.assertIn("--image", content)
+        # Must NOT use vlm_single_shot_client (single-image only)
+        self.assertNotIn("vlm_single_shot_client", content)
 
     def test_script_uses_camelcase_cli_flags(self):
         """Runner must use camelCase llm_inference flags (Thor-validated contract)."""

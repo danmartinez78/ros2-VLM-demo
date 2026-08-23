@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+# Copyright 2025 edge_vlm_ros contributors
+#
+# vlm_multi_frame_client — multi-frame VLM inference client for benchmarking.
+#
+# Invokes edge_vlm_cli (the repo's IPC-based CLI, installed alongside this
+# script) to run one multi-image inference against a running edge_vlm_server
+# and writes a structured JSON result artifact.  Suitable for automated
+# multi-frame latency characterisation via the VLM multi-frame benchmark runner.
+#
+# The script is installed into lib/edge_vlm_ros/ so it is available as:
+#   ros2 run edge_vlm_ros vlm_multi_frame_client ...
+#
+# Usage:
+#   vlm_multi_frame_client \
+#       --socket PATH           # IPC socket of edge_vlm_server (default: /tmp/edge_vlm.sock)
+#       --image  PATH           # input image (JPEG/PNG); repeat for multiple frames
+#       --prompt TEXT           # prompt string
+#       --max-tokens N          # maximum output tokens (passed as --max-generate-length)
+#       --output PATH           # where to write the JSON result artifact
+#       [--timeout N]           # seconds before the call is aborted (default: 120)
+#
+# Multiple images are passed to edge_vlm_cli as repeated --image arguments in
+# temporal order.  edge_vlm_cli packs all images into a single kSchemaFlagMultiImage
+# IPC request so the running edge_vlm_server receives them together.
+#
+# JSON result artifact fields:
+#   success            bool     — true if edge_vlm_cli exited 0
+#   error              str|null — error description when success is false
+#   output_text        str|null — inference response text (stdout of edge_vlm_cli)
+#   output_tokens      int|null — actual output token count from the backend if available; null otherwise
+#   output_words       int|null — whitespace-delimited word count of output_text (not a token count)
+#   inference_seconds  float|null — wall time reported by edge_vlm_cli on stderr
+#   client_latency_ms  int      — end-to-end wall time measured by this script
+#   frame_count        int      — number of image frames submitted
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def _find_edge_vlm_cli() -> str:
+    """Return the path to edge_vlm_cli installed alongside this script.
+
+    Mirrors the discovery logic in vlm_single_shot_client so both scripts
+    work correctly under ``colcon build --symlink-install`` and plain
+    ``colcon build``.
+    """
+    # 1. Prefer the directory of the invocation path (install dir for ros2 run).
+    invocation_dir = Path(os.path.abspath(sys.argv[0])).parent
+    candidate = invocation_dir / "edge_vlm_cli"
+    if candidate.is_file() and os.access(str(candidate), os.X_OK):
+        return str(candidate)
+
+    # 2. Fall back to PATH-based search.
+    found = shutil.which("edge_vlm_cli")
+    if found:
+        return found
+
+    raise RuntimeError(
+        f"edge_vlm_cli not found alongside {sys.argv[0]} or on PATH. "
+        "Ensure edge_vlm_ros is built and installed (colcon build)."
+    )
+
+
+def _parse_inference_seconds(stderr: str) -> float | None:
+    """Extract the 'Inference time: X seconds' value from edge_vlm_cli stderr."""
+    for line in stderr.splitlines():
+        if line.startswith("Inference time:"):
+            try:
+                return float(line.split(":")[1].strip().split()[0])
+            except (IndexError, ValueError):
+                pass
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Multi-frame VLM inference client.  Requires edge_vlm_server to be "
+            "running and reachable on the specified IPC socket.  Passes all images "
+            "in a single multi-frame IPC request via edge_vlm_cli."
+        ),
+    )
+    parser.add_argument(
+        "--socket",
+        default="/tmp/edge_vlm.sock",
+        help="Path to edge_vlm_server IPC socket (default: /tmp/edge_vlm.sock)",
+    )
+    parser.add_argument(
+        "--image",
+        dest="images",
+        action="append",
+        required=True,
+        metavar="PATH",
+        help="Path to an input image; repeat for multiple frames in temporal order",
+    )
+    parser.add_argument("--prompt", required=True, help="Prompt text for the VLM")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        required=True,
+        metavar="N",
+        help="Maximum output token budget (forwarded as --max-generate-length)",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="File path where the JSON result artifact will be written",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=120,
+        metavar="N",
+        help="Abort after N seconds (default: 120)",
+    )
+    args = parser.parse_args()
+
+    try:
+        cli = _find_edge_vlm_cli()
+    except RuntimeError as exc:
+        print(f"vlm_multi_frame_client: {exc}", file=sys.stderr)
+        return 2
+
+    # Build command: one --image per frame so edge_vlm_cli sends a single
+    # kSchemaFlagMultiImage IPC request carrying all frames together.
+    cmd = [
+        cli,
+        "--socket", args.socket,
+    ]
+    for img_path in args.images:
+        cmd += ["--image", img_path]
+    cmd += [
+        "--prompt", args.prompt,
+        "--max-generate-length", str(args.max_tokens),
+    ]
+
+    t_start = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=args.timeout,
+        )
+    except subprocess.TimeoutExpired:
+        elapsed_ms = round((time.monotonic() - t_start) * 1000.0)
+        result: dict = {
+            "success": False,
+            "error": f"timeout after {args.timeout}s",
+            "output_text": None,
+            "output_tokens": None,
+            "output_words": None,
+            "inference_seconds": None,
+            "client_latency_ms": elapsed_ms,
+            "frame_count": len(args.images),
+        }
+        Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        print(
+            f"vlm_multi_frame_client: timed out after {args.timeout}s",
+            file=sys.stderr,
+        )
+        return 1
+
+    elapsed_ms = round((time.monotonic() - t_start) * 1000.0)
+    success = proc.returncode == 0
+    output_text: str | None = proc.stdout.strip() if success else None
+    # output_tokens: real token count from backend when available; null otherwise.
+    # edge_vlm_cli does not currently expose a token count, so this is always null.
+    output_tokens: int | None = None
+    # output_words: whitespace-delimited word count — stored separately, not as token count.
+    output_words: int | None = len(output_text.split()) if output_text else None
+    inference_seconds = _parse_inference_seconds(proc.stderr)
+
+    error_msg: str | None
+    if success:
+        error_msg = None
+    else:
+        stderr_snippet = proc.stderr.strip()[:200]
+        error_msg = f"edge_vlm_cli exited {proc.returncode}: {stderr_snippet}"
+
+    result = {
+        "success": success,
+        "error": error_msg,
+        "output_text": output_text,
+        "output_tokens": output_tokens,
+        "output_words": output_words,
+        "inference_seconds": inference_seconds,
+        "client_latency_ms": elapsed_ms,
+        "frame_count": len(args.images),
+    }
+    Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

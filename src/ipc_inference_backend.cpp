@@ -92,13 +92,32 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   if (request.image.empty() || request.image.type() != CV_8UC3) {
     throw std::runtime_error("IPC backend requires a non-empty CV_8UC3 BGR image");
   }
+  if (request.extra_images.size() > ipc::kMaxExtraImages) {
+    throw std::runtime_error("IPC request exceeds maximum extra image count");
+  }
 
-  cv::Mat packed = request.image.isContinuous() ? request.image : request.image.clone();
-  const size_t image_size = packed.total() * packed.elemSize();
   const size_t max_image_bytes = std::min(
     config_.max_image_bytes, static_cast<size_t>(ipc::kMaxImageBytes));
   const size_t max_text_bytes = std::min(
     config_.max_text_bytes, static_cast<size_t>(ipc::kMaxTextBytes));
+
+  // Pack primary image.
+  cv::Mat packed = request.image.isContinuous() ? request.image : request.image.clone();
+  const size_t image_size = packed.total() * packed.elemSize();
+
+  // Pack extra images and validate.
+  std::vector<cv::Mat> packed_extra;
+  packed_extra.reserve(request.extra_images.size());
+  for (const auto & img : request.extra_images) {
+    if (img.empty() || img.type() != CV_8UC3) {
+      throw std::runtime_error("IPC backend: all extra images must be non-empty CV_8UC3 BGR");
+    }
+    packed_extra.push_back(img.isContinuous() ? img : img.clone());
+    const size_t sz = packed_extra.back().total() * packed_extra.back().elemSize();
+    if (sz > max_image_bytes) {
+      throw std::runtime_error("IPC request exceeds protocol limits");
+    }
+  }
 
   if (image_size > max_image_bytes) {
     throw std::runtime_error("IPC request exceeds protocol limits");
@@ -121,12 +140,16 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   // Determine schema flags based on request content.
   // Structured mode is used whenever a system message or history is present.
   const bool has_structured = !request.system_message.empty() || !request.history.empty();
+  const bool has_extra = !packed_extra.empty();
   uint32_t schema_flags = ipc::kSchemaFlagInline;
   if (has_structured) {
     schema_flags |= ipc::kSchemaFlagStructured;
     if (request.use_system_prompt_cache && !request.system_message.empty()) {
       schema_flags |= ipc::kSchemaFlagSysCache;
     }
+  }
+  if (has_extra) {
+    schema_flags |= ipc::kSchemaFlagMultiImage;
   }
 
   ipc::RequestHeader header;
@@ -143,11 +166,28 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   header.schema_flags = schema_flags;
   header.system_bytes = static_cast<uint32_t>(request.system_message.size());
   header.history_count = static_cast<uint32_t>(request.history.size());
+  header.image_count = has_extra ? static_cast<uint32_t>(1 + packed_extra.size()) : 0U;
 
   ipc::ResponseHeader response_header;
   try {
     ipc::write_all(socket_fd_, &header, sizeof(header));
+    // Multi-image: send PerImageHeaders for extra images, then all image data.
+    if (has_extra) {
+      for (const auto & ei : packed_extra) {
+        ipc::PerImageHeader pih;
+        pih.width = static_cast<uint32_t>(ei.cols);
+        pih.height = static_cast<uint32_t>(ei.rows);
+        pih.step = static_cast<uint32_t>(ei.cols * 3);
+        pih.image_bytes = static_cast<uint32_t>(ei.total() * ei.elemSize());
+        ipc::write_all(socket_fd_, &pih, sizeof(pih));
+      }
+    }
     ipc::write_all(socket_fd_, packed.data, image_size);
+    if (has_extra) {
+      for (const auto & ei : packed_extra) {
+        ipc::write_all(socket_fd_, ei.data, ei.total() * ei.elemSize());
+      }
+    }
     if (has_structured && !request.system_message.empty()) {
       ipc::write_all(socket_fd_, request.system_message.data(), request.system_message.size());
     }

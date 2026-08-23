@@ -38,6 +38,10 @@ struct HistoryEntry
 struct InferenceRequest
 {
   cv::Mat image;            //!< BGR image (OpenCV convention; backend converts as needed)
+  /// Additional images in temporal order (index 0 = first extra, after `image`).
+  /// When non-empty, the IPC backend sends a kSchemaFlagMultiImage request carrying
+  /// `image` + `extra_images` as a single multi-frame inference call.
+  std::vector<cv::Mat> extra_images;
   std::string prompt;       //!< User-message text (task prompt or full inline prompt)
   int max_generate_length;  //!< Maximum number of tokens to generate
   float temperature;        //!< Sampling temperature

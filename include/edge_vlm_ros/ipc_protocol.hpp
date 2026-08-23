@@ -35,6 +35,15 @@ constexpr uint32_t kMaxHistoryEntries = 256;
 constexpr uint32_t kSchemaFlagInline = 0U;
 constexpr uint32_t kSchemaFlagStructured = 1U << 0;
 constexpr uint32_t kSchemaFlagSysCache = 1U << 1;
+/// kSchemaFlagMultiImage: request carries multiple images in temporal order.
+/// When set, RequestHeader._reserved holds the total image count (>= 2).
+/// Wire format after RequestHeader:
+///   [image_count-1 × PerImageHeader]          — headers for extra images (index 1..N-1)
+///   [image_0_bytes]                            — raw BGR data for image 0 (primary)
+///   [image_1_bytes .. image_{N-1}_bytes]       — raw BGR data for extra images
+///   [system_bytes][prompt_bytes][history ...]  — normal structured/inline payload
+constexpr uint32_t kSchemaFlagMultiImage = 1U << 2;
+constexpr uint32_t kMaxExtraImages = 31U;  ///< Maximum extra images beyond the primary.
 
 struct RequestHeader
 {
@@ -58,7 +67,9 @@ struct RequestHeader
   uint32_t system_bytes{0};
   /// Number of prior (user, assistant) history turns that follow the prompt payload.
   uint32_t history_count{0};
-  uint32_t _reserved{0};
+  /// Single-image requests: 0 (reserved).
+  /// Multi-image requests (kSchemaFlagMultiImage set): total image count including primary (>= 2).
+  uint32_t image_count{0};
 };
 
 /// Fixed-size header preceding each history entry in the v2 wire format.
@@ -68,6 +79,18 @@ struct HistoryEntryHeader
   uint32_t user_bytes{0};
   uint32_t asst_bytes{0};
 };
+
+/// Per-image header used only when kSchemaFlagMultiImage is set.
+/// One PerImageHeader precedes each extra image (images 1..N-1).
+/// The primary image (index 0) is described by RequestHeader.width/height/step/image_bytes.
+struct PerImageHeader
+{
+  uint32_t width{0};
+  uint32_t height{0};
+  uint32_t step{0};
+  uint32_t image_bytes{0};
+};
+static_assert(std::is_trivially_copyable_v<PerImageHeader>);
 
 struct ResponseHeader
 {
