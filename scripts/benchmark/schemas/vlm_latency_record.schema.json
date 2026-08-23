@@ -130,6 +130,10 @@
       "type": ["number", "null"],
       "description": "Prefill (prompt processing) average time per run in milliseconds, from the NVIDIA-emitted profile JSON (prefill.average_time_per_run_ms). Null if not exposed by the runtime. Never inferred."
     },
+    "ttft_ms": {
+      "type": ["number", "null"],
+      "description": "Time-to-first-token in milliseconds. Null — the pinned TensorRT Edge-LLM runtime profile does not expose TTFT directly. `prefill_ms` is the closest available proxy but is a distinct metric; the two fields are never conflated."
+    },
     "decode_ms": {
       "type": ["number", "null"],
       "description": "Autoregressive generation total time in milliseconds, from the NVIDIA-emitted profile JSON (generation.total_time_ms). Null if not exposed by the runtime."

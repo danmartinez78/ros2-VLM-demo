@@ -38,6 +38,7 @@ from vlm_latency_report import (  # noqa: E402
     build_report,
     compute_cold_start_scaling,
     compute_direct_ipc_comparison,
+    compute_native_profile_table,
     compute_token_scaling,
     format_text_report,
     parse_jsonl,
@@ -66,6 +67,7 @@ def _make_record(
     error: str | None = None,
     cold_start_total_ms: float | None = None,
     total_latency_ms: float | None = 500.0,
+    ttft_ms: float | None = None,
     vision_encoder_ms: float | None = None,
     prefill_ms: float | None = None,
     decode_ms: float | None = None,
@@ -104,6 +106,7 @@ def _make_record(
         "error": error,
         "cold_start_total_ms": cold_start_total_ms,
         "total_latency_ms": total_latency_ms,
+        "ttft_ms": ttft_ms,
         "vision_encoder_ms": vision_encoder_ms,
         "prefill_ms": prefill_ms,
         "decode_ms": decode_ms,
@@ -1825,6 +1828,233 @@ class TestIpcArtifactFieldPreservation(unittest.TestCase):
         props = schema.get("properties", {})
         self.assertIn("ipc_result_path", props)
         self.assertIn("null", props["ipc_result_path"]["type"])
+
+
+# ── ttft_ms field tests ───────────────────────────────────────────────────────
+
+
+class TestTtftMsField(unittest.TestCase):
+    """ttft_ms must be retained as a nullable field distinct from prefill_ms."""
+
+    def test_schema_defines_ttft_ms_as_nullable(self):
+        schema_path = _BENCH_DIR / "schemas" / "vlm_latency_record.schema.json"
+        with schema_path.open("r", encoding="utf-8") as fh:
+            schema = json.load(fh)
+        props = schema.get("properties", {})
+        self.assertIn("ttft_ms", props, "ttft_ms must be present in schema")
+        self.assertIn("null", props["ttft_ms"]["type"], "ttft_ms must allow null")
+
+    def test_ttft_ms_and_prefill_ms_are_separate_schema_fields(self):
+        schema_path = _BENCH_DIR / "schemas" / "vlm_latency_record.schema.json"
+        with schema_path.open("r", encoding="utf-8") as fh:
+            schema = json.load(fh)
+        props = schema.get("properties", {})
+        self.assertIn("ttft_ms", props)
+        self.assertIn("prefill_ms", props)
+        # They must be separate entries — not aliased to the same definition.
+        self.assertIsNot(props["ttft_ms"], props["prefill_ms"])
+
+    def test_shell_script_writes_ttft_ms_null_in_direct_record(self):
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("'ttft_ms': None", text,
+                      "run_vlm_latency_benchmark.sh must emit ttft_ms: None in direct records")
+
+    def test_shell_script_writes_ttft_ms_null_in_ipc_record(self):
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        # Must appear in at least two record templates (direct + ipc).
+        occurrences = text.count("'ttft_ms': None")
+        self.assertGreaterEqual(occurrences, 2,
+                                "ttft_ms: None must appear in both direct and IPC record templates")
+
+    def test_make_record_has_ttft_ms_field(self):
+        rec = _make_record()
+        self.assertIn("ttft_ms", rec)
+        self.assertIsNone(rec["ttft_ms"])
+
+    def test_ttft_ms_not_equated_to_prefill_ms_in_script(self):
+        """Script must not assign prefill_ms value to ttft_ms."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertNotIn("'ttft_ms': prefill_ms", text)
+        self.assertNotIn("ttft_ms = prefill_ms", text)
+
+
+# ── native profile table tests ────────────────────────────────────────────────
+
+
+class TestComputeNativeProfileTable(unittest.TestCase):
+    def _direct_records(self):
+        return [
+            _make_record(
+                condition="A", path="direct", image_id="image_001",
+                total_latency_ms=None, cold_start_total_ms=400.0,
+                actual_output_tokens=16,
+                vision_encoder_ms=50.4, prefill_ms=35.7,
+                decode_tokens_per_sec=48.1, llm_generation_total_gpu_time_ms=None,
+                finish_reason="max-length", iteration=0,
+            ),
+            _make_record(
+                condition="E", path="direct", image_id="image_001",
+                total_latency_ms=None, cold_start_total_ms=5500.0,
+                actual_output_tokens=238,
+                vision_encoder_ms=38.5, prefill_ms=36.9,
+                decode_tokens_per_sec=45.5, llm_generation_total_gpu_time_ms=5231.9,
+                finish_reason="end-of-sequence", iteration=0,
+            ),
+            _make_record(
+                condition="A", path="ipc", image_id="image_001",
+                total_latency_ms=730.0, actual_output_tokens=None,
+            ),
+        ]
+
+    def test_table_contains_only_direct_rows(self):
+        records = self._direct_records()
+        by_cp = {}
+        for r in records:
+            by_cp.setdefault((r["condition"], r["path"]), []).append(r)
+        table = compute_native_profile_table(by_cp)
+        direct_conditions = {r["condition"] for r in records if r["path"] == "direct" and not r.get("warmup")}
+        for row in table:
+            self.assertIn(row["condition"], direct_conditions)
+        # All returned rows must originate from direct records.
+        direct_records = [r for r in records if r["path"] == "direct" and not r.get("warmup")]
+        self.assertEqual(len(table), len(direct_records))
+
+    def test_table_row_has_required_fields(self):
+        records = self._direct_records()
+        by_cp = {}
+        for r in records:
+            by_cp.setdefault((r["condition"], r["path"]), []).append(r)
+        table = compute_native_profile_table(by_cp)
+        self.assertTrue(len(table) > 0)
+        for field in ("condition", "image_id", "actual_output_tokens",
+                      "vision_encoder_ms", "prefill_ms",
+                      "decode_tokens_per_sec", "llm_generation_total_gpu_time_ms",
+                      "finish_reason"):
+            self.assertIn(field, table[0], f"Field {field!r} missing from native_profile_table row")
+
+    def test_table_values_match_source_records(self):
+        records = self._direct_records()
+        by_cp = {}
+        for r in records:
+            by_cp.setdefault((r["condition"], r["path"]), []).append(r)
+        table = compute_native_profile_table(by_cp)
+        row_a = next(r for r in table if r["condition"] == "A")
+        self.assertAlmostEqual(row_a["vision_encoder_ms"], 50.4, places=1)
+        self.assertAlmostEqual(row_a["prefill_ms"], 35.7, places=1)
+        self.assertEqual(row_a["finish_reason"], "max-length")
+        row_e = next(r for r in table if r["condition"] == "E")
+        self.assertAlmostEqual(row_e["llm_generation_total_gpu_time_ms"], 5231.9, places=0)
+        self.assertEqual(row_e["finish_reason"], "end-of-sequence")
+
+    def test_null_gpu_ms_is_preserved_not_fabricated(self):
+        records = [_make_record(
+            condition="A", path="direct",
+            total_latency_ms=None, cold_start_total_ms=400.0,
+            llm_generation_total_gpu_time_ms=None,
+        )]
+        by_cp = {("A", "direct"): records}
+        table = compute_native_profile_table(by_cp)
+        self.assertIsNone(table[0]["llm_generation_total_gpu_time_ms"])
+
+    def test_warmup_records_excluded_from_table(self):
+        records = [
+            _make_record(condition="A", path="direct", warmup=True,
+                         total_latency_ms=None, cold_start_total_ms=500.0),
+            _make_record(condition="A", path="direct", warmup=False,
+                         total_latency_ms=None, cold_start_total_ms=400.0),
+        ]
+        by_cp = {("A", "direct"): records}
+        table = compute_native_profile_table(by_cp)
+        self.assertEqual(len(table), 1)
+
+    def test_failed_records_excluded_from_table(self):
+        records = [
+            _make_record(condition="A", path="direct", success=False,
+                         total_latency_ms=None, cold_start_total_ms=None),
+            _make_record(condition="A", path="direct", success=True,
+                         total_latency_ms=None, cold_start_total_ms=400.0),
+        ]
+        by_cp = {("A", "direct"): records}
+        table = compute_native_profile_table(by_cp)
+        self.assertEqual(len(table), 1)
+
+    def test_native_profile_table_in_build_report(self):
+        records = [
+            _make_record(condition="A", path="direct",
+                         total_latency_ms=None, cold_start_total_ms=400.0),
+        ]
+        report = build_report(records)
+        self.assertIn("native_profile_table", report)
+        self.assertIsInstance(report["native_profile_table"], list)
+
+    def test_text_report_contains_native_profile_section(self):
+        records = [
+            _make_record(condition="A", path="direct",
+                         total_latency_ms=None, cold_start_total_ms=400.0,
+                         vision_encoder_ms=50.4, prefill_ms=35.7,
+                         decode_tokens_per_sec=48.1, finish_reason="max-length"),
+        ]
+        text = format_text_report(build_report(records))
+        self.assertIn("Native NVIDIA Profile Detail", text)
+        self.assertIn("max-length", text)
+
+
+# ── stage-availability scoped by path ────────────────────────────────────────
+
+
+class TestStageAvailabilityScopedByPath(unittest.TestCase):
+    """Stage timing availability must be reported per-path, not globally."""
+
+    def _mixed_records(self):
+        """direct has stage timings; ipc does not."""
+        return [
+            _make_record(condition="A", path="direct",
+                         total_latency_ms=None, cold_start_total_ms=400.0,
+                         prefill_ms=35.7, decode_ms=330.0, vision_encoder_ms=50.4),
+            _make_record(condition="A", path="ipc",
+                         total_latency_ms=730.0,
+                         prefill_ms=None, decode_ms=None, vision_encoder_ms=None),
+        ]
+
+    def test_ipc_unavailable_does_not_produce_global_unavailable(self):
+        """When direct has profile metrics and ipc does not, the report must
+        not claim the NVIDIA profile metrics are globally/unscoped unavailable,
+        and must not claim that the direct path lacks metrics it actually has."""
+        text = format_text_report(build_report(self._mixed_records()))
+        # Old behavior: a global line with no path label.  The new format
+        # includes the path label, e.g. "  ipc: prefill time: NOT available …".
+        # Assert that the report does NOT claim the direct path is missing
+        # prefill/decode/vision metrics it clearly has.
+        self.assertNotIn("direct: prefill time: NOT available", text)
+        self.assertNotIn("direct: decode time: NOT available", text)
+        self.assertNotIn("direct: vision encoder time: NOT available", text)
+
+    def test_availability_section_labels_path(self):
+        """If stage timings are unavailable on a specific path, the report must
+        include the path label (e.g. 'ipc:') in the availability note."""
+        # IPC records have no stage timings → report should mention 'ipc'
+        records = [
+            _make_record(condition="A", path="ipc",
+                         total_latency_ms=730.0,
+                         prefill_ms=None, decode_ms=None, vision_encoder_ms=None),
+        ]
+        text = format_text_report(build_report(records))
+        if "NOT available from runtime" in text:
+            self.assertIn("ipc:", text.lower())
+
+    def test_direct_with_all_stage_timings_produces_no_unavailable_line(self):
+        """When direct path has all NVIDIA profile metrics, the report must
+        not add any 'NOT available' line for those metrics on the direct path."""
+        records = [
+            _make_record(condition="A", path="direct",
+                         total_latency_ms=None, cold_start_total_ms=400.0,
+                         prefill_ms=35.7, decode_ms=330.0, vision_encoder_ms=50.4),
+        ]
+        text = format_text_report(build_report(records))
+        # direct path has all three metrics — no unavailable line for direct
+        self.assertNotIn("direct: prefill time: NOT available", text)
+        self.assertNotIn("direct: decode time: NOT available", text)
+        self.assertNotIn("direct: vision encoder time: NOT available", text)
 
 
 if __name__ == "__main__":

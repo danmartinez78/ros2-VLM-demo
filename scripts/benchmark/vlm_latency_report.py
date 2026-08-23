@@ -336,6 +336,46 @@ def compute_cold_start_scaling(
     return rows
 
 
+# ── native profile detail table ───────────────────────────────────────────────
+
+
+def compute_native_profile_table(
+    by_condition_path: dict[tuple[str, str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """
+    Build a per-inference row for every measured, successful direct-path record.
+
+    These rows expose the NVIDIA-authoritative profile metrics:
+    actual_output_tokens, vision_encoder_ms, prefill_ms, decode_tokens_per_sec,
+    llm_generation_total_gpu_time_ms, and finish_reason.
+
+    Null values mean the field was not exposed by the runtime — they are never
+    inferred or fabricated.  Per-image EOS vs max-length breakdown and
+    generated-token counts are essential for interpreting the latency sweep.
+    """
+    rows: list[dict[str, Any]] = []
+    for (condition, path), records in sorted(by_condition_path.items()):
+        if path != "direct":
+            continue
+        for rec in records:
+            if rec.get("warmup", False) or not rec.get("success", False):
+                continue
+            rows.append(
+                {
+                    "condition": condition,
+                    "image_id": rec.get("image_id"),
+                    "iteration": rec.get("iteration"),
+                    "actual_output_tokens": rec.get("actual_output_tokens"),
+                    "vision_encoder_ms": rec.get("vision_encoder_ms"),
+                    "prefill_ms": rec.get("prefill_ms"),
+                    "decode_tokens_per_sec": rec.get("decode_tokens_per_sec"),
+                    "llm_generation_total_gpu_time_ms": rec.get("llm_generation_total_gpu_time_ms"),
+                    "finish_reason": rec.get("finish_reason"),
+                }
+            )
+    return rows
+
+
 # ── full report generation ────────────────────────────────────────────────────
 
 
@@ -375,6 +415,7 @@ def build_report(
         "conditions": conditions_summary,
         "token_scaling_table": compute_token_scaling(by_condition_path),
         "cold_start_scaling_table": compute_cold_start_scaling(by_condition_path),
+        "native_profile_table": compute_native_profile_table(by_condition_path),
         "direct_ipc_comparison": compute_direct_ipc_comparison(by_condition_path),
         "raw_records": records,
     }
@@ -413,6 +454,33 @@ def format_text_report(report: dict[str, Any]) -> str:
         f"  Total records: {report.get('n_total_records', 'n/a')}",
         f"  Measured (non-warmup, success): {report.get('n_measured_records', 'n/a')}",
     ]
+
+    # ── Native NVIDIA profile detail (direct path, per-inference) ────────
+    native_profile = report.get("native_profile_table") or []
+    if native_profile:
+        lines += [
+            "",
+            "Native NVIDIA Profile Detail  (direct path, measured inferences only)",
+            "  NOTE: null = field not exposed by the runtime; never inferred.",
+            "-" * 72,
+            f"  {'Cond':<5} {'Image':<12} {'Iter':>4} {'GenTok':>6} "
+            f"{'Vision ms':>9} {'Prefill ms':>10} {'Gen tok/s':>9} {'GPU ms':>8} {'FinishReason':<14}",
+            "  " + "-" * 68,
+        ]
+        def _fmt_f(v: float | None, w: int = 8) -> str:
+            return f"{v:{w}.1f}" if v is not None else " " * (w - 3) + "n/a"
+        for row in native_profile:
+            lines.append(
+                f"  {row.get('condition', '?'):<5} "
+                f"{str(row.get('image_id', '?')):<12} "
+                f"{row.get('iteration', '?'):>4} "
+                f"{str(row.get('actual_output_tokens') or 'n/a'):>6} "
+                f"{_fmt_f(row.get('vision_encoder_ms'), 9):>9} "
+                f"{_fmt_f(row.get('prefill_ms'), 10):>10} "
+                f"{_fmt_f(row.get('decode_tokens_per_sec'), 9):>9} "
+                f"{_fmt_f(row.get('llm_generation_total_gpu_time_ms'), 8):>8} "
+                f"{str(row.get('finish_reason') or 'n/a'):<14}"
+            )
 
     # ── Token scaling table (IPC steady-state inference latency) ─────────
     scaling = report.get("token_scaling_table") or []
@@ -522,25 +590,44 @@ def format_text_report(report: dict[str, Any]) -> str:
                 "        max_output_tokens; they do not represent natural task completion.",
             ]
 
-    # ── Stage-timing availability note ───────────────────────────────────
-    unavailable_stages: list[str] = []
+    # ── Stage-timing availability note (scoped by path) ──────────────────
+    # NVIDIA-emitted profile stages (prefill, decode, vision_encoder) are
+    # expected only on the direct/native path.  IPC correctly has these null;
+    # mixing paths would produce a misleading global "unavailable" conclusion.
+    stage_avail_by_path: dict[str, dict[str, bool]] = {}
     for cond_data in conditions_summary.values():
-        for path_data in cond_data.values():
+        for path_label, path_data in cond_data.items():
             avail = path_data.get("stage_timings_available") or {}
-            if avail.get("prefill") is False:
-                unavailable_stages.append("prefill time")
-            if avail.get("decode") is False:
-                unavailable_stages.append("decode time")
-            if avail.get("vision_encoder") is False:
-                unavailable_stages.append("vision encoder time")
-    if unavailable_stages:
+            entry = stage_avail_by_path.setdefault(path_label, {})
+            for stage_key, stage_label in (
+                ("prefill", "prefill time"),
+                ("decode", "decode time"),
+                ("vision_encoder", "vision encoder time"),
+            ):
+                present = avail.get(stage_key, False)
+                # Once any condition has it available, mark path as available.
+                if present:
+                    entry[stage_label] = True
+                elif stage_label not in entry:
+                    entry[stage_label] = False
+
+    avail_lines: list[str] = []
+    for path_label in ("direct", "ipc"):
+        if path_label not in stage_avail_by_path:
+            continue
+        for stage_label, is_available in sorted(stage_avail_by_path[path_label].items()):
+            if not is_available:
+                avail_lines.append(
+                    f"  {path_label}: {stage_label}: NOT available from runtime"
+                    " — reported as null, not inferred"
+                )
+    if avail_lines:
         lines += [
             "",
-            "Stage Timing Availability",
+            "Stage Timing Availability  (per path)",
             "-" * 72,
         ]
-        for stage in sorted(set(unavailable_stages)):
-            lines.append(f"  {stage}: NOT available from runtime — reported as null, not inferred")
+        lines += avail_lines
 
     lines += ["", "=" * 72, ""]
     return "\n".join(lines)
