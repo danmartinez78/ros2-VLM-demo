@@ -167,11 +167,6 @@ _sha256_file() {
     sha256sum "$1" | awk '{print $1}'
 }
 
-_sha256_prefix() {
-    # Return first 12 hex chars of SHA-256 of stdin.
-    sha256sum | cut -c1-12
-}
-
 _sha256_string() {
     # Return first 12 hex chars of SHA-256 of a string.
     printf '%s' "$1" | sha256sum | cut -c1-12
@@ -328,7 +323,7 @@ _run_direct_inference() {
         --output_file "${response_path}" \
         --dumpProfile \
         --profileOutputFile "${profile_path}" \
-        2>/dev/null || true
+        2>/dev/null
 
     t_end=$(date +%s%3N)
     cold_start_ms=$(( t_end - t_start ))
@@ -458,7 +453,7 @@ _run_ipc_inference() {
         --socket "${socket}" \
         --input "${request_json_path}" \
         --output "${ipc_result_path}" \
-        2>/dev/null || true
+        2>/dev/null
 
     t_end=$(date +%s%3N)
     total_ms=$(( t_end - t_start ))
@@ -623,7 +618,7 @@ print(json.dumps({
     'native_profile_path': '${profile_path}',
     'ipc_result_path': null,
     'model_name': '${EDGE_VLM_MODEL_NAME:-unknown}',
-    'iteration': $([ '${is_warmup}' = 'true' ] && echo '${iter_idx}' || echo '${iter_idx}'),
+    'iteration': ${iter_idx},
     'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
 }))")
             _write_record "${record}"
@@ -688,7 +683,7 @@ print(json.dumps({
     'native_profile_path': null,
     'ipc_result_path': '${ipc_result_path}',
     'model_name': '${EDGE_VLM_MODEL_NAME:-unknown}',
-    'iteration': $([ '${is_warmup}' = 'true' ] && echo '${iter_idx}' || echo '${iter_idx}'),
+    'iteration': ${iter_idx},
     'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
 }))")
             _write_record "${record}"
