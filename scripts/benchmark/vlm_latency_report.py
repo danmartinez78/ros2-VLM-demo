@@ -310,6 +310,8 @@ def compute_cold_start_scaling(
         max_tokens = measured[0].get("max_output_tokens")
         prompt_id = measured[0].get("prompt_id", "")
         cold_start_vals = [r["cold_start_total_ms"] for r in measured if r.get("cold_start_total_ms") is not None]
+        if not cold_start_vals:
+            continue
         out_tokens = [r["actual_output_tokens"] for r in measured if r.get("actual_output_tokens") is not None]
         rows.append(
             {
