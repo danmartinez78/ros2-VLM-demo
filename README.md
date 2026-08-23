@@ -80,6 +80,10 @@ setup command.
 Before first run, accept the gated Cosmos license and authenticate with
 Hugging Face (`huggingface-cli login`) on the Thor host.
 
+The generated env file now reads the active model/profile selection from
+workspace state managed by `./scripts/modelctl`, so switching engines no longer
+requires renaming `engine/` directories by hand.
+
 The deployment verifier can be re-run independently:
 
 ```bash
@@ -102,6 +106,25 @@ boundary:
 
 For a fresh system and engine preparation, follow the full
 [Thor deployment recipe](docs/deployment.md).
+
+## Managed model/profile workflow
+
+```bash
+./scripts/modelctl list
+./scripts/modelctl status cosmos-reason2-8b thor-current
+./scripts/modelctl prepare cosmos-reason2-8b
+./scripts/modelctl build cosmos-reason2-8b thor-f8
+./scripts/modelctl validate cosmos-reason2-8b thor-f8
+./scripts/modelctl activate cosmos-reason2-8b thor-f8
+./scripts/modelctl current
+```
+
+- `thor-current` safely adopts the legacy `${MODEL}/engine` control engine
+  without moving or overwriting it.
+- `thor-f8` builds a separate managed engine under
+  `${EDGE_VLM_WORKSPACE_DIR}/Cosmos-Reason2-8B/engines/thor-f8`.
+- `prepare` reuses the existing JP7.2 quantize/export flow and stops before any
+  engine-profile-specific build output.
 
 ## Run with a ROS bag
 

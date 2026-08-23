@@ -12,6 +12,8 @@ skip_edge_llm=0
 skip_model=0
 skip_rtdetr=0
 skip_data=0
+skip_engine_build=0
+skip_runtime_config=0
 model_name=""
 
 usage() {
@@ -32,6 +34,8 @@ Options:
   --skip-model               Skip model workspace prep/validation phase
   --skip-rtdetr              Skip RT-DETR package/model install phase
   --skip-data                Skip rosbag + dataset preparation phase
+  --skip-engine-build        Stop after reusable quantized/onnx artifacts
+  --skip-runtime-config      Do not rewrite runtime env/config outputs
   --dry-run                  Print planned actions without mutating the system
   -h, --help                 Show this help
 
@@ -180,6 +184,14 @@ validate_model_layout() {
   done < <(manifest_list_optional "models.${chosen_model}.required_directories")
 
   [[ "${missing}" -eq 0 ]]
+}
+
+validate_prepared_model_artifacts() {
+  local workspace_dir="$1"
+  local chosen_model="$2"
+  local model_root="${workspace_dir}/${chosen_model}"
+
+  is_quantized_ready "${model_root}" && is_onnx_ready "${model_root}"
 }
 
 resolve_hf_token() {
@@ -490,6 +502,9 @@ build_cosmos_engines() {
   local llm_builder="${edge_build}/examples/llm/llm_build"
   local visual_builder="${edge_build}/examples/multimodal/visual_build"
   local plugin_dir=""
+  local llm_engine_dir="${EDGE_VLM_LLM_ENGINE_DIR:-${model_root}/engine/llm}"
+  local multimodal_engine_dir="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-${model_root}/engine}"
+  local -a visual_args=()
 
   plugin_dir="$(cd -- "$(dirname -- "${plugin_path}")" && pwd)"
   plugin_path="${plugin_dir}/$(basename -- "${plugin_path}")"
@@ -501,16 +516,24 @@ build_cosmos_engines() {
       "Missing Edge-LLM plugin at ${plugin_path}. Build TensorRT-Edge-LLM and ensure EDGELLM_PLUGIN_PATH points to libNvInfer_edgellm_plugin.so."
   fi
 
-  run_cmd mkdir -p "${model_root}/engine/llm" "${model_root}/engine"
+  if [[ -n "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS:-}" ]]; then
+    visual_args+=( --maxImageTokens "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS}" )
+  fi
+  if [[ -n "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS_PER_IMAGE:-}" ]]; then
+    visual_args+=( --maxImageTokensPerImage "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS_PER_IMAGE}" )
+  fi
+
+  run_cmd mkdir -p "${llm_engine_dir}" "${multimodal_engine_dir}"
   run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${llm_builder}" \
     --onnxDir "${model_root}/onnx/llm" \
-    --engineDir "${model_root}/engine/llm" \
+    --engineDir "${llm_engine_dir}" \
     --maxBatchSize "${EDGE_VLM_LLM_MAX_BATCH_SIZE:-1}" \
     --maxInputLen "${EDGE_VLM_LLM_MAX_INPUT_LEN:-1024}" \
     --maxKVCacheCapacity "${EDGE_VLM_LLM_MAX_KV_CACHE_CAPACITY:-4096}"
   run_cmd env "EDGELLM_PLUGIN_PATH=${plugin_path}" "${visual_builder}" \
     --onnxDir "${model_root}/onnx/visual" \
-    --engineDir "${model_root}/engine"
+    --engineDir "${multimodal_engine_dir}" \
+    "${visual_args[@]}"
 }
 
 prepare_cosmos_default() {
@@ -567,7 +590,7 @@ prepare_cosmos_default() {
     plan_export=1
     engine_ready=0
   fi
-  if [[ "${engine_ready}" -eq 0 ]]; then
+  if [[ "${skip_engine_build}" -eq 0 ]] && [[ "${engine_ready}" -eq 0 ]]; then
     plan_engine_build=1
   fi
 
@@ -590,10 +613,17 @@ prepare_cosmos_default() {
         "${container_image}" "${chosen_model}" "${chosen_model}"
     fi
     if [[ "${plan_engine_build}" -eq 1 ]]; then
-      printf 'DRY-RUN  planned stage: EDGELLM_PLUGIN_PATH=%s native Thor llm_build --onnxDir %s/onnx/llm --engineDir %s/engine/llm\n' \
-        "${plugin_path}" "${model_root}" "${model_root}"
-      printf 'DRY-RUN  planned stage: EDGELLM_PLUGIN_PATH=%s native Thor visual_build --onnxDir %s/onnx/visual --engineDir %s/engine\n' \
-        "${plugin_path}" "${model_root}" "${model_root}"
+      printf 'DRY-RUN  planned stage: EDGELLM_PLUGIN_PATH=%s native Thor llm_build --onnxDir %s/onnx/llm --engineDir %s\n' \
+        "${plugin_path}" "${model_root}" "${EDGE_VLM_LLM_ENGINE_DIR:-${model_root}/engine/llm}"
+      printf 'DRY-RUN  planned stage: EDGELLM_PLUGIN_PATH=%s native Thor visual_build --onnxDir %s/onnx/visual --engineDir %s' \
+        "${plugin_path}" "${model_root}" "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-${model_root}/engine}"
+      if [[ -n "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS:-}" ]]; then
+        printf ' --maxImageTokens %s' "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS}"
+      fi
+      if [[ -n "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS_PER_IMAGE:-}" ]]; then
+        printf ' --maxImageTokensPerImage %s' "${EDGE_VLM_VISUAL_MAX_IMAGE_TOKENS_PER_IMAGE}"
+      fi
+      printf '\n'
     fi
     return
   fi
@@ -629,12 +659,17 @@ prepare_cosmos_default() {
     engine_ready=0
   fi
 
-  if [[ "${engine_ready}" -eq 0 ]]; then
+  if [[ "${skip_engine_build}" -eq 0 ]] && [[ "${engine_ready}" -eq 0 ]]; then
     build_cosmos_engines "${model_root}" "${edge_build}" "${plugin_path}"
   fi
 
-  validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
-    "Model workspace is incomplete after first-class Cosmos preparation."
+  if [[ "${skip_engine_build}" -eq 0 ]]; then
+    validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
+      "Model workspace is incomplete after first-class Cosmos preparation."
+  else
+    validate_prepared_model_artifacts "${workspace_dir}" "${chosen_model}" || fail \
+      "Model workspace is incomplete after reusable artifact preparation."
+  fi
 }
 
 prepare_model_layout() {
@@ -644,26 +679,39 @@ prepare_model_layout() {
   local edge_build="$4"
   local plugin_path="$5"
 
-  if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
-    echo "Model workspace already valid at ${workspace_dir}."
+  if [[ "${skip_engine_build}" -eq 0 ]]; then
+    if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
+      echo "Model workspace already valid at ${workspace_dir}."
+      return
+    fi
+  elif validate_prepared_model_artifacts "${workspace_dir}" "${chosen_model}"; then
+    echo "Reusable model artifacts already valid at ${workspace_dir}."
     return
   fi
 
   apply_model_overrides "${workspace_dir}" "${chosen_model}"
-  if validate_model_layout "${workspace_dir}" "${chosen_model}"; then
+  if [[ "${skip_engine_build}" -eq 0 ]] && validate_model_layout "${workspace_dir}" "${chosen_model}"; then
     echo "Model workspace is valid after applying override inputs."
+    return
+  elif [[ "${skip_engine_build}" -eq 1 ]] && validate_prepared_model_artifacts "${workspace_dir}" "${chosen_model}"; then
+    echo "Reusable model artifacts are valid after applying override inputs."
     return
   fi
 
-  if [[ "${chosen_model}" == "Cosmos-Reason2-8B" ]]; then
+  if [[ -n "$(manifest_value "models.${chosen_model}.hf_model_id")" ]]; then
     prepare_cosmos_default "${workspace_dir}" "${chosen_model}" "${edge_root}" "${edge_build}" "${plugin_path}"
   fi
 
   if [[ "${dry_run}" -eq 1 ]]; then
     echo "DRY-RUN  model layout planning complete."
   else
-    validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
-      "Model workspace is incomplete. First-class Cosmos setup failed and optional overrides did not provide a valid layout."
+    if [[ "${skip_engine_build}" -eq 0 ]]; then
+      validate_model_layout "${workspace_dir}" "${chosen_model}" || fail \
+        "Model workspace is incomplete. First-class Cosmos setup failed and optional overrides did not provide a valid layout."
+    else
+      validate_prepared_model_artifacts "${workspace_dir}" "${chosen_model}" || fail \
+        "Reusable model artifacts are incomplete. First-class Cosmos setup failed and optional overrides did not provide a valid layout."
+    fi
   fi
 }
 
@@ -692,12 +740,18 @@ export ROS_DISTRO="${ros_distro}"
 export ROS_WORKSPACE="${ros_workspace}"
 export TENSORRT_EDGE_LLM_ROOT="${edge_root}"
 export TENSORRT_EDGE_LLM_BUILD_DIR="${edge_build}"
-export EDGE_VLM_MODEL_NAME="${chosen_model}"
 export EDGE_VLM_WORKSPACE_DIR="${workspace_dir}"
-export EDGE_VLM_LLM_ENGINE_DIR="${llm_dir}"
-export EDGE_VLM_MULTIMODAL_ENGINE_DIR="${multimodal_dir}"
 export EDGELLM_PLUGIN_PATH="${plugin_path}"
 export ISAAC_ROS_WS="${isaac_ros_ws}"
+export EDGE_VLM_RUNTIME_STATE_FILE="${workspace_dir}/.edge-vlm/active-profile.json"
+export EDGE_VLM_MODELCTL_PATH="${script_dir}/models/modelctl.py"
+if [[ -f "\${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then
+  eval "\$(python3 "\${EDGE_VLM_MODELCTL_PATH}" print-env --state-file "\${EDGE_VLM_RUNTIME_STATE_FILE}")"
+else
+  export EDGE_VLM_MODEL_NAME="${chosen_model}"
+  export EDGE_VLM_LLM_ENGINE_DIR="${llm_dir}"
+  export EDGE_VLM_MULTIMODAL_ENGINE_DIR="${multimodal_dir}"
+fi
 ENV
   chmod +x "${env_file}"
 }
@@ -715,6 +769,8 @@ for ((i = 1; i <= $#; i++)); do
     --skip-model) skip_model=1 ;;
     --skip-rtdetr) skip_rtdetr=1 ;;
     --skip-data) skip_data=1 ;;
+    --skip-engine-build) skip_engine_build=1 ;;
+    --skip-runtime-config) skip_runtime_config=1 ;;
     --dry-run) dry_run=1 ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown option: ${arg}" ;;
@@ -727,7 +783,7 @@ default_model="$(manifest_value default_model)"
 if [[ -z "${model_name}" ]]; then
   model_name="${EDGE_VLM_MODEL_NAME:-${default_model}}"
 fi
-[[ "${model_name}" == "Cosmos-Reason2-8B" ]] || fail "Unsupported --model-name '${model_name}' for this setup script."
+manifest_value "models.${model_name}" >/dev/null || fail "Unsupported --model-name '${model_name}' for this setup script."
 
 ros_distro="${ROS_DISTRO:-jazzy}"
 ros_workspace="$(infer_ros_workspace)"
@@ -788,16 +844,18 @@ if [[ "${skip_data}" -eq 0 ]]; then
   run_cmd bash "${script_dir}/test_data/prepare_datasets.sh"
 fi
 
-generate_env_file \
-  "${ros_distro}" \
-  "${ros_workspace}" \
-  "${edge_root}" \
-  "${edge_build}" \
-  "${model_name}" \
-  "${workspace_dir}" \
-  "${llm_dir}" \
-  "${multimodal_dir}" \
-  "${plugin_path}" \
-  "${isaac_ros_ws}"
+if [[ "${skip_runtime_config}" -eq 0 ]]; then
+  generate_env_file \
+    "${ros_distro}" \
+    "${ros_workspace}" \
+    "${edge_root}" \
+    "${edge_build}" \
+    "${model_name}" \
+    "${workspace_dir}" \
+    "${llm_dir}" \
+    "${multimodal_dir}" \
+    "${plugin_path}" \
+    "${isaac_ros_ws}"
+fi
 
 echo "Preparation completed."
