@@ -36,6 +36,7 @@ from vlm_latency_report import (  # noqa: E402
     aggregate_condition,
     build_condition_spec,
     build_report,
+    compute_cold_start_scaling,
     compute_direct_ipc_comparison,
     compute_token_scaling,
     format_text_report,
@@ -276,8 +277,8 @@ class TestAggregateCondition(unittest.TestCase):
 class TestComputeTokenScaling(unittest.TestCase):
     def test_one_row_per_condition_path(self):
         by_cp = {
-            ("A", "direct"): [_make_record(condition="A", path="direct", total_latency_ms=500.0)],
-            ("B", "direct"): [_make_record(condition="B", path="direct", max_output_tokens=32, total_latency_ms=700.0)],
+            ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=500.0)],
+            ("B", "ipc"): [_make_record(condition="B", path="ipc", max_output_tokens=32, total_latency_ms=700.0)],
         }
         rows = compute_token_scaling(by_cp)
         self.assertEqual(len(rows), 2)
@@ -286,14 +287,80 @@ class TestComputeTokenScaling(unittest.TestCase):
 
     def test_warmup_excluded_from_scaling(self):
         by_cp = {
-            ("A", "direct"): [
-                _make_record(total_latency_ms=9999.0, warmup=True),
-                _make_record(total_latency_ms=500.0, warmup=False),
+            ("A", "ipc"): [
+                _make_record(path="ipc", total_latency_ms=9999.0, warmup=True),
+                _make_record(path="ipc", total_latency_ms=500.0, warmup=False),
             ],
         }
         rows = compute_token_scaling(by_cp)
         self.assertEqual(rows[0]["n_measured"], 1)
         self.assertAlmostEqual(rows[0]["total_latency_ms_mean"], 500.0, places=1)
+
+    def test_direct_rows_with_null_total_latency_excluded(self):
+        """Direct rows with total_latency_ms=None must not appear in the token-scaling table."""
+        by_cp = {
+            ("A", "direct"): [_make_record(condition="A", path="direct", total_latency_ms=None,
+                                           cold_start_total_ms=410.0)],
+            ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=500.0)],
+        }
+        rows = compute_token_scaling(by_cp)
+        # Only the ipc row should appear; direct (cold-start) row must be absent.
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], "ipc")
+
+    def test_direct_row_with_runtime_total_included(self):
+        """A direct row is included when the profile exposes a runtime inference total."""
+        by_cp = {
+            ("A", "direct"): [_make_record(condition="A", path="direct",
+                                           total_latency_ms=410.0, cold_start_total_ms=2500.0)],
+        }
+        rows = compute_token_scaling(by_cp)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["total_latency_ms_mean"], 410.0, places=1)
+
+
+# ── cold-start scaling table tests ────────────────────────────────────────────
+
+
+class TestComputeColdStartScaling(unittest.TestCase):
+    def test_only_direct_path_rows_included(self):
+        by_cp = {
+            ("A", "direct"): [_make_record(condition="A", path="direct",
+                                           total_latency_ms=None, cold_start_total_ms=2500.0)],
+            ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=500.0)],
+        }
+        rows = compute_cold_start_scaling(by_cp)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], "direct")
+
+    def test_cold_start_ms_aggregated_correctly(self):
+        by_cp = {
+            ("A", "direct"): [
+                _make_record(path="direct", total_latency_ms=None, cold_start_total_ms=2000.0),
+                _make_record(path="direct", total_latency_ms=None, cold_start_total_ms=3000.0),
+            ],
+        }
+        rows = compute_cold_start_scaling(by_cp)
+        self.assertEqual(len(rows), 1)
+        self.assertAlmostEqual(rows[0]["cold_start_total_ms_mean"], 2500.0, places=1)
+
+    def test_warmup_excluded(self):
+        by_cp = {
+            ("A", "direct"): [
+                _make_record(path="direct", total_latency_ms=None, cold_start_total_ms=99999.0, warmup=True),
+                _make_record(path="direct", total_latency_ms=None, cold_start_total_ms=2500.0, warmup=False),
+            ],
+        }
+        rows = compute_cold_start_scaling(by_cp)
+        self.assertEqual(rows[0]["n_measured"], 1)
+        self.assertAlmostEqual(rows[0]["cold_start_total_ms_mean"], 2500.0, places=1)
+
+    def test_ipc_only_rows_produce_empty_table(self):
+        by_cp = {
+            ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=500.0)],
+        }
+        rows = compute_cold_start_scaling(by_cp)
+        self.assertEqual(rows, [])
 
 
 # ── direct-vs-IPC comparison tests ───────────────────────────────────────────
@@ -302,21 +369,25 @@ class TestComputeTokenScaling(unittest.TestCase):
 class TestComputeDirectIpcComparison(unittest.TestCase):
     def test_table_computed_for_paired_conditions(self):
         by_cp = {
-            ("D", "direct"): [_make_record(condition="D", path="direct", total_latency_ms=800.0)],
+            ("D", "direct"): [_make_record(condition="D", path="direct",
+                                           total_latency_ms=None, cold_start_total_ms=800.0)],
             ("D", "ipc"): [_make_record(condition="D", path="ipc", total_latency_ms=1000.0)],
         }
         rows = compute_direct_ipc_comparison(by_cp)
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertEqual(row["condition"], "D")
-        self.assertAlmostEqual(row["direct_total_latency_ms_mean"], 800.0, places=1)
+        self.assertAlmostEqual(row["direct_cold_start_total_ms_mean"], 800.0, places=1)
         self.assertAlmostEqual(row["ipc_total_latency_ms_mean"], 1000.0, places=1)
         # Must not carry an 'overhead' or comparison delta field — lifecycles differ.
         self.assertNotIn("overhead_ms", row)
+        # Must not use direct's total_latency_ms (which is null for direct path).
+        self.assertNotIn("direct_total_latency_ms_mean", row)
 
     def test_condition_with_only_direct_excluded(self):
         by_cp = {
-            ("A", "direct"): [_make_record(condition="A", path="direct")],
+            ("A", "direct"): [_make_record(condition="A", path="direct",
+                                           total_latency_ms=None, cold_start_total_ms=800.0)],
         }
         rows = compute_direct_ipc_comparison(by_cp)
         self.assertEqual(rows, [])
@@ -330,15 +401,90 @@ class TestComputeDirectIpcComparison(unittest.TestCase):
 
     def test_multiple_conditions(self):
         by_cp = {
-            ("A", "direct"): [_make_record(condition="A", path="direct", total_latency_ms=400.0)],
+            ("A", "direct"): [_make_record(condition="A", path="direct",
+                                           total_latency_ms=None, cold_start_total_ms=400.0)],
             ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=500.0)],
-            ("E", "direct"): [_make_record(condition="E", path="direct", total_latency_ms=7000.0)],
+            ("E", "direct"): [_make_record(condition="E", path="direct",
+                                           total_latency_ms=None, cold_start_total_ms=7000.0)],
             ("E", "ipc"): [_make_record(condition="E", path="ipc", total_latency_ms=8500.0)],
         }
         rows = compute_direct_ipc_comparison(by_cp)
         self.assertEqual(len(rows), 2)
         conds = {r["condition"] for r in rows}
         self.assertEqual(conds, {"A", "E"})
+
+
+# ── regression: cold-start wall time must not be presented as model latency ───
+
+
+class TestColdStartNotModelLatency(unittest.TestCase):
+    """Regression suite: direct-path cold_start_total_ms must NOT be fed into
+    total_latency_ms or the token-scaling table as model/runtime latency."""
+
+    def test_direct_record_total_latency_ms_is_null(self):
+        """Shell runner must write total_latency_ms=null for the direct path."""
+        script_text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        # The runner must not assign cold_start_total_ms to total_latency_ms.
+        self.assertNotIn("'total_latency_ms': cold_start_total_ms", script_text)
+        # The runner must write total_latency_ms as None for the direct path.
+        self.assertIn("'total_latency_ms': None", script_text)
+
+    def test_token_scaling_excludes_direct_rows_without_runtime_total(self):
+        """Direct rows with total_latency_ms=None must not appear in the
+        token-scaling table (the steady-state inference latency table)."""
+        by_cp = {
+            ("A", "direct"): [_make_record(condition="A", path="direct",
+                                           total_latency_ms=None, cold_start_total_ms=2500.0)],
+            ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=450.0)],
+        }
+        rows = compute_token_scaling(by_cp)
+        paths_in_table = {r["path"] for r in rows}
+        self.assertNotIn("direct", paths_in_table,
+                         "Direct cold-start rows must not appear in the inference latency table")
+
+    def test_cold_start_scaling_is_separate_from_token_scaling(self):
+        """cold_start_scaling_table must be a distinct key from token_scaling_table."""
+        records = [
+            _make_record(condition="A", path="direct",
+                         total_latency_ms=None, cold_start_total_ms=2500.0),
+            _make_record(condition="A", path="ipc", total_latency_ms=450.0),
+        ]
+        report = build_report(records)
+        self.assertIn("cold_start_scaling_table", report)
+        self.assertIn("token_scaling_table", report)
+        # Ensure they are not the same table
+        cold_paths = {r["path"] for r in report["cold_start_scaling_table"]}
+        scaling_paths = {r["path"] for r in report["token_scaling_table"]}
+        self.assertEqual(cold_paths, {"direct"})
+        self.assertNotIn("direct", scaling_paths)
+
+    def test_comparison_table_uses_cold_start_not_total_latency_for_direct(self):
+        """direct_ipc_comparison must use cold_start_total_ms for the direct side,
+        not total_latency_ms (which is null for direct rows)."""
+        by_cp = {
+            ("A", "direct"): [_make_record(condition="A", path="direct",
+                                           total_latency_ms=None, cold_start_total_ms=2500.0)],
+            ("A", "ipc"): [_make_record(condition="A", path="ipc", total_latency_ms=450.0)],
+        }
+        rows = compute_direct_ipc_comparison(by_cp)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        # Field must be cold_start, not total_latency
+        self.assertIn("direct_cold_start_total_ms_mean", row)
+        self.assertNotIn("direct_total_latency_ms_mean", row)
+        self.assertAlmostEqual(row["direct_cold_start_total_ms_mean"], 2500.0, places=1)
+
+    def test_text_report_cold_start_section_present(self):
+        """The text report must contain a separate Cold-Start section."""
+        records = [
+            _make_record(condition="A", path="direct",
+                         total_latency_ms=None, cold_start_total_ms=2500.0),
+            _make_record(condition="A", path="ipc", total_latency_ms=450.0),
+        ]
+        text = format_text_report(build_report(records))
+        self.assertIn("Cold-Start Wall Time vs Output-Token Cap", text)
+        # The cold-start section must note it includes process init, not model latency.
+        self.assertIn("process/engine/tokenizer initialisation", text)
 
 
 # ── full report building tests ────────────────────────────────────────────────
@@ -355,7 +501,8 @@ class TestBuildReport(unittest.TestCase):
                         path=path,
                         prompt_id=pid,
                         max_output_tokens=mtok,
-                        total_latency_ms=500.0 if path == "direct" else 650.0,
+                        total_latency_ms=None if path == "direct" else 650.0,
+                        cold_start_total_ms=2500.0 if path == "direct" else None,
                     )
                 )
         return recs
@@ -367,6 +514,7 @@ class TestBuildReport(unittest.TestCase):
         self.assertIn("generated_at", report)
         self.assertIn("conditions", report)
         self.assertIn("token_scaling_table", report)
+        self.assertIn("cold_start_scaling_table", report)
         self.assertIn("direct_ipc_comparison", report)
         self.assertIn("raw_records", report)
 
@@ -400,9 +548,10 @@ class TestBuildReport(unittest.TestCase):
 class TestFormatTextReport(unittest.TestCase):
     def _make_report(self) -> dict[str, Any]:
         records = [
-            _make_record(condition="A", path="direct", total_latency_ms=480.0),
+            _make_record(condition="A", path="direct", total_latency_ms=None, cold_start_total_ms=480.0),
             _make_record(condition="A", path="ipc", total_latency_ms=600.0),
-            _make_record(condition="E", path="direct", max_output_tokens=256, total_latency_ms=8000.0),
+            _make_record(condition="E", path="direct", max_output_tokens=256,
+                         total_latency_ms=None, cold_start_total_ms=8000.0),
             _make_record(condition="E", path="ipc", max_output_tokens=256, total_latency_ms=9500.0),
         ]
         return build_report(records)
@@ -410,7 +559,8 @@ class TestFormatTextReport(unittest.TestCase):
     def test_report_contains_key_sections(self):
         text = format_text_report(self._make_report())
         self.assertIn("VLM Latency Characterization Benchmark Report", text)
-        self.assertIn("Latency vs Output-Token Cap", text)
+        self.assertIn("Inference Latency vs Output-Token Cap", text)
+        self.assertIn("Cold-Start Wall Time vs Output-Token Cap", text)
         self.assertIn("Direct (cold-start, per-process) vs IPC (persistent server, steady-state)", text)
 
     def test_report_mentions_unavailable_stage_timings(self):
@@ -546,7 +696,9 @@ class TestShellScriptSyntax(unittest.TestCase):
 class TestRoundTrip(unittest.TestCase):
     def test_write_read_build_report(self):
         records = [
-            _make_record(condition=c, path=p, total_latency_ms=lat)
+            _make_record(condition=c, path=p,
+                         total_latency_ms=None if p == "direct" else lat,
+                         cold_start_total_ms=lat if p == "direct" else None)
             for c, p, lat in [
                 ("A", "direct", 500.0),
                 ("A", "ipc", 650.0),
@@ -564,7 +716,10 @@ class TestRoundTrip(unittest.TestCase):
             self.assertEqual(len(parsed), len(records))
             report = build_report(parsed, source_path=path)
             self.assertEqual(report["n_total_records"], len(records))
+            # ipc rows have total_latency_ms set, so token_scaling_table is populated.
             self.assertGreater(len(report["token_scaling_table"]), 0)
+            # cold_start_scaling_table is populated from direct rows' cold_start_total_ms.
+            self.assertGreater(len(report["cold_start_scaling_table"]), 0)
             # Both direct-vs-IPC conditions with paired runs should appear.
             comparison_conditions = {r["condition"] for r in report["direct_ipc_comparison"]}
             self.assertIn("A", comparison_conditions)

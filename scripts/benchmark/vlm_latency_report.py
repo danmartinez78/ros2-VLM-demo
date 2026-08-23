@@ -146,6 +146,7 @@ def aggregate_condition(
     """
     measured = [r for r in records if not r.get("warmup", False) and r.get("success", False)]
     total_latency = [r["total_latency_ms"] for r in measured if r.get("total_latency_ms") is not None]
+    cold_start_total = [r["cold_start_total_ms"] for r in measured if r.get("cold_start_total_ms") is not None]
     ttft = [r["ttft_ms"] for r in measured if r.get("ttft_ms") is not None]
     decode = [r["decode_ms"] for r in measured if r.get("decode_ms") is not None]
     visual = [r["visual_preprocess_ms"] for r in measured if r.get("visual_preprocess_ms") is not None]
@@ -174,6 +175,7 @@ def aggregate_condition(
         "n_measured": len(measured),
         "n_failed": failed,
         "total_latency_ms": _stats(total_latency),
+        "cold_start_total_ms": _stats(cold_start_total),
         "ttft_ms": _stats(ttft) if ttft_available else {"available": False},
         "decode_ms": _stats(decode) if decode_available else {"available": False},
         "visual_preprocess_ms": _stats(visual) if visual_available else {"available": False},
@@ -216,12 +218,14 @@ def compute_direct_ipc_comparison(
             continue
         direct_agg = aggregate_condition(direct_records)
         ipc_agg = aggregate_condition(ipc_records)
-        direct_mean = direct_agg["total_latency_ms"].get("mean")
+        # direct path: total_latency_ms is null (cold_start includes process init);
+        # use cold_start_total_ms as the direct lifecycle metric.
+        direct_mean = direct_agg["cold_start_total_ms"].get("mean")
         ipc_mean = ipc_agg["total_latency_ms"].get("mean")
         rows.append(
             {
                 "condition": condition,
-                "direct_total_latency_ms_mean": direct_mean,
+                "direct_cold_start_total_ms_mean": direct_mean,
                 "ipc_total_latency_ms_mean": ipc_mean,
                 "note": (
                     "direct=cold_start (per-process init included); "
@@ -239,8 +243,14 @@ def compute_token_scaling(
     by_condition_path: dict[tuple[str, str], list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
     """
-    Build a table of mean total latency vs max_output_tokens, per path, for all
-    conditions.  Makes scaling obvious.
+    Build a table of mean steady-state inference latency vs max_output_tokens
+    for IPC-path rows (which populate ``total_latency_ms``).
+
+    Direct-path rows have ``total_latency_ms=null`` because their wall-clock
+    measure includes process/engine initialisation; those rows are excluded
+    here and reported separately in the cold-start scaling table.  A direct
+    row is included only when the pinned runtime profile exposes an
+    authoritative inference total (i.e. ``total_latency_ms`` is not null).
     """
     rows: list[dict[str, Any]] = []
     for (condition, path), records in sorted(by_condition_path.items()):
@@ -254,6 +264,10 @@ def compute_token_scaling(
         max_tokens = measured[0].get("max_output_tokens")
         prompt_id = measured[0].get("prompt_id", "")
         latencies = [r["total_latency_ms"] for r in measured if r.get("total_latency_ms") is not None]
+        if not latencies:
+            # No runtime inference total available for this path (expected for
+            # direct/cold-start rows) — omit from this table.
+            continue
         out_tokens = [r["actual_output_tokens"] for r in measured if r.get("actual_output_tokens") is not None]
         rows.append(
             {
@@ -264,6 +278,48 @@ def compute_token_scaling(
                 "actual_output_tokens_mean": fmean(out_tokens) if out_tokens else None,
                 "total_latency_ms_mean": fmean(latencies) if latencies else None,
                 "total_latency_ms_p95": _percentile(latencies, 95),
+                "n_measured": len(measured),
+            }
+        )
+    return rows
+
+
+def compute_cold_start_scaling(
+    by_condition_path: dict[tuple[str, str], list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    """
+    Build a table of mean cold-start wall time (``cold_start_total_ms``) vs
+    max_output_tokens for direct-path rows only.
+
+    ``cold_start_total_ms`` includes per-process engine/tokenizer initialisation
+    and is the correct lifecycle metric for the direct path.  It is kept
+    separate from ``total_latency_ms`` (steady-state model/runtime inference)
+    so the two are never confused.
+    """
+    rows: list[dict[str, Any]] = []
+    for (condition, path), records in sorted(by_condition_path.items()):
+        if path != "direct":
+            continue
+        measured = [
+            r
+            for r in records
+            if not r.get("warmup", False) and r.get("success", False)
+        ]
+        if not measured:
+            continue
+        max_tokens = measured[0].get("max_output_tokens")
+        prompt_id = measured[0].get("prompt_id", "")
+        cold_start_vals = [r["cold_start_total_ms"] for r in measured if r.get("cold_start_total_ms") is not None]
+        out_tokens = [r["actual_output_tokens"] for r in measured if r.get("actual_output_tokens") is not None]
+        rows.append(
+            {
+                "condition": condition,
+                "path": path,
+                "prompt_id": prompt_id,
+                "max_output_tokens": max_tokens,
+                "actual_output_tokens_mean": fmean(out_tokens) if out_tokens else None,
+                "cold_start_total_ms_mean": fmean(cold_start_vals) if cold_start_vals else None,
+                "cold_start_total_ms_p95": _percentile(cold_start_vals, 95),
                 "n_measured": len(measured),
             }
         )
@@ -308,6 +364,7 @@ def build_report(
         ),
         "conditions": conditions_summary,
         "token_scaling_table": compute_token_scaling(by_condition_path),
+        "cold_start_scaling_table": compute_cold_start_scaling(by_condition_path),
         "direct_ipc_comparison": compute_direct_ipc_comparison(by_condition_path),
         "raw_records": records,
     }
@@ -347,12 +404,13 @@ def format_text_report(report: dict[str, Any]) -> str:
         f"  Measured (non-warmup, success): {report.get('n_measured_records', 'n/a')}",
     ]
 
-    # ── Token scaling table ───────────────────────────────────────────────
+    # ── Token scaling table (IPC steady-state inference latency) ─────────
     scaling = report.get("token_scaling_table") or []
     if scaling:
         lines += [
             "",
-            "Latency vs Output-Token Cap  (total end-to-end wall-clock time)",
+            "Inference Latency vs Output-Token Cap  (IPC path, persistent server)",
+            "  NOTE: direct-path rows are excluded here; see Cold-Start table below.",
             "-" * 72,
             f"  {'Cond':<5} {'Path':<8} {'Prompt style':<28} {'MaxTok':>6} "
             f"{'AvgActual':>9} {'Mean ms':>8} {'P95 ms':>7} {'N':>4}",
@@ -369,6 +427,29 @@ def format_text_report(report: dict[str, Any]) -> str:
                 f"{row.get('n_measured', '?'):>4}"
             )
 
+    # ── Cold-start scaling table (direct path, per-process wall time) ─────
+    cold_start_scaling = report.get("cold_start_scaling_table") or []
+    if cold_start_scaling:
+        lines += [
+            "",
+            "Cold-Start Wall Time vs Output-Token Cap  (direct path, per-process)",
+            "  NOTE: includes process/engine/tokenizer initialisation — not model inference latency.",
+            "-" * 72,
+            f"  {'Cond':<5} {'Path':<8} {'Prompt style':<28} {'MaxTok':>6} "
+            f"{'AvgActual':>9} {'Mean ms':>8} {'P95 ms':>7} {'N':>4}",
+            "  " + "-" * 68,
+        ]
+        for row in cold_start_scaling:
+            prompt_label = _PROMPT_LABELS.get(row.get("prompt_id", ""), row.get("prompt_id", ""))
+            lines.append(
+                f"  {row.get('condition', '?'):<5} {row.get('path', '?'):<8} "
+                f"{prompt_label:<28} {row.get('max_output_tokens') or '?':>6} "
+                f"{row.get('actual_output_tokens_mean') or 'n/a':>9} "
+                f"{_fmt_ms(row.get('cold_start_total_ms_mean')):>8} "
+                f"{_fmt_ms(row.get('cold_start_total_ms_p95')):>7} "
+                f"{row.get('n_measured', '?'):>4}"
+            )
+
     # ── Direct vs IPC comparison ──────────────────────────────────────────
     comparisons = report.get("direct_ipc_comparison") or []
     if comparisons:
@@ -379,14 +460,14 @@ def format_text_report(report: dict[str, Any]) -> str:
             "  NOTE: direct includes process/engine init; ipc connects to a running server.",
             "  These values reflect different lifecycle phases and are not comparable as overhead.",
             "-" * 72,
-            f"  {'Cond':<5} {'Direct mean ms':>14} {'IPC mean ms':>11}",
-            "  " + "-" * 34,
+            f"  {'Cond':<5} {'Direct cold-start ms':>20} {'IPC steady-state ms':>19}",
+            "  " + "-" * 44,
         ]
         for row in comparisons:
             lines.append(
                 f"  {row.get('condition', '?'):<5} "
-                f"{_fmt_ms(row.get('direct_total_latency_ms_mean')):>14} "
-                f"{_fmt_ms(row.get('ipc_total_latency_ms_mean')):>11}"
+                f"{_fmt_ms(row.get('direct_cold_start_total_ms_mean')):>20} "
+                f"{_fmt_ms(row.get('ipc_total_latency_ms_mean')):>19}"
             )
 
     # ── finish_reason / truncation summary ───────────────────────────────────

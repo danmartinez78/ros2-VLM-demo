@@ -542,7 +542,7 @@ record = {
     'success': success,
     'error': error,
     'cold_start_total_ms': cold_start_total_ms,
-    'total_latency_ms': cold_start_total_ms,
+    'total_latency_ms': None,
     'visual_preprocess_ms': visual_preprocess_ms,
     'ttft_ms': ttft_ms,
     'decode_ms': decode_ms,
