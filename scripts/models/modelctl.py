@@ -191,6 +191,23 @@ def _restore_file_snapshot(path: Path, snapshot: tuple[str, int] | None) -> None
     _write_text_atomic(path, content, mode=mode)
 
 
+def _rollback_activation_files(
+    snapshots: Iterable[tuple[Path, tuple[str, int] | None]],
+    *,
+    original_error: Exception,
+) -> None:
+    rollback_errors: list[str] = []
+    for path, snapshot in snapshots:
+        try:
+            _restore_file_snapshot(path, snapshot)
+        except Exception as restore_error:
+            rollback_errors.append(f"{path}: {restore_error}")
+    if rollback_errors:
+        raise ModelCtlError(
+            "Activation failed and rollback was incomplete:\n" + "\n".join(rollback_errors)
+        ) from original_error
+
+
 def _shell_export(name: str, value: str) -> str:
     return f"export {name}={shlex.quote(value)}"
 
@@ -836,9 +853,8 @@ def cmd_activate(args: argparse.Namespace) -> int:
     try:
         ensure_runtime_env_file(ctx, dry_run=False)
         _write_json_atomic(state_path, _active_state_payload(model, profile, ctx))
-    except Exception:
-        _restore_file_snapshot(env_path, previous_env)
-        _restore_file_snapshot(state_path, previous_state)
+    except Exception as exc:
+        _rollback_activation_files(((env_path, previous_env), (state_path, previous_state)), original_error=exc)
         raise
     print(f"Activated {model.model_id}/{profile.profile_id}")
     return 0
