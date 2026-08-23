@@ -39,6 +39,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -646,6 +647,166 @@ def format_text_report(report: dict[str, Any]) -> str:
 
     lines += ["", "=" * 80, ""]
     return "\n".join(lines)
+
+
+# ── record serialisers (called by run_vlm_multiframe_benchmark.sh) ────────────
+#
+# The shell script passes all dynamic values as environment variables with the
+# ``_BM_`` prefix so that no shell variable is ever interpolated directly into
+# Python source code.  This prevents NameError on JSON ``null``/``true``/``false``
+# and injection of arbitrary JSON strings.
+#
+# Scalar typed values (null, bool, number, JSON string, JSON array/object) are
+# passed pre-JSON-encoded; they are decoded with json.loads() below.
+# Plain strings (timestamps, path strings, model name) are passed raw.
+
+
+def _jl(env: dict[str, str], key: str, default: Any = None) -> Any:
+    """JSON-decode an environment variable; return ``default`` when absent/invalid."""
+    v = env.get(key)
+    if v is None:
+        return default
+    try:
+        return json.loads(v)
+    except (json.JSONDecodeError, ValueError):
+        return default
+
+
+def _js(env: dict[str, str], key: str, default: str = "") -> str:
+    """Return the raw string value of an environment variable."""
+    return env.get(key, default)
+
+
+def build_direct_record(env: dict[str, str] | None = None) -> str:
+    """Build a direct-path JSONL inference record from ``_BM_*`` environment variables.
+
+    Reads typed values with :func:`_jl` (JSON-decoded) and plain strings with
+    :func:`_js`.  Returns a compact JSON string suitable for appending to a
+    JSONL file.
+
+    Environment variables consumed
+    ──────────────────────────────
+    _BM_RUN_ID                run timestamp string
+    _BM_RECORDED_AT           ISO-8601 timestamp string
+    _BM_FRAME_CONDITION       label e.g. "F1"
+    _BM_FRAME_COUNT           JSON integer
+    _BM_FRAME_HASHES          JSON array  [{path, sha256}, ...]
+    _BM_PROMPT_HASH           12-hex string
+    _BM_MAX_OUTPUT_TOKENS     JSON integer
+    _BM_ACTUAL_OUTPUT_TOKENS  JSON integer or null
+    _BM_TOTAL_IMAGE_TOKENS    JSON integer or null
+    _BM_FINISH_REASON         JSON string or null
+    _BM_SUCCESS               JSON bool  (true / false)
+    _BM_ERROR                 JSON string or null
+    _BM_COLD_START_MS         JSON number or null
+    _BM_VISION_ENCODER_MS     JSON number or null
+    _BM_PREFILL_MS            JSON number or null
+    _BM_DECODE_MS             JSON number or null
+    _BM_DECODE_TOKENS_PER_SEC JSON number or null
+    _BM_LLM_GEN_GPU_MS        JSON number or null
+    _BM_RESPONSE_PATH         plain string path
+    _BM_PROFILE_PATH          plain string path
+    _BM_MODEL_NAME            plain string
+    _BM_ITERATION             JSON integer
+    _BM_IS_WARMUP             JSON bool
+    """
+    if env is None:
+        env = dict(os.environ)
+    return json.dumps({
+        "schema_version": "1",
+        "record_type": "inference",
+        "run_id": _js(env, "_BM_RUN_ID"),
+        "recorded_at": _js(env, "_BM_RECORDED_AT"),
+        "frame_condition": _js(env, "_BM_FRAME_CONDITION"),
+        "frame_count": _jl(env, "_BM_FRAME_COUNT"),
+        "path": "direct",
+        "frame_paths": _jl(env, "_BM_FRAME_HASHES"),
+        "prompt_hash": _js(env, "_BM_PROMPT_HASH"),
+        "max_output_tokens": _jl(env, "_BM_MAX_OUTPUT_TOKENS"),
+        "actual_output_tokens": _jl(env, "_BM_ACTUAL_OUTPUT_TOKENS"),
+        "total_image_tokens": _jl(env, "_BM_TOTAL_IMAGE_TOKENS"),
+        "finish_reason": _jl(env, "_BM_FINISH_REASON"),
+        "success": _jl(env, "_BM_SUCCESS"),
+        "error": _jl(env, "_BM_ERROR"),
+        "cold_start_total_ms": _jl(env, "_BM_COLD_START_MS"),
+        "total_latency_ms": None,
+        "ttft_ms": None,
+        "vision_encoder_ms": _jl(env, "_BM_VISION_ENCODER_MS"),
+        "prefill_ms": _jl(env, "_BM_PREFILL_MS"),
+        "decode_ms": _jl(env, "_BM_DECODE_MS"),
+        "decode_tokens_per_sec": _jl(env, "_BM_DECODE_TOKENS_PER_SEC"),
+        "llm_generation_total_gpu_time_ms": _jl(env, "_BM_LLM_GEN_GPU_MS"),
+        "inference_seconds": None,
+        "output_text": None,
+        "output_words": None,
+        "native_response_path": _js(env, "_BM_RESPONSE_PATH"),
+        "native_profile_path": _js(env, "_BM_PROFILE_PATH"),
+        "ipc_result_path": None,
+        "model_name": _js(env, "_BM_MODEL_NAME"),
+        "iteration": _jl(env, "_BM_ITERATION"),
+        "warmup": _jl(env, "_BM_IS_WARMUP"),
+    })
+
+
+def build_ipc_record(env: dict[str, str] | None = None) -> str:
+    """Build an IPC-path JSONL inference record from ``_BM_*`` environment variables.
+
+    Environment variables consumed
+    ──────────────────────────────
+    _BM_RUN_ID             run timestamp string
+    _BM_RECORDED_AT        ISO-8601 timestamp string
+    _BM_FRAME_CONDITION    label e.g. "F1"
+    _BM_FRAME_COUNT        JSON integer
+    _BM_FRAME_HASHES       JSON array  [{path, sha256}, ...]
+    _BM_PROMPT_HASH        12-hex string
+    _BM_MAX_OUTPUT_TOKENS  JSON integer
+    _BM_SUCCESS            JSON bool
+    _BM_ERROR              JSON string or null
+    _BM_TOTAL_LATENCY      JSON number or null  (outer client round-trip ms)
+    _BM_INFERENCE_SECONDS  JSON number or null  (backend inference_seconds)
+    _BM_OUTPUT_TEXT        JSON string or null
+    _BM_OUTPUT_WORDS       JSON integer or null
+    _BM_IPC_RESULT_PATH    JSON string or null  (path to result artifact)
+    _BM_MODEL_NAME         plain string
+    _BM_ITERATION          JSON integer
+    _BM_IS_WARMUP          JSON bool
+    """
+    if env is None:
+        env = dict(os.environ)
+    return json.dumps({
+        "schema_version": "1",
+        "record_type": "inference",
+        "run_id": _js(env, "_BM_RUN_ID"),
+        "recorded_at": _js(env, "_BM_RECORDED_AT"),
+        "frame_condition": _js(env, "_BM_FRAME_CONDITION"),
+        "frame_count": _jl(env, "_BM_FRAME_COUNT"),
+        "path": "ipc",
+        "frame_paths": _jl(env, "_BM_FRAME_HASHES"),
+        "prompt_hash": _js(env, "_BM_PROMPT_HASH"),
+        "max_output_tokens": _jl(env, "_BM_MAX_OUTPUT_TOKENS"),
+        "actual_output_tokens": None,
+        "total_image_tokens": None,
+        "finish_reason": None,
+        "success": _jl(env, "_BM_SUCCESS"),
+        "error": _jl(env, "_BM_ERROR"),
+        "cold_start_total_ms": None,
+        "total_latency_ms": _jl(env, "_BM_TOTAL_LATENCY"),
+        "ttft_ms": None,
+        "vision_encoder_ms": None,
+        "prefill_ms": None,
+        "decode_ms": None,
+        "decode_tokens_per_sec": None,
+        "llm_generation_total_gpu_time_ms": None,
+        "inference_seconds": _jl(env, "_BM_INFERENCE_SECONDS"),
+        "output_text": _jl(env, "_BM_OUTPUT_TEXT"),
+        "output_words": _jl(env, "_BM_OUTPUT_WORDS"),
+        "native_response_path": None,
+        "native_profile_path": None,
+        "ipc_result_path": _jl(env, "_BM_IPC_RESULT_PATH"),
+        "model_name": _js(env, "_BM_MODEL_NAME"),
+        "iteration": _jl(env, "_BM_ITERATION"),
+        "warmup": _jl(env, "_BM_IS_WARMUP"),
+    })
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

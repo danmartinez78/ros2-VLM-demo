@@ -599,55 +599,72 @@ _run_condition() {
             response_fields=$(_parse_native_response "${response_path}")
         fi
 
-        # Extract parsed fields
+        # Extract parsed fields — single Python invocation, all data via env vars.
+        # profile_fields / response_fields are already JSON objects (or "null")
+        # produced by _parse_native_profile / _parse_native_response.  Passing them
+        # as environment variables and decoding with json.loads() prevents
+        # any shell→Python literal injection.
+        local _extracted_fields
+        _extracted_fields=$(
+            export _BM_PROFILE="${profile_fields}"
+            export _BM_RESPONSE="${response_fields}"
+            python3 -c "
+import json, os
+def _jl(s):
+    try: return json.loads(s)
+    except Exception: return None
+p = _jl(os.environ.get('_BM_PROFILE', 'null')) or {}
+r = _jl(os.environ.get('_BM_RESPONSE', 'null')) or {}
+d = json.dumps
+print('\t'.join([
+    d(p.get('total_image_tokens')),
+    d(p.get('vision_encoder_ms')),
+    d(p.get('prefill_ms')),
+    d(p.get('decode_ms')),
+    d(p.get('actual_output_tokens') if p.get('actual_output_tokens') is not None else r.get('actual_output_tokens')),
+    d(p.get('decode_tokens_per_sec')),
+    d(p.get('llm_generation_total_gpu_time_ms')),
+    d(p.get('finish_reason') if p.get('finish_reason') is not None else r.get('finish_reason')),
+]))
+" 2>/dev/null || printf 'null\tnull\tnull\tnull\tnull\tnull\tnull\tnull')
         local total_image_tokens vision_encoder_ms prefill_ms decode_ms
         local actual_output_tokens decode_tokens_per_sec llm_gen_gpu_ms finish_reason
-        total_image_tokens=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('total_image_tokens') if p else None))" 2>/dev/null || echo "null")
-        vision_encoder_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('vision_encoder_ms') if p else None))" 2>/dev/null || echo "null")
-        prefill_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('prefill_ms') if p else None))" 2>/dev/null || echo "null")
-        decode_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('decode_ms') if p else None))" 2>/dev/null || echo "null")
-        actual_output_tokens=$(python3 -c "import json,sys; p=${profile_fields}; r=${response_fields}; v=(p or {}).get('actual_output_tokens') or (r or {}).get('actual_output_tokens'); print(json.dumps(v))" 2>/dev/null || echo "null")
-        decode_tokens_per_sec=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('decode_tokens_per_sec') if p else None))" 2>/dev/null || echo "null")
-        llm_gen_gpu_ms=$(python3 -c "import json,sys; p=${profile_fields}; print(json.dumps(p.get('llm_generation_total_gpu_time_ms') if p else None))" 2>/dev/null || echo "null")
-        finish_reason=$(python3 -c "import json,sys; p=${profile_fields}; r=${response_fields}; v=(p or {}).get('finish_reason') or (r or {}).get('finish_reason'); print(json.dumps(v))" 2>/dev/null || echo "null")
+        IFS=$'\t' read -r total_image_tokens vision_encoder_ms prefill_ms decode_ms \
+            actual_output_tokens decode_tokens_per_sec llm_gen_gpu_ms finish_reason \
+            <<< "${_extracted_fields}"
 
         local record
-        record=$(python3 -c "
-import json
-print(json.dumps({
-    'schema_version': '1',
-    'record_type': 'inference',
-    'run_id': '${TIMESTAMP}',
-    'recorded_at': '${recorded_at}',
-    'frame_condition': '${frame_condition}',
-    'frame_count': ${frame_count},
-    'path': 'direct',
-    'frame_paths': ${frame_hashes_json},
-    'prompt_hash': '${prompt_hash_val}',
-    'max_output_tokens': ${MAX_OUTPUT_TOKENS},
-    'actual_output_tokens': ${actual_output_tokens},
-    'total_image_tokens': ${total_image_tokens},
-    'finish_reason': ${finish_reason},
-    'success': $([ '${success}' = 'true' ] && echo 'true' || echo 'false'),
-    'error': ${error_msg},
-    'cold_start_total_ms': $([ '${DRY_RUN}' != 'true' ] && echo '${cold_start_ms}' || echo 'null'),
-    'total_latency_ms': null,
-    'ttft_ms': null,
-    'vision_encoder_ms': ${vision_encoder_ms},
-    'prefill_ms': ${prefill_ms},
-    'decode_ms': ${decode_ms},
-    'decode_tokens_per_sec': ${decode_tokens_per_sec},
-    'llm_generation_total_gpu_time_ms': ${llm_gen_gpu_ms},
-    'inference_seconds': null,
-    'output_text': null,
-    'output_words': null,
-    'native_response_path': '${response_path}',
-    'native_profile_path': '${profile_path}',
-    'ipc_result_path': null,
-    'model_name': '${EDGE_VLM_MODEL_NAME:-unknown}',
-    'iteration': ${iter_idx},
-    'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
-}))")
+        # Build the direct record via build_direct_record() in vlm_multiframe_report.py.
+        # All dynamic values are passed as _BM_* environment variables so that no
+        # shell variable is ever interpolated into Python source (prevents NameError
+        # on JSON null/true/false and injection via output_text or path strings).
+        record=$(
+            export _BM_RUN_ID="${TIMESTAMP}"
+            export _BM_RECORDED_AT="${recorded_at}"
+            export _BM_FRAME_CONDITION="${frame_condition}"
+            export _BM_FRAME_COUNT="${frame_count}"
+            export _BM_FRAME_HASHES="${frame_hashes_json}"
+            export _BM_PROMPT_HASH="${prompt_hash_val}"
+            export _BM_MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS}"
+            export _BM_ACTUAL_OUTPUT_TOKENS="${actual_output_tokens}"
+            export _BM_TOTAL_IMAGE_TOKENS="${total_image_tokens}"
+            export _BM_FINISH_REASON="${finish_reason}"
+            export _BM_SUCCESS="$([ "${success}" = 'true' ] && echo 'true' || echo 'false')"
+            export _BM_ERROR="${error_msg}"
+            export _BM_COLD_START_MS="$([ "${DRY_RUN}" != 'true' ] && echo "${cold_start_ms}" || echo 'null')"
+            export _BM_VISION_ENCODER_MS="${vision_encoder_ms}"
+            export _BM_PREFILL_MS="${prefill_ms}"
+            export _BM_DECODE_MS="${decode_ms}"
+            export _BM_DECODE_TOKENS_PER_SEC="${decode_tokens_per_sec}"
+            export _BM_LLM_GEN_GPU_MS="${llm_gen_gpu_ms}"
+            export _BM_RESPONSE_PATH="${response_path}"
+            export _BM_PROFILE_PATH="${profile_path}"
+            export _BM_MODEL_NAME="${EDGE_VLM_MODEL_NAME:-unknown}"
+            export _BM_ITERATION="${iter_idx}"
+            export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
+            PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
+            python3 -c "from vlm_multiframe_report import build_direct_record; print(build_direct_record())"
+        )
         _write_record "${record}"
         done
     fi
@@ -742,42 +759,30 @@ PYEOF
             fi
 
             local ipc_record
-            ipc_record=$(python3 -c "
-import json
-print(json.dumps({
-    'schema_version': '1',
-    'record_type': 'inference',
-    'run_id': '${TIMESTAMP}',
-    'recorded_at': '${ipc_recorded_at}',
-    'frame_condition': '${frame_condition}',
-    'frame_count': ${frame_count},
-    'path': 'ipc',
-    'frame_paths': ${frame_hashes_json},
-    'prompt_hash': '${prompt_hash_val}',
-    'max_output_tokens': ${MAX_OUTPUT_TOKENS},
-    'actual_output_tokens': None,
-    'total_image_tokens': None,
-    'finish_reason': None,
-    'success': $([ '${ipc_success}' = 'true' ] && echo 'true' || echo 'false'),
-    'error': ${ipc_error_msg},
-    'cold_start_total_ms': None,
-    'total_latency_ms': $([ '${ipc_success}' = 'true' ] && echo '${ipc_actual_latency_ms}' || echo 'null'),
-    'ttft_ms': None,
-    'vision_encoder_ms': None,
-    'prefill_ms': None,
-    'decode_ms': None,
-    'decode_tokens_per_sec': None,
-    'llm_generation_total_gpu_time_ms': None,
-    'inference_seconds': ${ipc_inference_seconds},
-    'output_text': ${ipc_output_text},
-    'output_words': ${ipc_output_words},
-    'native_response_path': None,
-    'native_profile_path': None,
-    'ipc_result_path': ${ipc_result_path_json},
-    'model_name': '${EDGE_VLM_MODEL_NAME:-unknown}',
-    'iteration': ${iter_idx},
-    'warmup': $([ '${is_warmup}' = 'true' ] && echo 'true' || echo 'false'),
-}))")
+            # Build the IPC record via build_ipc_record() in vlm_multiframe_report.py.
+            # All dynamic values are passed as _BM_* env vars — no shell variable is
+            # interpolated into Python source.
+            ipc_record=$(
+                export _BM_RUN_ID="${TIMESTAMP}"
+                export _BM_RECORDED_AT="${ipc_recorded_at}"
+                export _BM_FRAME_CONDITION="${frame_condition}"
+                export _BM_FRAME_COUNT="${frame_count}"
+                export _BM_FRAME_HASHES="${frame_hashes_json}"
+                export _BM_PROMPT_HASH="${prompt_hash_val}"
+                export _BM_MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS}"
+                export _BM_SUCCESS="$([ "${ipc_success}" = 'true' ] && echo 'true' || echo 'false')"
+                export _BM_ERROR="${ipc_error_msg}"
+                export _BM_TOTAL_LATENCY="$([ "${ipc_success}" = 'true' ] && echo "${ipc_actual_latency_ms}" || echo 'null')"
+                export _BM_INFERENCE_SECONDS="${ipc_inference_seconds}"
+                export _BM_OUTPUT_TEXT="${ipc_output_text}"
+                export _BM_OUTPUT_WORDS="${ipc_output_words}"
+                export _BM_IPC_RESULT_PATH="${ipc_result_path_json}"
+                export _BM_MODEL_NAME="${EDGE_VLM_MODEL_NAME:-unknown}"
+                export _BM_ITERATION="${iter_idx}"
+                export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
+                PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
+                python3 -c "from vlm_multiframe_report import build_ipc_record; print(build_ipc_record())"
+            )
             _write_record "${ipc_record}"
         done
     fi

@@ -38,6 +38,8 @@ from vlm_multiframe_report import (  # noqa: E402
     MAX_OUTPUT_TOKENS,
     MULTIFRAME_PROMPT_TEXT,
     aggregate_frame_condition,
+    build_direct_record,
+    build_ipc_record,
     build_multiframe_request_metadata,
     build_report,
     compute_frame_scaling_table,
@@ -1234,6 +1236,403 @@ class TestInsufficientFrameFailure(unittest.TestCase):
         """select_frames succeeds when exactly the required count is available."""
         result = select_frames([f"/seq/{i}.jpg" for i in range(8)], 8)
         self.assertEqual(len(result), 8)
+
+
+# ── record serialiser regression tests ───────────────────────────────────────
+#
+# These tests exercise the exact record-construction path used by the shell
+# script: build_direct_record() and build_ipc_record() read _BM_* env vars via
+# json.loads(), so they are immune to JSON null/true/false NameError and to
+# injection via output_text or path strings.
+
+
+def _direct_env(
+    *,
+    run_id: str = "20250101_120000",
+    recorded_at: str = "2025-01-01T12:00:00Z",
+    frame_condition: str = "F1",
+    frame_count: int = 1,
+    frame_hashes: list | None = None,
+    prompt_hash: str = "abc123def456",
+    max_output_tokens: int = 32,
+    actual_output_tokens: str = "null",
+    total_image_tokens: str = "null",
+    finish_reason: str = "null",
+    success: str = "true",
+    error: str = "null",
+    cold_start_ms: str = "4321",
+    vision_encoder_ms: str = "null",
+    prefill_ms: str = "null",
+    decode_ms: str = "null",
+    decode_tokens_per_sec: str = "null",
+    llm_gen_gpu_ms: str = "null",
+    response_path: str = "/tmp/resp.json",
+    profile_path: str = "/tmp/prof.json",
+    model_name: str = "TestModel",
+    iteration: int = 0,
+    is_warmup: str = "false",
+) -> dict[str, str]:
+    """Build a minimal _BM_* env dict for a direct record."""
+    if frame_hashes is None:
+        frame_hashes = [{"path": f"/tmp/f{i}.jpg", "sha256": "a" * 64} for i in range(frame_count)]
+    return {
+        "_BM_RUN_ID": run_id,
+        "_BM_RECORDED_AT": recorded_at,
+        "_BM_FRAME_CONDITION": frame_condition,
+        "_BM_FRAME_COUNT": str(frame_count),
+        "_BM_FRAME_HASHES": json.dumps(frame_hashes),
+        "_BM_PROMPT_HASH": prompt_hash,
+        "_BM_MAX_OUTPUT_TOKENS": str(max_output_tokens),
+        "_BM_ACTUAL_OUTPUT_TOKENS": actual_output_tokens,
+        "_BM_TOTAL_IMAGE_TOKENS": total_image_tokens,
+        "_BM_FINISH_REASON": finish_reason,
+        "_BM_SUCCESS": success,
+        "_BM_ERROR": error,
+        "_BM_COLD_START_MS": cold_start_ms,
+        "_BM_VISION_ENCODER_MS": vision_encoder_ms,
+        "_BM_PREFILL_MS": prefill_ms,
+        "_BM_DECODE_MS": decode_ms,
+        "_BM_DECODE_TOKENS_PER_SEC": decode_tokens_per_sec,
+        "_BM_LLM_GEN_GPU_MS": llm_gen_gpu_ms,
+        "_BM_RESPONSE_PATH": response_path,
+        "_BM_PROFILE_PATH": profile_path,
+        "_BM_MODEL_NAME": model_name,
+        "_BM_ITERATION": str(iteration),
+        "_BM_IS_WARMUP": is_warmup,
+    }
+
+
+def _ipc_env(
+    *,
+    run_id: str = "20250101_120000",
+    recorded_at: str = "2025-01-01T12:00:00Z",
+    frame_condition: str = "F1",
+    frame_count: int = 1,
+    frame_hashes: list | None = None,
+    prompt_hash: str = "abc123def456",
+    max_output_tokens: int = 32,
+    success: str = "true",
+    error: str = "null",
+    total_latency: str = "312",
+    inference_seconds: str = "null",
+    output_text: str = "null",
+    output_words: str = "null",
+    ipc_result_path: str = "null",
+    model_name: str = "TestModel",
+    iteration: int = 0,
+    is_warmup: str = "false",
+) -> dict[str, str]:
+    """Build a minimal _BM_* env dict for an IPC record."""
+    if frame_hashes is None:
+        frame_hashes = [{"path": f"/tmp/f{i}.jpg", "sha256": "b" * 64} for i in range(frame_count)]
+    return {
+        "_BM_RUN_ID": run_id,
+        "_BM_RECORDED_AT": recorded_at,
+        "_BM_FRAME_CONDITION": frame_condition,
+        "_BM_FRAME_COUNT": str(frame_count),
+        "_BM_FRAME_HASHES": json.dumps(frame_hashes),
+        "_BM_PROMPT_HASH": prompt_hash,
+        "_BM_MAX_OUTPUT_TOKENS": str(max_output_tokens),
+        "_BM_SUCCESS": success,
+        "_BM_ERROR": error,
+        "_BM_TOTAL_LATENCY": total_latency,
+        "_BM_INFERENCE_SECONDS": inference_seconds,
+        "_BM_OUTPUT_TEXT": output_text,
+        "_BM_OUTPUT_WORDS": output_words,
+        "_BM_IPC_RESULT_PATH": ipc_result_path,
+        "_BM_MODEL_NAME": model_name,
+        "_BM_ITERATION": str(iteration),
+        "_BM_IS_WARMUP": is_warmup,
+    }
+
+
+class TestRecordSerializer(unittest.TestCase):
+    """Regression tests for build_direct_record() / build_ipc_record().
+
+    Exercises the exact code path the shell script uses after the fix:
+    JSON null/true/false are passed as env-var strings and decoded with
+    json.loads() — no shell→Python literal interpolation.
+    """
+
+    # ── direct record ─────────────────────────────────────────────────────
+
+    def test_direct_success_true(self):
+        """success=true is serialised as a JSON boolean true, not a string."""
+        rec = json.loads(build_direct_record(_direct_env(success="true")))
+        self.assertIs(rec["success"], True)
+        self.assertEqual(rec["path"], "direct")
+
+    def test_direct_success_false(self):
+        """success=false is serialised as JSON boolean false; error field preserved."""
+        rec = json.loads(build_direct_record(
+            _direct_env(success="false", error='"direct inference failed"')
+        ))
+        self.assertIs(rec["success"], False)
+        self.assertEqual(rec["error"], "direct inference failed")
+
+    def test_direct_warmup_true(self):
+        """warmup=true produces warmup:true in the record."""
+        rec = json.loads(build_direct_record(_direct_env(is_warmup="true")))
+        self.assertIs(rec["warmup"], True)
+
+    def test_direct_warmup_false(self):
+        """warmup=false produces warmup:false in the record."""
+        rec = json.loads(build_direct_record(_direct_env(is_warmup="false")))
+        self.assertIs(rec["warmup"], False)
+
+    def test_direct_nullable_fields_are_none(self):
+        """JSON null env vars arrive as Python None in the record."""
+        rec = json.loads(build_direct_record(_direct_env(
+            actual_output_tokens="null",
+            total_image_tokens="null",
+            finish_reason="null",
+            vision_encoder_ms="null",
+            prefill_ms="null",
+            decode_ms="null",
+        )))
+        self.assertIsNone(rec["actual_output_tokens"])
+        self.assertIsNone(rec["total_image_tokens"])
+        self.assertIsNone(rec["finish_reason"])
+        self.assertIsNone(rec["vision_encoder_ms"])
+        self.assertIsNone(rec["prefill_ms"])
+        self.assertIsNone(rec["decode_ms"])
+        # Fixed fields always null on direct path
+        self.assertIsNone(rec["total_latency_ms"])
+        self.assertIsNone(rec["ttft_ms"])
+        self.assertIsNone(rec["inference_seconds"])
+        self.assertIsNone(rec["output_text"])
+        self.assertIsNone(rec["output_words"])
+        self.assertIsNone(rec["ipc_result_path"])
+
+    def test_direct_numeric_fields(self):
+        """Numeric profile fields arrive as Python numbers, not strings."""
+        rec = json.loads(build_direct_record(_direct_env(
+            vision_encoder_ms="58.1",
+            prefill_ms="38.4",
+            decode_ms="639.0",
+            decode_tokens_per_sec="46.8",
+            llm_gen_gpu_ms="640.9",
+            actual_output_tokens="30",
+            total_image_tokens="1024",
+            cold_start_ms="4567",
+        )))
+        self.assertAlmostEqual(rec["vision_encoder_ms"], 58.1)
+        self.assertAlmostEqual(rec["prefill_ms"], 38.4)
+        self.assertAlmostEqual(rec["decode_ms"], 639.0)
+        self.assertAlmostEqual(rec["decode_tokens_per_sec"], 46.8)
+        self.assertAlmostEqual(rec["llm_generation_total_gpu_time_ms"], 640.9)
+        self.assertEqual(rec["actual_output_tokens"], 30)
+        self.assertEqual(rec["total_image_tokens"], 1024)
+        self.assertAlmostEqual(rec["cold_start_total_ms"], 4567)
+
+    def test_direct_finish_reason_string(self):
+        """finish_reason JSON string arrives as a Python string."""
+        rec = json.loads(build_direct_record(_direct_env(finish_reason='"eos"')))
+        self.assertEqual(rec["finish_reason"], "eos")
+
+    def test_direct_finish_reason_max_length(self):
+        """finish_reason='max-length' (JSON string) is preserved exactly."""
+        rec = json.loads(build_direct_record(_direct_env(finish_reason='"max-length"')))
+        self.assertEqual(rec["finish_reason"], "max-length")
+
+    def test_direct_cold_start_null_in_dry_run(self):
+        """cold_start_total_ms is null when DRY_RUN passes 'null'."""
+        rec = json.loads(build_direct_record(_direct_env(cold_start_ms="null")))
+        self.assertIsNone(rec["cold_start_total_ms"])
+
+    def test_direct_path_and_model_name_preserved(self):
+        """Path strings and model_name are preserved exactly."""
+        rec = json.loads(build_direct_record(_direct_env(
+            response_path="/bench/F1/direct/measured_iter_0/response.json",
+            profile_path="/bench/F1/direct/measured_iter_0/profile.json",
+            model_name="Cosmos-Reason2-8B",
+        )))
+        self.assertEqual(rec["native_response_path"], "/bench/F1/direct/measured_iter_0/response.json")
+        self.assertEqual(rec["native_profile_path"], "/bench/F1/direct/measured_iter_0/profile.json")
+        self.assertEqual(rec["model_name"], "Cosmos-Reason2-8B")
+
+    def test_direct_frame_hashes_json_array_round_trip(self):
+        """frame_paths JSON array is deserialised correctly."""
+        hashes = [{"path": "/tmp/a.jpg", "sha256": "a" * 64}, {"path": "/tmp/b.jpg", "sha256": "b" * 64}]
+        rec = json.loads(build_direct_record(_direct_env(frame_count=2, frame_hashes=hashes)))
+        self.assertEqual(rec["frame_paths"], hashes)
+
+    def test_direct_output_is_valid_jsonl_line(self):
+        """build_direct_record() output is valid JSON (parseable JSONL line)."""
+        raw = build_direct_record(_direct_env())
+        obj = json.loads(raw)
+        self.assertEqual(obj["schema_version"], "1")
+        self.assertEqual(obj["record_type"], "inference")
+
+    # ── IPC record ────────────────────────────────────────────────────────
+
+    def test_ipc_success_true(self):
+        """IPC success=true is a boolean."""
+        rec = json.loads(build_ipc_record(_ipc_env(success="true")))
+        self.assertIs(rec["success"], True)
+        self.assertEqual(rec["path"], "ipc")
+
+    def test_ipc_success_false_with_error(self):
+        """IPC success=false with error message preserves the error string."""
+        rec = json.loads(build_ipc_record(
+            _ipc_env(success="false", error='"ipc client exited with code 1"', total_latency="null")
+        ))
+        self.assertIs(rec["success"], False)
+        self.assertEqual(rec["error"], "ipc client exited with code 1")
+        self.assertIsNone(rec["total_latency_ms"])
+
+    def test_ipc_warmup_true(self):
+        """IPC warmup=true serialises as boolean true."""
+        rec = json.loads(build_ipc_record(_ipc_env(is_warmup="true")))
+        self.assertIs(rec["warmup"], True)
+
+    def test_ipc_warmup_false(self):
+        """IPC warmup=false serialises as boolean false."""
+        rec = json.loads(build_ipc_record(_ipc_env(is_warmup="false")))
+        self.assertIs(rec["warmup"], False)
+
+    def test_ipc_with_output_text_and_words(self):
+        """IPC output_text and output_words are preserved (JSON-encoded strings)."""
+        escaped_text = json.dumps("compact result: {objects: [], hazards: []}")
+        rec = json.loads(build_ipc_record(_ipc_env(
+            output_text=escaped_text,
+            output_words="7",
+        )))
+        self.assertEqual(rec["output_text"], "compact result: {objects: [], hazards: []}")
+        self.assertEqual(rec["output_words"], 7)
+
+    def test_ipc_output_text_with_quotes_and_backslash(self):
+        """IPC output_text with quotes/backslash is round-tripped safely."""
+        original = 'result: {"key": "val\\nline2"}'
+        escaped_text = json.dumps(original)
+        rec = json.loads(build_ipc_record(_ipc_env(output_text=escaped_text)))
+        self.assertEqual(rec["output_text"], original)
+
+    def test_ipc_output_text_null(self):
+        """IPC output_text=null is Python None."""
+        rec = json.loads(build_ipc_record(_ipc_env(output_text="null")))
+        self.assertIsNone(rec["output_text"])
+
+    def test_ipc_with_inference_seconds(self):
+        """IPC inference_seconds is preserved as a float."""
+        rec = json.loads(build_ipc_record(_ipc_env(inference_seconds="0.273")))
+        self.assertAlmostEqual(rec["inference_seconds"], 0.273)
+
+    def test_ipc_with_latency_and_result_path(self):
+        """IPC total_latency_ms (number) and ipc_result_path (JSON string) are set."""
+        result_path = "/tmp/bench/F2/ipc/measured_iter_0/ipc_result.json"
+        rec = json.loads(build_ipc_record(_ipc_env(
+            total_latency="387",
+            ipc_result_path=json.dumps(result_path),
+        )))
+        self.assertEqual(rec["total_latency_ms"], 387)
+        self.assertEqual(rec["ipc_result_path"], result_path)
+
+    def test_ipc_nullable_stage_fields_are_none(self):
+        """IPC records always have null for direct-only stage timings."""
+        rec = json.loads(build_ipc_record(_ipc_env()))
+        for field in [
+            "actual_output_tokens", "total_image_tokens", "finish_reason",
+            "cold_start_total_ms", "ttft_ms", "vision_encoder_ms",
+            "prefill_ms", "decode_ms", "decode_tokens_per_sec",
+            "llm_generation_total_gpu_time_ms", "native_response_path",
+            "native_profile_path",
+        ]:
+            self.assertIsNone(rec[field], msg=f"{field} should be null in IPC record")
+
+    def test_ipc_output_is_valid_jsonl_line(self):
+        """build_ipc_record() output is valid JSON."""
+        raw = build_ipc_record(_ipc_env())
+        obj = json.loads(raw)
+        self.assertEqual(obj["schema_version"], "1")
+        self.assertEqual(obj["record_type"], "inference")
+
+    # ── shell-level serialiser test ────────────────────────────────────────
+    # Exercises the env-var → Python path as the shell script does it, using
+    # subprocess so the interpreter boundary is identical to production.
+
+    def test_shell_direct_record_via_subprocess(self):
+        """Direct record builder produces valid JSON when called via subprocess with env vars."""
+        env = dict(os.environ)
+        env.update(_direct_env(
+            success="true",
+            finish_reason='"eos"',
+            actual_output_tokens="12",
+            total_image_tokens="256",
+            vision_encoder_ms="45.5",
+            prefill_ms="38.4",
+            cold_start_ms="4321",
+            is_warmup="false",
+        ))
+        env["PYTHONPATH"] = str(_BENCH_DIR) + ((":" + os.environ["PYTHONPATH"]) if "PYTHONPATH" in os.environ else "")
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from vlm_multiframe_report import build_direct_record; print(build_direct_record())"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rec = json.loads(result.stdout.strip())
+        self.assertIs(rec["success"], True)
+        self.assertEqual(rec["finish_reason"], "eos")
+        self.assertEqual(rec["actual_output_tokens"], 12)
+        self.assertEqual(rec["total_image_tokens"], 256)
+        self.assertAlmostEqual(rec["vision_encoder_ms"], 45.5)
+        self.assertIsNone(rec["total_latency_ms"])
+        self.assertIs(rec["warmup"], False)
+
+    def test_shell_ipc_record_via_subprocess_with_output_text(self):
+        """IPC record builder produces valid JSON when called via subprocess with env vars."""
+        output_text_val = 'scene: {"objects": ["robot"], "hazards": null}'
+        env = dict(os.environ)
+        env.update(_ipc_env(
+            success="true",
+            total_latency="312",
+            inference_seconds="0.25",
+            output_text=json.dumps(output_text_val),
+            output_words="5",
+            ipc_result_path=json.dumps("/tmp/ipc_result.json"),
+            is_warmup="false",
+        ))
+        env["PYTHONPATH"] = str(_BENCH_DIR) + ((":" + os.environ["PYTHONPATH"]) if "PYTHONPATH" in os.environ else "")
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from vlm_multiframe_report import build_ipc_record; print(build_ipc_record())"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rec = json.loads(result.stdout.strip())
+        self.assertIs(rec["success"], True)
+        self.assertEqual(rec["total_latency_ms"], 312)
+        self.assertAlmostEqual(rec["inference_seconds"], 0.25)
+        self.assertEqual(rec["output_text"], output_text_val)
+        self.assertEqual(rec["output_words"], 5)
+        self.assertEqual(rec["ipc_result_path"], "/tmp/ipc_result.json")
+        self.assertIsNone(rec["vision_encoder_ms"])
+
+    def test_shell_ipc_record_via_subprocess_null_fields(self):
+        """IPC record with null output_text/output_words/inference_seconds via subprocess."""
+        env = dict(os.environ)
+        env.update(_ipc_env(
+            success="false",
+            error='"ros2 not available \u2014 ipc path skipped"',
+            total_latency="null",
+            output_text="null",
+            output_words="null",
+            inference_seconds="null",
+        ))
+        env["PYTHONPATH"] = str(_BENCH_DIR) + ((":" + os.environ["PYTHONPATH"]) if "PYTHONPATH" in os.environ else "")
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "from vlm_multiframe_report import build_ipc_record; print(build_ipc_record())"],
+            capture_output=True, text=True, env=env,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rec = json.loads(result.stdout.strip())
+        self.assertIs(rec["success"], False)
+        self.assertIsNone(rec["total_latency_ms"])
+        self.assertIsNone(rec["output_text"])
+        self.assertIsNone(rec["output_words"])
+        self.assertIsNone(rec["inference_seconds"])
 
 
 if __name__ == "__main__":
