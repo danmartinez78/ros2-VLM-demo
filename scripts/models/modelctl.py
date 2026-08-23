@@ -175,9 +175,11 @@ def _write_text_atomic(path: Path, content: str, mode: int = 0o755) -> None:
 
 
 def _read_file_snapshot(path: Path) -> tuple[str, int] | None:
-    if not path.exists():
+    try:
+        content = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    return (path.read_text(encoding="utf-8"), path.stat().st_mode & 0o777)
+    return (content, path.stat().st_mode & 0o777)
 
 
 def _restore_file_snapshot(path: Path, snapshot: tuple[str, int] | None) -> None:
