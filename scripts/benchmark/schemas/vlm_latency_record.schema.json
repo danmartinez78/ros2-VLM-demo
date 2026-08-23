@@ -1,0 +1,190 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "vlm_latency_record.schema.json",
+  "title": "VLM Latency Characterization Record",
+  "description": "Per-inference record emitted by run_vlm_latency_benchmark.sh and consumed by vlm_latency_report.py. Fields unavailable from the runtime are represented as null — they are never inferred or fabricated.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "record_type",
+    "run_id",
+    "recorded_at",
+    "condition",
+    "path",
+    "image_id",
+    "prompt_id",
+    "max_output_tokens",
+    "success",
+    "total_latency_ms"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Schema version for forward-compatibility checks."
+    },
+    "record_type": {
+      "type": "string",
+      "enum": ["inference"],
+      "description": "Fixed discriminator field."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "Unique run identifier (timestamp-based), shared across all records in one benchmark invocation."
+    },
+    "recorded_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 wall-clock timestamp when this inference record was written."
+    },
+    "condition": {
+      "type": "string",
+      "description": "Experiment condition label from the matrix (e.g. A, B, C, D, E).",
+      "pattern": "^[A-Z][0-9]?$"
+    },
+    "path": {
+      "type": "string",
+      "enum": ["direct", "ipc"],
+      "description": "Invocation path: 'direct' for native Edge-LLM cold-start invocation, 'ipc' for persistent edge_vlm_server via IPC socket."
+    },
+    "lifecycle_semantics": {
+      "type": ["string", "null"],
+      "enum": ["cold_start", "persistent", null],
+      "description": "Lifecycle phase measured: 'cold_start' for direct (includes per-process init), 'persistent' for ipc (steady-state against running server). Null for records written before this field was introduced."
+    },
+    "image_id": {
+      "type": "string",
+      "description": "Stable identifier for the input image (filename stem or content hash prefix)."
+    },
+    "image_path": {
+      "type": ["string", "null"],
+      "description": "Absolute or relative path to the input image file used for this inference."
+    },
+    "image_width_px": {
+      "type": ["integer", "null"],
+      "description": "Effective image width in pixels after any resize applied before encoding."
+    },
+    "image_height_px": {
+      "type": ["integer", "null"],
+      "description": "Effective image height in pixels after any resize applied before encoding."
+    },
+    "content_hash": {
+      "type": ["string", "null"],
+      "description": "Short SHA-256 hex prefix (12 chars) of the image file content, for reproducibility verification. Null if not computed."
+    },
+    "prompt_id": {
+      "type": "string",
+      "description": "Human-readable prompt style identifier (e.g. 'terse_id', 'compact_odd_json', 'scene_description')."
+    },
+    "prompt_hash": {
+      "type": ["string", "null"],
+      "description": "Short SHA-256 hex prefix of the exact prompt text used, for reproducibility verification."
+    },
+    "max_output_tokens": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Maximum number of output tokens requested from the model."
+    },
+    "actual_output_tokens": {
+      "type": ["integer", "null"],
+      "description": "Actual number of output tokens generated. Null if the runtime does not expose this."
+    },
+    "finish_reason": {
+      "type": ["string", "null"],
+      "description": "Finish reason from the native response JSON (e.g. 'eos', 'max-length', 'stop'). Null if not available from the runtime. Responses with finish_reason='max-length' are capped and do not represent natural task completion."
+    },
+    "output_text": {
+      "type": ["string", "null"],
+      "description": "Response text from the native output JSON or IPC client artifact, preserved for reference. Null when unavailable."
+    },
+    "output_words": {
+      "type": ["integer", "null"],
+      "description": "Whitespace-delimited word count of output_text from the IPC client artifact. Not a model token count. Null for direct path or when unavailable."
+    },
+    "inference_seconds": {
+      "type": ["number", "null"],
+      "description": "Wall-clock inference time in seconds as reported by edge_vlm_cli (IPC path only). Null for direct path or when not reported."
+    },
+    "success": {
+      "type": "boolean",
+      "description": "True when inference completed without error."
+    },
+    "error": {
+      "type": ["string", "null"],
+      "description": "Error message when success is false; null otherwise."
+    },
+    "cold_start_total_ms": {
+      "type": ["number", "null"],
+      "description": "Shell/process wall time for direct-path invocations in milliseconds (includes process startup, engine load, tokenizer init, and model inference). Null for ipc path. Distinct from model/runtime stage metrics in native_profile_path."
+    },
+    "total_latency_ms": {
+      "type": ["number", "null"],
+      "description": "Measured end-to-end wall-clock latency in milliseconds from inference request to response received. Null on failure. For direct path this equals cold_start_total_ms."
+    },
+    "vision_encoder_ms": {
+      "type": ["number", "null"],
+      "description": "Vision encoder (ViT) average time per run in milliseconds, from the NVIDIA-emitted profile JSON (stages[name=vision_encoder].average_time_per_run_ms). Null if not exposed by the runtime."
+    },
+    "prefill_ms": {
+      "type": ["number", "null"],
+      "description": "Prefill (prompt processing) average time per run in milliseconds, from the NVIDIA-emitted profile JSON (prefill.average_time_per_run_ms). Null if not exposed by the runtime. Never inferred."
+    },
+    "ttft_ms": {
+      "type": ["number", "null"],
+      "description": "Time-to-first-token in milliseconds. Null — the pinned TensorRT Edge-LLM runtime profile does not expose TTFT directly. `prefill_ms` is the closest available proxy but is a distinct metric; the two fields are never conflated."
+    },
+    "decode_ms": {
+      "type": ["number", "null"],
+      "description": "Autoregressive generation total time in milliseconds, from the NVIDIA-emitted profile JSON (generation.total_time_ms). Null if not exposed by the runtime."
+    },
+    "decode_tokens_per_sec": {
+      "type": ["number", "null"],
+      "description": "Generation throughput in tokens per second, from the NVIDIA-emitted profile JSON (generation.tokens_per_second). Null if not available."
+    },
+    "average_time_per_token_ms": {
+      "type": ["number", "null"],
+      "description": "Average time per generated token in milliseconds, from the NVIDIA-emitted profile JSON (generation.average_time_per_token_ms). Null if not exposed by the runtime."
+    },
+    "llm_generation_total_gpu_time_ms": {
+      "type": ["number", "null"],
+      "description": "Total GPU time for LLM generation in milliseconds, from the NVIDIA-emitted profile JSON (llm_generation.total_gpu_time_ms). Null if not exposed by the runtime."
+    },
+    "native_response_path": {
+      "type": ["string", "null"],
+      "description": "Path to the preserved raw llm_inference response JSON artifact. Null for ipc path or when the runtime did not produce output."
+    },
+    "native_profile_path": {
+      "type": ["string", "null"],
+      "description": "Path to the preserved NVIDIA-emitted llm_inference profile JSON artifact (--dumpProfile). Null for ipc path or when profiling was not available."
+    },
+    "ipc_result_path": {
+      "type": ["string", "null"],
+      "description": "Path to the preserved vlm_single_shot_client result JSON artifact in OUTPUT_DIR. Null for direct path or when the IPC call did not produce output."
+    },
+    "model_name": {
+      "type": ["string", "null"],
+      "description": "Model identifier (e.g. Cosmos-Reason2-8B)."
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Zero-based iteration index within this condition/path/image combination."
+    },
+    "warmup": {
+      "type": "boolean",
+      "description": "True when this record is a warmup iteration that should be excluded from aggregate statistics."
+    },
+    "tegrastats": {
+      "type": ["object", "null"],
+      "description": "Optional synchronized tegrastats snapshot captured during this inference.",
+      "properties": {
+        "emc_pct": {"type": ["number", "null"]},
+        "gr3d_pct": {"type": ["number", "null"]},
+        "module_power_w": {"type": ["number", "null"]},
+        "cpu_hotspot_pct": {"type": ["number", "null"]}
+      },
+      "additionalProperties": false
+    }
+  }
+}

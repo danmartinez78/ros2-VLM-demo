@@ -444,6 +444,12 @@ install(TARGETS edge_vlm_ros_node edge_vlm_tracked_observation_adapter edge_vlm_
   RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
+# Single-shot IPC client script used by the VLM latency benchmark runner.
+# Installed into lib/${PROJECT_NAME} so `ros2 run edge_vlm_ros vlm_single_shot_client` works.
+install(PROGRAMS scripts/vlm_single_shot_client
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 install(TARGETS vlm_reasoner_node
   EXPORT vlm_reasoner_nodeTargets
   ARCHIVE DESTINATION lib
