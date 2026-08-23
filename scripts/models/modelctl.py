@@ -25,6 +25,7 @@ PROFILES_REGISTRY_PATH = REGISTRY_DIR / "engine_profiles.json"
 THOR_MANIFEST_PATH = SCRIPTS_DIR / "thor" / "jp72_manifest.json"
 PREPARE_SCRIPT_PATH = SCRIPTS_DIR / "prepare_thor_jp72_assets.sh"
 VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+_MISSING = object()
 
 
 class ModelCtlError(RuntimeError):
@@ -331,14 +332,14 @@ def _find_first_value(payload: Any, key: str) -> Any:
             if payload_key == key:
                 return value
             found = _find_first_value(value, key)
-            if found is not None:
+            if found is not _MISSING:
                 return found
     elif isinstance(payload, list):
         for item in payload:
             found = _find_first_value(item, key)
-            if found is not None:
+            if found is not _MISSING:
                 return found
-    return None
+    return _MISSING
 
 
 def _load_json_if_exists(path: Path) -> dict[str, Any] | None:
@@ -379,14 +380,14 @@ def _validate_limits_against_configs(paths: EnginePaths, profile: ProfileRecord)
         for key in ("maxBatchSize", "maxInputLen", "maxKVCacheCapacity"):
             actual = _find_first_value(llm_config, key)
             expected = profile.llm.get(key)
-            if actual is not None and expected is not None and actual != expected:
+            if actual is not _MISSING and expected is not None and actual != expected:
                 mismatches.append(f"llm config {key}={actual} does not match profile value {expected}")
     visual_config = _load_json_if_exists(paths.multimodal_dir / "visual" / "config.json")
     if visual_config is not None:
         for key in ("maxImageTokens", "maxImageTokensPerImage"):
             actual = _find_first_value(visual_config, key)
             expected = profile.visual.get(key)
-            if actual is not None and expected is not None and actual != expected:
+            if actual is not _MISSING and expected is not None and actual != expected:
                 mismatches.append(f"visual config {key}={actual} does not match profile value {expected}")
     return mismatches
 
@@ -491,8 +492,20 @@ def render_runtime_env(ctx: RuntimeContext, *, include_active_lookup: bool = Tru
     if include_active_lookup:
         lines.extend(
             [
-                'if [[ -f "${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then',
-                '  eval "$(python3 "${EDGE_VLM_MODELCTL_PATH}" print-env --state-file "${EDGE_VLM_RUNTIME_STATE_FILE}")"',
+                'if [[ "${EDGE_VLM_RUNTIME_STATE_FILE}" == "${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/"* ]] && [[ -f "${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then',
+                '  _edge_vlm_exports="$(python3 "${EDGE_VLM_MODELCTL_PATH}" print-env --state-file "${EDGE_VLM_RUNTIME_STATE_FILE}")"',
+                '  _edge_vlm_exports_valid=1',
+                '  while IFS= read -r _edge_vlm_line; do',
+                '    [[ -n "${_edge_vlm_line}" ]] || continue',
+                '    case "${_edge_vlm_line}" in',
+                '      export\\ EDGE_VLM_MODEL_NAME=*|export\\ EDGE_VLM_MODEL_ID=*|export\\ EDGE_VLM_ENGINE_PROFILE_ID=*|export\\ EDGE_VLM_LLM_ENGINE_DIR=*|export\\ EDGE_VLM_MULTIMODAL_ENGINE_DIR=*|export\\ EDGELLM_PLUGIN_PATH=*) ;;',
+                '      *) _edge_vlm_exports_valid=0; break ;;',
+                '    esac',
+                '  done <<< "${_edge_vlm_exports}"',
+                '  if [[ "${_edge_vlm_exports_valid}" -eq 1 ]]; then',
+                '    eval "${_edge_vlm_exports}"',
+                '  fi',
+                '  unset _edge_vlm_exports _edge_vlm_exports_valid _edge_vlm_line',
                 "fi",
             ]
         )
@@ -767,7 +780,7 @@ def cmd_print_env(args: argparse.Namespace) -> int:
 
 def cmd_registry_check(args: argparse.Namespace) -> int:
     models, profiles, manifest = load_registries()
-    print(f"models={len(models)} profiles={len(profiles)} manifest_default={manifest['default_model']}")
+    print(f"models={len(models)} profiles={len(profiles)} manifest_default={manifest.get('default_model', '<unset>')}")
     return 0
 
 

@@ -745,8 +745,20 @@ export EDGELLM_PLUGIN_PATH="${plugin_path}"
 export ISAAC_ROS_WS="${isaac_ros_ws}"
 export EDGE_VLM_RUNTIME_STATE_FILE="${workspace_dir}/.edge-vlm/active-profile.json"
 export EDGE_VLM_MODELCTL_PATH="${script_dir}/models/modelctl.py"
-if [[ -f "\${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then
-  eval "\$(python3 "\${EDGE_VLM_MODELCTL_PATH}" print-env --state-file "\${EDGE_VLM_RUNTIME_STATE_FILE}")"
+if [[ "\${EDGE_VLM_RUNTIME_STATE_FILE}" == "\${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/"* ]] && [[ -f "\${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then
+  _edge_vlm_exports="\$(python3 "\${EDGE_VLM_MODELCTL_PATH}" print-env --state-file "\${EDGE_VLM_RUNTIME_STATE_FILE}")"
+  _edge_vlm_exports_valid=1
+  while IFS= read -r _edge_vlm_line; do
+    [[ -n "\${_edge_vlm_line}" ]] || continue
+    case "\${_edge_vlm_line}" in
+      export\ EDGE_VLM_MODEL_NAME=*|export\ EDGE_VLM_MODEL_ID=*|export\ EDGE_VLM_ENGINE_PROFILE_ID=*|export\ EDGE_VLM_LLM_ENGINE_DIR=*|export\ EDGE_VLM_MULTIMODAL_ENGINE_DIR=*|export\ EDGELLM_PLUGIN_PATH=*) ;;
+      *) _edge_vlm_exports_valid=0; break ;;
+    esac
+  done <<< "\${_edge_vlm_exports}"
+  if [[ "\${_edge_vlm_exports_valid}" -eq 1 ]]; then
+    eval "\${_edge_vlm_exports}"
+  fi
+  unset _edge_vlm_exports _edge_vlm_exports_valid _edge_vlm_line
 else
   export EDGE_VLM_MODEL_NAME="${chosen_model}"
   export EDGE_VLM_LLM_ENGINE_DIR="${llm_dir}"

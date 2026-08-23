@@ -234,7 +234,7 @@ class ModelCtlWorkspaceTests(unittest.TestCase):
                 [
                     "bash",
                     "-lc",
-                    f'source {sh_quote(str(env_file))} && printf "%s|%s|%s" "$EDGE_VLM_MODEL_ID" "$EDGE_VLM_ENGINE_PROFILE_ID" "$EDGE_VLM_LLM_ENGINE_DIR"',
+                    f'source {shlex.quote(str(env_file))} && printf "%s|%s|%s" "$EDGE_VLM_MODEL_ID" "$EDGE_VLM_ENGINE_PROFILE_ID" "$EDGE_VLM_LLM_ENGINE_DIR"',
                 ],
                 cwd=REPO_ROOT,
                 text=True,
@@ -340,10 +340,6 @@ class ModelCtlWorkspaceTests(unittest.TestCase):
             self.assertIn("--skip-runtime-config", result.stdout)
             self.assertNotIn("native Thor llm_build", result.stdout)
             self.assertFalse(env_file.exists())
-
-
-def sh_quote(value: str) -> str:
-    return shlex.quote(value)
 
 
 if __name__ == "__main__":
