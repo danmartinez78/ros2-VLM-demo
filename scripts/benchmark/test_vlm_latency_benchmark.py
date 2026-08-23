@@ -1601,17 +1601,25 @@ gen = prof.get('generation') if isinstance(prof, dict) else None
 if isinstance(gen, dict):
     if actual_output_tokens is None:
         actual_output_tokens = gen.get('generated_tokens')
-    decode_tokens_per_sec = gen.get('tokens_per_second') or decode_tokens_per_sec
+    v = gen.get('tokens_per_second')
+    if v is not None:
+        decode_tokens_per_sec = v
     average_time_per_token_ms = gen.get('average_time_per_token_ms')
-    decode_ms = gen.get('total_time_ms') or decode_ms
+    v = gen.get('total_time_ms')
+    if v is not None:
+        decode_ms = v
 prefill = prof.get('prefill') if isinstance(prof, dict) else None
 if isinstance(prefill, dict):
-    prefill_ms = prefill.get('average_time_per_run_ms') or prefill_ms
+    v = prefill.get('average_time_per_run_ms')
+    if v is not None:
+        prefill_ms = v
 stages = prof.get('stages') if isinstance(prof, dict) else None
 if isinstance(stages, list):
     for stage in stages:
         if isinstance(stage, dict) and stage.get('name') == 'vision_encoder':
-            vision_encoder_ms = stage.get('average_time_per_run_ms') or vision_encoder_ms
+            v = stage.get('average_time_per_run_ms')
+            if v is not None:
+                vision_encoder_ms = v
 llm_gen = prof.get('llm_generation') if isinstance(prof, dict) else None
 if isinstance(llm_gen, dict):
     llm_generation_total_gpu_time_ms = llm_gen.get('total_gpu_time_ms')
