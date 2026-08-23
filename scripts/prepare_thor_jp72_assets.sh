@@ -698,8 +698,13 @@ prepare_model_layout() {
     return
   fi
 
-  if [[ -n "$(manifest_value "models.${chosen_model}.hf_model_id")" ]]; then
+  if [[ -n "$(manifest_value "models.${chosen_model}.hf_model_id")" ]] \
+    && [[ -n "$(manifest_value "models.${chosen_model}.quantization")" ]] \
+    && [[ -n "$(manifest_value "models.${chosen_model}.pytorch_container")" ]] \
+    && [[ -n "$(manifest_value "models.${chosen_model}.modelopt_version")" ]]; then
     prepare_cosmos_default "${workspace_dir}" "${chosen_model}" "${edge_root}" "${edge_build}" "${plugin_path}"
+  elif [[ -n "$(manifest_value "models.${chosen_model}.hf_model_id")" ]]; then
+    fail "Model ${chosen_model} declares a checkpoint but not a supported first-class preparation layout."
   fi
 
   if [[ "${dry_run}" -eq 1 ]]; then

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import importlib.util
 import json
 import os
@@ -126,6 +127,12 @@ class ModelCtlWorkspaceTests(unittest.TestCase):
             else:
                 target.write_text(rel + "\n", encoding="utf-8")
 
+    def write_valid_managed_manifest(
+        self, model: modelctl.ModelRecord, profile: modelctl.ProfileRecord, ctx: modelctl.RuntimeContext
+    ) -> None:
+        paths = modelctl.engine_paths(model, profile, ctx)
+        modelctl._write_json_atomic(paths.manifest_path, modelctl._engine_manifest_payload(model, profile, ctx))
+
     def test_prepared_artifact_reuse_detection(self) -> None:
         models, _, _ = modelctl.load_registries()
         with tempfile.TemporaryDirectory(prefix="edge-vlm-prepared-") as tmpdir:
@@ -155,8 +162,7 @@ class ModelCtlWorkspaceTests(unittest.TestCase):
                 model = models["cosmos-reason2-8b"]
                 profile = profiles["thor-f8"]
                 self.create_engine_artifacts(model, profile, ctx)
-                paths = modelctl.engine_paths(model, profile, ctx)
-                modelctl._write_json_atomic(paths.manifest_path, modelctl._engine_manifest_payload(model, profile, ctx))
+                self.write_valid_managed_manifest(model, profile, ctx)
                 ok, errors = modelctl.validate_engine_profile(model, profile, ctx, require_manifest=True)
         self.assertTrue(ok, errors)
 
@@ -214,8 +220,7 @@ class ModelCtlWorkspaceTests(unittest.TestCase):
                 model = models["cosmos-reason2-8b"]
                 profile = profiles["thor-f8"]
                 self.create_engine_artifacts(model, profile, ctx)
-                paths = modelctl.engine_paths(model, profile, ctx)
-                modelctl._write_json_atomic(paths.manifest_path, modelctl._engine_manifest_payload(model, profile, ctx))
+                self.write_valid_managed_manifest(model, profile, ctx)
             result = subprocess.run(
                 [str(MODELCTL_WRAPPER), "activate", "cosmos-reason2-8b", "thor-f8"],
                 cwd=REPO_ROOT,
@@ -279,6 +284,192 @@ class ModelCtlWorkspaceTests(unittest.TestCase):
             state = json.loads((workspace / ".edge-vlm" / "active-profile.json").read_text(encoding="utf-8"))
             self.assertEqual(state["llm_engine_dir"], str(workspace / "Cosmos-Reason2-8B" / "engine" / "llm"))
             self.assertFalse((workspace / "Cosmos-Reason2-8B" / "engines" / "thor-current" / "llm" / "llm.engine").exists())
+
+    def test_external_layout_prepare_is_rejected_before_shell_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-external-prepare-") as tmpdir:
+            env = {
+                **os.environ,
+                "EDGE_VLM_WORKSPACE_DIR": str(Path(tmpdir) / "workspace"),
+                "EDGE_VLM_ENV_FILE": str(Path(tmpdir) / "edge_vlm_env.sh"),
+            }
+            result = subprocess.run(
+                [str(MODELCTL_WRAPPER), "prepare", "qwen3-vl-2b-instruct", "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("preparation_strategy 'external_layout'", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_external_layout_build_is_rejected_before_standard_build_commands(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-external-build-") as tmpdir:
+            env = {
+                **os.environ,
+                "EDGE_VLM_WORKSPACE_DIR": str(Path(tmpdir) / "workspace"),
+                "EDGE_VLM_ENV_FILE": str(Path(tmpdir) / "edge_vlm_env.sh"),
+            }
+            result = subprocess.run(
+                [str(MODELCTL_WRAPPER), "build", "qwen3-vl-2b-instruct", "thor-f8", "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("build_strategy 'external_layout'", result.stderr)
+        self.assertNotIn("llm_build", result.stdout)
+        self.assertNotIn("visual_build", result.stdout)
+
+    def test_template_profile_cannot_build_validate_or_activate(self) -> None:
+        models, profiles, _ = modelctl.load_registries()
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-mtp-template-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            plugin = Path(tmpdir) / "libNvInfer_edgellm_plugin.so"
+            plugin.write_text("plugin\n", encoding="utf-8")
+            self.create_prepared_artifacts(workspace, models["cosmos-reason2-8b"].display_name)
+            env = {
+                **os.environ,
+                "EDGE_VLM_WORKSPACE_DIR": str(workspace),
+                "EDGE_VLM_ENV_FILE": str(env_file),
+                "EDGELLM_PLUGIN_PATH": str(plugin),
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                ctx = modelctl._runtime_context()
+                model = models["cosmos-reason2-8b"]
+                profile = profiles["thor-mtp-template"]
+                self.create_engine_artifacts(model, profile, ctx)
+                self.write_valid_managed_manifest(model, profile, ctx)
+                ok, errors = modelctl.validate_engine_profile(model, profile, ctx, require_manifest=True)
+            self.assertFalse(ok)
+            self.assertTrue(any("decode strategy 'mtp'" in error for error in errors))
+            self.assertTrue(any(str(workspace / "Cosmos-Reason2-8B" / "engines" / "thor-mtp-template" / "draft") in error for error in errors))
+            build = subprocess.run(
+                [str(MODELCTL_WRAPPER), "build", "cosmos-reason2-8b", "thor-mtp-template", "--dry-run"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(build.returncode, 0)
+            self.assertIn("cannot be built", build.stderr)
+            activate = subprocess.run(
+                [str(MODELCTL_WRAPPER), "activate", "cosmos-reason2-8b", "thor-mtp-template"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(activate.returncode, 0)
+            self.assertIn("cannot be activated", activate.stderr)
+
+    def test_activation_rollback_preserves_existing_env_when_env_write_fails(self) -> None:
+        models, profiles, _ = modelctl.load_registries()
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-activate-env-fail-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            state_file = workspace / ".edge-vlm" / "active-profile.json"
+            plugin = Path(tmpdir) / "libNvInfer_edgellm_plugin.so"
+            plugin.write_text("plugin\n", encoding="utf-8")
+            legacy_env = "#!/usr/bin/env bash\nexport EDGE_VLM_MODEL_ID=legacy\n"
+            env_file.write_text(legacy_env, encoding="utf-8")
+            env = {
+                "EDGE_VLM_WORKSPACE_DIR": str(workspace),
+                "EDGE_VLM_ENV_FILE": str(env_file),
+                "EDGELLM_PLUGIN_PATH": str(plugin),
+            }
+            self.create_prepared_artifacts(workspace, models["cosmos-reason2-8b"].display_name)
+            with mock.patch.dict(os.environ, env, clear=False):
+                ctx = modelctl._runtime_context()
+                model = models["cosmos-reason2-8b"]
+                profile = profiles["thor-f8"]
+                self.create_engine_artifacts(model, profile, ctx)
+                self.write_valid_managed_manifest(model, profile, ctx)
+                with mock.patch.object(modelctl, "ensure_runtime_env_file", side_effect=OSError("env write failed")):
+                    with self.assertRaises(OSError):
+                        modelctl.cmd_activate(argparse.Namespace(model=model.model_id, profile=profile.profile_id, dry_run=False))
+            self.assertEqual(env_file.read_text(encoding="utf-8"), legacy_env)
+            self.assertFalse(state_file.exists())
+
+    def test_activation_rollback_restores_legacy_env_on_first_migration_failure(self) -> None:
+        models, profiles, _ = modelctl.load_registries()
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-activate-migration-fail-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            state_file = workspace / ".edge-vlm" / "active-profile.json"
+            plugin = Path(tmpdir) / "libNvInfer_edgellm_plugin.so"
+            plugin.write_text("plugin\n", encoding="utf-8")
+            legacy_env = "#!/usr/bin/env bash\nexport EDGE_VLM_MODEL_ID=legacy\nexport EDGE_VLM_LLM_ENGINE_DIR=/legacy/llm\n"
+            env_file.write_text(legacy_env, encoding="utf-8")
+            env = {
+                "EDGE_VLM_WORKSPACE_DIR": str(workspace),
+                "EDGE_VLM_ENV_FILE": str(env_file),
+                "EDGELLM_PLUGIN_PATH": str(plugin),
+            }
+            self.create_prepared_artifacts(workspace, models["cosmos-reason2-8b"].display_name)
+            with mock.patch.dict(os.environ, env, clear=False):
+                ctx = modelctl._runtime_context()
+                model = models["cosmos-reason2-8b"]
+                profile = profiles["thor-f8"]
+                self.create_engine_artifacts(model, profile, ctx)
+                self.write_valid_managed_manifest(model, profile, ctx)
+                original_write_json_atomic = modelctl._write_json_atomic
+
+                def fail_on_active_state(path: Path, payload: dict[str, object]) -> None:
+                    if path == Path(ctx.state_file):
+                        raise OSError("state write failed")
+                    original_write_json_atomic(path, payload)
+
+                with mock.patch.object(modelctl, "_write_json_atomic", side_effect=fail_on_active_state):
+                    with self.assertRaises(OSError):
+                        modelctl.cmd_activate(argparse.Namespace(model=model.model_id, profile=profile.profile_id, dry_run=False))
+            self.assertEqual(env_file.read_text(encoding="utf-8"), legacy_env)
+            self.assertFalse(state_file.exists())
+
+    def test_activation_rollback_preserves_existing_active_state_on_reactivation_failure(self) -> None:
+        models, profiles, _ = modelctl.load_registries()
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-activate-reactivation-fail-") as tmpdir:
+            workspace = Path(tmpdir) / "workspace"
+            env_file = Path(tmpdir) / "edge_vlm_env.sh"
+            plugin = Path(tmpdir) / "libNvInfer_edgellm_plugin.so"
+            plugin.write_text("plugin\n", encoding="utf-8")
+            env = {
+                "EDGE_VLM_WORKSPACE_DIR": str(workspace),
+                "EDGE_VLM_ENV_FILE": str(env_file),
+                "EDGELLM_PLUGIN_PATH": str(plugin),
+            }
+            self.create_prepared_artifacts(workspace, models["cosmos-reason2-8b"].display_name)
+            with mock.patch.dict(os.environ, env, clear=False):
+                ctx = modelctl._runtime_context()
+                model = models["cosmos-reason2-8b"]
+                current_profile = profiles["thor-current"]
+                next_profile = profiles["thor-f8"]
+                self.create_engine_artifacts(model, current_profile, ctx)
+                self.create_engine_artifacts(model, next_profile, ctx)
+                self.write_valid_managed_manifest(model, next_profile, ctx)
+                current_state = modelctl._active_state_payload(model, current_profile, ctx)
+                modelctl._write_json_atomic(Path(ctx.state_file), current_state)
+                current_env = modelctl.render_runtime_env(ctx)
+                modelctl._write_text_atomic(Path(ctx.env_file), current_env)
+                original_write_json_atomic = modelctl._write_json_atomic
+
+                def fail_on_active_state(path: Path, payload: dict[str, object]) -> None:
+                    if path == Path(ctx.state_file):
+                        raise OSError("state write failed")
+                    original_write_json_atomic(path, payload)
+
+                with mock.patch.object(modelctl, "_write_json_atomic", side_effect=fail_on_active_state):
+                    with self.assertRaises(OSError):
+                        modelctl.cmd_activate(argparse.Namespace(model=model.model_id, profile=next_profile.profile_id, dry_run=False))
+            state = json.loads((workspace / ".edge-vlm" / "active-profile.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["engine_profile_id"], "thor-current")
+            self.assertEqual(env_file.read_text(encoding="utf-8"), current_env)
 
     def test_cli_dry_runs_do_not_mutate_workspace(self) -> None:
         models, _, _ = modelctl.load_registries()

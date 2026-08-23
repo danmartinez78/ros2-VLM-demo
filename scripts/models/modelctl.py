@@ -26,6 +26,10 @@ THOR_MANIFEST_PATH = SCRIPTS_DIR / "thor" / "jp72_manifest.json"
 PREPARE_SCRIPT_PATH = SCRIPTS_DIR / "prepare_thor_jp72_assets.sh"
 VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _MISSING = object()
+SUPPORTED_PREPARATION_STRATEGIES = {"cosmos_reason2"}
+SUPPORTED_BUILD_STRATEGIES = {"cosmos_reason2"}
+SUPPORTED_DECODE_STRATEGIES = {"standard"}
+SUPPORTED_COMPONENT_KINDS = {"llm", "visual"}
 
 
 class ModelCtlError(RuntimeError):
@@ -170,6 +174,23 @@ def _write_text_atomic(path: Path, content: str, mode: int = 0o755) -> None:
         raise
 
 
+def _read_file_snapshot(path: Path) -> tuple[str, int] | None:
+    if not path.exists():
+        return None
+    return (path.read_text(encoding="utf-8"), path.stat().st_mode & 0o777)
+
+
+def _restore_file_snapshot(path: Path, snapshot: tuple[str, int] | None) -> None:
+    if snapshot is None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return
+    content, mode = snapshot
+    _write_text_atomic(path, content, mode=mode)
+
+
 def _shell_export(name: str, value: str) -> str:
     return f"export {name}={shlex.quote(value)}"
 
@@ -310,7 +331,51 @@ def required_engine_artifacts(model: ModelRecord) -> tuple[list[str], list[str]]
     return llm, visual
 
 
-def check_engine_artifacts(model: ModelRecord, paths: EnginePaths) -> list[str]:
+def _profile_support_errors(profile: ProfileRecord) -> list[str]:
+    errors: list[str] = []
+    strategy = str(profile.decode.get("strategy", ""))
+    if strategy not in SUPPORTED_DECODE_STRATEGIES:
+        errors.append(
+            f"Profile {profile.profile_id} decode strategy '{strategy}' is not supported by modelctl yet."
+        )
+    for component_name, component in profile.components.items():
+        kind = str(component.get("kind", ""))
+        if kind not in SUPPORTED_COMPONENT_KINDS:
+            errors.append(
+                f"Profile {profile.profile_id} component '{component_name}' kind '{kind}' is not supported by modelctl yet."
+            )
+    return errors
+
+
+def _ensure_prepare_strategy_supported(model: ModelRecord) -> None:
+    if model.preparation_strategy in SUPPORTED_PREPARATION_STRATEGIES:
+        return
+    raise ModelCtlError(
+        f"Model {model.model_id} uses preparation_strategy '{model.preparation_strategy}', which modelctl "
+        "cannot prepare automatically. Use the documented external layout workflow for this model."
+    )
+
+
+def _ensure_build_strategy_supported(model: ModelRecord) -> None:
+    if model.build_strategy in SUPPORTED_BUILD_STRATEGIES:
+        return
+    raise ModelCtlError(
+        f"Model {model.model_id} uses build_strategy '{model.build_strategy}', which modelctl cannot build "
+        "automatically. Use the documented external layout workflow for this model."
+    )
+
+
+def _ensure_profile_supported(profile: ProfileRecord, *, operation: str) -> None:
+    errors = _profile_support_errors(profile)
+    if not errors:
+        return
+    raise ModelCtlError(
+        f"Profile {profile.profile_id} cannot be {operation} until its declared build strategy is implemented.\n"
+        + "\n".join(errors)
+    )
+
+
+def check_engine_artifacts(model: ModelRecord, profile: ProfileRecord, paths: EnginePaths) -> list[str]:
     missing: list[str] = []
     if not paths.runtime_root.is_dir():
         missing.append(str(paths.runtime_root))
@@ -321,6 +386,10 @@ def check_engine_artifacts(model: ModelRecord, paths: EnginePaths) -> list[str]:
         candidate = paths.model_root / rel_dir
         if not candidate.is_dir():
             missing.append(str(candidate))
+    for component in profile.components.values():
+        component_dir = paths.runtime_root / component["relative_engine_dir"]
+        if not component_dir.is_dir():
+            missing.append(str(component_dir))
     for rel in llm_artifacts:
         candidate = paths.llm_dir / rel
         if not candidate.is_file():
@@ -406,7 +475,8 @@ def validate_engine_profile(
     require_manifest: bool,
 ) -> tuple[bool, list[str]]:
     paths = engine_paths(model, profile, ctx)
-    errors = check_engine_artifacts(model, paths)
+    errors = _profile_support_errors(profile)
+    errors.extend(check_engine_artifacts(model, profile, paths))
     errors.extend(_validate_limits_against_configs(paths, profile))
     manifest_data = _load_manifest_data(paths)
     if require_manifest:
@@ -433,6 +503,8 @@ def validate_engine_profile(
                     )
             if manifest_data.get("decode") != profile.decode:
                 errors.append("Engine manifest decode settings do not match registry profile.")
+            if manifest_data.get("components") != profile.components:
+                errors.append("Engine manifest component layout does not match registry profile.")
             prepared = manifest_data.get("prepared_artifacts", {})
             quantized_digest = _collect_inventory_digest(paths.model_root / "quantized")
             onnx_digest = _collect_inventory_digest(paths.model_root / "onnx")
@@ -656,6 +728,7 @@ def _prepare_command(model: ModelRecord, *, dry_run: bool) -> list[str]:
 def cmd_prepare(args: argparse.Namespace) -> int:
     models, _, _ = load_registries()
     model = resolve_model(args.model, models)
+    _ensure_prepare_strategy_supported(model)
     ctx = _runtime_context()
     prep = prepared_status(model, ctx)
     if prep["prepared"]:
@@ -675,6 +748,8 @@ def cmd_build(args: argparse.Namespace) -> int:
     ctx = _runtime_context()
     model = resolve_model(args.model, models)
     profile = resolve_profile(args.profile, profiles)
+    _ensure_build_strategy_supported(model)
+    _ensure_profile_supported(profile, operation="built")
     if not profile.managed:
         raise ModelCtlError(
             f"Profile {profile.profile_id} is a legacy adoption profile and is not rebuilt by modelctl."
@@ -742,6 +817,7 @@ def cmd_activate(args: argparse.Namespace) -> int:
     ctx = _runtime_context()
     model = resolve_model(args.model, models)
     profile = resolve_profile(args.profile, profiles)
+    _ensure_profile_supported(profile, operation="activated")
     ok, errors = validate_engine_profile(model, profile, ctx, require_manifest=profile.managed)
     if not ok:
         raise ModelCtlError("Cannot activate an unvalidated profile:\n" + "\n".join(errors))
@@ -749,8 +825,17 @@ def cmd_activate(args: argparse.Namespace) -> int:
         print(f"DRY-RUN  write active state {ctx.state_file}")
         print(f"DRY-RUN  write runtime env wrapper {ctx.env_file}")
         return 0
-    ensure_runtime_env_file(ctx, dry_run=False)
-    _write_json_atomic(Path(ctx.state_file), _active_state_payload(model, profile, ctx))
+    env_path = Path(ctx.env_file)
+    state_path = Path(ctx.state_file)
+    previous_env = _read_file_snapshot(env_path)
+    previous_state = _read_file_snapshot(state_path)
+    try:
+        ensure_runtime_env_file(ctx, dry_run=False)
+        _write_json_atomic(state_path, _active_state_payload(model, profile, ctx))
+    except Exception:
+        _restore_file_snapshot(env_path, previous_env)
+        _restore_file_snapshot(state_path, previous_state)
+        raise
     print(f"Activated {model.model_id}/{profile.profile_id}")
     return 0
 
