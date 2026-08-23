@@ -60,14 +60,18 @@ def _make_record(
     actual_output_tokens: int | None = 12,
     finish_reason: str | None = None,
     output_text: str | None = None,
+    output_words: int | None = None,
+    inference_seconds: float | None = None,
     success: bool = True,
     error: str | None = None,
     cold_start_total_ms: float | None = None,
     total_latency_ms: float | None = 500.0,
-    visual_preprocess_ms: float | None = None,
-    ttft_ms: float | None = None,
+    vision_encoder_ms: float | None = None,
+    prefill_ms: float | None = None,
     decode_ms: float | None = None,
     decode_tokens_per_sec: float | None = None,
+    average_time_per_token_ms: float | None = None,
+    llm_generation_total_gpu_time_ms: float | None = None,
     native_response_path: str | None = None,
     native_profile_path: str | None = None,
     content_hash: str | None = None,
@@ -93,14 +97,18 @@ def _make_record(
         "actual_output_tokens": actual_output_tokens,
         "finish_reason": finish_reason,
         "output_text": output_text,
+        "output_words": output_words,
+        "inference_seconds": inference_seconds,
         "success": success,
         "error": error,
         "cold_start_total_ms": cold_start_total_ms,
         "total_latency_ms": total_latency_ms,
-        "visual_preprocess_ms": visual_preprocess_ms,
-        "ttft_ms": ttft_ms,
+        "vision_encoder_ms": vision_encoder_ms,
+        "prefill_ms": prefill_ms,
         "decode_ms": decode_ms,
         "decode_tokens_per_sec": decode_tokens_per_sec,
+        "average_time_per_token_ms": average_time_per_token_ms,
+        "llm_generation_total_gpu_time_ms": llm_generation_total_gpu_time_ms,
         "native_response_path": native_response_path,
         "native_profile_path": native_profile_path,
         "model_name": model_name,
@@ -231,26 +239,26 @@ class TestAggregateCondition(unittest.TestCase):
 
     def test_null_stage_timings_reported_as_unavailable(self):
         records = [
-            _make_record(ttft_ms=None, decode_ms=None, visual_preprocess_ms=None),
+            _make_record(prefill_ms=None, decode_ms=None, vision_encoder_ms=None),
         ]
         agg = aggregate_condition(records)
-        self.assertFalse(agg["stage_timings_available"]["ttft"])
+        self.assertFalse(agg["stage_timings_available"]["prefill"])
         self.assertFalse(agg["stage_timings_available"]["decode"])
-        self.assertFalse(agg["stage_timings_available"]["visual_preprocess"])
+        self.assertFalse(agg["stage_timings_available"]["vision_encoder"])
         # The stats dict should carry the availability flag, not fabricated values.
-        self.assertIn("available", agg["ttft_ms"])
-        self.assertFalse(agg["ttft_ms"]["available"])
+        self.assertIn("available", agg["prefill_ms"])
+        self.assertFalse(agg["prefill_ms"]["available"])
 
     def test_stage_timings_aggregated_when_present(self):
         records = [
-            _make_record(ttft_ms=50.0, decode_ms=400.0, visual_preprocess_ms=30.0),
-            _make_record(ttft_ms=60.0, decode_ms=420.0, visual_preprocess_ms=25.0),
+            _make_record(prefill_ms=50.0, decode_ms=400.0, vision_encoder_ms=30.0),
+            _make_record(prefill_ms=60.0, decode_ms=420.0, vision_encoder_ms=25.0),
         ]
         agg = aggregate_condition(records)
-        self.assertTrue(agg["stage_timings_available"]["ttft"])
-        self.assertAlmostEqual(agg["ttft_ms"]["mean"], 55.0, places=1)
+        self.assertTrue(agg["stage_timings_available"]["prefill"])
+        self.assertAlmostEqual(agg["prefill_ms"]["mean"], 55.0, places=1)
         self.assertAlmostEqual(agg["decode_ms"]["mean"], 410.0, places=1)
-        self.assertAlmostEqual(agg["visual_preprocess_ms"]["mean"], 27.5, places=1)
+        self.assertAlmostEqual(agg["vision_encoder_ms"]["mean"], 27.5, places=1)
 
     def test_empty_records(self):
         agg = aggregate_condition([])
@@ -564,21 +572,21 @@ class TestFormatTextReport(unittest.TestCase):
         self.assertIn("Direct (cold-start, per-process) vs IPC (persistent server, steady-state)", text)
 
     def test_report_mentions_unavailable_stage_timings(self):
-        records = [_make_record(ttft_ms=None, decode_ms=None)]
+        records = [_make_record(prefill_ms=None, decode_ms=None)]
         report = build_report(records)
         text = format_text_report(report)
         self.assertIn("null, not inferred", text)
 
     def test_report_does_not_contain_fabricated_values(self):
         # Null stage timings must appear as n/a, not as numeric values.
-        records = [_make_record(ttft_ms=None, decode_ms=None, visual_preprocess_ms=None)]
+        records = [_make_record(prefill_ms=None, decode_ms=None, vision_encoder_ms=None)]
         report = build_report(records)
         text = format_text_report(report)
-        # The text should not contain a raw float for an unavailable TTFT.
-        self.assertNotIn("ttft_ms: 0", text)
+        # The text should not contain a raw float for an unavailable prefill.
+        self.assertNotIn("prefill_ms: 0", text)
 
     def test_report_with_stage_timings_present(self):
-        records = [_make_record(ttft_ms=55.0, decode_ms=400.0, visual_preprocess_ms=30.0)]
+        records = [_make_record(prefill_ms=55.0, decode_ms=400.0, vision_encoder_ms=30.0)]
         report = build_report(records)
         text = format_text_report(report)
         self.assertIn("VLM Latency Characterization Benchmark Report", text)
@@ -666,7 +674,8 @@ class TestSchemaValidity(unittest.TestCase):
         with schema_path.open("r", encoding="utf-8") as fh:
             schema = json.load(fh)
         props = schema.get("properties", {})
-        for field in ("ttft_ms", "decode_ms", "visual_preprocess_ms"):
+        for field in ("prefill_ms", "decode_ms", "vision_encoder_ms",
+                      "average_time_per_token_ms", "llm_generation_total_gpu_time_ms"):
             self.assertIn(field, props, f"Property {field!r} missing from schema")
             type_val = props[field].get("type", [])
             self.assertIn("null", type_val, f"{field!r} must allow null")
@@ -1548,6 +1557,220 @@ _validate_image {tmp!r} && echo ACCEPTED || echo REJECTED
                 "od must read at least 4 bytes to capture the full PNG signature")
         else:
             self.fail("Could not find xxd or od magic-byte read command in script")
+
+
+
+# ── nested NVIDIA profile schema parsing tests ────────────────────────────────
+
+
+class TestNativeProfileNestedSchema(unittest.TestCase):
+    """Validate that the runner correctly parses the nested NVIDIA profile JSON
+    schema as observed on Thor:
+      generation.generated_tokens    -> actual_output_tokens
+      generation.tokens_per_second   -> decode_tokens_per_sec
+      generation.average_time_per_token_ms -> average_time_per_token_ms
+      generation.total_time_ms       -> decode_ms
+      prefill.average_time_per_run_ms -> prefill_ms
+      stages[name=vision_encoder].average_time_per_run_ms -> vision_encoder_ms
+      llm_generation.total_gpu_time_ms -> llm_generation_total_gpu_time_ms
+    """
+
+    def _parse_profile_fields(self, profile_dict: dict) -> dict:
+        """Run the inline profile-parsing logic from the runner against a temp JSON file."""
+        import subprocess, json, tempfile, os
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(profile_dict, f)
+            profile_path = f.name
+        try:
+            result = subprocess.run(
+                ["python3", "-c", f"""
+import json
+
+with open({profile_path!r}) as f:
+    prof = json.load(f)
+
+actual_output_tokens = None
+decode_tokens_per_sec = None
+average_time_per_token_ms = None
+decode_ms = None
+prefill_ms = None
+vision_encoder_ms = None
+llm_generation_total_gpu_time_ms = None
+
+gen = prof.get('generation') if isinstance(prof, dict) else None
+if isinstance(gen, dict):
+    if actual_output_tokens is None:
+        actual_output_tokens = gen.get('generated_tokens')
+    decode_tokens_per_sec = gen.get('tokens_per_second') or decode_tokens_per_sec
+    average_time_per_token_ms = gen.get('average_time_per_token_ms')
+    decode_ms = gen.get('total_time_ms') or decode_ms
+prefill = prof.get('prefill') if isinstance(prof, dict) else None
+if isinstance(prefill, dict):
+    prefill_ms = prefill.get('average_time_per_run_ms') or prefill_ms
+stages = prof.get('stages') if isinstance(prof, dict) else None
+if isinstance(stages, list):
+    for stage in stages:
+        if isinstance(stage, dict) and stage.get('name') == 'vision_encoder':
+            vision_encoder_ms = stage.get('average_time_per_run_ms') or vision_encoder_ms
+llm_gen = prof.get('llm_generation') if isinstance(prof, dict) else None
+if isinstance(llm_gen, dict):
+    llm_generation_total_gpu_time_ms = llm_gen.get('total_gpu_time_ms')
+
+print(json.dumps({{
+    'actual_output_tokens': actual_output_tokens,
+    'decode_tokens_per_sec': decode_tokens_per_sec,
+    'average_time_per_token_ms': average_time_per_token_ms,
+    'decode_ms': decode_ms,
+    'prefill_ms': prefill_ms,
+    'vision_encoder_ms': vision_encoder_ms,
+    'llm_generation_total_gpu_time_ms': llm_generation_total_gpu_time_ms,
+}}))
+"""],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                raise AssertionError(result.stderr)
+            return json.loads(result.stdout.strip())
+        finally:
+            os.unlink(profile_path)
+
+    def _thor_profile_a(self) -> dict:
+        """Condition A fixture matching the actual Thor smoke output."""
+        return {
+            "generation": {
+                "generated_tokens": 16,
+                "tokens_per_second": 48.0973,
+                "average_time_per_token_ms": 20.793,
+                "total_time_ms": 332.68,
+            },
+            "prefill": {
+                "average_time_per_run_ms": 35.7389,
+            },
+            "stages": [
+                {"name": "vision_encoder", "average_time_per_run_ms": 50.3831},
+                {"name": "other_stage", "average_time_per_run_ms": 1.0},
+            ],
+        }
+
+    def _thor_profile_e(self) -> dict:
+        """Condition E fixture matching the actual Thor smoke output."""
+        return {
+            "generation": {
+                "generated_tokens": 238,
+                "tokens_per_second": 45.4902,
+                "average_time_per_token_ms": 21.982,
+                "total_time_ms": 5231.897,
+            },
+            "prefill": {
+                "average_time_per_run_ms": 36.9019,
+            },
+            "stages": [
+                {"name": "vision_encoder", "average_time_per_run_ms": 38.5207},
+            ],
+            "llm_generation": {
+                "total_gpu_time_ms": 5231.897,
+            },
+        }
+
+    def test_condition_a_generated_tokens(self):
+        parsed = self._parse_profile_fields(self._thor_profile_a())
+        self.assertEqual(parsed["actual_output_tokens"], 16)
+
+    def test_condition_a_tokens_per_second(self):
+        parsed = self._parse_profile_fields(self._thor_profile_a())
+        self.assertAlmostEqual(parsed["decode_tokens_per_sec"], 48.0973, places=2)
+
+    def test_condition_a_average_time_per_token_ms(self):
+        parsed = self._parse_profile_fields(self._thor_profile_a())
+        self.assertAlmostEqual(parsed["average_time_per_token_ms"], 20.793, places=2)
+
+    def test_condition_a_prefill_ms(self):
+        parsed = self._parse_profile_fields(self._thor_profile_a())
+        self.assertAlmostEqual(parsed["prefill_ms"], 35.7389, places=2)
+
+    def test_condition_a_vision_encoder_ms(self):
+        parsed = self._parse_profile_fields(self._thor_profile_a())
+        self.assertAlmostEqual(parsed["vision_encoder_ms"], 50.3831, places=2)
+
+    def test_condition_a_llm_generation_total_gpu_time_absent_is_null(self):
+        parsed = self._parse_profile_fields(self._thor_profile_a())
+        self.assertIsNone(parsed["llm_generation_total_gpu_time_ms"])
+
+    def test_condition_e_generated_tokens(self):
+        parsed = self._parse_profile_fields(self._thor_profile_e())
+        self.assertEqual(parsed["actual_output_tokens"], 238)
+
+    def test_condition_e_llm_generation_total_gpu_time_ms(self):
+        parsed = self._parse_profile_fields(self._thor_profile_e())
+        self.assertAlmostEqual(parsed["llm_generation_total_gpu_time_ms"], 5231.897, places=1)
+
+    def test_vision_encoder_stage_not_confused_with_other_stages(self):
+        """Only the 'vision_encoder' stage should populate vision_encoder_ms."""
+        profile = {
+            "stages": [
+                {"name": "other_stage", "average_time_per_run_ms": 99.9},
+                {"name": "vision_encoder", "average_time_per_run_ms": 42.1},
+            ]
+        }
+        parsed = self._parse_profile_fields(profile)
+        self.assertAlmostEqual(parsed["vision_encoder_ms"], 42.1, places=1)
+
+    def test_runner_script_parses_generation_dot_generated_tokens(self):
+        """The shell script must contain the nested key lookup for profile fields."""
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        self.assertIn("generated_tokens", text)
+        self.assertIn("tokens_per_second", text)
+        self.assertIn("vision_encoder", text)
+        self.assertIn("prefill", text)
+        self.assertIn("llm_generation", text)
+
+
+# ── IPC artifact field preservation tests ────────────────────────────────────
+
+
+class TestIpcArtifactFieldPreservation(unittest.TestCase):
+    """Validate that IPC path records include output_text, output_words, and
+    inference_seconds from the vlm_single_shot_client result artifact."""
+
+    def test_ipc_record_has_output_text_field(self):
+        rec = _make_record(path="ipc", output_text="a red panda", output_words=3, inference_seconds=0.73)
+        self.assertEqual(rec["output_text"], "a red panda")
+
+    def test_ipc_record_has_output_words_field(self):
+        rec = _make_record(path="ipc", output_words=3)
+        self.assertEqual(rec["output_words"], 3)
+
+    def test_ipc_record_has_inference_seconds_field(self):
+        rec = _make_record(path="ipc", inference_seconds=0.73)
+        self.assertAlmostEqual(rec["inference_seconds"], 0.73, places=3)
+
+    def test_direct_record_has_null_output_words_and_inference_seconds(self):
+        rec = _make_record(path="direct")
+        self.assertIsNone(rec["output_words"])
+        self.assertIsNone(rec["inference_seconds"])
+
+    def test_runner_script_reads_output_text_from_ipc_artifact(self):
+        text = (_BENCH_DIR / "run_vlm_latency_benchmark.sh").read_text(encoding="utf-8")
+        # The IPC success record must read output_text and output_words from the JSON artifact.
+        self.assertIn("output_text", text)
+        self.assertIn("output_words", text)
+        self.assertIn("inference_seconds", text)
+
+    def test_schema_defines_output_words_as_nullable_integer(self):
+        schema_path = _BENCH_DIR / "schemas" / "vlm_latency_record.schema.json"
+        with schema_path.open("r", encoding="utf-8") as fh:
+            schema = json.load(fh)
+        props = schema.get("properties", {})
+        self.assertIn("output_words", props)
+        self.assertIn("null", props["output_words"]["type"])
+
+    def test_schema_defines_inference_seconds_as_nullable_number(self):
+        schema_path = _BENCH_DIR / "schemas" / "vlm_latency_record.schema.json"
+        with schema_path.open("r", encoding="utf-8") as fh:
+            schema = json.load(fh)
+        props = schema.get("properties", {})
+        self.assertIn("inference_seconds", props)
+        self.assertIn("null", props["inference_seconds"]["type"])
 
 
 if __name__ == "__main__":

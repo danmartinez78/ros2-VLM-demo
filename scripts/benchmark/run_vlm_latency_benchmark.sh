@@ -349,14 +349,18 @@ print(json.dumps({
     'actual_output_tokens': None,
     'finish_reason': None,
     'output_text': None,
+    'output_words': None,
+    'inference_seconds': None,
     'success': False,
     'error': 'TENSORRT_EDGE_LLM_ROOT not set or llm_inference not built — hardware path unavailable',
     'cold_start_total_ms': None,
     'total_latency_ms': None,
-    'visual_preprocess_ms': None,
-    'ttft_ms': None,
+    'vision_encoder_ms': None,
+    'prefill_ms': None,
     'decode_ms': None,
     'decode_tokens_per_sec': None,
+    'average_time_per_token_ms': None,
+    'llm_generation_total_gpu_time_ms': None,
     'native_response_path': None,
     'native_profile_path': None,
     'model_name': sys.argv[9] if sys.argv[9] else None,
@@ -471,10 +475,12 @@ profile_path  = profile_json_path if os.path.exists(profile_json_path) else None
 # Only fields actually present are extracted; nothing is inferred or fabricated.
 actual_output_tokens = None
 finish_reason = None
-ttft_ms = None
+prefill_ms = None
 decode_ms = None
-visual_preprocess_ms = None
+vision_encoder_ms = None
 decode_tokens_per_sec = None
+average_time_per_token_ms = None
+llm_generation_total_gpu_time_ms = None
 output_text = None
 
 def _first_present(d, *keys):
@@ -498,27 +504,42 @@ if success and response_path:
         actual_output_tokens = _first_present(entry, 'outputTokens', 'output_tokens', 'numOutputTokens')
         finish_reason = _first_present(entry, 'finishReason', 'finish_reason')
         output_text = _first_present(entry, 'outputText', 'output_text', 'text', 'response')
-        # Stage timings from the response JSON (if present)
-        ttft_ms = _first_present(entry, 'ttftMs', 'ttft_ms')
-        decode_ms = _first_present(entry, 'decodeMs', 'decode_ms')
-        visual_preprocess_ms = _first_present(entry, 'visualMs', 'visual_ms', 'visual_preprocess_ms')
     except Exception:
         pass
 
 # Prefer NVIDIA-emitted profile data for stage timings (authoritative).
+# Parse the pinned TensorRT Edge-LLM nested profile schema:
+#   generation.generated_tokens   -> actual_output_tokens (if not already set)
+#   generation.tokens_per_second  -> decode_tokens_per_sec
+#   generation.average_time_per_token_ms -> average_time_per_token_ms
+#   generation.total_time_ms      -> decode_ms
+#   prefill.average_time_per_run_ms -> prefill_ms
+#   stages[].name == 'vision_encoder' .average_time_per_run_ms -> vision_encoder_ms
+#   llm_generation.total_gpu_time_ms -> llm_generation_total_gpu_time_ms
 if success and profile_path:
     try:
         with open(profile_path) as f:
             prof = json.load(f)
-        # Profile fields vary by runtime version; extract only what is present.
-        ttft_ms = _first_present(prof, 'ttftMs', 'ttft_ms', 'prefillMs', 'prefill_ms') or ttft_ms
-        decode_ms = _first_present(prof, 'decodeMs', 'decode_ms') or decode_ms
-        visual_preprocess_ms = _first_present(prof, 'visualMs', 'visual_ms', 'visual_preprocess_ms') or visual_preprocess_ms
+        gen = prof.get('generation') if isinstance(prof, dict) else None
+        if isinstance(gen, dict):
+            if actual_output_tokens is None:
+                actual_output_tokens = gen.get('generated_tokens')
+            decode_tokens_per_sec = gen.get('tokens_per_second') or decode_tokens_per_sec
+            average_time_per_token_ms = gen.get('average_time_per_token_ms')
+            decode_ms = gen.get('total_time_ms') or decode_ms
+        prefill = prof.get('prefill') if isinstance(prof, dict) else None
+        if isinstance(prefill, dict):
+            prefill_ms = prefill.get('average_time_per_run_ms') or prefill_ms
+        stages = prof.get('stages') if isinstance(prof, dict) else None
+        if isinstance(stages, list):
+            for stage in stages:
+                if isinstance(stage, dict) and stage.get('name') == 'vision_encoder':
+                    vision_encoder_ms = stage.get('average_time_per_run_ms') or vision_encoder_ms
+        llm_gen = prof.get('llm_generation') if isinstance(prof, dict) else None
+        if isinstance(llm_gen, dict):
+            llm_generation_total_gpu_time_ms = llm_gen.get('total_gpu_time_ms')
     except Exception:
         pass
-
-if actual_output_tokens is not None and decode_ms is not None and decode_ms > 0:
-    decode_tokens_per_sec = actual_output_tokens / (decode_ms / 1000.0)
 
 record = {
     'schema_version': '1',
@@ -539,14 +560,18 @@ record = {
     'actual_output_tokens': actual_output_tokens,
     'finish_reason': finish_reason,
     'output_text': output_text,
+    'output_words': None,
+    'inference_seconds': None,
     'success': success,
     'error': error,
     'cold_start_total_ms': cold_start_total_ms,
     'total_latency_ms': None,
-    'visual_preprocess_ms': visual_preprocess_ms,
-    'ttft_ms': ttft_ms,
+    'vision_encoder_ms': vision_encoder_ms,
+    'prefill_ms': prefill_ms,
     'decode_ms': decode_ms,
     'decode_tokens_per_sec': decode_tokens_per_sec,
+    'average_time_per_token_ms': average_time_per_token_ms,
+    'llm_generation_total_gpu_time_ms': llm_generation_total_gpu_time_ms,
     'native_response_path': response_path,
     'native_profile_path': profile_path,
     'model_name': model_name,
@@ -619,14 +644,18 @@ print(json.dumps({
     'actual_output_tokens': None,
     'finish_reason': None,
     'output_text': None,
+    'output_words': None,
+    'inference_seconds': None,
     'success': False,
     'error': 'ros2 not available — ipc path (vlm_single_shot_client) skipped',
     'cold_start_total_ms': None,
     'total_latency_ms': None,
-    'visual_preprocess_ms': None,
-    'ttft_ms': None,
+    'vision_encoder_ms': None,
+    'prefill_ms': None,
     'decode_ms': None,
     'decode_tokens_per_sec': None,
+    'average_time_per_token_ms': None,
+    'llm_generation_total_gpu_time_ms': None,
     'native_response_path': None,
     'native_profile_path': None,
     'model_name': sys.argv[9] if sys.argv[9] else None,
@@ -686,14 +715,22 @@ total_ms = float(total_latency_ms) if success else None
 content_hash = content_hash_arg if content_hash_arg != 'null' else None
 
 # IPC path does not expose stage timings (TTFT, decode, visual) — all null.
-# actual_output_tokens comes from backend if available; output_tokens in the
-# result artifact is null when the backend does not report a real token count.
+# Preserve output_text, output_words, and inference_seconds from the client
+# artifact so output semantics are available for analysis.
+# actual_output_tokens is null when the backend does not report a real token count.
 actual_output_tokens = None
+output_text = None
+output_words = None
+inference_seconds = None
 if success and os.path.exists(result_json_path):
     try:
         with open(result_json_path) as f:
             out = json.load(f)
         actual_output_tokens = out.get('output_tokens') or out.get('actualOutputTokens')
+        output_text = out.get('output_text')
+        output_words = out.get('output_words')
+        raw_secs = out.get('inference_seconds')
+        inference_seconds = float(raw_secs) if raw_secs is not None else None
     except Exception:
         pass
 
@@ -715,15 +752,19 @@ record = {
     'max_output_tokens': max_tokens,
     'actual_output_tokens': actual_output_tokens,
     'finish_reason': None,
-    'output_text': None,
+    'output_text': output_text,
+    'output_words': output_words,
+    'inference_seconds': inference_seconds,
     'success': success,
     'error': error,
     'cold_start_total_ms': None,
     'total_latency_ms': total_ms,
-    'visual_preprocess_ms': None,
-    'ttft_ms': None,
+    'vision_encoder_ms': None,
+    'prefill_ms': None,
     'decode_ms': None,
     'decode_tokens_per_sec': None,
+    'average_time_per_token_ms': None,
+    'llm_generation_total_gpu_time_ms': None,
     'native_response_path': None,
     'native_profile_path': None,
     'model_name': model_name,

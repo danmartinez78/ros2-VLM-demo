@@ -147,9 +147,11 @@ def aggregate_condition(
     measured = [r for r in records if not r.get("warmup", False) and r.get("success", False)]
     total_latency = [r["total_latency_ms"] for r in measured if r.get("total_latency_ms") is not None]
     cold_start_total = [r["cold_start_total_ms"] for r in measured if r.get("cold_start_total_ms") is not None]
-    ttft = [r["ttft_ms"] for r in measured if r.get("ttft_ms") is not None]
+    prefill = [r["prefill_ms"] for r in measured if r.get("prefill_ms") is not None]
     decode = [r["decode_ms"] for r in measured if r.get("decode_ms") is not None]
-    visual = [r["visual_preprocess_ms"] for r in measured if r.get("visual_preprocess_ms") is not None]
+    vision_encoder = [r["vision_encoder_ms"] for r in measured if r.get("vision_encoder_ms") is not None]
+    avg_token_ms = [r["average_time_per_token_ms"] for r in measured if r.get("average_time_per_token_ms") is not None]
+    llm_gen_gpu = [r["llm_generation_total_gpu_time_ms"] for r in measured if r.get("llm_generation_total_gpu_time_ms") is not None]
     output_tokens = [r["actual_output_tokens"] for r in measured if r.get("actual_output_tokens") is not None]
     decode_tps_vals = [v for r in measured if (v := _decode_tps(r)) is not None]
 
@@ -157,9 +159,11 @@ def aggregate_condition(
     warmup_count = sum(1 for r in records if r.get("warmup", False))
 
     # Determine whether stage timings were available at all
-    ttft_available = any(r.get("ttft_ms") is not None for r in measured)
+    prefill_available = any(r.get("prefill_ms") is not None for r in measured)
     decode_available = any(r.get("decode_ms") is not None for r in measured)
-    visual_available = any(r.get("visual_preprocess_ms") is not None for r in measured)
+    vision_encoder_available = any(r.get("vision_encoder_ms") is not None for r in measured)
+    avg_token_available = any(r.get("average_time_per_token_ms") is not None for r in measured)
+    llm_gen_gpu_available = any(r.get("llm_generation_total_gpu_time_ms") is not None for r in measured)
 
     # finish_reason breakdown — count by value; null when not reported.
     finish_reason_counts: dict[str, int] = {}
@@ -176,15 +180,19 @@ def aggregate_condition(
         "n_failed": failed,
         "total_latency_ms": _stats(total_latency),
         "cold_start_total_ms": _stats(cold_start_total),
-        "ttft_ms": _stats(ttft) if ttft_available else {"available": False},
+        "prefill_ms": _stats(prefill) if prefill_available else {"available": False},
         "decode_ms": _stats(decode) if decode_available else {"available": False},
-        "visual_preprocess_ms": _stats(visual) if visual_available else {"available": False},
+        "vision_encoder_ms": _stats(vision_encoder) if vision_encoder_available else {"available": False},
+        "average_time_per_token_ms": _stats(avg_token_ms) if avg_token_available else {"available": False},
+        "llm_generation_total_gpu_time_ms": _stats(llm_gen_gpu) if llm_gen_gpu_available else {"available": False},
         "actual_output_tokens": _stats(output_tokens) if output_tokens else {"available": False},
         "decode_tokens_per_sec": _stats(decode_tps_vals) if decode_tps_vals else {"available": False},
         "stage_timings_available": {
-            "ttft": ttft_available,
+            "prefill": prefill_available,
             "decode": decode_available,
-            "visual_preprocess": visual_available,
+            "vision_encoder": vision_encoder_available,
+            "average_time_per_token": avg_token_available,
+            "llm_generation_total_gpu_time": llm_gen_gpu_available,
             "actual_output_tokens": bool(output_tokens),
             "decode_tokens_per_sec": bool(decode_tps_vals),
         },
@@ -519,12 +527,12 @@ def format_text_report(report: dict[str, Any]) -> str:
     for cond_data in conditions_summary.values():
         for path_data in cond_data.values():
             avail = path_data.get("stage_timings_available") or {}
-            if avail.get("ttft") is False:
-                unavailable_stages.append("TTFT / prefill")
+            if avail.get("prefill") is False:
+                unavailable_stages.append("prefill time")
             if avail.get("decode") is False:
                 unavailable_stages.append("decode time")
-            if avail.get("visual_preprocess") is False:
-                unavailable_stages.append("visual preprocessing time")
+            if avail.get("vision_encoder") is False:
+                unavailable_stages.append("vision encoder time")
     if unavailable_stages:
         lines += [
             "",
