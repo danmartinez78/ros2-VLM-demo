@@ -1117,6 +1117,34 @@ class TestFormatTextReport(unittest.TestCase):
         self.assertIn("Engine provenance", text)
         self.assertIn("thor-f8", text)
 
+    def test_report_keeps_single_engine_32_token_fixed_summary(self):
+        text = format_text_report(self._full_report())
+        self.assertIn(
+            "Fixed: model, engines, precision, prompt text, max_output_tokens=32",
+            text,
+        )
+        self.assertNotIn("Mixed request config", text)
+
+    def test_report_renders_actual_max_output_tokens(self):
+        records = [
+            _make_record(frame_condition="F1", frame_count=1, path="direct", max_output_tokens=8),
+            _make_record(frame_condition="F1", frame_count=1, path="ipc", max_output_tokens=8),
+        ]
+        text = format_text_report(build_report(records))
+        self.assertIn("max_output_tokens=8", text)
+        self.assertNotIn("max_output_tokens=32", text)
+
+    def test_report_flags_mixed_max_output_tokens(self):
+        records = [
+            _make_record(frame_condition="F1", frame_count=1, path="direct", max_output_tokens=8),
+            _make_record(frame_condition="F1", frame_count=1, path="ipc", max_output_tokens=32),
+        ]
+        text = format_text_report(build_report(records))
+        self.assertIn(
+            "Mixed request config: max_output_tokens varies across records (8, 32)",
+            text,
+        )
+
     def test_report_contains_ipc_artifact_section(self):
         text = format_text_report(self._full_report())
         self.assertIn("IPC Result Artifacts", text)
@@ -1128,22 +1156,33 @@ class TestFormatTextReport(unittest.TestCase):
         self.assertIn("steady-state", text.lower())
 
     def test_report_flags_mixed_engine_provenance(self):
-        report = self._full_report()
-        report["engine_provenance"] = None
-        report["mixed_engine_provenance"] = True
-        report["engine_provenance_variants"] = [
-            _make_engine_provenance(),
-            _make_engine_provenance(
-                engine_profile_id="legacy",
-                llm_engine_dir="/tmp/engine/llm",
-                multimodal_engine_dir="/tmp/engine",
-                engine_manifest_path=None,
-                engine_manifest_sha256=None,
-                engine_manifest_status="missing",
+        report = build_report([
+            _make_record(
+                model_name="Cosmos-Reason2-8B",
+                engine_provenance=_make_engine_provenance(model_name="Cosmos-Reason2-8B"),
             ),
-        ]
+            _make_record(
+                model_name="Cosmos-Reason2-2B",
+                engine_provenance=_make_engine_provenance(
+                    model_name="Cosmos-Reason2-2B",
+                    engine_profile_id="legacy",
+                    llm_engine_dir="/tmp/engine/llm",
+                    multimodal_engine_dir="/tmp/engine",
+                    engine_manifest_path=None,
+                    engine_manifest_sha256=None,
+                    engine_manifest_status="missing",
+                ),
+            ),
+        ])
         text = format_text_report(report)
         self.assertIn("MIXED", text)
+        self.assertIn(
+            "Mixed/non-comparable: model/engine configuration varies across records",
+            text,
+        )
+        self.assertNotIn("Fixed: model, engines", text)
+        self.assertIn("Cosmos-Reason2-8B", text)
+        self.assertIn("Cosmos-Reason2-2B", text)
 
     def test_report_serializable_as_json(self):
         report = self._full_report()

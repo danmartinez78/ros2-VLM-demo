@@ -470,6 +470,26 @@ def collect_unique_engine_provenance(records: list[dict[str, Any]]) -> list[dict
     return unique
 
 
+def collect_unique_max_output_tokens(records: list[dict[str, Any]]) -> list[int | str]:
+    """Collect distinct max_output_tokens values from raw records."""
+    unique: list[int | str] = []
+    seen: set[str] = set()
+    for record in records:
+        value = record.get("max_output_tokens")
+        if value is None:
+            continue
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        key = json.dumps(value, sort_keys=True)
+        if key in seen:
+            continue
+        unique.append(value)
+        seen.add(key)
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in unique):
+        unique.sort()
+    return unique
+
+
 # ── full report generation ────────────────────────────────────────────────────
 
 
@@ -543,6 +563,8 @@ def format_text_report(report: dict[str, Any]) -> str:
 
     model_names = report.get("model_names") or []
     run_ids = report.get("run_ids") or []
+    max_output_tokens_values = collect_unique_max_output_tokens(report.get("raw_records") or [])
+    mixed_model_or_engine = report.get("mixed_engine_provenance") or len(model_names) > 1
     if model_names:
         lines += ["", f"  Model(s): {', '.join(model_names)}"]
     if run_ids:
@@ -582,9 +604,23 @@ def format_text_report(report: dict[str, Any]) -> str:
         f"  Measured (non-warmup, success): {report.get('n_measured_records', 'n/a')}",
         "",
         "  Frame-count conditions: F1=1 frame, F2=2 frames, F4=4 frames, F8=8 frames",
-        "  Fixed: model, engines, precision, prompt text, max_output_tokens=32",
-        "  Prompt policy: compact temporal JSON (one structured result for full sequence)",
     ]
+    if mixed_model_or_engine:
+        lines.append(
+            "  Mixed/non-comparable: model/engine configuration varies across records"
+        )
+        fixed_fields = ["precision", "prompt text"]
+    else:
+        fixed_fields = ["model", "engines", "precision", "prompt text"]
+    if len(max_output_tokens_values) == 1:
+        fixed_fields.append(f"max_output_tokens={max_output_tokens_values[0]}")
+    lines.append(f"  Fixed: {', '.join(fixed_fields)}")
+    if len(max_output_tokens_values) > 1:
+        mixed_values = ", ".join(str(value) for value in max_output_tokens_values)
+        lines.append(
+            f"  Mixed request config: max_output_tokens varies across records ({mixed_values})"
+        )
+    lines.append("  Prompt policy: compact temporal JSON (one structured result for full sequence)")
 
     # ── Frame-scaling table ───────────────────────────────────────────────
     scaling = report.get("frame_scaling_table") or []
