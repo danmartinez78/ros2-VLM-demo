@@ -9,6 +9,18 @@ It publishes a structured `VlmResult` for each sampled frame.
 The production design uses two processes. This is a correctness requirement on
 the validated Thor stack, not merely a deployment preference.
 
+## Broader design documentation
+
+This document is the source of truth for the **currently deployed ROS/IPC/Edge-LLM runtime architecture**. The broader temporal-reasoning and ODD-observation design is documented separately so target architecture is not confused with what is already deployed on `main`:
+
+- [Architecture design map](architecture/README.md)
+- [Temporal VLM architecture](architecture/temporal-vlm-architecture.md)
+- [ODD observation system architecture](architecture/odd-observation-system.md)
+- [Temporal VLM task-distillation pipeline](distillation-pipeline-design.md)
+- [Architecture decision records](adr/README.md)
+
+Those documents explicitly label validated/current behavior, implementation in progress, and target design.
+
 ## Process topology
 
 ```mermaid
