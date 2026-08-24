@@ -100,7 +100,7 @@
 #   --fps N                  Optional FPS metadata for temporal modes
 #   --frame-timestamps-sec   Optional comma-separated per-frame timestamps (seconds)
 #   --render-timestamps      Render visible timestamps on frames (experimental control)
-#                            (IPC path only; direct temporal/video rejects this flag)
+#                            (IPC path only; direct path rejects this flag)
 #   --skip-ipc               Alias for --paths direct
 #   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
@@ -181,12 +181,13 @@ if [[ "${SEQUENCE_TYPE}" == "images" && ( -n "${FPS}" || -n "${FRAME_TIMESTAMPS_
     exit 1
 fi
 
+if [[ ",${PATHS}," == *",direct,"* && "${RENDER_TIMESTAMPS}" == "true" ]]; then
+    echo "ERROR: direct path does not implement --render-timestamps preprocessing." >&2
+    echo "       Use --paths ipc, or run without --render-timestamps." >&2
+    exit 1
+fi
+
 if [[ ",${PATHS}," == *",direct,"* && "${SEQUENCE_TYPE}" != "images" ]]; then
-    if [[ "${RENDER_TIMESTAMPS}" == "true" ]]; then
-        echo "ERROR: direct path does not implement --render-timestamps preprocessing for temporal/video requests." >&2
-        echo "       Use --paths ipc, or run without --render-timestamps." >&2
-        exit 1
-    fi
     if [[ -n "${FRAME_TIMESTAMPS_SEC}" ]]; then
         echo "ERROR: direct path temporal/video request JSON supports frames+fps but not explicit --frame-timestamps-sec arrays." >&2
         echo "       Use --paths ipc for explicit per-frame timestamps." >&2
@@ -681,6 +682,10 @@ PYEOF
     elif [[ -n "${FPS}" && "${SEQUENCE_TYPE}" != "images" ]]; then
         frame_timestamp_policy='"implicit_uniform_from_fps"'
     fi
+    local direct_frame_timestamp_policy="${frame_timestamp_policy}"
+    if [[ "${SEQUENCE_TYPE}" != "images" ]]; then
+        direct_frame_timestamp_policy='"implicit_uniform_from_fps"'
+    fi
 
     # ── direct path ────────────────────────────────────────────────────────────
     if [[ ",${PATHS}," == *",direct,"* ]]; then
@@ -799,9 +804,9 @@ print('\t'.join([
             export _BM_MODEL_NAME="${RESOLVED_MODEL_NAME:-unknown}"
             export _BM_ENGINE_PROVENANCE="${ENGINE_PROVENANCE_JSON}"
             export _BM_SEQUENCE_TYPE="\"${SEQUENCE_TYPE}\""
-            export _BM_FPS="$([ -n "${FPS}" ] && echo "${FPS}" || echo 'null')"
+            export _BM_FPS="$([ "${SEQUENCE_TYPE}" != "images" ] && echo "${FPS:-1.0}" || echo 'null')"
             export _BM_FRAME_TIMESTAMPS_SEC="${frame_timestamps_json}"
-            export _BM_FRAME_TIMESTAMP_POLICY="${frame_timestamp_policy}"
+            export _BM_FRAME_TIMESTAMP_POLICY="${direct_frame_timestamp_policy}"
             export _BM_RENDERED_TIMESTAMPS="$([ "${RENDER_TIMESTAMPS}" = 'true' ] && echo 'true' || echo 'false')"
             export _BM_RUNTIME_TEMPORAL_ENCODING="\"$(_runtime_temporal_encoding_for_direct)\""
             export _BM_TEMPORAL_FALLBACK_USED="false"

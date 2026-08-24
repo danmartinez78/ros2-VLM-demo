@@ -1348,11 +1348,19 @@ class TestShellSyntax(unittest.TestCase):
             self.skipTest(f"Script not found: {script}")
         content = script.read_text(encoding="utf-8")
         self.assertIn(
-            "direct path does not implement --render-timestamps preprocessing for temporal/video requests",
+            "direct path does not implement --render-timestamps preprocessing.",
             content,
         )
         self.assertIn(
             "direct path temporal/video request JSON supports frames+fps but not explicit --frame-timestamps-sec arrays",
+            content,
+        )
+        self.assertIn(
+            "export _BM_FPS=\"$([ \"${SEQUENCE_TYPE}\" != \"images\" ] && echo \"${FPS:-1.0}\" || echo 'null')\"",
+            content,
+        )
+        self.assertIn(
+            "direct_frame_timestamp_policy='\"implicit_uniform_from_fps\"'",
             content,
         )
         self.assertIn(
