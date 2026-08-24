@@ -240,10 +240,10 @@ This generates, in order:
 
 1. Checkpoint acquisition (`huggingface-cli download`).
 2. ONNX export for the reasoning path (`tensorrt-edgellm-export … --task reasoning`).
-3. LLM engine build (`llm_build`).
-4. Visual engine build (`visual_build`).
-5. Smoke inference, single frame / image (F1) (`llm_inference --engineDir … --inputFile …`).
-6. Provenance / manifest capture (`modelctl`).
+3a. LLM engine build (`llm_build`).
+3b. Visual engine build (`visual_build`).
+4. Smoke inference, single frame / image (F1) (`llm_inference --engineDir … --inputFile …`).
+5. Provenance / manifest capture (`modelctl`).
 
 No large downloads or builds are performed on CI.  All commands are printed
 to stdout and validated for structural correctness only.
