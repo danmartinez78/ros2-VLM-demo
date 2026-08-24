@@ -26,10 +26,13 @@ THOR_MANIFEST_PATH = SCRIPTS_DIR / "thor" / "jp72_manifest.json"
 PREPARE_SCRIPT_PATH = SCRIPTS_DIR / "prepare_thor_jp72_assets.sh"
 VALID_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 _MISSING = object()
-SUPPORTED_PREPARATION_STRATEGIES = {"cosmos_reason2"}
-SUPPORTED_BUILD_STRATEGIES = {"cosmos_reason2"}
+SUPPORTED_PREPARATION_STRATEGIES = {"cosmos_reason2", "cosmos3_edge"}
+SUPPORTED_BUILD_STRATEGIES = {"cosmos_reason2", "cosmos3_edge"}
 SUPPORTED_DECODE_STRATEGIES = {"standard"}
 SUPPORTED_COMPONENT_KINDS = {"llm", "visual"}
+SUPPORTED_RUNTIME_STRATEGIES = {"standard_vlm", "cosmos3_edge_vlm"}
+# cosmos3_policy_inference is intentionally excluded: it applies only to
+# nvidia/Cosmos3-Edge-Policy-DROID, not to the base scene-understanding checkpoint.
 
 
 class ModelCtlError(RuntimeError):
@@ -57,6 +60,8 @@ class ProfileRecord:
     visual: dict[str, Any]
     decode: dict[str, Any]
     components: dict[str, dict[str, Any]]
+    runtime_strategy: str
+    temporal_input: str
 
 
 @dataclass(frozen=True)
@@ -275,6 +280,8 @@ def load_registries() -> tuple[dict[str, ModelRecord], dict[str, ProfileRecord],
             visual=data["visual"],
             decode=data["decode"],
             components=components,
+            runtime_strategy=str(data.get("runtime_strategy", "standard_vlm")),
+            temporal_input=str(data.get("temporal_input", "image")),
         )
     return models, profiles, manifest
 
@@ -356,6 +363,13 @@ def _profile_support_errors(profile: ProfileRecord) -> list[str]:
     if strategy not in SUPPORTED_DECODE_STRATEGIES:
         errors.append(
             f"Profile {profile.profile_id} decode strategy '{strategy}' is not supported by modelctl yet."
+        )
+    if profile.runtime_strategy not in SUPPORTED_RUNTIME_STRATEGIES:
+        errors.append(
+            f"Profile {profile.profile_id} runtime_strategy '{profile.runtime_strategy}' is not supported. "
+            f"Supported strategies: {sorted(SUPPORTED_RUNTIME_STRATEGIES)}. "
+            "Note: 'cosmos3_policy_inference' is only valid for nvidia/Cosmos3-Edge-Policy-DROID "
+            "and is not supported by this project's scene-understanding workflow."
         )
     for component_name, component in profile.components.items():
         kind = str(component.get("kind", ""))
@@ -513,6 +527,8 @@ def validate_engine_profile(
                 "quantization": model.manifest_model.get("quantization"),
                 "engine_profile_id": profile.profile_id,
                 "target": profile.target,
+                "runtime_strategy": profile.runtime_strategy,
+                "temporal_input": profile.temporal_input,
                 "maxBatchSize": profile.llm.get("maxBatchSize"),
                 "maxInputLen": profile.llm.get("maxInputLen"),
                 "maxKVCacheCapacity": profile.llm.get("maxKVCacheCapacity"),
@@ -550,6 +566,8 @@ def _engine_manifest_payload(model: ModelRecord, profile: ProfileRecord, ctx: Ru
         "quantization": model.manifest_model.get("quantization"),
         "engine_profile_id": profile.profile_id,
         "target": profile.target,
+        "runtime_strategy": profile.runtime_strategy,
+        "temporal_input": profile.temporal_input,
         "tensorrt_edge_llm_commit": manifest["edge_llm"]["commit"],
         "maxBatchSize": profile.llm.get("maxBatchSize"),
         "maxInputLen": profile.llm.get("maxInputLen"),
@@ -625,6 +643,8 @@ def _active_state_payload(model: ModelRecord, profile: ProfileRecord, ctx: Runti
         "model_name": model.display_name,
         "engine_profile_id": profile.profile_id,
         "target": profile.target,
+        "runtime_strategy": profile.runtime_strategy,
+        "temporal_input": profile.temporal_input,
         "workspace_dir": ctx.workspace_dir,
         "llm_engine_dir": str(paths.llm_dir),
         "multimodal_engine_dir": str(paths.multimodal_dir),
@@ -720,6 +740,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         paths = engine_paths(model, profile, ctx)
         valid, errors = validate_engine_profile(model, profile, ctx, require_manifest=profile.managed)
         print(f"profile_id: {profile.profile_id}")
+        print(f"runtime_strategy: {profile.runtime_strategy}")
+        print(f"temporal_input: {profile.temporal_input}")
         print(f"engine_root: {paths.runtime_root}")
         print(f"managed_root: {paths.metadata_root}")
         print(f"engine_ready: {valid}")

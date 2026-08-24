@@ -85,6 +85,34 @@
           "relative_engine_dir": "draft"
         }
       }
+    },
+    "cosmos3-edge-thor-f8": {
+      "target": "jetson-thor",
+      "managed": true,
+      "runtime_strategy": "cosmos3_edge_vlm",
+      "temporal_input": "native_video",
+      "llm": {
+        "maxBatchSize": 1,
+        "maxInputLen": 2048,
+        "maxKVCacheCapacity": 4096
+      },
+      "visual": {
+        "maxImageTokens": 2048,
+        "maxImageTokensPerImage": 512
+      },
+      "decode": {
+        "strategy": "standard"
+      },
+      "components": {
+        "llm": {
+          "kind": "llm",
+          "relative_engine_dir": "llm"
+        },
+        "visual": {
+          "kind": "visual",
+          "relative_engine_dir": "visual"
+        }
+      }
     }
   }
 }

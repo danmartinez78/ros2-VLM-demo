@@ -1,0 +1,137 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "cosmos3_edge_provenance.schema.json",
+  "title": "Cosmos3-Edge Runtime Provenance Record",
+  "description": "Provenance record for a Cosmos3-Edge benchmark or inference run. Additive to native_benchmark_result.schema.json; does not replace CR2 fields. Fields marked 'unresolved until hardware' must be populated during Phase 2 on Jetson AGX Thor.",
+  "type": "object",
+  "required": ["schema_version", "checkpoint_id", "edge_llm_commit", "runtime_strategy", "component_identities", "temporal_input"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1",
+      "description": "Schema version for forward-compatibility checks."
+    },
+    "checkpoint_id": {
+      "type": "string",
+      "description": "HuggingFace model ID, e.g. 'nvidia/Cosmos3-Edge'."
+    },
+    "edge_llm_commit": {
+      "type": "string",
+      "description": "Exact TensorRT Edge-LLM git commit SHA used to build the engines."
+    },
+    "edge_llm_version": {
+      "type": ["string", "null"],
+      "description": "TensorRT Edge-LLM release tag if available, e.g. '0.10.0'."
+    },
+    "runtime_strategy": {
+      "type": "string",
+      "enum": ["cosmos3_edge_vlm", "cosmos3_policy_inference"],
+      "description": "Runtime strategy. 'cosmos3_edge_vlm' for the base scene-understanding checkpoint; 'cosmos3_policy_inference' for Policy-DROID (not used by this project)."
+    },
+    "component_identities": {
+      "type": "object",
+      "description": "Per-component identity records. Keys are component names (e.g. 'llm', 'visual').",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["engine_dir"],
+        "properties": {
+          "engine_dir": {
+            "type": "string",
+            "description": "Absolute path to the TensorRT engine directory for this component."
+          },
+          "engine_sha256": {
+            "type": ["string", "null"],
+            "description": "SHA-256 digest of the primary engine file, if available."
+          },
+          "config_sha256": {
+            "type": ["string", "null"],
+            "description": "SHA-256 digest of the engine config.json, if available."
+          }
+        }
+      }
+    },
+    "temporal_input": {
+      "type": "object",
+      "description": "Description of the video/temporal input submitted to the model.",
+      "required": ["frame_count"],
+      "properties": {
+        "frame_count": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of video frames submitted."
+        },
+        "fps": {
+          "type": ["number", "null"],
+          "description": "Frame rate of submitted video in frames per second."
+        },
+        "timestamps_ms": {
+          "type": ["array", "null"],
+          "items": {"type": "number"},
+          "description": "Per-frame timestamps in milliseconds."
+        },
+        "input_mode": {
+          "type": "string",
+          "enum": ["native_video", "image_list"],
+          "description": "How frames are packaged. 'native_video' stacks frames into a single ImageData with temporal metadata. 'image_list' is legacy independent-frame mode (not used for Cosmos3-Edge)."
+        }
+      }
+    },
+    "task_mode": {
+      "type": "string",
+      "enum": ["text_reasoning", "action_policy"],
+      "description": "Output modality. 'text_reasoning' for scene-understanding/spatial-reasoning output; 'action_policy' for robot joint-space actions (Policy-DROID only)."
+    },
+    "cosmos3_native_stages": {
+      "type": ["array", "null"],
+      "items": {"type": "string"},
+      "description": "Native stage names reported by the Cosmos3-Edge runtime profiler. Populated during Phase 2 hardware execution. Null until then. Do not substitute CR2 stage names ('vision', 'prefill', 'generation') here."
+    },
+    "timing": {
+      "type": ["object", "null"],
+      "description": "Timing measurements. All values in milliseconds. Populated during Phase 2.",
+      "additionalProperties": false,
+      "properties": {
+        "total_ms": {
+          "type": ["number", "null"],
+          "description": "Total end-to-end latency in milliseconds."
+        },
+        "stage_timings_ms": {
+          "type": ["object", "null"],
+          "description": "Per-stage latency keyed by cosmos3_native_stages names.",
+          "additionalProperties": {"type": "number"}
+        },
+        "tokens_generated": {
+          "type": ["integer", "null"],
+          "description": "Number of output tokens generated."
+        },
+        "tokens_per_second": {
+          "type": ["number", "null"],
+          "description": "Output token throughput."
+        }
+      }
+    },
+    "quantization": {
+      "type": ["string", "null"],
+      "description": "Quantization format, e.g. 'nvfp4'."
+    },
+    "engine_profile_id": {
+      "type": ["string", "null"],
+      "description": "Engine profile identifier from engine_profiles.json, e.g. 'cosmos3-edge-thor-f8'."
+    },
+    "build_timestamp": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when the TensorRT engines were built."
+    },
+    "run_timestamp": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when this inference run occurred."
+    },
+    "notes": {
+      "type": ["string", "null"],
+      "description": "Free-form notes for Phase 2 observations."
+    }
+  }
+}

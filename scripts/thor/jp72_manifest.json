@@ -64,6 +64,27 @@
         "engine/llm",
         "engine/visual"
       ]
+    },
+    "Cosmos3-Edge": {
+      "hf_model_id": "nvidia/Cosmos3-Edge",
+      "quantization": "nvfp4",
+      "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
+      "modelopt_version": "0.45.0",
+      "runtime_strategy": "cosmos3_edge_vlm",
+      "temporal_input": "native_video",
+      "required_llm_artifacts": [
+        "llm.engine",
+        "embedding.safetensors",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processed_chat_template.json"
+      ],
+      "required_visual_artifacts": [
+        "visual/visual.engine",
+        "visual/config.json",
+        "visual/preprocessor_config.json"
+      ]
     }
   },
   "default_model": "Cosmos-Reason2-8B",
