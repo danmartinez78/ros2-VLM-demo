@@ -60,8 +60,7 @@ class Cosmos3EdgeRegistryTests(unittest.TestCase):
         entry = self.manifest["models"]["Cosmos3-Edge"]
         self.assertEqual(entry["hf_model_id"], "nvidia/Cosmos3-Edge")
         self.assertEqual(entry["quantization"], "nvfp4")
-        self.assertEqual(entry["runtime_strategy"], "cosmos3_edge_vlm")
-        self.assertEqual(entry["temporal_input"], "native_video")
+        self.assertEqual(entry["runtime_strategy"], "standard_vlm")
         self.assertIn("required_llm_artifacts", entry)
         self.assertIn("required_visual_artifacts", entry)
 
@@ -72,8 +71,7 @@ class Cosmos3EdgeRegistryTests(unittest.TestCase):
         profile = self.profiles["cosmos3-edge-thor-f8"]
         self.assertEqual(profile.target, "jetson-thor")
         self.assertTrue(profile.managed)
-        self.assertEqual(profile.runtime_strategy, "cosmos3_edge_vlm")
-        self.assertEqual(profile.temporal_input, "native_video")
+        self.assertEqual(profile.runtime_strategy, "standard_vlm")
         self.assertIn("llm", profile.components)
         self.assertIn("visual", profile.components)
         self.assertEqual(profile.components["llm"]["kind"], "llm")
@@ -85,7 +83,7 @@ class Cosmos3EdgeRegistryTests(unittest.TestCase):
         cr2_profile = self.profiles["thor-f8"]
         self.assertNotEqual(c3_profile.profile_id, cr2_profile.profile_id)
         self.assertEqual(cr2_profile.runtime_strategy, "standard_vlm")
-        self.assertEqual(c3_profile.runtime_strategy, "cosmos3_edge_vlm")
+        self.assertEqual(c3_profile.runtime_strategy, "standard_vlm")
 
 
 class Cosmos3EdgeRuntimeStrategyTests(unittest.TestCase):
@@ -102,15 +100,11 @@ class Cosmos3EdgeRuntimeStrategyTests(unittest.TestCase):
                 "standard_vlm",
                 f"Profile {pid} should have standard_vlm strategy",
             )
-            self.assertEqual(
-                profile.temporal_input,
-                "image",
-                f"Profile {pid} should have image temporal_input",
-            )
 
-    def test_cosmos3_edge_profile_has_native_video_temporal_input(self) -> None:
+    def test_cosmos3_edge_profile_also_uses_standard_vlm_strategy(self) -> None:
+        """Cosmos3-Edge base checkpoint uses the same standard_vlm runtime as CR2."""
         profile = self.profiles["cosmos3-edge-thor-f8"]
-        self.assertEqual(profile.temporal_input, "native_video")
+        self.assertEqual(profile.runtime_strategy, "standard_vlm")
 
     def test_policy_runtime_strategy_is_rejected_by_validation(self) -> None:
         """cosmos3_policy_inference must not be accepted as a valid runtime strategy."""
@@ -127,7 +121,6 @@ class Cosmos3EdgeRuntimeStrategyTests(unittest.TestCase):
                 "visual": {"kind": "visual", "relative_engine_dir": "visual"},
             },
             runtime_strategy="cosmos3_policy_inference",
-            temporal_input="native_video",
         )
         errors = modelctl._profile_support_errors(bad_profile)
         self.assertTrue(
@@ -139,7 +132,7 @@ class Cosmos3EdgeRuntimeStrategyTests(unittest.TestCase):
             f"Expected Policy-DROID mention in rejection, got: {errors}",
         )
 
-    def test_cosmos3_edge_vlm_strategy_passes_validation(self) -> None:
+    def test_standard_vlm_strategy_passes_validation(self) -> None:
         profile = self.profiles["cosmos3-edge-thor-f8"]
         errors = modelctl._profile_support_errors(profile)
         self.assertEqual(
@@ -249,27 +242,61 @@ class Cosmos3EdgeDryRunCommandTests(unittest.TestCase):
         self.assertIn("--maxImageTokens", cmd)
         self.assertIn("--maxImageTokensPerImage", cmd)
 
-    def test_smoke_inference_command_carries_frame_count(self) -> None:
-        for n_frames in [1, 4, 8]:
-            cmd = c3_commands.smoke_inference_command(self.ctx, self.model, self.profile, n_frames)
-            self.assertIn("--frameCount", cmd)
-            idx = cmd.index("--frameCount")
-            self.assertEqual(cmd[idx + 1], str(n_frames))
+    def test_export_command_uses_tensorrt_edgellm_export(self) -> None:
+        cmd = c3_commands.export_command(self.ctx, self.model)
+        cmd_str = " ".join(cmd)
+        self.assertIn("tensorrt-edgellm-export", cmd_str)
+        self.assertIn("--task", cmd)
+        self.assertIn("reasoning", cmd)
+        # Must not reference the ModelOpt quantization tool
+        self.assertNotIn("modelopt.onnx.quantization", cmd_str)
+
+    def test_smoke_inference_command_uses_correct_cli_path(self) -> None:
+        cmd = c3_commands.smoke_inference_command(self.ctx, self.model, self.profile, 1)
+        cmd_str = " ".join(cmd)
+        self.assertIn("llm_inference", cmd_str)
+        self.assertIn("examples/llm/llm_inference", cmd_str)
+        self.assertNotIn("examples/multimodal/llm_inference", cmd_str)
+
+    def test_smoke_inference_command_carries_required_flags(self) -> None:
+        cmd = c3_commands.smoke_inference_command(self.ctx, self.model, self.profile, 1)
+        self.assertIn("--engineDir", cmd)
+        self.assertIn("--multimodalEngineDir", cmd)
+        self.assertIn("--inputFile", cmd)
+        self.assertIn("--outputFile", cmd)
+        # Must not use invented flags
+        self.assertNotIn("--frameCount", cmd)
+        self.assertNotIn("--inputPrompt", cmd)
+        self.assertNotIn("--llmEngineDir", cmd)
 
     def test_build_procedure_contains_required_steps(self) -> None:
         steps = c3_commands.build_procedure(self.ctx, self.model, self.profile)
         labels = [label for label, _ in steps]
         self.assertTrue(any("acquisition" in l.lower() for l in labels))
+        self.assertTrue(any("export" in l.lower() for l in labels))
         self.assertTrue(any("LLM engine" in l for l in labels))
         self.assertTrue(any("visual engine" in l.lower() or "Visual engine" in l for l in labels))
-        self.assertTrue(any("F4" in l for l in labels))
-        self.assertTrue(any("F8" in l for l in labels))
+        self.assertTrue(any("F1" in l for l in labels))
         self.assertTrue(any("provenance" in l.lower() or "manifest" in l.lower() for l in labels))
 
     def test_validate_procedure_passes_for_generated_steps(self) -> None:
         steps = c3_commands.build_procedure(self.ctx, self.model, self.profile)
         errors = c3_commands.validate_procedure(steps)
         self.assertEqual(errors, [], f"Expected no validation errors, got: {errors}")
+
+    def test_validate_procedure_rejects_modelopt_in_export(self) -> None:
+        bad_steps = [
+            ("2. ONNX export (tensorrt-edgellm-export)", [
+                "docker", "run", "pytorch:26.05-py3",
+                "python3", "-m", "modelopt.onnx.quantization",
+                "--model_path", "/tmp/x",
+            ])
+        ]
+        errors = c3_commands.validate_procedure(bad_steps)
+        self.assertTrue(
+            any("modelopt.onnx.quantization" in e for e in errors),
+            f"Expected modelopt.onnx.quantization rejection, got: {errors}",
+        )
 
     def test_validate_procedure_rejects_policy_acquisition(self) -> None:
         bad_steps = [("1. Checkpoint acquisition", ["huggingface-cli", "download", "nvidia/Cosmos3-Edge-Policy-DROID", "--local-dir", "/tmp/x"])]
@@ -306,7 +333,7 @@ class Cosmos3EdgeProvenanceSchemaTests(unittest.TestCase):
         props = self.schema["properties"]
         self.assertIn("runtime_strategy", props)
         enum_vals = props["runtime_strategy"].get("enum", [])
-        self.assertIn("cosmos3_edge_vlm", enum_vals)
+        self.assertIn("standard_vlm", enum_vals)
         self.assertIn("cosmos3_policy_inference", enum_vals)
 
     def test_schema_has_temporal_input_field(self) -> None:
@@ -340,16 +367,13 @@ class Cosmos3EdgeProvenanceSchemaTests(unittest.TestCase):
             "schema_version": "1",
             "checkpoint_id": "nvidia/Cosmos3-Edge",
             "edge_llm_commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
-            "runtime_strategy": "cosmos3_edge_vlm",
+            "runtime_strategy": "standard_vlm",
             "component_identities": {
                 "llm": {"engine_dir": "/workspace/Cosmos3-Edge/engines/cosmos3-edge-thor-f8/llm"},
                 "visual": {"engine_dir": "/workspace/Cosmos3-Edge/engines/cosmos3-edge-thor-f8/visual"},
             },
             "temporal_input": {
-                "frame_count": 4,
-                "fps": 10.0,
-                "timestamps_ms": [0.0, 100.0, 200.0, 300.0],
-                "input_mode": "native_video",
+                "frame_count": 1,
             },
         }
         for field in self.schema["required"]:
@@ -372,7 +396,7 @@ class Cosmos3EdgeProvenanceSchemaTests(unittest.TestCase):
             "checkpoint_id": "nvidia/Cosmos3-Edge",
             "edge_llm_commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
             "edge_llm_version": "0.10.0",
-            "runtime_strategy": "cosmos3_edge_vlm",
+            "runtime_strategy": "standard_vlm",
             "component_identities": {
                 "llm": {
                     "engine_dir": "/workspace/Cosmos3-Edge/engines/cosmos3-edge-thor-f8/llm",
@@ -386,10 +410,9 @@ class Cosmos3EdgeProvenanceSchemaTests(unittest.TestCase):
                 },
             },
             "temporal_input": {
-                "frame_count": 8,
-                "fps": 10.0,
-                "timestamps_ms": [0.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0],
-                "input_mode": "native_video",
+                "frame_count": 1,
+                "fps": None,
+                "timestamps_ms": None,
             },
             "task_mode": "text_reasoning",
             "cosmos3_native_stages": None,
@@ -402,8 +425,8 @@ class Cosmos3EdgeProvenanceSchemaTests(unittest.TestCase):
         }
         serialized = json.dumps(record, indent=2, sort_keys=True)
         recovered = json.loads(serialized)
-        self.assertEqual(recovered["runtime_strategy"], "cosmos3_edge_vlm")
-        self.assertEqual(recovered["temporal_input"]["frame_count"], 8)
+        self.assertEqual(recovered["runtime_strategy"], "standard_vlm")
+        self.assertEqual(recovered["temporal_input"]["frame_count"], 1)
         self.assertIsNone(recovered["cosmos3_native_stages"])
 
     def test_cr2_provenance_fields_are_not_present_in_cosmos3_schema(self) -> None:
@@ -441,9 +464,9 @@ class Cosmos3EdgeModelctlEnginePaths(unittest.TestCase):
                 model = models["cosmos3-edge"]
                 profile = profiles["cosmos3-edge-thor-f8"]
                 payload = modelctl._engine_manifest_payload(model, profile, ctx)
-        self.assertEqual(payload["runtime_strategy"], "cosmos3_edge_vlm")
-        self.assertEqual(payload["temporal_input"], "native_video")
+        self.assertEqual(payload["runtime_strategy"], "standard_vlm")
         self.assertEqual(payload["checkpoint_id"], "nvidia/Cosmos3-Edge")
+        self.assertNotIn("temporal_input", payload)
 
     def test_cr2_engine_manifest_has_standard_vlm_strategy(self) -> None:
         models, profiles, _ = modelctl.load_registries()
@@ -456,7 +479,7 @@ class Cosmos3EdgeModelctlEnginePaths(unittest.TestCase):
                 profile = profiles["thor-f8"]
                 payload = modelctl._engine_manifest_payload(model, profile, ctx)
         self.assertEqual(payload["runtime_strategy"], "standard_vlm")
-        self.assertEqual(payload["temporal_input"], "image")
+        self.assertNotIn("temporal_input", payload)
 
 
 if __name__ == "__main__":

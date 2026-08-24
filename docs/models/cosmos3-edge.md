@@ -45,15 +45,16 @@ properties:
 - **Modality:** native video (natively video-aware; not a list of independent
   still images).
 - **Runtime class:** standard Edge-LLM VLM multimodal runtime
-  (`cosmos3_edge_vlm`), **not** the Cosmos3 policy runtime
+  (`standard_vlm`), the same `llm_inference` / `edge_vlm_server` path used
+  for Cosmos-Reason2.  This is **not** the Cosmos3 policy runtime
   (`cosmos3_policy_inference`).
 - **Checkpoint family:** `cosmos3-edge` (distinct from Cosmos-Reason2 and from
   Cosmos3-Edge-Policy).
 
-The distinction matters for provenance: Cosmos-Reason2 encodes frames as
-independent images; Cosmos3-Edge encodes them as a single stacked video
-`ImageData` object with temporal metadata (see
-`src/tensorrt_edge_llm_backend.cpp`).
+The distinction matters for provenance: both Cosmos-Reason2 and Cosmos3-Edge
+use the standard Edge-LLM VLM runtime.  Cosmos3-Edge preparation and build
+use the `cosmos3_edge` strategy; the runtime strategy for both models is
+`standard_vlm` (see `scripts/models/engine_profiles.json`).
 
 ---
 
@@ -89,8 +90,8 @@ directory should be created until Phase 2 on Jetson AGX Thor.
 
 For `nvidia/Cosmos3-Edge` (base VLM checkpoint) the supported workflow is:
 
-1. Quantize/export checkpoint to ONNX via ModelOpt in the NVIDIA PyTorch
-   container (`nvcr.io/nvidia/pytorch:26.05-py3`, ModelOpt 0.45.0).
+1. Export checkpoint to ONNX via the pinned `tensorrt-edgellm-export` tool:
+   `tensorrt-edgellm-export <checkpoint> <onnx_dir/reasoning> --task reasoning`
 2. Build LLM engine: `llm_build --onnxDir … --engineDir …`
 3. Build visual engine: `visual_build --onnxDir … --engineDir …`
 
@@ -129,23 +130,23 @@ for the base checkpoint.
 
 ## 8. Image / video input and temporal metadata
 
-Cosmos3-Edge processes input as a **native video sequence**, not as an ordered
-list of independent images.  The upstream contract (already implemented in this
-project for temporal VLM requests) is:
+The pinned TRT Edge-LLM 0.10.0 guide defines the Cosmos3-Edge reasoning path
+as **image + prompt → text**, using the standard image message format.  The
+exact multi-frame / native-video input contract for the reasoner is **not
+confirmed** at this revision; the `--video frame_...` examples in the upstream
+guide apply to the policy runtime, not the reasoning path.
 
-- Frames packed into a single stacked `ImageData` object.
-- A `video` content item carrying frame count, FPS, and per-frame timestamps.
-- Temporal metadata fields: `frame_count`, `fps`, `timestamps_ms`.
+Phase 2 smoke tests therefore start with the documented single-image (F1) path:
 
-This is identical to the temporal encoding already used for Cosmos-Reason2 in
-`src/tensorrt_edge_llm_backend.cpp` (lines 336–349) and is preserved without
-change for Cosmos3-Edge.
+```
+llm_inference --engineDir <llm_dir> --multimodalEngineDir <visual_dir> \
+              --inputFile <smoke_input_f1.json> --outputFile <smoke_output_f1.json>
+```
 
-For Phase 2 smoke tests, the following frame counts must be verified against
-hardware:
+where `smoke_input_f1.json` uses the documented image message format.
 
-- F4 (4 frames, temporal window)
-- F8 (8 frames, temporal window)
+Multi-image or native-video smoke tests will be added in a subsequent phase
+after the Cosmos3 reasoner parser/runner contract is confirmed on hardware.
 
 ---
 
@@ -187,9 +188,9 @@ fields to avoid mislabeling:
 
 | Schema field | Description |
 |---|---|
-| `runtime_strategy` | `cosmos3_edge_vlm` (base) or `cosmos3_policy_inference` (policy) |
+| `runtime_strategy` | `standard_vlm` (base) or `cosmos3_policy_inference` (policy) |
 | `cosmos3_native_stages` | Array of native stage names reported by the runtime |
-| `temporal_input.frame_count` | Number of video frames submitted |
+| `temporal_input.frame_count` | Number of frames submitted |
 | `temporal_input.fps` | Frame rate of submitted video |
 | `temporal_input.timestamps_ms` | Per-frame timestamps in milliseconds |
 | `task_mode` | `text_reasoning` or `action_policy` |
@@ -238,13 +239,11 @@ python3 scripts/models/cosmos3_edge_commands.py --dry-run
 This generates, in order:
 
 1. Checkpoint acquisition (`huggingface-cli download`).
-2. ONNX export / quantization (ModelOpt container).
+2. ONNX export for the reasoning path (`tensorrt-edgellm-export … --task reasoning`).
 3. LLM engine build (`llm_build`).
 4. Visual engine build (`visual_build`).
-4. Smoke inference, single frame (F1) (`llm_inference --frameCount 1`).
-4. Smoke inference, F4 native-video (`llm_inference --frameCount 4`).
-4. Smoke inference, F8 native-video (`llm_inference --frameCount 8`).
-5. Provenance / manifest capture (`modelctl`).
+5. Smoke inference, single frame / image (F1) (`llm_inference --engineDir … --inputFile …`).
+6. Provenance / manifest capture (`modelctl`).
 
 No large downloads or builds are performed on CI.  All commands are printed
 to stdout and validated for structural correctness only.

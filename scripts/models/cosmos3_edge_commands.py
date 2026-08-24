@@ -40,15 +40,14 @@ _spec.loader.exec_module(_modelctl)
 MODEL_ID = "cosmos3-edge"
 PROFILE_ID = "cosmos3-edge-thor-f8"
 
-# Smoke-test frame counts for Phase 2.
-SMOKE_FRAME_COUNTS = [1, 4, 8]
+# Smoke-test frame count for Phase 2.  Phase 2 starts with the documented
+# single-image (F1) path per the pinned TRT Edge-LLM 0.10.0 guide.
+# Multi-frame / native-video smoke tests are deferred until the Cosmos3
+# reasoner input contract is confirmed on hardware.
+SMOKE_FRAME_COUNTS = [1]
 
 # HuggingFace model identifier (no secrets — public model card).
 HF_MODEL_ID = "nvidia/Cosmos3-Edge"
-
-# ModelOpt quantization container (from jp72_manifest.json).
-PYTORCH_CONTAINER = "nvcr.io/nvidia/pytorch:26.05-py3"
-MODELOPT_VERSION = "0.45.0"
 
 
 def _ctx() -> "_modelctl.RuntimeContext":  # type: ignore[name-defined]
@@ -81,31 +80,24 @@ def acquire_command(ctx: "_modelctl.RuntimeContext", model: "_modelctl.ModelReco
     ]
 
 
-def export_quantize_command(
+def export_command(
     ctx: "_modelctl.RuntimeContext",
     model: "_modelctl.ModelRecord",
 ) -> list[str]:
-    """Step 2: quantize and export to ONNX via ModelOpt in PyTorch container."""
+    """Step 2: export reasoning ONNX via tensorrt-edgellm-export.
+
+    Uses the documented Cosmos3-Edge reasoner export workflow from the pinned
+    TRT Edge-LLM 0.10.0 guide::
+
+        tensorrt-edgellm-export <checkpoint> <onnx_dir/reasoning> --task reasoning
+    """
     model_root = _modelctl.model_root(model, ctx)
-    # The container-internal paths mirror the workspace layout.
     return [
-        "docker",
-        "run",
-        "--rm",
-        "--gpus",
-        "all",
-        "-v",
-        f"{model_root}:{model_root}",
-        PYTORCH_CONTAINER,
-        "python3",
-        "-m",
-        "modelopt.onnx.quantization",
-        "--model_path",
+        "tensorrt-edgellm-export",
         str(model_root / "hf_checkpoint"),
-        "--quant_type",
-        str(model.manifest_model.get("quantization", "nvfp4")),
-        "--output_path",
-        str(model_root / "onnx"),
+        str(model_root / "onnx" / "reasoning"),
+        "--task",
+        "reasoning",
     ]
 
 
@@ -133,22 +125,35 @@ def smoke_inference_command(
     profile: "_modelctl.ProfileRecord",
     frame_count: int,
 ) -> list[str]:
-    """Step 4: run smoke inference for a given number of video frames."""
+    """Step 4: run smoke inference for a given number of frames.
+
+    Uses the documented Phase-2 CLI contract from the pinned TRT Edge-LLM
+    0.10.0 guide::
+
+        build/examples/llm/llm_inference \\
+            --engineDir <llm_dir> \\
+            --multimodalEngineDir <visual_dir> \\
+            --inputFile <smoke_input.json> \\
+            --outputFile <smoke_output.json>
+
+    The input JSON uses the documented image message format.  Phase 2 starts
+    with the single-image (F1) path; multi-frame / native-video smoke tests
+    are deferred until the Cosmos3 reasoner parser/runner contract is confirmed
+    on hardware.
+    """
     paths = _modelctl.engine_paths(model, profile, ctx)
+    model_root = _modelctl.model_root(model, ctx)
+    label = f"f{frame_count}"
     return [
-        str(Path(ctx.edge_build) / "examples" / "multimodal" / "llm_inference"),
-        "--llmEngineDir",
+        str(Path(ctx.edge_build) / "examples" / "llm" / "llm_inference"),
+        "--engineDir",
         str(paths.llm_dir),
         "--multimodalEngineDir",
         str(paths.multimodal_dir),
-        "--pluginPath",
-        ctx.plugin_path,
-        "--maxGenerateLength",
-        "256",
-        "--frameCount",
-        str(frame_count),
-        "--inputPrompt",
-        "Describe the scene.",
+        "--inputFile",
+        str(model_root / f"smoke_input_{label}.json"),
+        "--outputFile",
+        str(model_root / f"smoke_output_{label}.json"),
     ]
 
 
@@ -158,7 +163,6 @@ def provenance_capture_command(
     profile: "_modelctl.ProfileRecord",
 ) -> list[str]:
     """Step 5: capture provenance manifest via modelctl."""
-    paths = _modelctl.engine_paths(model, profile, ctx)
     return [
         "python3",
         str(MODELCTL_PATH),
@@ -178,7 +182,7 @@ def build_procedure(
     """Return the ordered list of (label, command) pairs for Phase 2 Thor bring-up."""
     steps: list[tuple[str, list[str]]] = [
         ("1. Checkpoint acquisition", acquire_command(ctx, model)),
-        ("2. ONNX export / quantization", export_quantize_command(ctx, model)),
+        ("2. ONNX export (tensorrt-edgellm-export)", export_command(ctx, model)),
         ("3a. LLM engine build", build_llm_command(ctx, model, profile)),
         ("3b. Visual engine build", build_visual_command(ctx, model, profile)),
     ]
@@ -198,12 +202,23 @@ def _required_flags() -> dict[str, list[str]]:
     """Build the required-step/token map dynamically from SMOKE_FRAME_COUNTS."""
     flags: dict[str, list[str]] = {
         "1. Checkpoint acquisition": ["huggingface-cli", "--local-dir"],
+        "2. ONNX export (tensorrt-edgellm-export)": [
+            "tensorrt-edgellm-export",
+            "--task",
+            "reasoning",
+        ],
         "3a. LLM engine build": ["llm_build", "--onnxDir", "--engineDir", "--maxBatchSize"],
         "3b. Visual engine build": ["visual_build", "--onnxDir", "--engineDir"],
         "5. Provenance / manifest capture": ["modelctl.py", "validate"],
     }
     for n in SMOKE_FRAME_COUNTS:
-        flags[f"4. Smoke inference (F{n})"] = ["llm_inference", "--frameCount"]
+        flags[f"4. Smoke inference (F{n})"] = [
+            "llm_inference",
+            "--engineDir",
+            "--multimodalEngineDir",
+            "--inputFile",
+            "--outputFile",
+        ]
     return flags
 
 
@@ -221,15 +236,6 @@ def validate_procedure(steps: list[tuple[str, list[str]]]) -> list[str]:
             for token in required_tokens:
                 if token not in cmd_str:
                     errors.append(f"Step '{label}': missing required token '{token}'")
-            # For smoke steps, verify the frame count argument value matches the label.
-            if "Smoke inference" in label and "(F" in label:
-                frame_str = label.split("(F")[1].rstrip(")")
-                if "--frameCount" in cmd:
-                    idx = cmd.index("--frameCount")
-                    if idx + 1 < len(cmd) and cmd[idx + 1] != frame_str:
-                        errors.append(
-                            f"Step '{label}': --frameCount value {cmd[idx + 1]!r} does not match label frame count {frame_str!r}"
-                        )
 
     # Ensure acquire does not reference a policy component.
     for label, cmd in steps:
@@ -250,6 +256,17 @@ def validate_procedure(steps: list[tuple[str, list[str]]]) -> list[str]:
                 f"Step '{label}': command references a Cosmos-Reason2 path. "
                 "Cosmos3-Edge must use an isolated workspace."
             )
+
+    # Ensure the export step does not use a policy-style or invented tool.
+    for label, cmd in steps:
+        if "export" in label.lower():
+            cmd_str = " ".join(cmd)
+            for forbidden in ("modelopt.onnx.quantization", "cosmos3_policy_inference"):
+                if forbidden in cmd_str:
+                    errors.append(
+                        f"Step '{label}': '{forbidden}' is not the documented Cosmos3-Edge "
+                        "reasoner export workflow. Use tensorrt-edgellm-export --task reasoning."
+                    )
     return errors
 
 
