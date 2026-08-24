@@ -102,6 +102,13 @@ class TrainingConfig:
 
     # NOTE: no GRPO/RL fields – reserved for a follow-on implementation.
 
+    # Model loading
+    trust_remote_code: bool = False
+    """
+    Set to True only when the model hub entry requires custom code execution.
+    This enables arbitrary code from the remote repository; opt in consciously.
+    """
+
     # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
@@ -131,6 +138,7 @@ class TrainingConfig:
             "lora": self.lora.to_dict(),
             "repo_commit": self.repo_commit,
             "base_checkpoint_hash": self.base_checkpoint_hash,
+            "trust_remote_code": self.trust_remote_code,
         }
         return d
 
@@ -326,13 +334,14 @@ def run_training(
     from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer  # type: ignore[import-untyped]
     from peft import get_peft_model, LoraConfig as PeftLoraConfig, TaskType  # type: ignore[import-untyped]
 
+    model_name = config.base_model if not config.base_checkpoint else config.base_checkpoint
     tokenizer = AutoTokenizer.from_pretrained(
-        config.base_model if not config.base_checkpoint else config.base_checkpoint,
-        trust_remote_code=True,
+        model_name,
+        trust_remote_code=config.trust_remote_code,
     )
     model = AutoModelForCausalLM.from_pretrained(
-        config.base_model if not config.base_checkpoint else config.base_checkpoint,
-        trust_remote_code=True,
+        model_name,
+        trust_remote_code=config.trust_remote_code,
     )
 
     if config.use_lora:
@@ -362,10 +371,25 @@ def run_training(
     )
 
     def _tokenize(example):
-        text = " ".join(
-            m["content"] if isinstance(m["content"], str) else str(m["content"])
-            for m in example.get("messages", [])
-        )
+        messages = example.get("messages", [])
+        if hasattr(tokenizer, "apply_chat_template") and callable(
+            getattr(tokenizer, "apply_chat_template", None)
+        ):
+            # Use the model's own chat template to match inference-time formatting.
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        else:
+            # Fallback: simple role-prefixed concatenation for tokenizers without
+            # a chat template.
+            text = "".join(
+                f"<|{m['role']}|>\n"
+                + (m["content"] if isinstance(m["content"], str) else str(m["content"]))
+                + "\n"
+                for m in messages
+            )
         return tokenizer(
             text,
             truncation=True,

@@ -131,19 +131,16 @@ class Provenance:
     validation_version: str = ""
     generated_at_utc: str = ""
     input_representation: str = ""
-    """
-    Temporal input representation used when the sample was generated.
-
-    Possible values (aligned with #72 distinctions):
-      ``"ordered_images"``        – frames passed as an ordered image list
-      ``"rendered_timestamps"``   – timestamps rendered into the image or prompt
-      ``"temporal_images_meta"``  – frames with temporal-images metadata block
-      ``"native_video"``          – frames encoded as a native video segment
-      ``""``                      – unspecified / legacy (pre-provenance)
-
-    Two samples sharing the same frame/timestamp provenance but different
-    ``input_representation`` values represent materially different model inputs.
-    """
+    # Temporal input representation used when the sample was generated.
+    # Possible values (aligned with #72 distinctions):
+    #   "ordered_images"        – frames passed as an ordered image list
+    #   "rendered_timestamps"   – timestamps rendered into the image or prompt
+    #   "temporal_images_meta"  – frames with temporal-images metadata block
+    #   "native_video"          – frames encoded as a native video segment
+    #   ""                      – unspecified / legacy (pre-provenance)
+    #
+    # Two samples sharing the same frame/timestamp provenance but different
+    # input_representation values represent materially different model inputs.
 
     def to_dict(self) -> dict:
         return {
