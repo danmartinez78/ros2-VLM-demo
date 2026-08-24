@@ -1325,19 +1325,40 @@ class TestShellSyntax(unittest.TestCase):
         self.assertNotIn("--max_new_tokens", content)
 
     def test_script_request_uses_image_type(self):
-        """Runner must emit Thor-validated image item type: type:image, image:path."""
+        """Runner must emit image and video request-item shapes for direct path."""
         script = _BENCH_DIR / "run_vlm_multiframe_benchmark.sh"
         if not script.exists():
             self.skipTest(f"Script not found: {script}")
         content = script.read_text(encoding="utf-8")
         self.assertIn('"type":"image"', content)
         self.assertIn('"image":', content)
+        self.assertIn('"type":"video"', content)
+        self.assertIn('"frames":', content)
+        self.assertIn('"fps":', content)
         # Forbidden: old image_url shape and payload metadata fields
         self.assertNotIn('"type":"image_url"', content)
         self.assertNotIn("image_url", content)
         self.assertNotIn('"content_hash"', content)
         self.assertNotIn('"source_path"', content)
         self.assertNotIn("max_new_tokens", content)
+
+    def test_script_direct_temporal_limitations_are_explicit(self):
+        script = _BENCH_DIR / "run_vlm_multiframe_benchmark.sh"
+        if not script.exists():
+            self.skipTest(f"Script not found: {script}")
+        content = script.read_text(encoding="utf-8")
+        self.assertIn(
+            "direct path does not implement --render-timestamps preprocessing for temporal/video requests",
+            content,
+        )
+        self.assertIn(
+            "direct path temporal/video request JSON supports frames+fps but not explicit --frame-timestamps-sec arrays",
+            content,
+        )
+        self.assertIn(
+            "native_qwen3vl_video_json_frames_fps_no_explicit_timestamps",
+            content,
+        )
 
     def test_script_artifact_paths_use_phase_prefix(self):
         """Runner must include warmup/measured phase in artifact directory to prevent collision."""
@@ -1674,20 +1695,20 @@ class TestRecordSerializer(unittest.TestCase):
         rec = json.loads(build_direct_record(_direct_env(
             sequence_type='"temporal_images"',
             fps="8.0",
-            frame_timestamps_sec="[0.0, 0.125]",
-            frame_timestamp_policy='"explicit"',
-            rendered_timestamps="true",
-            runtime_temporal_encoding='"native_qwen3vl_video_imagedata_mrope_timestamps"',
+            frame_timestamps_sec="null",
+            frame_timestamp_policy='"implicit_uniform_from_fps"',
+            rendered_timestamps="false",
+            runtime_temporal_encoding='"native_qwen3vl_video_json_frames_fps_no_explicit_timestamps"',
             temporal_fallback_used="false",
         )))
         self.assertEqual(rec["sequence_type"], "temporal_images")
         self.assertAlmostEqual(rec["fps"], 8.0)
-        self.assertEqual(rec["frame_timestamps_sec"], [0.0, 0.125])
-        self.assertEqual(rec["frame_timestamp_policy"], "explicit")
-        self.assertIs(rec["rendered_timestamps"], True)
+        self.assertIsNone(rec["frame_timestamps_sec"])
+        self.assertEqual(rec["frame_timestamp_policy"], "implicit_uniform_from_fps")
+        self.assertIs(rec["rendered_timestamps"], False)
         self.assertEqual(
             rec["runtime_temporal_encoding"],
-            "native_qwen3vl_video_imagedata_mrope_timestamps",
+            "native_qwen3vl_video_json_frames_fps_no_explicit_timestamps",
         )
         self.assertIs(rec["temporal_fallback_used"], False)
 

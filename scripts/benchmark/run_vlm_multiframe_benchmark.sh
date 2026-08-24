@@ -20,9 +20,8 @@
 #            server steady-state path; total_latency_ms is the outer client
 #            round-trip.  Stage timings are null; TTFT is null.
 #
-# Both paths use the same Thor-validated request shape and prompt, so
-# direct cold-start and IPC steady-state measurements are directly comparable
-# within each frame-count condition.
+# Both paths use the same prompt and frame selection policy. Request transport
+# differs by path when temporal/video mode is enabled.
 #
 # This script does NOT:
 #   - Change power mode, clock caps, model size, quantization, or engines.
@@ -40,12 +39,14 @@
 #
 # Input request shape
 # -------------------
-# Uses the Thor-validated TensorRT Edge-LLM VLM request shape:
+# Uses the TensorRT Edge-LLM VLM request shape:
 #   requests -> messages -> content[]   (role: user)
-# Multiple image content items {"type":"image","image":path} are placed in
-# temporal order, followed by one text item.  SHA-256 content hashes are
-# stored in JSONL benchmark metadata (frame_paths field), not in the model
-# message payload.
+# - sequence_type=images:
+#     multiple {"type":"image","image":path} items in temporal order, then text
+# - sequence_type=temporal_images|video (direct path):
+#     one {"type":"video","frames":[...],"fps":N} item, then text
+# SHA-256 content hashes are stored in JSONL benchmark metadata (frame_paths
+# field), not in the model message payload.
 #
 # Native profiling
 # ----------------
@@ -99,6 +100,7 @@
 #   --fps N                  Optional FPS metadata for temporal modes
 #   --frame-timestamps-sec   Optional comma-separated per-frame timestamps (seconds)
 #   --render-timestamps      Render visible timestamps on frames (experimental control)
+#                            (IPC path only; direct temporal/video rejects this flag)
 #   --skip-ipc               Alias for --paths direct
 #   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
@@ -172,6 +174,24 @@ fi
 if [[ "${SEQUENCE_TYPE}" != "images" && "${SEQUENCE_TYPE}" != "temporal_images" && "${SEQUENCE_TYPE}" != "video" ]]; then
     echo "ERROR: --sequence-type must be one of: images, temporal_images, video" >&2
     exit 1
+fi
+
+if [[ "${SEQUENCE_TYPE}" == "images" && ( -n "${FPS}" || -n "${FRAME_TIMESTAMPS_SEC}" ) ]]; then
+    echo "ERROR: --sequence-type=images must not include --fps or --frame-timestamps-sec" >&2
+    exit 1
+fi
+
+if [[ ",${PATHS}," == *",direct,"* && "${SEQUENCE_TYPE}" != "images" ]]; then
+    if [[ "${RENDER_TIMESTAMPS}" == "true" ]]; then
+        echo "ERROR: direct path does not implement --render-timestamps preprocessing for temporal/video requests." >&2
+        echo "       Use --paths ipc, or run without --render-timestamps." >&2
+        exit 1
+    fi
+    if [[ -n "${FRAME_TIMESTAMPS_SEC}" ]]; then
+        echo "ERROR: direct path temporal/video request JSON supports frames+fps but not explicit --frame-timestamps-sec arrays." >&2
+        echo "       Use --paths ipc for explicit per-frame timestamps." >&2
+        exit 1
+    fi
 fi
 
 # ── derived paths ─────────────────────────────────────────────────────────────
@@ -259,7 +279,7 @@ _runtime_temporal_encoding_for_direct() {
     if [[ "${SEQUENCE_TYPE}" == "images" ]]; then
         echo "ordered_multi_image_no_native_temporal_metadata"
     else
-        echo "native_qwen3vl_video_imagedata_mrope_timestamps"
+        echo "native_qwen3vl_video_json_frames_fps_no_explicit_timestamps"
     fi
 }
 
@@ -362,20 +382,29 @@ _select_frames() {
 # ── request JSON construction ─────────────────────────────────────────────────
 
 _build_request_json() {
-    # Build the Thor-validated TensorRT Edge-LLM VLM request JSON for multiple frames.
+    # Build TensorRT Edge-LLM VLM request JSON for multiple frames.
     # Shape: requests -> messages -> content[]  (role: user)
-    # Image items: {"type":"image","image":path} in temporal order, then text prompt.
+    # sequence_type=images: image items {"type":"image","image":path} in temporal order.
+    # sequence_type=temporal_images|video: one video item {"type":"video","frames":[...],"fps":N}.
     # max_output_tokens is NOT embedded in the payload; it is passed via --maxGenerateLength.
     # SHA-256 content hashes go in JSONL metadata (frame_paths), not in the model payload.
     local frames=("$@")
-
-    # Build content array: image items in temporal order, then text prompt.
     local content_items=""
-    local sep=""
-    for img_path in "${frames[@]}"; do
-        content_items="${content_items}${sep}{\"type\":\"image\",\"image\":\"${img_path}\"}"
-        sep=","
-    done
+    if [[ "${SEQUENCE_TYPE}" == "images" ]]; then
+        # Build content array: image items in temporal order, then text prompt.
+        local sep=""
+        local img_path
+        for img_path in "${frames[@]}"; do
+            content_items="${content_items}${sep}{\"type\":\"image\",\"image\":\"${img_path}\"}"
+            sep=","
+        done
+    else
+        local frames_json
+        frames_json=$(printf '%s\n' "${frames[@]}" | python3 -c "import json,sys; print(json.dumps([x.strip() for x in sys.stdin if x.strip()]))")
+        local effective_fps="${FPS:-1.0}"
+        content_items="{\"type\":\"video\",\"frames\":${frames_json},\"fps\":${effective_fps}}"
+    fi
+
     # Append text prompt
     local escaped_prompt
     escaped_prompt=$(printf '%s' "${PROMPT_TEXT}" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
