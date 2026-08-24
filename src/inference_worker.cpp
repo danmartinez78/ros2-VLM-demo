@@ -6,6 +6,7 @@
 #include <opencv2/core.hpp>
 
 #include <csignal>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -156,6 +157,23 @@ int main(int argc, char ** argv)
         {
           throw std::runtime_error("invalid IPC request header");
         }
+        if (header.sequence_type > static_cast<uint32_t>(edge_vlm_ros::TemporalSequenceType::kVideo))
+        {
+          throw std::runtime_error("invalid IPC sequence_type");
+        }
+        const bool has_fps =
+          (header.schema_flags & edge_vlm_ros::ipc::kSchemaFlagHasFps) != 0U;
+        const bool has_timestamps =
+          (header.schema_flags & edge_vlm_ros::ipc::kSchemaFlagHasFrameTimestamps) != 0U;
+        if (has_fps && (!std::isfinite(header.fps) || header.fps <= 0.0)) {
+          throw std::runtime_error("invalid IPC fps");
+        }
+        if (!has_fps && header.fps != 0.0) {
+          throw std::runtime_error("IPC fps present without kSchemaFlagHasFps");
+        }
+        if (!has_timestamps && header.timestamp_count != 0U) {
+          throw std::runtime_error("IPC timestamp_count present without timestamp flag");
+        }
         const uint64_t expected_image_bytes =
           static_cast<uint64_t>(header.step) * header.height;
         if (expected_image_bytes != header.image_bytes ||
@@ -172,6 +190,9 @@ int main(int argc, char ** argv)
           (image_count < 2U || image_count > edge_vlm_ros::ipc::kMaxExtraImages + 1U))
         {
           throw std::runtime_error("invalid IPC multi-image count");
+        }
+        if (has_timestamps && header.timestamp_count != image_count) {
+          throw std::runtime_error("IPC timestamp_count must equal total frame count");
         }
         struct ExtraImageInfo
         {
@@ -211,6 +232,13 @@ int main(int argc, char ** argv)
             edge_vlm_ros::ipc::read_all(client_fd, buf.data(), buf.size());
             extra_image_bytes.push_back(std::move(buf));
           }
+        }
+        std::vector<double> frame_timestamps_sec;
+        if (has_timestamps) {
+          frame_timestamps_sec.resize(header.timestamp_count);
+          edge_vlm_ros::ipc::read_all(
+            client_fd, frame_timestamps_sec.data(),
+            frame_timestamps_sec.size() * sizeof(double));
         }
 
         // ── Read structured or inline payload ─────────────────────────────────
@@ -274,6 +302,13 @@ int main(int argc, char ** argv)
         request.prompt = std::move(prompt);
         request.system_message = std::move(system_message);
         request.history = std::move(history);
+        request.sequence_type =
+          static_cast<edge_vlm_ros::TemporalSequenceType>(header.sequence_type);
+        if (has_fps) {
+          request.fps = header.fps;
+        }
+        request.frame_timestamps_sec = std::move(frame_timestamps_sec);
+        edge_vlm_ros::detail::validate_temporal_metadata(request);
         request.use_system_prompt_cache =
           (header.schema_flags & edge_vlm_ros::ipc::kSchemaFlagSysCache) != 0;
         request.max_generate_length = header.max_generate_length;
@@ -327,7 +362,8 @@ int main(int argc, char ** argv)
         watchdog.cancel();
   
         if (result.text.size() > edge_vlm_ros::ipc::kMaxTextBytes ||
-          result.error.size() > edge_vlm_ros::ipc::kMaxTextBytes)
+          result.error.size() > edge_vlm_ros::ipc::kMaxTextBytes ||
+          result.runtime_temporal_encoding.size() > edge_vlm_ros::ipc::kMaxTextBytes)
         {
           throw std::runtime_error("inference response exceeds IPC protocol limits");
         }
@@ -337,11 +373,17 @@ int main(int argc, char ** argv)
         response.success = result.success ? 1U : 0U;
         response.text_bytes = static_cast<uint32_t>(result.text.size());
         response.error_bytes = static_cast<uint32_t>(result.error.size());
+        response.temporal_encoding_bytes =
+          static_cast<uint32_t>(result.runtime_temporal_encoding.size());
+        response.temporal_fallback_used = result.temporal_fallback_used ? 1U : 0U;
         response.inference_seconds = result.inference_seconds;
         edge_vlm_ros::ipc::write_all(client_fd, &response, sizeof(response));
         edge_vlm_ros::ipc::write_all(client_fd, result.text.data(), result.text.size());
         edge_vlm_ros::ipc::write_all(
           client_fd, result.error.data(), result.error.size());
+        edge_vlm_ros::ipc::write_all(
+          client_fd, result.runtime_temporal_encoding.data(),
+          result.runtime_temporal_encoding.size());
       }
       ::close(client_fd);
       g_client_fd = -1;

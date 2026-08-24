@@ -132,12 +132,51 @@ def _socket_listener_pid(socket_path: str) -> int | None:
     if not output:
         return None
     socket_pattern = re.compile(rf"(^|\s){re.escape(canonical_socket)}(\s|$)")
+    saw_socket_listener = False
     for line in output.splitlines():
         if not socket_pattern.search(line):
             continue
+        saw_socket_listener = True
         match = re.search(r"pid=(\d+)", line)
         if match:
             return int(match.group(1))
+    if saw_socket_listener:
+        return _socket_listener_pid_fallback_from_proc(canonical_socket)
+    return None
+
+
+def _socket_listener_pid_fallback_from_proc(canonical_socket: str) -> int | None:
+    """Best-effort same-user /proc fallback when `ss -p` omits process metadata."""
+    try:
+        current_uid = os.getuid()
+        proc_entries = sorted(Path("/proc").iterdir(), key=lambda p: p.name)
+    except OSError:
+        return None
+
+    for proc_entry in proc_entries:
+        if not proc_entry.name.isdigit():
+            continue
+        try:
+            if proc_entry.stat().st_uid != current_uid:
+                continue
+            parts = (proc_entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if parts and parts[-1] == b"":
+            parts = parts[:-1]
+        if len(parts) <= _EDGE_VLM_SERVER_ARGV_SOCKET_PATH:
+            continue
+        argv0 = parts[0].decode("utf-8", errors="replace").strip()
+        if Path(argv0).name != "edge_vlm_server":
+            continue
+        server_socket = parts[_EDGE_VLM_SERVER_ARGV_SOCKET_PATH].decode(
+            "utf-8", errors="replace"
+        ).strip()
+        if _canonical_path(server_socket) == canonical_socket:
+            try:
+                return int(proc_entry.name)
+            except ValueError:
+                continue
     return None
 
 

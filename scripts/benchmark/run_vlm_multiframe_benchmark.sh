@@ -20,9 +20,8 @@
 #            server steady-state path; total_latency_ms is the outer client
 #            round-trip.  Stage timings are null; TTFT is null.
 #
-# Both paths use the same Thor-validated request shape and prompt, so
-# direct cold-start and IPC steady-state measurements are directly comparable
-# within each frame-count condition.
+# Both paths use the same prompt and frame selection policy. Request transport
+# differs by path when temporal/video mode is enabled.
 #
 # This script does NOT:
 #   - Change power mode, clock caps, model size, quantization, or engines.
@@ -40,12 +39,14 @@
 #
 # Input request shape
 # -------------------
-# Uses the Thor-validated TensorRT Edge-LLM VLM request shape:
+# Uses the TensorRT Edge-LLM VLM request shape:
 #   requests -> messages -> content[]   (role: user)
-# Multiple image content items {"type":"image","image":path} are placed in
-# temporal order, followed by one text item.  SHA-256 content hashes are
-# stored in JSONL benchmark metadata (frame_paths field), not in the model
-# message payload.
+# - sequence_type=images:
+#     multiple {"type":"image","image":path} items in temporal order, then text
+# - sequence_type=temporal_images|video (direct path):
+#     one {"type":"video","frames":[...],"fps":N} item, then text
+# SHA-256 content hashes are stored in JSONL benchmark metadata (frame_paths
+# field), not in the model message payload.
 #
 # Native profiling
 # ----------------
@@ -95,6 +96,11 @@
 #   --warmup N               Warmup iterations per condition (default: 1)
 #   --iterations N           Measured iterations per condition (default: 3)
 #   --paths LIST             Comma-separated paths: direct,ipc (default: direct,ipc)
+#   --sequence-type MODE     images|temporal_images|video (default: images)
+#   --fps N                  Optional FPS metadata for temporal modes
+#   --frame-timestamps-sec   Optional comma-separated per-frame timestamps (seconds)
+#   --render-timestamps      Render visible timestamps on frames (experimental control)
+#                            (IPC path only; direct path rejects this flag)
 #   --skip-ipc               Alias for --paths direct
 #   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
@@ -112,6 +118,10 @@ ITERATIONS=3
 SEQUENCE_DIR=""
 DRY_RUN=false
 PATHS="direct,ipc"
+SEQUENCE_TYPE="images"
+FPS=""
+FRAME_TIMESTAMPS_SEC=""
+RENDER_TIMESTAMPS=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -137,6 +147,10 @@ while [[ $# -gt 0 ]]; do
         --warmup)           WARMUP="$2";               shift 2 ;;
         --iterations)       ITERATIONS="$2";           shift 2 ;;
         --paths)            PATHS="$2";                shift 2 ;;
+        --sequence-type)    SEQUENCE_TYPE="$2";        shift 2 ;;
+        --fps)              FPS="$2";                  shift 2 ;;
+        --frame-timestamps-sec) FRAME_TIMESTAMPS_SEC="$2"; shift 2 ;;
+        --render-timestamps) RENDER_TIMESTAMPS=true;   shift ;;
         --skip-ipc)         PATHS="direct";            shift ;;
         --skip-direct)      PATHS="ipc";               shift ;;
         --dry-run)          DRY_RUN=true;              shift ;;
@@ -155,6 +169,30 @@ fi
 if [[ ! -d "${SEQUENCE_DIR}" ]]; then
     echo "ERROR: sequence directory does not exist: ${SEQUENCE_DIR}" >&2
     exit 1
+fi
+
+if [[ "${SEQUENCE_TYPE}" != "images" && "${SEQUENCE_TYPE}" != "temporal_images" && "${SEQUENCE_TYPE}" != "video" ]]; then
+    echo "ERROR: --sequence-type must be one of: images, temporal_images, video" >&2
+    exit 1
+fi
+
+if [[ "${SEQUENCE_TYPE}" == "images" && ( -n "${FPS}" || -n "${FRAME_TIMESTAMPS_SEC}" ) ]]; then
+    echo "ERROR: --sequence-type=images must not include --fps or --frame-timestamps-sec" >&2
+    exit 1
+fi
+
+if [[ ",${PATHS}," == *",direct,"* && "${RENDER_TIMESTAMPS}" == "true" ]]; then
+    echo "ERROR: direct path does not implement --render-timestamps preprocessing." >&2
+    echo "       Use --paths ipc, or run without --render-timestamps." >&2
+    exit 1
+fi
+
+if [[ ",${PATHS}," == *",direct,"* && "${SEQUENCE_TYPE}" != "images" ]]; then
+    if [[ -n "${FRAME_TIMESTAMPS_SEC}" ]]; then
+        echo "ERROR: direct path temporal/video request JSON supports frames+fps but not explicit --frame-timestamps-sec arrays." >&2
+        echo "       Use --paths ipc for explicit per-frame timestamps." >&2
+        exit 1
+    fi
 fi
 
 # ── derived paths ─────────────────────────────────────────────────────────────
@@ -235,6 +273,14 @@ _resolve_ipc_engine_provenance() {
         echo "WARNING: caller-shell engine paths differ from the running edge_vlm_server." >&2
         echo "         Direct records will use caller-shell runtime paths; IPC records will use server-process paths." >&2
         echo "         The generated report will be marked with mixed engine provenance and should be treated as non-comparable." >&2
+    fi
+}
+
+_runtime_temporal_encoding_for_direct() {
+    if [[ "${SEQUENCE_TYPE}" == "images" ]]; then
+        echo "ordered_multi_image_no_native_temporal_metadata"
+    else
+        echo "native_qwen3vl_video_json_frames_fps_no_explicit_timestamps"
     fi
 }
 
@@ -337,20 +383,29 @@ _select_frames() {
 # ── request JSON construction ─────────────────────────────────────────────────
 
 _build_request_json() {
-    # Build the Thor-validated TensorRT Edge-LLM VLM request JSON for multiple frames.
+    # Build TensorRT Edge-LLM VLM request JSON for multiple frames.
     # Shape: requests -> messages -> content[]  (role: user)
-    # Image items: {"type":"image","image":path} in temporal order, then text prompt.
+    # sequence_type=images: image items {"type":"image","image":path} in temporal order.
+    # sequence_type=temporal_images|video: one video item {"type":"video","frames":[...],"fps":N}.
     # max_output_tokens is NOT embedded in the payload; it is passed via --maxGenerateLength.
     # SHA-256 content hashes go in JSONL metadata (frame_paths), not in the model payload.
     local frames=("$@")
-
-    # Build content array: image items in temporal order, then text prompt.
     local content_items=""
-    local sep=""
-    for img_path in "${frames[@]}"; do
-        content_items="${content_items}${sep}{\"type\":\"image\",\"image\":\"${img_path}\"}"
-        sep=","
-    done
+    if [[ "${SEQUENCE_TYPE}" == "images" ]]; then
+        # Build content array: image items in temporal order, then text prompt.
+        local sep=""
+        local img_path
+        for img_path in "${frames[@]}"; do
+            content_items="${content_items}${sep}{\"type\":\"image\",\"image\":\"${img_path}\"}"
+            sep=","
+        done
+    else
+        local frames_json
+        frames_json=$(printf '%s\n' "${frames[@]}" | python3 -c "import json,sys; print(json.dumps([x.strip() for x in sys.stdin if x.strip()]))")
+        local effective_fps="${FPS:-1.0}"
+        content_items="{\"type\":\"video\",\"frames\":${frames_json},\"fps\":${effective_fps}}"
+    fi
+
     # Append text prompt
     local escaped_prompt
     escaped_prompt=$(printf '%s' "${PROMPT_TEXT}" | python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))")
@@ -559,9 +614,21 @@ _run_ipc_inference() {
         image_args+=(--image "${img}")
     done
 
+    local temporal_args=(--sequence-type "${SEQUENCE_TYPE}")
+    if [[ -n "${FPS}" ]]; then
+        temporal_args+=(--fps "${FPS}")
+    fi
+    if [[ -n "${FRAME_TIMESTAMPS_SEC}" ]]; then
+        temporal_args+=(--frame-timestamps-sec "${FRAME_TIMESTAMPS_SEC}")
+    fi
+    if [[ "${RENDER_TIMESTAMPS}" == "true" ]]; then
+        temporal_args+=(--render-timestamps)
+    fi
+
     _run ros2 run edge_vlm_ros vlm_multi_frame_client \
         --socket "${EDGE_VLM_WORKER_SOCKET:-/tmp/edge_vlm.sock}" \
         "${image_args[@]}" \
+        "${temporal_args[@]}" \
         --prompt "${PROMPT_TEXT}" \
         --max-tokens "${MAX_OUTPUT_TOKENS}" \
         --output "${result_json_path}" \
@@ -601,6 +668,24 @@ _run_condition() {
 
     local prompt_hash_val
     prompt_hash_val=$(_sha256_string "${PROMPT_TEXT}")
+    local frame_timestamps_json="null"
+    local frame_timestamp_policy='"none"'
+    if [[ -n "${FRAME_TIMESTAMPS_SEC}" ]]; then
+        frame_timestamps_json=$(
+            python3 - "${FRAME_TIMESTAMPS_SEC}" <<'PYEOF'
+import json, sys
+items = [x.strip() for x in sys.argv[1].split(",") if x.strip()]
+print(json.dumps([float(x) for x in items]))
+PYEOF
+        )
+        frame_timestamp_policy='"explicit"'
+    elif [[ -n "${FPS}" && "${SEQUENCE_TYPE}" != "images" ]]; then
+        frame_timestamp_policy='"implicit_uniform_from_fps"'
+    fi
+    local direct_frame_timestamp_policy="${frame_timestamp_policy}"
+    if [[ "${SEQUENCE_TYPE}" != "images" ]]; then
+        direct_frame_timestamp_policy='"implicit_uniform_from_fps"'
+    fi
 
     # ── direct path ────────────────────────────────────────────────────────────
     if [[ ",${PATHS}," == *",direct,"* ]]; then
@@ -718,6 +803,13 @@ print('\t'.join([
             export _BM_PROFILE_PATH="${profile_path}"
             export _BM_MODEL_NAME="${RESOLVED_MODEL_NAME:-unknown}"
             export _BM_ENGINE_PROVENANCE="${ENGINE_PROVENANCE_JSON}"
+            export _BM_SEQUENCE_TYPE="\"${SEQUENCE_TYPE}\""
+            export _BM_FPS="$([ "${SEQUENCE_TYPE}" != "images" ] && echo "${FPS:-1.0}" || echo 'null')"
+            export _BM_FRAME_TIMESTAMPS_SEC="${frame_timestamps_json}"
+            export _BM_FRAME_TIMESTAMP_POLICY="${direct_frame_timestamp_policy}"
+            export _BM_RENDERED_TIMESTAMPS="$([ "${RENDER_TIMESTAMPS}" = 'true' ] && echo 'true' || echo 'false')"
+            export _BM_RUNTIME_TEMPORAL_ENCODING="\"$(_runtime_temporal_encoding_for_direct)\""
+            export _BM_TEMPORAL_FALLBACK_USED="false"
             export _BM_ITERATION="${iter_idx}"
             export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
             PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
@@ -784,6 +876,12 @@ print('\t'.join([
             local ipc_output_text="null"
             local ipc_output_words="null"
             local ipc_inference_seconds="null"
+            local ipc_requested_sequence_type="null"
+            local ipc_runtime_temporal_encoding="null"
+            local ipc_temporal_fallback_used="null"
+            local ipc_rendered_timestamps="$([ "${RENDER_TIMESTAMPS}" = 'true' ] && echo 'true' || echo 'false')"
+            local ipc_sequence_type_json
+            ipc_sequence_type_json="\"${SEQUENCE_TYPE}\""
             local ipc_actual_latency_ms
             if [[ "${ipc_success}" == "true" && "${DRY_RUN}" != "true" && -f "${result_json_path}" ]]; then
                 local ipc_fields
@@ -797,14 +895,19 @@ try:
     ow = json.dumps(r.get("output_words"))
     iv = r.get("inference_seconds")
     inf = json.dumps(float(iv) if iv is not None else None)
+    rq = json.dumps(r.get("requested_sequence_type"))
+    enc = json.dumps(r.get("runtime_temporal_encoding"))
+    tfb = json.dumps(r.get("temporal_fallback_used"))
+    sts = json.dumps(r.get("sequence_type"))
+    rts = json.dumps(r.get("rendered_timestamps"))
     cv = r.get("client_latency_ms")
     lms = str(int(cv)) if cv is not None else fallback_ms
 except Exception:
-    ot, ow, inf, lms = "null", "null", "null", fallback_ms
-print(f"{ot}\t{ow}\t{inf}\t{lms}")
+    ot, ow, inf, rq, enc, tfb, sts, rts, lms = "null", "null", "null", "null", "null", "null", "null", "null", fallback_ms
+print(f"{ot}\t{ow}\t{inf}\t{rq}\t{enc}\t{tfb}\t{sts}\t{rts}\t{lms}")
 PYEOF
-                2>/dev/null || printf 'null\tnull\tnull\t%s' "${total_latency_ms}")
-                IFS=$'\t' read -r ipc_output_text ipc_output_words ipc_inference_seconds ipc_actual_latency_ms <<< "${ipc_fields}"
+                2>/dev/null || printf 'null\tnull\tnull\tnull\tnull\tnull\tnull\tnull\t%s' "${total_latency_ms}")
+                IFS=$'\t' read -r ipc_output_text ipc_output_words ipc_inference_seconds ipc_requested_sequence_type ipc_runtime_temporal_encoding ipc_temporal_fallback_used ipc_sequence_type_json ipc_rendered_timestamps ipc_actual_latency_ms <<< "${ipc_fields}"
             else
                 ipc_actual_latency_ms="${total_latency_ms}"
             fi
@@ -837,6 +940,14 @@ PYEOF
                 export _BM_IPC_RESULT_PATH="${ipc_result_path_json}"
                 export _BM_MODEL_NAME="${IPC_RESOLVED_MODEL_NAME:-unknown}"
                 export _BM_ENGINE_PROVENANCE="${IPC_ENGINE_PROVENANCE_JSON}"
+                export _BM_SEQUENCE_TYPE="${ipc_sequence_type_json}"
+                export _BM_FPS="$([ -n "${FPS}" ] && echo "${FPS}" || echo 'null')"
+                export _BM_FRAME_TIMESTAMPS_SEC="${frame_timestamps_json}"
+                export _BM_FRAME_TIMESTAMP_POLICY="${frame_timestamp_policy}"
+                export _BM_RENDERED_TIMESTAMPS="${ipc_rendered_timestamps}"
+                export _BM_REQUESTED_SEQUENCE_TYPE="${ipc_requested_sequence_type}"
+                export _BM_RUNTIME_TEMPORAL_ENCODING="${ipc_runtime_temporal_encoding}"
+                export _BM_TEMPORAL_FALLBACK_USED="${ipc_temporal_fallback_used}"
                 export _BM_ITERATION="${iter_idx}"
                 export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
                 PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
@@ -860,6 +971,10 @@ echo "  Timestamp: ${TIMESTAMP}"
 echo "  Sequence dir: ${SEQUENCE_DIR}"
 echo "  Frame counts: ${FRAME_COUNTS}"
 echo "  Max output tokens: ${MAX_OUTPUT_TOKENS}"
+echo "  Sequence type: ${SEQUENCE_TYPE}"
+echo "  FPS: ${FPS:-unset}"
+echo "  Frame timestamps sec: ${FRAME_TIMESTAMPS_SEC:-unset}"
+echo "  Render timestamps: ${RENDER_TIMESTAMPS}"
 echo "  Paths: ${PATHS}"
 echo "  Engine: ${RESOLVED_MODEL_NAME:-unknown} ${RESOLVED_ENGINE_PROFILE_ID:+(${RESOLVED_ENGINE_PROFILE_ID})}"
 echo "  LLM engine dir: ${RESOLVED_LLM_ENGINE_DIR:-unset}"
