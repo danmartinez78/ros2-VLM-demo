@@ -572,5 +572,35 @@ class Cosmos3EdgeModelctlEnginePaths(unittest.TestCase):
         self.assertNotIn("temporal_input", payload)
 
 
+class Cosmos3EdgeCliTests(unittest.TestCase):
+    """Tests for the cosmos3_edge_commands.py CLI interface."""
+
+    def test_dry_run_flag_is_accepted(self) -> None:
+        """--dry-run must not raise an unrecognised-argument error."""
+        import io
+        import contextlib
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = c3_commands.main(["--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertGreater(len(buf.getvalue()), 0, "--dry-run should still emit commands")
+
+    def test_dry_run_output_matches_plain_invocation(self) -> None:
+        """--dry-run output must be identical to the plain (no-flag) output."""
+        import io
+        import contextlib
+
+        buf_default = io.StringIO()
+        with contextlib.redirect_stdout(buf_default):
+            c3_commands.main([])
+
+        buf_dry_run = io.StringIO()
+        with contextlib.redirect_stdout(buf_dry_run):
+            c3_commands.main(["--dry-run"])
+
+        self.assertEqual(buf_default.getvalue(), buf_dry_run.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

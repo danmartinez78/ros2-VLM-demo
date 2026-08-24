@@ -327,6 +327,12 @@ def main(argv: list[str] | None = None) -> int:
         "Commands are printed to stdout only; nothing is executed."
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        dest="dry_run",
+        help="Emit commands to stdout without executing them (default behaviour; flag provided for explicitness).",
+    )
+    parser.add_argument(
         "--validate",
         action="store_true",
         help="Validate structural correctness of the generated commands and exit.",
