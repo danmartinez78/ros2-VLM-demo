@@ -12,10 +12,19 @@ Supported metrics
 - static_false_positive_rate
 - schema_adherence
 - hallucinated_frame_reference_rate
-- confidence_calibration (mean absolute error vs binary ground truth where available)
+- mean_confidence          (average reported confidence across predictions)
+
+Note: a ``confidence_mae`` metric against the binary change-detected label was
+removed because it is semantically incorrect — a high-confidence correct
+no-change response would appear maximally miscalibrated.  Calibration can be
+re-added once the schema carries an explicit ``change_probability`` float field.
 
 Controlled sequence transforms supported in ``ControlledSequenceEvaluator``:
   chronological, reversed, shuffled, duplicated_frame, single_terminal_frame.
+
+For ``reversed`` and ``shuffled`` transforms the evaluator derives
+control-specific expected targets rather than scoring against the original
+label unchanged.  See ``_derive_control_target``.
 
 Linkage to hardware latency benchmarks is provided through the
 ``attach_latency_record`` helper which grafts F1/F2/F4/F8 timing into the
@@ -29,7 +38,7 @@ import statistics
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from distillation.schema import TemporalSample
+from distillation.schema import TemporalSample, TemporalTarget
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +157,6 @@ class EvaluationReport:
     schema_adherence: Optional[float] = None
     hallucinated_frame_reference_rate: Optional[float] = None
     mean_confidence: Optional[float] = None
-    confidence_mae: Optional[float] = None
 
     # Optional latency entries from hardware benchmark linkage.
     latency_records: Dict[str, dict] = field(default_factory=dict)
@@ -165,7 +173,6 @@ class EvaluationReport:
             "schema_adherence": self.schema_adherence,
             "hallucinated_frame_reference_rate": self.hallucinated_frame_reference_rate,
             "mean_confidence": self.mean_confidence,
-            "confidence_mae": self.confidence_mae,
             "latency_records": self.latency_records,
         }
 
@@ -231,17 +238,6 @@ def evaluate_batch(
     if conf_vals:
         report.mean_confidence = statistics.mean(conf_vals)
 
-    # Confidence calibration (MAE vs binary ground truth)
-    calib_pairs = [
-        (m.confidence, float(m.gt_change_detected))
-        for m in per_sample
-        if m.confidence is not None and m.gt_change_detected is not None
-    ]
-    if calib_pairs:
-        report.confidence_mae = statistics.mean(
-            abs(pred_c - gt_c) for pred_c, gt_c in calib_pairs
-        )
-
     return report
 
 
@@ -255,6 +251,12 @@ class ControlledSequenceEvaluator:
 
     Supported transforms: chronological, reversed, shuffled,
     duplicated_frame, single_terminal_frame.
+
+    For ``reversed`` and ``shuffled`` transforms, the expected ground-truth
+    target is derived from the original via ``_derive_control_target`` rather
+    than being used unchanged.  This avoids the semantic error of scoring a
+    reversed-approaching sequence against an "approaching" target when the
+    correct expectation is "receding".
     """
 
     TRANSFORMS = [
@@ -264,6 +266,14 @@ class ControlledSequenceEvaluator:
         "duplicated_frame",
         "single_terminal_frame",
     ]
+
+    # Directions whose semantic meaning inverts under time-reversal.
+    _REVERSE_DIRECTION_MAP: dict = {
+        "approaching": "receding",
+        "receding": "approaching",
+        "accelerating": "decelerating",
+        "decelerating": "accelerating",
+    }
 
     def __init__(self, seed: int = 42) -> None:
         self.seed = seed
@@ -293,13 +303,55 @@ class ControlledSequenceEvaluator:
             raise ValueError(f"Unknown transform: {transform}")
         return s
 
+    def _derive_control_target(
+        self, original: TemporalSample, transform: str
+    ) -> TemporalSample:
+        """
+        Derive the expected ground-truth sample for control-scoring purposes.
+
+        For ``reversed``: invert the temporal direction of the change label
+        (e.g. approaching → receding) and swap state_start/state_end.
+        For ``shuffled``: change_detected semantics are ambiguous for arbitrary
+        orderings, so the sample is marked as control-only (no expected change
+        direction), and only schema/hallucination metrics are meaningful.
+        All other transforms: return the original unchanged.
+        """
+        import copy
+
+        if transform == "reversed" and original.target is not None:
+            s = copy.deepcopy(original)
+            t = s.target
+            inverted_dir = self._REVERSE_DIRECTION_MAP.get(t.change, t.change)
+            s.target = TemporalTarget(
+                change_detected=t.change_detected,
+                change=inverted_dir,
+                state_start=t.state_end,
+                state_end=t.state_start,
+                evidence_start_s=t.evidence_start_s,
+                evidence_end_s=t.evidence_end_s,
+                confidence=t.confidence,
+                odd_observation=t.odd_observation,
+            )
+            return s
+
+        if transform == "shuffled":
+            # For shuffled sequences the original temporal ordering is lost;
+            # direction/time metrics are not meaningful.  Return a copy with
+            # the target cleared so that only schema/hallucination are scored.
+            s = copy.deepcopy(original)
+            s.target = None
+            return s
+
+        return original
+
     def evaluate_transforms(
         self,
         predictions_by_transform: Dict[str, List[TemporalSample]],
         ground_truths: List[TemporalSample],
-    ) -> Dict[str, EvaluationReport]:
+    ) -> Dict[str, "EvaluationReport"]:
         """
-        Evaluate predictions for each transform.
+        Evaluate predictions for each transform using control-appropriate
+        expected targets.
 
         Parameters
         ----------
@@ -310,10 +362,17 @@ class ControlledSequenceEvaluator:
         -------
         dict mapping transform name -> EvaluationReport
         """
-        return {
-            transform: evaluate_batch(preds, ground_truths)
-            for transform, preds in predictions_by_transform.items()
-        }
+        gt_map = {s.sample_id: s for s in ground_truths}
+        results: Dict[str, EvaluationReport] = {}
+        for transform, preds in predictions_by_transform.items():
+            control_gts = [
+                self._derive_control_target(gt_map[p.sample_id], transform)
+                if p.sample_id in gt_map
+                else p
+                for p in preds
+            ]
+            results[transform] = evaluate_batch(preds, control_gts)
+        return results
 
 
 # ---------------------------------------------------------------------------

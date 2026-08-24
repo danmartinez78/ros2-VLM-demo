@@ -85,15 +85,38 @@ class TemporalTarget:
 
     @classmethod
     def from_dict(cls, d: dict) -> "TemporalTarget":
+        # Strict type validation: reject string/non-bool for change_detected so
+        # that bool("false") == True cannot silently corrupt a target.
+        cd = d["change_detected"]
+        if not isinstance(cd, bool):
+            raise TypeError(
+                f"change_detected must be a JSON boolean, got {type(cd).__name__}: {cd!r}"
+            )
+        conf = d["confidence"]
+        if not isinstance(conf, (int, float)):
+            raise TypeError(
+                f"confidence must be a JSON number, got {type(conf).__name__}: {conf!r}"
+            )
+        for float_field in ("evidence_start_s", "evidence_end_s"):
+            v = d[float_field]
+            if not isinstance(v, (int, float)):
+                raise TypeError(
+                    f"{float_field} must be a JSON number, got {type(v).__name__}: {v!r}"
+                )
+        for str_field in ("change", "state_start", "state_end", "odd_observation"):
+            if not isinstance(d[str_field], str):
+                raise TypeError(
+                    f"{str_field} must be a JSON string, got {type(d[str_field]).__name__}: {d[str_field]!r}"
+                )
         return cls(
-            change_detected=bool(d["change_detected"]),
-            change=str(d["change"]),
-            state_start=str(d["state_start"]),
-            state_end=str(d["state_end"]),
+            change_detected=cd,
+            change=d["change"],
+            state_start=d["state_start"],
+            state_end=d["state_end"],
             evidence_start_s=float(d["evidence_start_s"]),
             evidence_end_s=float(d["evidence_end_s"]),
             confidence=float(d["confidence"]),
-            odd_observation=str(d["odd_observation"]),
+            odd_observation=d["odd_observation"],
         )
 
 
@@ -107,6 +130,20 @@ class Provenance:
     teacher_prompt_version: str = ""
     validation_version: str = ""
     generated_at_utc: str = ""
+    input_representation: str = ""
+    """
+    Temporal input representation used when the sample was generated.
+
+    Possible values (aligned with #72 distinctions):
+      ``"ordered_images"``        – frames passed as an ordered image list
+      ``"rendered_timestamps"``   – timestamps rendered into the image or prompt
+      ``"temporal_images_meta"``  – frames with temporal-images metadata block
+      ``"native_video"``          – frames encoded as a native video segment
+      ``""``                      – unspecified / legacy (pre-provenance)
+
+    Two samples sharing the same frame/timestamp provenance but different
+    ``input_representation`` values represent materially different model inputs.
+    """
 
     def to_dict(self) -> dict:
         return {
@@ -116,6 +153,7 @@ class Provenance:
             "teacher_prompt_version": self.teacher_prompt_version,
             "validation_version": self.validation_version,
             "generated_at_utc": self.generated_at_utc,
+            "input_representation": self.input_representation,
         }
 
     @classmethod

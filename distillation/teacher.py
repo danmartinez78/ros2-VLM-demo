@@ -143,33 +143,75 @@ class TeacherLabelGenerator:
         output_dir: Path,
         repo_commit: str = "",
         prompt_version: str = TEACHER_PROMPT_VERSION,
+        input_representation: str = "",
     ) -> None:
         self.runtime = runtime
         self.output_dir = output_dir
         self.repo_commit = repo_commit
         self.prompt_version = prompt_version
+        self.input_representation = input_representation
         output_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
+    def _input_fingerprint(self, sample: TemporalSample) -> str:
+        """
+        Stable fingerprint over the inputs that determine whether a cached label
+        is still valid: source frame paths/timestamps, prompt version, teacher
+        model/engine identity, and input representation.
+
+        If any of these change the cached file must be regenerated.
+        """
+        import hashlib as _hashlib
+        import json as _json
+
+        key = {
+            "frames": [f.to_dict() for f in sample.frames],
+            "prompt_profile": sample.prompt_profile,
+            "prompt_version": self.prompt_version,
+            "teacher_model": self.runtime.model_identity,
+            "teacher_engine_identity": self.runtime.engine_identity,
+            "input_representation": self.input_representation,
+        }
+        raw = _json.dumps(key, sort_keys=True).encode()
+        return _hashlib.sha256(raw).hexdigest()[:16]
+
     def run(self, samples: List[TemporalSample]) -> List[TemporalSample]:
         """
         Generate teacher labels for all samples.
+
+        Resume behaviour: an existing ``<output_dir>/<sample_id>.json`` is
+        reused only when its embedded ``input_fingerprint`` matches the current
+        combination of frames, prompt, teacher identity, and input
+        representation.  A fingerprint mismatch causes the file to be
+        overwritten, preventing stale labels from silently entering training.
 
         Returns the updated list (including skipped/resumed samples).
         """
         results: List[TemporalSample] = []
         for sample in samples:
             out_path = self.output_dir / f"{sample.sample_id}.json"
+            current_fp = self._input_fingerprint(sample)
             if out_path.exists():
-                # Resume: load the already-generated label.
-                loaded = TemporalSample.from_dict(json.loads(out_path.read_text()))
-                results.append(loaded)
-                continue
+                try:
+                    cached = json.loads(out_path.read_text())
+                    if cached.get("input_fingerprint") == current_fp:
+                        # Valid cached label: remove bookkeeping key before
+                        # constructing the TemporalSample.
+                        cached.pop("input_fingerprint", None)
+                        loaded = TemporalSample.from_dict(cached)
+                        results.append(loaded)
+                        continue
+                    # Fingerprint mismatch – fall through to regenerate.
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    pass  # Corrupt file – regenerate.
             labelled = self._generate_one(sample)
-            out_path.write_text(json.dumps(labelled.to_dict(), indent=2))
+            # Write with fingerprint so future resumes can verify freshness.
+            serialised = labelled.to_dict()
+            serialised["input_fingerprint"] = current_fp
+            out_path.write_text(json.dumps(serialised, indent=2))
             results.append(labelled)
         return results
 
@@ -202,6 +244,7 @@ class TeacherLabelGenerator:
             teacher_prompt_version=self.prompt_version,
             validation_version="",
             generated_at_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            input_representation=self.input_representation,
         )
 
         # Attempt to parse target; leave as None if malformed.

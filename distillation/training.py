@@ -268,11 +268,144 @@ def run_training(
         effective_cfg_path.write_text(json.dumps(config.to_dict(), indent=2))
         return result
 
-    # Real training path (not executed in CI – requires GPU + model download).
-    raise NotImplementedError(
-        "Real training requires GPU hardware and model downloads. "
-        "Use --dry-run for CI validation."
+    # ---------------------------------------------------------------------------
+    # Real training path
+    # ---------------------------------------------------------------------------
+    # Heavy imports (torch, transformers, peft) are deferred to here so that
+    # dry-run / config-validation passes in CPU-only CI without any model
+    # downloads or GPU requirements.
+    #
+    # Backend: Hugging Face ``transformers`` Trainer with ``peft`` QLoRA adapters.
+    # Both packages must be available at runtime:
+    #   pip install transformers>=4.40 peft>=0.10 datasets accelerate bitsandbytes
+    #
+    # The dataset directory (config.dataset_dir) must contain the JSONL files
+    # produced by ``distillation.dataset.export_sft_dataset`` and a
+    # ``dataset_manifest.json``.  The manifest hash is read back and verified
+    # against ``config.dataset_manifest_hash`` (when the config provides one)
+    # so that training never silently uses a stale or replaced dataset.
+    try:
+        import transformers  # type: ignore[import-untyped]
+        import peft  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ImportError(
+            "Real training requires 'transformers' and 'peft'. "
+            "Install them with: pip install transformers peft datasets accelerate bitsandbytes"
+        ) from exc
+
+    dataset_dir = Path(config.dataset_dir)
+    manifest_path = dataset_dir / "dataset_manifest.json"
+    if manifest_path.exists():
+        manifest_data = json.loads(manifest_path.read_text())
+        if config.dataset_manifest_hash:
+            import hashlib
+            actual_hash = hashlib.sha256(
+                json.dumps(manifest_data, sort_keys=True).encode()
+            ).hexdigest()[:16]
+            if actual_hash != config.dataset_manifest_hash:
+                raise ValueError(
+                    f"Dataset manifest hash mismatch: config expects "
+                    f"{config.dataset_manifest_hash!r} but found {actual_hash!r}. "
+                    "Re-export the dataset or update the config hash."
+                )
+    elif config.dataset_manifest_hash:
+        raise FileNotFoundError(
+            f"dataset_manifest.json not found in {dataset_dir} "
+            f"but config specifies a manifest hash {config.dataset_manifest_hash!r}."
+        )
+
+    resolved_out.mkdir(parents=True, exist_ok=True)
+
+    # Write effective config before training starts for provenance.
+    effective_cfg_path = resolved_out / "effective_config.json"
+    effective_cfg_path.write_text(json.dumps(config.to_dict(), indent=2))
+
+    # ------------------------------------------------------------------
+    # Model + tokenizer
+    # ------------------------------------------------------------------
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer  # type: ignore[import-untyped]
+    from peft import get_peft_model, LoraConfig as PeftLoraConfig, TaskType  # type: ignore[import-untyped]
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.base_model if not config.base_checkpoint else config.base_checkpoint,
+        trust_remote_code=True,
     )
+    model = AutoModelForCausalLM.from_pretrained(
+        config.base_model if not config.base_checkpoint else config.base_checkpoint,
+        trust_remote_code=True,
+    )
+
+    if config.use_lora:
+        lora_cfg = PeftLoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=config.lora.r,
+            lora_alpha=config.lora.alpha,
+            lora_dropout=config.lora.dropout,
+            target_modules=config.lora.target_modules,
+        )
+        model = get_peft_model(model, lora_cfg)
+
+    # ------------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------------
+    try:
+        from datasets import load_dataset  # type: ignore[import-untyped]
+    except ImportError as exc:
+        raise ImportError("Install 'datasets': pip install datasets") from exc
+
+    raw_datasets = load_dataset(
+        "json",
+        data_files={
+            "train": str(dataset_dir / "train.jsonl"),
+            "validation": str(dataset_dir / "val.jsonl"),
+        },
+    )
+
+    def _tokenize(example):
+        text = " ".join(
+            m["content"] if isinstance(m["content"], str) else str(m["content"])
+            for m in example.get("messages", [])
+        )
+        return tokenizer(
+            text,
+            truncation=True,
+            max_length=config.max_seq_length,
+            padding="max_length",
+        )
+
+    tokenized = raw_datasets.map(_tokenize, batched=False)
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+    training_args = TrainingArguments(
+        output_dir=str(resolved_out),
+        num_train_epochs=config.num_epochs,
+        per_device_train_batch_size=config.per_device_train_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        learning_rate=config.learning_rate,
+        lr_scheduler_type=config.lr_scheduler,
+        warmup_steps=config.warmup_steps,
+        fp16=config.fp16,
+        bf16=config.bf16,
+        dataloader_num_workers=config.dataloader_num_workers,
+        seed=config.seed,
+        resume_from_checkpoint=config.resume_from_checkpoint or None,
+        report_to="none",
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized["train"],
+        eval_dataset=tokenized["validation"],
+        tokenizer=tokenizer,
+    )
+    trainer.train(resume_from_checkpoint=config.resume_from_checkpoint or None)
+    trainer.save_model(str(resolved_out / "final_adapter"))
+
+    result["plan"] = {**plan, "checkpoint": str(resolved_out / "final_adapter")}
+    return result
 
 
 # ---------------------------------------------------------------------------

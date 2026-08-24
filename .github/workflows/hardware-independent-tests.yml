@@ -178,6 +178,21 @@ jobs:
       - name: Run web console tests (CPU-only, no hardware required)
         run: python3 web_console/tests/test_web_console.py -v
 
+  distillation-pipeline-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run distillation pipeline tests (CPU-only, no hardware required)
+        run: python3 distillation/tests/test_distillation_pipeline.py -v
+
   obsolete-identifier-check:
     runs-on: ubuntu-24.04
     timeout-minutes: 5

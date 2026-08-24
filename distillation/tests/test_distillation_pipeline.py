@@ -160,6 +160,33 @@ class TestSchemaRoundTrip(unittest.TestCase):
         restored = TemporalSample.from_dict(d)
         self.assertIsNone(restored.target)
 
+    def test_target_from_dict_rejects_string_bool(self):
+        """bool('false') == True; from_dict must reject non-JSON-bool change_detected."""
+        d = _make_target().to_dict()
+        d["change_detected"] = "false"
+        with self.assertRaises(TypeError):
+            TemporalTarget.from_dict(d)
+
+    def test_target_from_dict_rejects_string_confidence(self):
+        d = _make_target().to_dict()
+        d["confidence"] = "0.9"
+        with self.assertRaises(TypeError):
+            TemporalTarget.from_dict(d)
+
+    def test_provenance_input_representation_round_trip(self):
+        p = Provenance(input_representation="rendered_timestamps")
+        d = p.to_dict()
+        restored = Provenance.from_dict(d)
+        self.assertEqual(restored.input_representation, "rendered_timestamps")
+
+    def test_provenance_input_representation_default_empty(self):
+        """Legacy samples without input_representation round-trip as empty string."""
+        p = Provenance()
+        d = p.to_dict()
+        del d["input_representation"]
+        restored = Provenance.from_dict(d)
+        self.assertEqual(restored.input_representation, "")
+
 
 # ---------------------------------------------------------------------------
 # 2. Teacher generation (fake runtime)
@@ -226,6 +253,43 @@ class TestTeacherGeneration(unittest.TestCase):
             out = json.loads((Path(tmpdir) / "out" / "seq-ord-0.json").read_text())
         ts = [f["t_seconds"] for f in out["frames"]]
         self.assertEqual(ts, sorted(ts))
+
+    def test_resume_rejects_stale_label_on_frame_change(self):
+        """If frames change, cached label must not be reused."""
+        sample = _make_sample("seq-stale-0", with_target=False)
+        runtime = FakeTeacherRuntime(responses={"seq-stale-0": _make_fake_teacher_response()})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gen = TeacherLabelGenerator(runtime=runtime, output_dir=self._gen_dir(tmpdir))
+            gen.run([sample])
+            runtime.call_log.clear()
+            # Mutate the frame timestamps to simulate a changed source.
+            mutated = _make_sample("seq-stale-0", with_target=False)
+            mutated.frames[0] = FrameRef("different_path.jpg", 999.0)
+            gen.run([mutated])
+        # Must have regenerated.
+        self.assertIn("seq-stale-0", runtime.call_log)
+
+    def test_resume_stores_and_verifies_fingerprint(self):
+        """Cached file must contain the input fingerprint key."""
+        sample = _make_sample("seq-fp-0", with_target=False)
+        runtime = FakeTeacherRuntime(responses={"seq-fp-0": _make_fake_teacher_response()})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gen = TeacherLabelGenerator(runtime=runtime, output_dir=self._gen_dir(tmpdir))
+            gen.run([sample])
+            cached = json.loads((self._gen_dir(tmpdir) / "seq-fp-0.json").read_text())
+        self.assertIn("input_fingerprint", cached)
+
+    def test_input_representation_stored_in_provenance(self):
+        sample = _make_sample("seq-repr-0", with_target=False)
+        runtime = FakeTeacherRuntime(responses={"seq-repr-0": _make_fake_teacher_response()})
+        with tempfile.TemporaryDirectory() as tmpdir:
+            gen = TeacherLabelGenerator(
+                runtime=runtime,
+                output_dir=self._gen_dir(tmpdir),
+                input_representation="ordered_images",
+            )
+            results = gen.run([sample])
+        self.assertEqual(results[0].provenance.input_representation, "ordered_images")
 
 
 # ---------------------------------------------------------------------------
@@ -528,9 +592,10 @@ class TestTrainingConfig(unittest.TestCase):
         cfg = self._default_config()
         self.assertEqual(cfg.config_hash(), cfg.config_hash())
 
-    def test_real_training_raises_not_implemented(self):
+    def test_real_training_raises_import_error_without_deps(self):
+        """Non-dry-run path requires heavy deps; on CI they are absent → ImportError."""
         cfg = self._default_config()
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises((ImportError, FileNotFoundError)):
             run_training(cfg, dry_run=False)
 
 
@@ -646,6 +711,29 @@ class TestEvaluation(unittest.TestCase):
         reports = evaluator.evaluate_transforms(preds_by_transform, gts)
         self.assertIn("chronological", reports)
         self.assertIn("reversed", reports)
+
+    def test_derive_control_target_reversed_inverts_direction(self):
+        """reversed GT must flip approaching → receding."""
+        evaluator = ControlledSequenceEvaluator()
+        gt = self._gt_sample("s0")  # change="approaching"
+        derived = evaluator._derive_control_target(gt, "reversed")
+        self.assertEqual(derived.target.change, "receding")
+        # state_start and state_end should swap.
+        self.assertEqual(derived.target.state_start, gt.target.state_end)
+        self.assertEqual(derived.target.state_end, gt.target.state_start)
+
+    def test_derive_control_target_shuffled_clears_target(self):
+        """shuffled GT clears the target; only schema/halluc metrics are meaningful."""
+        evaluator = ControlledSequenceEvaluator()
+        gt = self._gt_sample("s0")
+        derived = evaluator._derive_control_target(gt, "shuffled")
+        self.assertIsNone(derived.target)
+
+    def test_derive_control_target_chronological_unchanged(self):
+        evaluator = ControlledSequenceEvaluator()
+        gt = self._gt_sample("s0")
+        derived = evaluator._derive_control_target(gt, "chronological")
+        self.assertIs(derived, gt)
 
 
 # ---------------------------------------------------------------------------
