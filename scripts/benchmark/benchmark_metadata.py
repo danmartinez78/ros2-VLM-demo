@@ -146,6 +146,8 @@ def _proc_argv(pid: int, index: int) -> str:
         parts = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
         return ""
+    if parts and parts[-1] == b"":
+        parts = parts[:-1]
     if index < 0 or index >= len(parts):
         return ""
     return parts[index].decode("utf-8", errors="replace").strip()
@@ -284,6 +286,11 @@ def collect_server_engine_provenance(
     requested_socket = socket_path or os.environ.get("EDGE_VLM_WORKER_SOCKET", "/tmp/edge_vlm.sock")
     server_pid = _socket_listener_pid(requested_socket)
     if server_pid is None:
+        if Path(requested_socket).exists():
+            raise RuntimeError(
+                "socket exists but no live edge_vlm_server listener could be identified for "
+                f"{requested_socket!r}; ensure 'ss' can inspect the running server process"
+            )
         raise RuntimeError(f"no live edge_vlm_server listener found for socket {requested_socket!r}")
 
     llm_engine_dir = _proc_argv(server_pid, _EDGE_VLM_SERVER_ARGV_LLM_DIR)
