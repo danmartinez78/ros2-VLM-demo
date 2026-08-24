@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
 #include <string>
 
 // ─── Forward declarations for TensorRT Edge-LLM types ──────────────────────
@@ -62,11 +63,11 @@ struct TensorRTEdgeLLMConfig
 ///
 /// Multi-frame support
 /// ────────────────────
-/// When InferenceRequest::extra_images is non-empty the backend encodes
-/// every frame (primary first, then extra_images in temporal order) and
-/// produces one "image" content item + one imageBuffers entry per frame,
-/// followed by the single text content item.  Single-frame behaviour is
-/// unchanged (extra_images is empty).
+/// - sequence_type=images: one "image" content item + one imageBuffers entry
+///   per frame (primary first, then extra_images in temporal order).
+/// - sequence_type=temporal_images|video: one native "video" content item and
+///   one stacked ImageData buffer with shape [T,H,W,3], isVideo=true, fps, and
+///   optional source timestamps.
 class TensorRTEdgeLLMBackend : public InferenceBackend
 {
 public:
@@ -99,20 +100,53 @@ private:
 namespace detail
 {
 
-/// Returns the expected number of image content items for a request.
-/// Primary image contributes 1; each extra_image contributes 1 more.
-/// This equals the number of imageBuffers entries the backend will push.
-/// Callable without TensorRT headers — used by CPU-only tests.
-inline std::size_t image_content_count(const InferenceRequest & request) noexcept
+inline bool uses_native_video_encoding(const InferenceRequest & request) noexcept
 {
-  return 1u + request.extra_images.size();
+  return request.sequence_type != TemporalSequenceType::kImages;
+}
+
+inline std::optional<double> infer_effective_video_fps(const InferenceRequest & request) noexcept
+{
+  if (!uses_native_video_encoding(request)) {
+    return std::nullopt;
+  }
+  if (request.fps.has_value()) {
+    return request.fps;
+  }
+  if (request.frame_timestamps_sec.size() >= 2U) {
+    const double span = request.frame_timestamps_sec.back() - request.frame_timestamps_sec.front();
+    if (span > 0.0) {
+      return static_cast<double>(frame_count(request) - 1U) / span;
+    }
+  }
+  return 1.0;
+}
+
+/// Returns the expected number of media content items for a request.
+/// `images` => one "image" item per frame.
+/// `temporal_images`/`video` => one "video" item for the stacked frame tensor.
+inline std::size_t media_content_count(const InferenceRequest & request) noexcept
+{
+  return uses_native_video_encoding(request) ? 1U : frame_count(request);
+}
+
+/// Returns the expected media content type for the current user message.
+inline const char * media_content_type(const InferenceRequest & request) noexcept
+{
+  return uses_native_video_encoding(request) ? "video" : "image";
+}
+
+/// Returns the expected number of imageBuffers entries the backend will push.
+inline std::size_t image_buffer_count(const InferenceRequest & request) noexcept
+{
+  return media_content_count(request);
 }
 
 /// Returns the expected total number of content items in the user message:
-/// one per frame (image items) plus one text item.
+/// media items plus one text item.
 inline std::size_t user_message_content_count(const InferenceRequest & request) noexcept
 {
-  return image_content_count(request) + 1u;  // +1 for the text item
+  return media_content_count(request) + 1U;  // +1 for the text item
 }
 
 }  // namespace detail

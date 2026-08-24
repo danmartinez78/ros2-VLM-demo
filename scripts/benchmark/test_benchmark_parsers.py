@@ -633,6 +633,25 @@ class TestBenchmarkMetadata(unittest.TestCase):
         self.assertEqual(provenance["server_socket_path"], str(Path("/tmp/edge_vlm.sock").resolve()))
         self.assertEqual(provenance["provenance_source"], "server_process")
 
+    def test_socket_listener_pid_falls_back_to_proc_when_ss_omits_pid(self):
+        import tempfile
+        from benchmark_metadata import _socket_listener_pid
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            socket_path = str((Path(tmpdir) / "edge_vlm.sock").resolve())
+            ss_output = (
+                "Netid State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess\n"
+                f"u_str LISTEN 0      4096   {socket_path} 0            * 0\n"
+            )
+            with patch("benchmark_metadata._run", return_value=ss_output), patch(
+                "benchmark_metadata._socket_listener_pid_fallback_from_proc",
+                return_value=4242,
+            ) as mock_fallback:
+                pid = _socket_listener_pid(socket_path)
+
+        self.assertEqual(pid, 4242)
+        mock_fallback.assert_called_once_with(socket_path)
+
     def test_collect_server_engine_provenance_raises_without_listener(self):
         import tempfile
         from benchmark_metadata import collect_server_engine_provenance

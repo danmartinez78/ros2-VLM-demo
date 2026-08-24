@@ -208,6 +208,7 @@ struct ParsedRequest
 {
   ipc::RequestHeader header;
   std::vector<uint8_t> image;
+  std::vector<double> frame_timestamps_sec;
   std::string system_message;
   std::string prompt;
   std::vector<std::pair<std::string, std::string>> history;  // {user_text, asst_text}
@@ -219,6 +220,12 @@ ParsedRequest read_full_request(int fd)
   ipc::read_all(fd, &parsed.header, sizeof(parsed.header));
   parsed.image.resize(parsed.header.image_bytes);
   ipc::read_all(fd, parsed.image.data(), parsed.image.size());
+  if ((parsed.header.schema_flags & ipc::kSchemaFlagHasFrameTimestamps) != 0U) {
+    parsed.frame_timestamps_sec.resize(parsed.header.timestamp_count);
+    ipc::read_all(
+      fd, parsed.frame_timestamps_sec.data(),
+      parsed.frame_timestamps_sec.size() * sizeof(double));
+  }
   if (parsed.header.system_bytes > 0) {
     parsed.system_message.resize(parsed.header.system_bytes);
     ipc::read_all(fd, parsed.system_message.data(), parsed.system_message.size());
@@ -462,6 +469,47 @@ TEST(IpcInferenceBackend, ReturnsWorkerErrorResponse)
   worker.join_and_rethrow();
 }
 
+TEST(IpcInferenceBackend, ParsesTemporalEncodingFieldsFromWorkerResponse)
+{
+  OneClientWorker worker([&](int client_fd) {
+    ipc::RequestHeader request_header;
+    std::vector<uint8_t> image;
+    std::string prompt;
+    read_request_frame(client_fd, request_header, image, prompt);
+
+    const std::string encoding = "native_qwen3vl_video_imagedata_mrope_timestamps";
+    ipc::ResponseHeader response;
+    response.request_id = request_header.request_id;
+    response.success = 1;
+    response.text_bytes = 2;
+    response.error_bytes = 0;
+    response.temporal_encoding_bytes = static_cast<uint32_t>(encoding.size());
+    response.temporal_fallback_used = 0U;
+    ipc::write_all(client_fd, &response, sizeof(response));
+    const std::string text = "ok";
+    ipc::write_all(client_fd, text.data(), text.size());
+    ipc::write_all(client_fd, encoding.data(), encoding.size());
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  auto response = backend.infer(make_request());
+  EXPECT_TRUE(response.success);
+  EXPECT_EQ(response.text, "ok");
+  EXPECT_EQ(
+    response.runtime_temporal_encoding,
+    "native_qwen3vl_video_imagedata_mrope_timestamps");
+  EXPECT_FALSE(response.temporal_fallback_used);
+  EXPECT_EQ(response.requested_sequence_type, "images");
+  worker.join_and_rethrow();
+}
+
 TEST(IpcInferenceBackend, FailsCleanlyOnTruncatedResponsePayload)
 {
   OneClientWorker worker([&](int client_fd) {
@@ -634,7 +682,7 @@ TEST(IpcInferenceBackend, TimesOutThenReconnectsAfterWorkerSelfTermination)
   replacement_worker.join_and_rethrow();
 }
 
-// ── Structured-message round-trip tests (IPC schema v2) ──────────────────────
+// ── Structured-message round-trip tests (IPC schema v3) ──────────────────────
 
 TEST(IpcInferenceBackend, InlineModeEmitsSchemaFlagsZero)
 {
@@ -828,5 +876,105 @@ TEST(IpcInferenceBackend, StructuredModeHistoryOnlyNoSystemMessage)
   ASSERT_EQ(seen.history.size(), 1U);
   EXPECT_EQ(seen.history[0].first, "prev user");
   EXPECT_EQ(seen.history[0].second, "prev asst");
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, TemporalMetadataRoundTrip)
+{
+  ParsedRequest seen;
+
+  OneClientWorker worker([&](int client_fd) {
+    seen = read_full_request(client_fd);
+    send_success_response(client_fd, seen.header.request_id, "ok");
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 2;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  InferenceRequest request = make_request("temporal");
+  request.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  request.fps = 7.5;
+  request.frame_timestamps_sec = {0.0};
+
+  ASSERT_TRUE(backend.infer(request).success);
+  EXPECT_EQ(seen.header.sequence_type, 1U);
+  EXPECT_TRUE(seen.header.schema_flags & ipc::kSchemaFlagHasFps);
+  EXPECT_TRUE(seen.header.schema_flags & ipc::kSchemaFlagHasFrameTimestamps);
+  EXPECT_DOUBLE_EQ(seen.header.fps, 7.5);
+  ASSERT_EQ(seen.frame_timestamps_sec.size(), 1U);
+  EXPECT_DOUBLE_EQ(seen.frame_timestamps_sec[0], 0.0);
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, RejectsTemporalMetadataInImagesMode)
+{
+  OneClientWorker worker([](int client_fd) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ::close(client_fd);
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 1;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  InferenceRequest request = make_request("bad");
+  request.fps = 4.0;
+  EXPECT_THROW(backend.infer(request), std::runtime_error);
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, RejectsTimestampFrameCountMismatch)
+{
+  OneClientWorker worker([](int client_fd) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ::close(client_fd);
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 1;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  InferenceRequest request = make_request("bad");
+  request.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  request.extra_images.push_back(cv::Mat(4, 5, CV_8UC3, cv::Scalar(1, 2, 3)));
+  request.frame_timestamps_sec = {0.0};
+  EXPECT_THROW(backend.infer(request), std::runtime_error);
+  worker.join_and_rethrow();
+}
+
+TEST(IpcInferenceBackend, RejectsFpsTimestampConflict)
+{
+  OneClientWorker worker([](int client_fd) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ::close(client_fd);
+  });
+
+  IpcInferenceConfig config;
+  config.socket_path = worker.socket_path();
+  config.connect_timeout_seconds = 2;
+  config.request_timeout_seconds = 1;
+
+  IpcInferenceBackend backend(config);
+  backend.initialize();
+
+  InferenceRequest request = make_request("bad");
+  request.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  request.extra_images.push_back(cv::Mat(4, 5, CV_8UC3, cv::Scalar(1, 2, 3)));
+  request.fps = 10.0;
+  request.frame_timestamps_sec = {0.0, 0.2};
+  EXPECT_THROW(backend.infer(request), std::runtime_error);
   worker.join_and_rethrow();
 }

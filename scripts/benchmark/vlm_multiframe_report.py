@@ -490,6 +490,29 @@ def collect_unique_max_output_tokens(records: list[dict[str, Any]]) -> list[int 
     return unique
 
 
+def collect_temporal_config_variants(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect distinct temporal configuration/effective-runtime combinations."""
+    variants: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        item = {
+            "sequence_type": record.get("sequence_type"),
+            "fps": record.get("fps"),
+            "frame_timestamps_sec": record.get("frame_timestamps_sec"),
+            "frame_timestamp_policy": record.get("frame_timestamp_policy"),
+            "rendered_timestamps": record.get("rendered_timestamps"),
+            "requested_sequence_type": record.get("requested_sequence_type"),
+            "runtime_temporal_encoding": record.get("runtime_temporal_encoding"),
+            "temporal_fallback_used": record.get("temporal_fallback_used"),
+        }
+        key = json.dumps(item, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        variants.append(item)
+    return variants
+
+
 # ── full report generation ────────────────────────────────────────────────────
 
 
@@ -517,6 +540,7 @@ def build_report(
     model_names = list({r.get("model_name", "") for r in records if r.get("model_name")})
     provenance_variants = collect_unique_engine_provenance(records)
     mixed_engine_provenance = len(provenance_variants) > 1
+    temporal_variants = collect_temporal_config_variants(records)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -531,6 +555,7 @@ def build_report(
         "engine_provenance": provenance_variants[0] if len(provenance_variants) == 1 else None,
         "engine_provenance_variants": provenance_variants,
         "mixed_engine_provenance": mixed_engine_provenance,
+        "temporal_config_variants": temporal_variants,
         "frame_conditions": conditions_summary,
         "frame_scaling_table": compute_frame_scaling_table(by_condition_path),
         "ipc_artifact_table": compute_ipc_artifact_table(by_condition_path),
@@ -623,6 +648,19 @@ def format_text_report(report: dict[str, Any]) -> str:
             f"  Mixed request config: max_output_tokens varies across records ({mixed_values})"
         )
     lines.append("  Prompt policy: compact temporal JSON (one structured result for full sequence)")
+    temporal_variants = report.get("temporal_config_variants") or []
+    if temporal_variants:
+        lines += ["", "  Temporal representation variants:"]
+        for variant in temporal_variants:
+            lines.append(
+                "    - "
+                f"sequence_type={variant.get('sequence_type')}, "
+                f"fps={variant.get('fps')}, "
+                f"timestamp_policy={variant.get('frame_timestamp_policy')}, "
+                f"rendered_timestamps={variant.get('rendered_timestamps')}, "
+                f"runtime_temporal_encoding={variant.get('runtime_temporal_encoding')}, "
+                f"fallback={variant.get('temporal_fallback_used')}"
+            )
 
     # ── Frame-scaling table ───────────────────────────────────────────────
     scaling = report.get("frame_scaling_table") or []
@@ -803,6 +841,13 @@ def build_direct_record(env: dict[str, str] | None = None) -> str:
     _BM_FRAME_COUNT           JSON integer
     _BM_FRAME_HASHES          JSON array  [{path, sha256}, ...]
     _BM_PROMPT_HASH           12-hex string
+    _BM_SEQUENCE_TYPE         JSON string
+    _BM_FPS                   JSON number or null
+    _BM_FRAME_TIMESTAMPS_SEC  JSON array or null
+    _BM_FRAME_TIMESTAMP_POLICY JSON string
+    _BM_RENDERED_TIMESTAMPS   JSON bool
+    _BM_RUNTIME_TEMPORAL_ENCODING JSON string or null
+    _BM_TEMPORAL_FALLBACK_USED JSON bool or null
     _BM_MAX_OUTPUT_TOKENS     JSON integer
     _BM_ACTUAL_OUTPUT_TOKENS  JSON integer or null
     _BM_TOTAL_IMAGE_TOKENS    JSON integer or null
@@ -834,6 +879,14 @@ def build_direct_record(env: dict[str, str] | None = None) -> str:
         "path": "direct",
         "frame_paths": _jl(env, "_BM_FRAME_HASHES"),
         "prompt_hash": _js(env, "_BM_PROMPT_HASH"),
+        "sequence_type": _jl(env, "_BM_SEQUENCE_TYPE"),
+        "fps": _jl(env, "_BM_FPS"),
+        "frame_timestamps_sec": _jl(env, "_BM_FRAME_TIMESTAMPS_SEC"),
+        "frame_timestamp_policy": _jl(env, "_BM_FRAME_TIMESTAMP_POLICY"),
+        "rendered_timestamps": _jl(env, "_BM_RENDERED_TIMESTAMPS"),
+        "requested_sequence_type": _jl(env, "_BM_SEQUENCE_TYPE"),
+        "runtime_temporal_encoding": _jl(env, "_BM_RUNTIME_TEMPORAL_ENCODING"),
+        "temporal_fallback_used": _jl(env, "_BM_TEMPORAL_FALLBACK_USED"),
         "max_output_tokens": _jl(env, "_BM_MAX_OUTPUT_TOKENS"),
         "actual_output_tokens": _jl(env, "_BM_ACTUAL_OUTPUT_TOKENS"),
         "total_image_tokens": _jl(env, "_BM_TOTAL_IMAGE_TOKENS"),
@@ -872,6 +925,14 @@ def build_ipc_record(env: dict[str, str] | None = None) -> str:
     _BM_FRAME_COUNT        JSON integer
     _BM_FRAME_HASHES       JSON array  [{path, sha256}, ...]
     _BM_PROMPT_HASH        12-hex string
+    _BM_SEQUENCE_TYPE      JSON string
+    _BM_FPS                JSON number or null
+    _BM_FRAME_TIMESTAMPS_SEC JSON array or null
+    _BM_FRAME_TIMESTAMP_POLICY JSON string
+    _BM_RENDERED_TIMESTAMPS JSON bool
+    _BM_REQUESTED_SEQUENCE_TYPE JSON string or null
+    _BM_RUNTIME_TEMPORAL_ENCODING JSON string or null
+    _BM_TEMPORAL_FALLBACK_USED JSON bool or null
     _BM_MAX_OUTPUT_TOKENS  JSON integer
     _BM_SUCCESS            JSON bool
     _BM_ERROR              JSON string or null
@@ -897,6 +958,14 @@ def build_ipc_record(env: dict[str, str] | None = None) -> str:
         "path": "ipc",
         "frame_paths": _jl(env, "_BM_FRAME_HASHES"),
         "prompt_hash": _js(env, "_BM_PROMPT_HASH"),
+        "sequence_type": _jl(env, "_BM_SEQUENCE_TYPE"),
+        "fps": _jl(env, "_BM_FPS"),
+        "frame_timestamps_sec": _jl(env, "_BM_FRAME_TIMESTAMPS_SEC"),
+        "frame_timestamp_policy": _jl(env, "_BM_FRAME_TIMESTAMP_POLICY"),
+        "rendered_timestamps": _jl(env, "_BM_RENDERED_TIMESTAMPS"),
+        "requested_sequence_type": _jl(env, "_BM_REQUESTED_SEQUENCE_TYPE"),
+        "runtime_temporal_encoding": _jl(env, "_BM_RUNTIME_TEMPORAL_ENCODING"),
+        "temporal_fallback_used": _jl(env, "_BM_TEMPORAL_FALLBACK_USED"),
         "max_output_tokens": _jl(env, "_BM_MAX_OUTPUT_TOKENS"),
         "actual_output_tokens": None,
         "total_image_tokens": None,
