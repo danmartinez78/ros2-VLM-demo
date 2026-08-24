@@ -11,7 +11,9 @@ Tests cover:
 - no hardware/model download requirement in CI.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -577,9 +579,6 @@ class Cosmos3EdgeCliTests(unittest.TestCase):
 
     def test_dry_run_flag_is_accepted(self) -> None:
         """--dry-run must not raise an unrecognised-argument error."""
-        import io
-        import contextlib
-
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = c3_commands.main(["--dry-run"])
@@ -588,16 +587,15 @@ class Cosmos3EdgeCliTests(unittest.TestCase):
 
     def test_dry_run_output_matches_plain_invocation(self) -> None:
         """--dry-run output must be identical to the plain (no-flag) output."""
-        import io
-        import contextlib
-
         buf_default = io.StringIO()
         with contextlib.redirect_stdout(buf_default):
-            c3_commands.main([])
+            rc_default = c3_commands.main([])
+        self.assertEqual(rc_default, 0)
 
         buf_dry_run = io.StringIO()
         with contextlib.redirect_stdout(buf_dry_run):
-            c3_commands.main(["--dry-run"])
+            rc_dry_run = c3_commands.main(["--dry-run"])
+        self.assertEqual(rc_dry_run, 0)
 
         self.assertEqual(buf_default.getvalue(), buf_dry_run.getvalue())
 
