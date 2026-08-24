@@ -51,35 +51,6 @@ from typing import List, Optional
 TRAINING_CONFIG_VERSION: str = "training_config_v1"
 
 
-@dataclass
-class VideoMetadataLike:
-    """
-    CPU-testable stand-in for ``transformers.VideoMetadata`` (or the analogous
-    Qwen3-VL processor namedtuple).  The Qwen3-VL video-token replacement step
-    reads ``video_inputs["video_metadata"][video_idx].fps`` (and optionally
-    ``.total_frames`` / ``.frames_indices``) to construct timestamp tokens.
-    When this object is absent or ``fps=None``, the processor falls back to
-    ``_QWEN3VL_DEFAULT_FPS`` (24 FPS), silently corrupting the temporal
-    encoding for samples captured at any other rate.
-
-    This dataclass matches the public field contract of the Transformers
-    ``VideoMetadata`` type and can be used in CPU-only tests without importing
-    ``transformers``.  At real training time the same dict is consumed by the
-    actual Qwen3-VL processor, which reads the same ``.fps`` attribute.
-
-    Fields
-    ------
-    fps : effective capture rate (Hz).  Must not be ``None`` for video samples.
-    total_frames : number of pre-sampled frames in the ``"path"`` list.
-    frames_indices : ``list(range(total_frames))`` — identity mapping, since
-        the frames have already been selected by the export step and the
-        processor must not re-index/re-sample them.
-    """
-
-    fps: Optional[float] = None
-    total_frames: Optional[int] = None
-    frames_indices: Optional[List[int]] = None
-
 
 @dataclass
 class LoraConfig:
@@ -558,15 +529,23 @@ def build_video_processor_kwargs(messages: list, timing: dict) -> dict:
     contains:
 
     * ``"do_sample_frames": False`` — always present for video examples.
-    * ``"video_metadata": [VideoMetadataLike(...)]`` — one entry per video
-      content object, carrying the actual ``fps`` / ``total_frames`` /
-      ``frames_indices``.  Qwen3-VL reads ``video_metadata[i].fps`` to
-      construct timestamp tokens; without this the processor defaults to
-      ``_QWEN3VL_DEFAULT_FPS`` (24 FPS) even when ``do_sample_frames=False``.
+    * ``"video_metadata": [{...}]`` — one plain dict per video content object,
+      with keys ``fps`` (required), ``total_num_frames``, and ``frames_indices``
+      (identity mapping for pre-sampled frames).  Transformers'
+      ``make_batched_metadata()`` normalises each dict into the real
+      ``VideoMetadata`` namedtuple before Qwen3-VL reads ``.fps`` and
+      ``.frames_indices`` for timestamp-token construction.  Using the
+      Transformers-native dict path (rather than a custom stand-in object)
+      ensures compatibility with the ``VideosKwargs``/``video_metadata_validator``
+      pipeline.
     * ``"fps"`` is intentionally **not** included as a standalone key in the
       returned dict: Qwen3-VL's ``fps`` processor kwarg is consumed during
       frame sampling only (which is disabled here); the canonical FPS for
-      timestamp-token construction must come from ``video_metadata[i].fps``.
+      timestamp-token construction must come from ``video_metadata[i]["fps"]``.
+
+    Video samples with no effective FPS raise ``ValueError``; Qwen3-VL would
+    otherwise silently default to ``_QWEN3VL_DEFAULT_FPS`` (24 FPS), creating
+    a silent train/inference mismatch.
 
     Notes
     -----
@@ -578,10 +557,24 @@ def build_video_processor_kwargs(messages: list, timing: dict) -> dict:
     if timing["video_count"] == 0:
         return {}
 
-    # Build one VideoMetadataLike entry per video content object in messages.
-    # VideoMetadataLike is structurally compatible with transformers.VideoMetadata
-    # (same field names) so the real Qwen3-VL processor can read .fps from it.
-    video_metadata_list: List[VideoMetadataLike] = []
+    # Reject video samples with no FPS: Qwen3-VL would silently default to
+    # _QWEN3VL_DEFAULT_FPS (24 FPS), creating a train/inference mismatch for
+    # any sample captured at a different rate.
+    effective_fps = timing["fps"]
+    if effective_fps is None:
+        raise ValueError(
+            "Video sample has no effective FPS in provenance/content metadata. "
+            "Qwen3-VL would default to 24 FPS for timestamp-token construction, "
+            "silently corrupting the temporal encoding. "
+            "Either record the capture rate or exclude this sample from training."
+        )
+
+    # Build one video_metadata dict per video content object.  Transformers
+    # VideosKwargs / make_batched_metadata() accepts a list of plain dicts and
+    # normalises them into the real VideoMetadata namedtuple before Qwen3-VL
+    # reads .fps and .frames_indices for timestamp-token construction.
+    # Use the documented field name ``total_num_frames`` (not ``total_frames``).
+    video_metadata_list: List[dict] = []
     for msg in messages:
         content = msg.get("content")
         if not isinstance(content, list):
@@ -593,22 +586,21 @@ def build_video_processor_kwargs(messages: list, timing: dict) -> dict:
             if isinstance(paths, str):
                 paths = [paths]
             n_frames = len(paths)
-            video_metadata_list.append(
-                VideoMetadataLike(
-                    fps=timing["fps"],         # actual capture rate
-                    total_frames=n_frames or None,
-                    frames_indices=list(range(n_frames)) if n_frames else None,
-                )
-            )
+            entry: dict = {
+                "fps": effective_fps,
+                "frames_indices": list(range(n_frames)) if n_frames else None,
+            }
+            if n_frames:
+                entry["total_num_frames"] = n_frames
+            video_metadata_list.append(entry)
 
     kwargs: dict = {
         # Disable processor-side re-sampling: the content object already
         # carries exactly the pre-sampled frame paths from the export step.
         "do_sample_frames": False,
-        # Canonical per-video metadata consumed by Qwen3-VL for timestamp-token
-        # construction.  fps=None here means the sample had no fps in provenance,
-        # and the caller must have already rejected it via derive_video_timing_metadata
-        # (rule 1: t_seconds without fps raises ValueError).
+        # Canonical per-video metadata normalised by Transformers
+        # make_batched_metadata() into VideoMetadata before Qwen3-VL reads
+        # .fps / .frames_indices for timestamp-token construction.
         "video_metadata": video_metadata_list,
     }
     return kwargs
