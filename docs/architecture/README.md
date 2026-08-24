@@ -9,6 +9,7 @@ The existing [`../architecture.md`](../architecture.md) remains the source of tr
 | Document | Purpose |
 | --- | --- |
 | [Temporal VLM architecture](temporal-vlm-architecture.md) | End-to-end temporal context path, representation contract, scheduling/runtime boundaries, timing semantics, and evaluation implications |
+| [Temporal VLM evidence/results matrix](temporal-results-matrix.md) | Compact synthesis of measured latency/runtime evidence, evidence strength, architecture interpretation, and open experiment gaps |
 | [ODD observation system](odd-observation-system.md) | Per-axis estimator architecture, coupled constraints, deterministic exit monitoring, and placement of VLM/CNN/detector/tracker methods |
 | [`../distillation-pipeline-design.md`](../distillation-pipeline-design.md) | CR2-8B teacher -> CR2-2B student task-distillation design, with explicit temporal-representation fidelity requirements |
 
@@ -29,6 +30,8 @@ These documents deliberately distinguish three kinds of statements:
 - **Target design** — intended architecture that constrains future implementation but may not yet exist.
 
 Do not silently promote a target-design statement into a claim about the current runtime.
+
+The results matrix also separates controlled benchmarks/profiles, hardware validation, smoke/sanity tests, implementation/API findings, design invariants, and open experiments so evidence strength is visible at a glance.
 
 ## Related tracking
 
