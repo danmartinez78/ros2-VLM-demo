@@ -1,0 +1,62 @@
+# CR2-2B SFT / LoRA training configuration v1 (QLoRA when quantize_bits=4)
+# Framework-neutral; consumed by distillation/training.py
+#
+# All paths are relative to the repository root.
+# Do NOT commit machine-specific absolute paths here.
+#
+# Usage:
+#   python -m distillation.training --config distillation/configs/cr2_2b_lora_v1.yaml --dry-run
+
+config_version: training_config_v1
+experiment_id: cr2-2b-lora-v1
+
+# Base model (HuggingFace hub ID or relative local path)
+base_model: nvidia/Cosmos-Reason2-2B
+base_checkpoint: ""          # leave empty to download from hub
+
+# Dataset (relative path; created by export_sft_dataset)
+dataset_dir: distillation/datasets/sft_v1
+dataset_manifest_hash: ""    # filled in by the pipeline at export time
+
+# Output (relative; {experiment_id} is interpolated at runtime)
+output_dir: distillation/runs/{experiment_id}
+resume_from_checkpoint: ""   # set to a checkpoint dir to resume
+
+# Training hyperparameters
+num_epochs: 1
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+learning_rate: 0.0002
+lr_scheduler: cosine
+warmup_steps: 10
+max_seq_length: 2048
+fp16: false
+bf16: true
+dataloader_num_workers: 0
+seed: 42
+
+# LoRA adapter
+use_lora: true
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - v_proj
+
+# Quantization
+# Set quantize_bits: 4 for true QLoRA (4-bit NF4 via bitsandbytes +
+# prepare_model_for_kbit_training).  Set to 0 to disable quantization
+# and use plain full-precision LoRA.
+quantize_bits: 4
+
+# Model trust
+trust_remote_code: false
+
+# Provenance (populated automatically at runtime; do not edit by hand)
+repo_commit: ""
+base_checkpoint_hash: ""
+
+# NOTE: GRPO/RL fields are intentionally absent from this first version.
+# They will be added in a follow-on PR once the SFT scaffold is validated.
