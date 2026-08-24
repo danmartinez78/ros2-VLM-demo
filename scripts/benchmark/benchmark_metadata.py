@@ -12,10 +12,10 @@ from __future__ import annotations
 import json
 import os
 import platform
+import hashlib
 import re
 import subprocess
 import sys
-import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -427,8 +427,27 @@ def main() -> None:
     parser.add_argument("--engine-profile-id", default="")
     parser.add_argument("--quantization", default="")
     parser.add_argument("--edge-llm-root", default="")
+    parser.add_argument(
+        "--output-provenance-lines",
+        action="store_true",
+        help="Print canonical provenance as 5 newline-delimited fields instead of JSON",
+    )
     parser.add_argument("--output", default="-", help="Output JSON path (- for stdout)")
     args = parser.parse_args()
+
+    if args.output_provenance_lines:
+        provenance = collect_engine_provenance(
+            llm_engine_dir=args.llm_engine_dir,
+            multimodal_engine_dir=args.multimodal_engine_dir,
+            model_name=args.model_name,
+            engine_profile_id=args.engine_profile_id,
+        )
+        sys.stdout.write((provenance.get("model_name") or "") + "\n")
+        sys.stdout.write((provenance.get("engine_profile_id") or "") + "\n")
+        sys.stdout.write((provenance.get("llm_engine_dir") or "") + "\n")
+        sys.stdout.write((provenance.get("multimodal_engine_dir") or "") + "\n")
+        sys.stdout.write(json.dumps(provenance, sort_keys=True) + "\n")
+        return
 
     meta = collect_all_metadata(
         llm_engine_dir=args.llm_engine_dir,

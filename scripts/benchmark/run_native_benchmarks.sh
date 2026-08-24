@@ -107,23 +107,12 @@ LLM_INFERENCE="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_inference"
 resolve_engine_provenance() {
   local resolved
   resolved="$(
-    PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" python3 - <<'PY'
-import json
-import os
-from benchmark_metadata import collect_engine_provenance
-
-provenance = collect_engine_provenance(
-    llm_engine_dir=os.environ.get("EDGE_VLM_LLM_ENGINE_DIR", ""),
-    multimodal_engine_dir=os.environ.get("EDGE_VLM_MULTIMODAL_ENGINE_DIR", ""),
-    model_name=os.environ.get("EDGE_VLM_MODEL_NAME", ""),
-    engine_profile_id=os.environ.get("EDGE_VLM_ENGINE_PROFILE_ID", ""),
-)
-print(provenance.get("model_name", "") or "")
-print(provenance.get("engine_profile_id", "") or "")
-print(provenance.get("llm_engine_dir", "") or "")
-print(provenance.get("multimodal_engine_dir", "") or "")
-print(json.dumps(provenance, sort_keys=True))
-PY
+    python3 "${SCRIPT_DIR}/benchmark_metadata.py" \
+      --llm-engine-dir "${EDGE_VLM_LLM_ENGINE_DIR}" \
+      --multimodal-engine-dir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
+      --model-name "${EDGE_VLM_MODEL_NAME:-}" \
+      --engine-profile-id "${EDGE_VLM_ENGINE_PROFILE_ID:-}" \
+      --output-provenance-lines
   )"
   mapfile -t _resolved_lines <<< "${resolved}"
   RESOLVED_MODEL_NAME="${_resolved_lines[0]:-${EDGE_VLM_MODEL_NAME:-}}"
