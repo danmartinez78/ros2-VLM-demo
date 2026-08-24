@@ -23,6 +23,14 @@ from typing import Any
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+#
+# edge_vlm_server is launched as:
+#   edge_vlm_server <llm_engine_dir> <multimodal_engine_dir> <plugin_path> <socket_path> ...
+#
+_EDGE_VLM_SERVER_ARGV_LLM_DIR = 1
+_EDGE_VLM_SERVER_ARGV_MULTIMODAL_DIR = 2
+_EDGE_VLM_SERVER_ARGV_SOCKET_PATH = 4
+
 
 def _run(cmd: list[str], *, timeout: int = 5) -> str:
     """Run a command and return its stdout; return '' on any error."""
@@ -276,9 +284,9 @@ def collect_server_engine_provenance(
     if server_pid is None:
         raise RuntimeError(f"no live edge_vlm_server listener found for socket {requested_socket!r}")
 
-    llm_engine_dir = _proc_argv(server_pid, 1)
-    multimodal_engine_dir = _proc_argv(server_pid, 2)
-    server_socket_path = _proc_argv(server_pid, 4) or requested_socket
+    llm_engine_dir = _proc_argv(server_pid, _EDGE_VLM_SERVER_ARGV_LLM_DIR)
+    multimodal_engine_dir = _proc_argv(server_pid, _EDGE_VLM_SERVER_ARGV_MULTIMODAL_DIR)
+    server_socket_path = _proc_argv(server_pid, _EDGE_VLM_SERVER_ARGV_SOCKET_PATH) or requested_socket
     if not llm_engine_dir or not multimodal_engine_dir:
         raise RuntimeError(
             f"could not determine edge_vlm_server engine directories from /proc/{server_pid}/cmdline"

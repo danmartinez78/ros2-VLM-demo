@@ -611,11 +611,15 @@ class TestBenchmarkMetadata(unittest.TestCase):
 
             with patch("benchmark_metadata._socket_listener_pid", return_value=4242), \
                  patch("benchmark_metadata._proc_argv") as mock_proc_argv:
-                mock_proc_argv.side_effect = lambda pid, index: {
-                    1: str(llm_dir),
-                    2: str(profile_dir),
-                    4: "/tmp/edge_vlm.sock",
-                }.get(index, "")
+                def _mock_proc_argv(pid, index):
+                    self.assertEqual(pid, 4242)
+                    return {
+                        1: str(llm_dir),
+                        2: str(profile_dir),
+                        4: "/tmp/edge_vlm.sock",
+                    }.get(index, "")
+
+                mock_proc_argv.side_effect = _mock_proc_argv
                 provenance = collect_server_engine_provenance(
                     socket_path="/tmp/edge_vlm.sock",
                     model_name="Cosmos-Reason2-8B",
