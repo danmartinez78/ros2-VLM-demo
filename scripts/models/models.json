@@ -21,6 +21,13 @@
       "family": "qwen3-vl",
       "preparation_strategy": "external_layout",
       "build_strategy": "external_layout"
+    },
+    "cosmos3-edge": {
+      "display_name": "Cosmos3-Edge",
+      "manifest_model_key": "Cosmos3-Edge",
+      "family": "cosmos3-edge",
+      "preparation_strategy": "cosmos3_edge",
+      "build_strategy": "cosmos3_edge"
     }
   }
 }

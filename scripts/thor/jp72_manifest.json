@@ -1,71 +1,91 @@
 {
-  "supported_target": {
-    "os": "ubuntu",
-    "version": "24.04",
-    "arch": "aarch64",
-    "l4t": "# R39 (release), REVISION: 2.x"
-  },
-  "edge_llm": {
-    "repo_url": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
-    "commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
-    "host_cuda_family": "13.2",
-    "cuda_ctk_version": "13.0",
-    "default_root": "${HOME}/TensorRT-Edge-LLM",
-    "default_build_dir": "${HOME}/TensorRT-Edge-LLM/build",
-    "plugin_name": "libNvInfer_edgellm_plugin.so",
-    "required_build_artifacts": [
-      "cpp/libedgellmCore.a",
-      "libNvInfer_edgellm_plugin.so"
-    ]
-  },
-  "models": {
-    "Cosmos-Reason2-8B": {
-      "hf_model_id": "nvidia/Cosmos-Reason2-8B",
-      "quantization": "nvfp4",
-      "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
-      "modelopt_version": "0.45.0",
-      "required_llm_artifacts": [
-        "llm.engine",
-        "embedding.safetensors",
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "processed_chat_template.json"
-      ],
-      "required_visual_artifacts": [
-        "visual/visual.engine",
-        "visual/config.json",
-        "visual/preprocessor_config.json"
-      ]
+    "supported_target": {
+        "os": "ubuntu",
+        "version": "24.04",
+        "arch": "aarch64",
+        "l4t": "# R39 (release), REVISION: 2.x"
     },
-    "Cosmos-Reason2-2B": {
-      "hf_model_id": "nvidia/Cosmos-Reason2-2B",
-      "quantization": "nvfp4",
-      "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
-      "modelopt_version": "0.45.0",
-      "required_llm_artifacts": [
-        "llm.engine",
-        "embedding.safetensors",
-        "config.json",
-        "tokenizer.json",
-        "tokenizer_config.json",
-        "processed_chat_template.json"
-      ],
-      "required_visual_artifacts": [
-        "visual/visual.engine",
-        "visual/config.json",
-        "visual/preprocessor_config.json"
-      ]
+    "edge_llm": {
+        "repo_url": "https://github.com/NVIDIA/TensorRT-Edge-LLM.git",
+        "commit": "71dd1bae032e70771265917ec74d3ff4cad07a10",
+        "host_cuda_family": "13.2",
+        "cuda_ctk_version": "13.0",
+        "default_root": "${HOME}/TensorRT-Edge-LLM",
+        "default_build_dir": "${HOME}/TensorRT-Edge-LLM/build",
+        "plugin_name": "libNvInfer_edgellm_plugin.so",
+        "required_build_artifacts": [
+            "cpp/libedgellmCore.a",
+            "libNvInfer_edgellm_plugin.so"
+        ]
     },
-    "Qwen3-VL-2B-Instruct": {
-      "required_directories": [
-        "quantized",
-        "onnx",
-        "engine/llm",
-        "engine/visual"
-      ]
-    }
-  },
-  "default_model": "Cosmos-Reason2-8B",
-  "default_workspace": "${HOME}/tensorrt-edgellm-workspace"
+    "models": {
+        "Cosmos-Reason2-8B": {
+            "hf_model_id": "nvidia/Cosmos-Reason2-8B",
+            "quantization": "nvfp4",
+            "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
+            "modelopt_version": "0.45.0",
+            "required_llm_artifacts": [
+                "llm.engine",
+                "embedding.safetensors",
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "processed_chat_template.json"
+            ],
+            "required_visual_artifacts": [
+                "visual/visual.engine",
+                "visual/config.json",
+                "visual/preprocessor_config.json"
+            ]
+        },
+        "Cosmos-Reason2-2B": {
+            "hf_model_id": "nvidia/Cosmos-Reason2-2B",
+            "quantization": "nvfp4",
+            "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
+            "modelopt_version": "0.45.0",
+            "required_llm_artifacts": [
+                "llm.engine",
+                "embedding.safetensors",
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "processed_chat_template.json"
+            ],
+            "required_visual_artifacts": [
+                "visual/visual.engine",
+                "visual/config.json",
+                "visual/preprocessor_config.json"
+            ]
+        },
+        "Qwen3-VL-2B-Instruct": {
+            "required_directories": [
+                "quantized",
+                "onnx",
+                "engine/llm",
+                "engine/visual"
+            ]
+        },
+        "Cosmos3-Edge": {
+            "hf_model_id": "nvidia/Cosmos3-Edge",
+            "quantization": "nvfp4",
+            "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
+            "modelopt_version": "0.45.0",
+            "runtime_strategy": "standard_vlm",
+            "required_llm_artifacts": [
+                "llm.engine",
+                "embedding.safetensors",
+                "config.json",
+                "tokenizer.json",
+                "tokenizer_config.json",
+                "processed_chat_template.json"
+            ],
+            "required_visual_artifacts": [
+                "visual/visual.engine",
+                "visual/config.json",
+                "visual/preprocessor_config.json"
+            ]
+        }
+    },
+    "default_model": "Cosmos-Reason2-8B",
+    "default_workspace": "${HOME}/tensorrt-edgellm-workspace"
 }

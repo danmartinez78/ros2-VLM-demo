@@ -1,90 +1,117 @@
 {
-  "schema_version": 1,
-  "profiles": {
-    "thor-current": {
-      "target": "jetson-thor",
-      "managed": false,
-      "adopt_legacy_engine": true,
-      "llm": {
-        "maxBatchSize": 1,
-        "maxInputLen": 1024,
-        "maxKVCacheCapacity": 4096
-      },
-      "visual": {
-        "maxImageTokens": null,
-        "maxImageTokensPerImage": null
-      },
-      "decode": {
-        "strategy": "standard"
-      },
-      "components": {
-        "llm": {
-          "kind": "llm",
-          "relative_engine_dir": "llm"
+    "schema_version": 1,
+    "profiles": {
+        "thor-current": {
+            "target": "jetson-thor",
+            "managed": false,
+            "adopt_legacy_engine": true,
+            "llm": {
+                "maxBatchSize": 1,
+                "maxInputLen": 1024,
+                "maxKVCacheCapacity": 4096
+            },
+            "visual": {
+                "maxImageTokens": null,
+                "maxImageTokensPerImage": null
+            },
+            "decode": {
+                "strategy": "standard"
+            },
+            "components": {
+                "llm": {
+                    "kind": "llm",
+                    "relative_engine_dir": "llm"
+                },
+                "visual": {
+                    "kind": "visual",
+                    "relative_engine_dir": "visual"
+                }
+            }
         },
-        "visual": {
-          "kind": "visual",
-          "relative_engine_dir": "visual"
+        "thor-f8": {
+            "target": "jetson-thor",
+            "managed": true,
+            "llm": {
+                "maxBatchSize": 1,
+                "maxInputLen": 2048,
+                "maxKVCacheCapacity": 4096
+            },
+            "visual": {
+                "maxImageTokens": 2048,
+                "maxImageTokensPerImage": 512
+            },
+            "decode": {
+                "strategy": "standard"
+            },
+            "components": {
+                "llm": {
+                    "kind": "llm",
+                    "relative_engine_dir": "llm"
+                },
+                "visual": {
+                    "kind": "visual",
+                    "relative_engine_dir": "visual"
+                }
+            }
+        },
+        "thor-mtp-template": {
+            "target": "jetson-thor",
+            "managed": true,
+            "llm": {
+                "maxBatchSize": 1,
+                "maxInputLen": 2048,
+                "maxKVCacheCapacity": 4096
+            },
+            "visual": {
+                "maxImageTokens": 2048,
+                "maxImageTokensPerImage": 512
+            },
+            "decode": {
+                "strategy": "mtp",
+                "draft_steps": 3,
+                "verify_size": 4
+            },
+            "components": {
+                "llm": {
+                    "kind": "llm",
+                    "relative_engine_dir": "llm"
+                },
+                "visual": {
+                    "kind": "visual",
+                    "relative_engine_dir": "visual"
+                },
+                "draft": {
+                    "kind": "draft-llm",
+                    "relative_engine_dir": "draft"
+                }
+            }
+        },
+        "cosmos3-edge-thor-f8": {
+            "target": "jetson-thor",
+            "managed": true,
+            "runtime_strategy": "standard_vlm",
+            "llm": {
+                "maxBatchSize": 1,
+                "maxInputLen": 2048,
+                "maxKVCacheCapacity": 4096
+            },
+            "visual": {
+                "maxImageTokens": 2048,
+                "maxImageTokensPerImage": 512
+            },
+            "decode": {
+                "strategy": "standard"
+            },
+            "components": {
+                "llm": {
+                    "kind": "llm",
+                    "relative_engine_dir": "llm"
+                },
+                "visual": {
+                    "kind": "visual",
+                    "relative_engine_dir": "visual"
+                }
+            }
         }
-      }
-    },
-    "thor-f8": {
-      "target": "jetson-thor",
-      "managed": true,
-      "llm": {
-        "maxBatchSize": 1,
-        "maxInputLen": 2048,
-        "maxKVCacheCapacity": 4096
-      },
-      "visual": {
-        "maxImageTokens": 2048,
-        "maxImageTokensPerImage": 512
-      },
-      "decode": {
-        "strategy": "standard"
-      },
-      "components": {
-        "llm": {
-          "kind": "llm",
-          "relative_engine_dir": "llm"
-        },
-        "visual": {
-          "kind": "visual",
-          "relative_engine_dir": "visual"
-        }
-      }
-    },
-    "thor-mtp-template": {
-      "target": "jetson-thor",
-      "managed": true,
-      "llm": {
-        "maxBatchSize": 1,
-        "maxInputLen": 2048,
-        "maxKVCacheCapacity": 4096
-      },
-      "visual": {
-        "maxImageTokens": 2048,
-        "maxImageTokensPerImage": 512
-      },
-      "decode": {
-        "strategy": "mtp",
-        "draft_steps": 3,
-        "verify_size": 4
-      },
-      "components": {
-        "llm": {
-          "kind": "llm",
-          "relative_engine_dir": "llm"
-        },
-        "visual": {
-          "kind": "visual",
-          "relative_engine_dir": "visual"
-        },
-        "draft": {
-          "kind": "draft-llm",
-          "relative_engine_dir": "draft"
-        }
-      }
     }
-  }
 }
