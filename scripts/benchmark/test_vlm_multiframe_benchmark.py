@@ -1145,6 +1145,12 @@ class TestFormatTextReport(unittest.TestCase):
             text,
         )
 
+    def test_report_marks_missing_max_output_tokens_unknown(self):
+        record = _make_record(frame_condition="F1", frame_count=1, path="direct")
+        record.pop("max_output_tokens", None)
+        text = format_text_report(build_report([record]))
+        self.assertIn("Request config: max_output_tokens=unknown", text)
+
     def test_report_contains_ipc_artifact_section(self):
         text = format_text_report(self._full_report())
         self.assertIn("IPC Result Artifacts", text)

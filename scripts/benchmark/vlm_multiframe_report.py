@@ -620,6 +620,8 @@ def format_text_report(report: dict[str, Any]) -> str:
         lines.append(
             f"  Mixed request config: max_output_tokens varies across records ({mixed_values})"
         )
+    elif not max_output_tokens_values:
+        lines.append("  Request config: max_output_tokens=unknown")
     lines.append("  Prompt policy: compact temporal JSON (one structured result for full sequence)")
 
     # ── Frame-scaling table ───────────────────────────────────────────────
