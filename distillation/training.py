@@ -1,5 +1,6 @@
 """
-Student training config and dry-run launcher for Cosmos-Reason2-2B SFT/QLoRA.
+Student training config and dry-run launcher for Cosmos-Reason2-2B SFT / LoRA
+(and optionally QLoRA when BitsAndBytes quantization is enabled).
 
 The launcher deliberately does *not* import torch, transformers, or peft so
 that dry-run / config-validation passes in CPU-only CI without any model
@@ -22,10 +23,19 @@ The real training path uses ``AutoModelForVision2Seq`` + ``AutoProcessor``
 tensors produced by the processor are forwarded to the model rather than
 stringified image references.  The CPU-testable helper
 ``validate_multimodal_messages`` checks that a message list carries
-structured image content objects (dicts with ``"type": "image_url"``) rather
-than plain text, and raises ``ValueError`` if they have been flattened to
-strings.  This guard runs before the heavy model load so that config/format
-errors are caught early.
+structured image/video content objects (dicts with ``"type": "image"`` or
+``"type": "video"``) rather than plain text, and raises ``ValueError`` if they
+have been flattened to strings.  This guard runs before the heavy model load
+so that config/format errors are caught early.
+
+QLoRA vs LoRA
+-------------
+When ``quantize_bits`` is set to 4 (the default for QLoRA), the base model is
+loaded in 4-bit NF4 quantization via ``bitsandbytes`` and
+``prepare_model_for_kbit_training`` is called before wrapping with PEFT LoRA.
+Set ``quantize_bits`` to 0 (or omit it) to disable quantization and use plain
+full-precision LoRA.  The YAML config comment and experiment labeling reflect
+the actual quantization level used at runtime.
 """
 
 from __future__ import annotations
@@ -121,6 +131,13 @@ class TrainingConfig:
     This enables arbitrary code from the remote repository; opt in consciously.
     """
 
+    quantize_bits: int = 4
+    """
+    Quantization precision for QLoRA.  Set to 4 for 4-bit NF4 (true QLoRA),
+    or 0 to disable quantization and use plain full-precision LoRA.
+    Other values are not currently supported and will raise at runtime.
+    """
+
     # ------------------------------------------------------------------
     # Serialisation
     # ------------------------------------------------------------------
@@ -151,6 +168,7 @@ class TrainingConfig:
             "repo_commit": self.repo_commit,
             "base_checkpoint_hash": self.base_checkpoint_hash,
             "trust_remote_code": self.trust_remote_code,
+            "quantize_bits": self.quantize_bits,
         }
         return d
 
@@ -274,11 +292,18 @@ def assert_collated_features_multimodal(features: dict, sample_id: str = "") -> 
 def validate_multimodal_messages(messages: list) -> None:
     """
     CPU-testable guard: verify that a message list preserves multimodal image
-    content as structured dicts rather than stringifying them to text.
+    and video content as structured dicts rather than stringifying them.
 
     Each message with role ``"user"`` may carry a ``content`` list.  Any entry
-    with ``"type": "image_url"`` must remain a dict (not be cast to ``str``).
-    Raises ``ValueError`` if image content objects have been flattened.
+    with ``"type": "image"`` or ``"type": "video"`` must remain a dict (not
+    be cast to ``str``).  The Qwen3-VL / Cosmos-Reason2 processor-native
+    content schema uses ``{"type": "image", "url": "..."}`` and
+    ``{"type": "video", "path": [...]}``; the deprecated OpenAI-style
+    ``"image_url"`` / ``"video_url"`` wrapper keys are also flagged.
+
+    Raises ``ValueError`` if any multimodal content object has been flattened
+    to a string, or if an OpenAI-style ``image_url``/``video_url`` wrapper is
+    detected (which would not be resolved by the multimodal processor).
 
     This function has *no* heavy dependencies and runs in CI without a GPU or
     model weights.  It is called by ``run_training`` before the model is loaded
@@ -291,34 +316,51 @@ def validate_multimodal_messages(messages: list) -> None:
     Raises
     ------
     ValueError
-        If any ``image_url`` content object has been stringified.
+        If any multimodal content object has been stringified or uses an
+        unsupported wrapper schema.
     """
+    _NATIVE_VISUAL_TYPES = {"image", "video"}
+    _LEGACY_WRAPPER_TYPES = {"image_url", "video_url"}
+
     for i, msg in enumerate(messages):
         content = msg.get("content")
         if isinstance(content, list):
             for j, part in enumerate(content):
                 if isinstance(part, str):
-                    # A plain string in a multipart content list is acceptable
-                    # only if there are no image_url dicts at all in this message.
-                    # If a string looks like a serialised image object, reject it.
-                    if '"type": "image_url"' in part or "'type': 'image_url'" in part:
-                        raise ValueError(
-                            f"messages[{i}].content[{j}] is a stringified image_url "
-                            f"object; pass the dict directly to preserve visual content. "
-                            f"Got: {part[:80]!r}"
-                        )
-                elif isinstance(part, dict):
-                    if part.get("type") == "image_url":
-                        url_val = part.get("image_url")
-                        if isinstance(url_val, str) and url_val.startswith("{"):
+                    # A stringified dict that looks like a visual content object.
+                    for marker in (
+                        '"type": "image"', '"type": "video"',
+                        '"type": "image_url"', '"type": "video_url"',
+                        "'type': 'image'", "'type': 'video'",
+                    ):
+                        if marker in part:
                             raise ValueError(
-                                f"messages[{i}].content[{j}].image_url is a "
-                                f"stringified dict; pass the image_url as a "
-                                f"nested dict. Got: {url_val[:80]!r}"
+                                f"messages[{i}].content[{j}] is a stringified visual "
+                                f"content object; pass the dict directly. "
+                                f"Got: {part[:80]!r}"
                             )
+                elif isinstance(part, dict):
+                    t = part.get("type", "")
+                    # Reject legacy OpenAI-style image_url / video_url wrappers.
+                    if t in _LEGACY_WRAPPER_TYPES:
+                        raise ValueError(
+                            f"messages[{i}].content[{j}] uses legacy wrapper "
+                            f"type={t!r}; use the processor-native "
+                            f"{{'type': 'image', 'url': ...}} / "
+                            f"{{'type': 'video', 'path': [...]}} schema instead."
+                        )
+                    # Reject nested stringified image/video inside native types.
+                    if t in _NATIVE_VISUAL_TYPES:
+                        for key in ("url", "path"):
+                            val = part.get(key)
+                            if isinstance(val, str) and val.startswith("{"):
+                                raise ValueError(
+                                    f"messages[{i}].content[{j}].{key} is a "
+                                    f"stringified dict; pass it as a nested "
+                                    f"dict. Got: {val[:80]!r}"
+                                )
         elif isinstance(content, str):
-            # Single-string content is text-only and valid even when there are
-            # no images; nothing to check.
+            # Single-string content is text-only and valid.
             pass
 
 
@@ -453,10 +495,45 @@ def run_training(
         model_name,
         trust_remote_code=config.trust_remote_code,
     )
-    model = AutoModelForVision2Seq.from_pretrained(
-        model_name,
-        trust_remote_code=config.trust_remote_code,
-    )
+
+    # ------------------------------------------------------------------
+    # QLoRA vs plain LoRA base model loading
+    # ------------------------------------------------------------------
+    if config.quantize_bits == 4:
+        # True QLoRA: load base in 4-bit NF4 quantization via bitsandbytes,
+        # then call prepare_model_for_kbit_training before wrapping with PEFT.
+        try:
+            from transformers import BitsAndBytesConfig  # type: ignore[import-untyped]
+            from peft import prepare_model_for_kbit_training  # type: ignore[import-untyped]
+            import torch  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise ImportError(
+                "4-bit QLoRA requires 'bitsandbytes' and 'torch'. "
+                "Install with: pip install bitsandbytes torch"
+            ) from exc
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+        )
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            trust_remote_code=config.trust_remote_code,
+        )
+        model = prepare_model_for_kbit_training(model)
+    elif config.quantize_bits == 0:
+        # Plain full-precision LoRA — no quantization.
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_name,
+            trust_remote_code=config.trust_remote_code,
+        )
+    else:
+        raise ValueError(
+            f"Unsupported quantize_bits={config.quantize_bits!r}. "
+            "Use 4 for QLoRA (4-bit NF4) or 0 for plain LoRA."
+        )
 
     if config.use_lora:
         lora_cfg = PeftLoraConfig(

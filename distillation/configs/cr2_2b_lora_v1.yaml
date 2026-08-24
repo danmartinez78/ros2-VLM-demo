@@ -1,4 +1,4 @@
-# CR2-2B SFT/QLoRA training configuration v1
+# CR2-2B SFT / LoRA training configuration v1 (QLoRA when quantize_bits=4)
 # Framework-neutral; consumed by distillation/training.py
 #
 # All paths are relative to the repository root.
@@ -44,6 +44,15 @@ lora:
   target_modules:
     - q_proj
     - v_proj
+
+# Quantization
+# Set quantize_bits: 4 for true QLoRA (4-bit NF4 via bitsandbytes +
+# prepare_model_for_kbit_training).  Set to 0 to disable quantization
+# and use plain full-precision LoRA.
+quantize_bits: 4
+
+# Model trust
+trust_remote_code: false
 
 # Provenance (populated automatically at runtime; do not edit by hand)
 repo_commit: ""

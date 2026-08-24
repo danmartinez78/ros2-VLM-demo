@@ -554,8 +554,8 @@ class TestDataset(unittest.TestCase):
                 self.assertIn("messages", obj)
                 self.assertIn("sample_id", obj)
 
-    def test_export_image_sequence_uses_image_url(self):
-        """image_sequence samples are exported as independent image_url objects."""
+    def test_export_image_sequence_uses_image_type(self):
+        """image_sequence samples are exported as independent {"type":"image"} objects."""
         s = _make_sample("img-seq-0", n_frames=4)
         s.target = _make_target(evidence_start_s=0.0, evidence_end_s=0.75)
         s.validation_status = "accepted"
@@ -575,12 +575,18 @@ class TestDataset(unittest.TestCase):
                         continue
                     obj = json.loads(line)
                     user_parts = obj["messages"][1]["content"]
-                    image_parts = [p for p in user_parts if p.get("type") == "image_url"]
+                    image_parts = [p for p in user_parts if p.get("type") == "image"]
+                    # Must not contain legacy image_url wrappers.
+                    legacy_parts = [p for p in user_parts if p.get("type") == "image_url"]
                     self.assertEqual(len(image_parts), 4)
+                    self.assertEqual(len(legacy_parts), 0)
                     self.assertEqual(obj["metadata"]["export_modality"], "image_sequence")
+                    # Each image entry carries a url key.
+                    for img in image_parts:
+                        self.assertIn("url", img)
 
-    def test_export_video_sample_uses_video_url(self):
-        """video samples are exported as a single video_url content object."""
+    def test_export_video_sample_uses_video_type(self):
+        """video samples are exported as a single {"type":"video","path":[...]} object."""
         s = _make_sample("vid-0", n_frames=4)
         s.target = _make_target(evidence_start_s=0.0, evidence_end_s=0.75)
         s.validation_status = "accepted"
@@ -600,18 +606,50 @@ class TestDataset(unittest.TestCase):
                         continue
                     obj = json.loads(line)
                     user_parts = obj["messages"][1]["content"]
-                    video_parts = [p for p in user_parts if p.get("type") == "video_url"]
-                    image_parts = [p for p in user_parts if p.get("type") == "image_url"]
+                    video_parts = [p for p in user_parts if p.get("type") == "video"]
+                    image_parts = [p for p in user_parts if p.get("type") in ("image", "image_url")]
+                    # Must not contain legacy video_url wrappers.
+                    legacy_parts = [p for p in user_parts if p.get("type") == "video_url"]
                     self.assertEqual(len(video_parts), 1)
                     self.assertEqual(len(image_parts), 0)
+                    self.assertEqual(len(legacy_parts), 0)
                     self.assertEqual(obj["metadata"]["export_modality"], "video")
-                    # video_url payload should carry frame paths and timestamps
-                    vurl = video_parts[0]["video_url"]
-                    self.assertIn("frame_paths", vurl)
-                    self.assertEqual(len(vurl["frame_paths"]), 4)
+                    # video entry carries a path list and t_seconds.
+                    vid = video_parts[0]
+                    self.assertIn("path", vid)
+                    self.assertIsInstance(vid["path"], list)
+                    self.assertEqual(len(vid["path"]), 4)
+                    self.assertIn("t_seconds", vid)
 
-    def test_export_legacy_unspecified_uses_image_url(self):
-        """Legacy/unspecified-provenance samples fall back to image_url export."""
+    def test_export_temporal_images_uses_video_type(self):
+        """temporal_images (#74) samples are exported as native video, not independent images."""
+        s = _make_sample("temporal-img-0", n_frames=4)
+        s.target = _make_target(evidence_start_s=0.0, evidence_end_s=0.75)
+        s.validation_status = "accepted"
+        s.provenance = Provenance(
+            sequence_type="temporal_images",
+            runtime_temporal_encoding="native_qwen3vl_video_imagedata_mrope_timestamps",
+            effective_fps=2.0,
+        )
+        train, val, test = split_dataset([s], seed=42)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "sft"
+            export_sft_dataset(train, val, test, out)
+            for split_name in ("train", "val", "test"):
+                lines = (out / f"{split_name}.jsonl").read_text().splitlines()
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    user_parts = obj["messages"][1]["content"]
+                    video_parts = [p for p in user_parts if p.get("type") == "video"]
+                    image_parts = [p for p in user_parts if p.get("type") in ("image", "image_url")]
+                    self.assertEqual(len(video_parts), 1, "temporal_images must export as video")
+                    self.assertEqual(len(image_parts), 0)
+                    self.assertEqual(obj["metadata"]["export_modality"], "video")
+
+    def test_export_legacy_unspecified_uses_image_type(self):
+        """Legacy/unspecified-provenance samples fall back to native {"type":"image"} export."""
         s = _make_sample("legacy-0", n_frames=3)
         s.target = _make_target(evidence_start_s=0.0, evidence_end_s=0.5)
         s.validation_status = "accepted"
@@ -627,8 +665,10 @@ class TestDataset(unittest.TestCase):
                         continue
                     obj = json.loads(line)
                     user_parts = obj["messages"][1]["content"]
-                    image_parts = [p for p in user_parts if p.get("type") == "image_url"]
+                    image_parts = [p for p in user_parts if p.get("type") == "image"]
+                    legacy_parts = [p for p in user_parts if p.get("type") == "image_url"]
                     self.assertEqual(len(image_parts), 3)
+                    self.assertEqual(len(legacy_parts), 0)
                     self.assertEqual(obj["metadata"]["export_modality"], "image_sequence")
 
 
@@ -721,28 +761,64 @@ class TestTrainingConfig(unittest.TestCase):
             run_training(cfg, dry_run=False)
 
     def test_validate_multimodal_messages_accepts_clean_messages(self):
-        """Text-only and properly structured image_url messages must pass."""
+        """Text-only and properly structured image/video messages must pass."""
         messages = [
             {"role": "user", "content": "describe the scene"},
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "what is this?"},
-                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}},
+                    # Processor-native image format.
+                    {"type": "image", "url": "data:image/jpeg;base64,abc"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    # Processor-native video format.
+                    {"type": "video", "path": ["frame0.jpg", "frame1.jpg"]},
+                    {"type": "text", "text": "describe motion"},
                 ],
             },
         ]
         # Must not raise.
         validate_multimodal_messages(messages)
 
-    def test_validate_multimodal_messages_rejects_stringified_image_url(self):
-        """A stringified image_url dict inside a content list must be rejected."""
+    def test_validate_multimodal_messages_rejects_stringified_image(self):
+        """A stringified image dict inside a content list must be rejected."""
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "caption:"},
-                    '{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}',
+                    '{"type": "image", "url": "data:image/jpeg;base64,abc"}',
+                ],
+            }
+        ]
+        with self.assertRaises(ValueError):
+            validate_multimodal_messages(messages)
+
+    def test_validate_multimodal_messages_rejects_legacy_image_url(self):
+        """Legacy OpenAI-style image_url wrapper must be rejected."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "caption:"},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}},
+                ],
+            }
+        ]
+        with self.assertRaises(ValueError):
+            validate_multimodal_messages(messages)
+
+    def test_validate_multimodal_messages_rejects_legacy_video_url(self):
+        """Legacy video_url wrapper must be rejected."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": "video://frames"}},
                 ],
             }
         ]

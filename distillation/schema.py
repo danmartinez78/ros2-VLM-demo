@@ -149,7 +149,12 @@ class Provenance:
 
     sequence_type: str = ""
     # Modality of the sequence input.
-    # Possible values: "image_sequence" | "video" | "" (unspecified)
+    # Possible values:
+    #   "image_sequence"  – ordered still images, independent per-frame inputs
+    #   "temporal_images" – ordered frames delivered as a native video ImageData
+    #                       to Qwen3-VL/Cosmos-Reason2 (#74 Edge-LLM video path)
+    #   "video"           – encoded video segment (e.g. MP4/decoded tensor)
+    #   ""                – unspecified / legacy
 
     timestamp_policy: str = ""
     # How frame timestamps are represented in the model input.
@@ -169,9 +174,12 @@ class Provenance:
     runtime_temporal_encoding: str = ""
     # How frames were encoded at runtime for the actual forward pass.
     # Possible values:
-    #   "independent_images"  – each frame is a separate image input
-    #   "video_tensor"        – frames concatenated into a [T,H,W,3] video tensor
-    #   ""                    – unspecified
+    #   "independent_images"                          – each frame is a separate image input
+    #   "video_tensor"                                – frames concatenated into a [T,H,W,3] tensor
+    #   "native_qwen3vl_video_imagedata_mrope_timestamps"
+    #                                                 – #74 Qwen3-VL native video ImageData with
+    #                                                   MRoPE-compatible per-frame timestamps
+    #   ""                                            – unspecified
 
     def to_dict(self) -> dict:
         return {
