@@ -52,6 +52,36 @@ TRAINING_CONFIG_VERSION: str = "training_config_v1"
 
 
 @dataclass
+class VideoMetadataLike:
+    """
+    CPU-testable stand-in for ``transformers.VideoMetadata`` (or the analogous
+    Qwen3-VL processor namedtuple).  The Qwen3-VL video-token replacement step
+    reads ``video_inputs["video_metadata"][video_idx].fps`` (and optionally
+    ``.total_frames`` / ``.frames_indices``) to construct timestamp tokens.
+    When this object is absent or ``fps=None``, the processor falls back to
+    ``_QWEN3VL_DEFAULT_FPS`` (24 FPS), silently corrupting the temporal
+    encoding for samples captured at any other rate.
+
+    This dataclass matches the public field contract of the Transformers
+    ``VideoMetadata`` type and can be used in CPU-only tests without importing
+    ``transformers``.  At real training time the same dict is consumed by the
+    actual Qwen3-VL processor, which reads the same ``.fps`` attribute.
+
+    Fields
+    ------
+    fps : effective capture rate (Hz).  Must not be ``None`` for video samples.
+    total_frames : number of pre-sampled frames in the ``"path"`` list.
+    frames_indices : ``list(range(total_frames))`` — identity mapping, since
+        the frames have already been selected by the export step and the
+        processor must not re-index/re-sample them.
+    """
+
+    fps: Optional[float] = None
+    total_frames: Optional[int] = None
+    frames_indices: Optional[List[int]] = None
+
+
+@dataclass
 class LoraConfig:
     r: int = 16
     alpha: int = 32
@@ -524,7 +554,19 @@ def build_video_processor_kwargs(messages: list, timing: dict) -> dict:
     Returns
     -------
     dict — to be passed as ``processor_kwargs=<return_value>`` in every
-    ``processor.apply_chat_template(...)`` call for this example.
+    ``processor.apply_chat_template(...)`` call for this example.  The dict
+    contains:
+
+    * ``"do_sample_frames": False`` — always present for video examples.
+    * ``"video_metadata": [VideoMetadataLike(...)]`` — one entry per video
+      content object, carrying the actual ``fps`` / ``total_frames`` /
+      ``frames_indices``.  Qwen3-VL reads ``video_metadata[i].fps`` to
+      construct timestamp tokens; without this the processor defaults to
+      ``_QWEN3VL_DEFAULT_FPS`` (24 FPS) even when ``do_sample_frames=False``.
+    * ``"fps"`` is intentionally **not** included as a standalone key in the
+      returned dict: Qwen3-VL's ``fps`` processor kwarg is consumed during
+      frame sampling only (which is disabled here); the canonical FPS for
+      timestamp-token construction must come from ``video_metadata[i].fps``.
 
     Notes
     -----
@@ -535,15 +577,40 @@ def build_video_processor_kwargs(messages: list, timing: dict) -> dict:
     """
     if timing["video_count"] == 0:
         return {}
+
+    # Build one VideoMetadataLike entry per video content object in messages.
+    # VideoMetadataLike is structurally compatible with transformers.VideoMetadata
+    # (same field names) so the real Qwen3-VL processor can read .fps from it.
+    video_metadata_list: List[VideoMetadataLike] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "video":
+                continue
+            paths = part.get("path") or part.get("url") or []
+            if isinstance(paths, str):
+                paths = [paths]
+            n_frames = len(paths)
+            video_metadata_list.append(
+                VideoMetadataLike(
+                    fps=timing["fps"],         # actual capture rate
+                    total_frames=n_frames or None,
+                    frames_indices=list(range(n_frames)) if n_frames else None,
+                )
+            )
+
     kwargs: dict = {
         # Disable processor-side re-sampling: the content object already
         # carries exactly the pre-sampled frame paths from the export step.
         "do_sample_frames": False,
+        # Canonical per-video metadata consumed by Qwen3-VL for timestamp-token
+        # construction.  fps=None here means the sample had no fps in provenance,
+        # and the caller must have already rejected it via derive_video_timing_metadata
+        # (rule 1: t_seconds without fps raises ValueError).
+        "video_metadata": video_metadata_list,
     }
-    if timing["fps"] is not None:
-        # Convey the actual capture rate so the processor does not substitute
-        # _QWEN3VL_DEFAULT_FPS (24 FPS) for samples at any other rate.
-        kwargs["fps"] = timing["fps"]
     return kwargs
 
 

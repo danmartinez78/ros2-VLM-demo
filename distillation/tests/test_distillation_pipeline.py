@@ -46,7 +46,7 @@ from distillation.validator import (
     VALIDATORS,
 )
 from distillation.dataset import split_dataset, export_sft_dataset
-from distillation.training import TrainingConfig, run_training, validate_multimodal_messages, assert_collated_features_multimodal, derive_video_timing_metadata, build_video_processor_kwargs, _QWEN3VL_DEFAULT_FPS
+from distillation.training import TrainingConfig, run_training, validate_multimodal_messages, assert_collated_features_multimodal, derive_video_timing_metadata, build_video_processor_kwargs, _QWEN3VL_DEFAULT_FPS, VideoMetadataLike
 from distillation.evaluation import (
     EvaluationReport,
     evaluate_batch,
@@ -948,18 +948,52 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertIn("do_sample_frames", kwargs)
         self.assertFalse(kwargs["do_sample_frames"])
 
+    def test_build_video_kwargs_video_metadata_frame_count(self):
+        """video_metadata[0] carries correct total_frames and identity frames_indices."""
+        # _video_messages builds a video content object with 8 paths (f0.mp4, …, f7.mp4).
+        messages = self._video_messages(fps=8.0)
+        # Count how many frame paths are in the first video content object.
+        paths = []
+        for msg in messages:
+            for part in (msg.get("content") or []):
+                if isinstance(part, dict) and part.get("type") == "video":
+                    raw = part.get("path") or part.get("url") or []
+                    paths = raw if isinstance(raw, list) else [raw]
+                    break
+        n_frames = len(paths)
+        timing = derive_video_timing_metadata(messages)
+        kwargs = build_video_processor_kwargs(messages, timing)
+        self.assertIn("video_metadata", kwargs)
+        meta = kwargs["video_metadata"]
+        self.assertEqual(len(meta), 1)
+        m = meta[0]
+        self.assertIsInstance(m, VideoMetadataLike)
+        if n_frames:
+            self.assertEqual(m.total_frames, n_frames)
+            self.assertEqual(m.frames_indices, list(range(n_frames)),
+                             "frames_indices must be identity mapping for pre-sampled frames")
+
     def test_build_video_kwargs_8fps_not_default(self):
-        """8-FPS video → fps=8.0 in kwargs, not _QWEN3VL_DEFAULT_FPS=24."""
+        """8-FPS video → video_metadata[0].fps==8.0, not _QWEN3VL_DEFAULT_FPS=24."""
         t_seconds = [i / 8.0 for i in range(8)]
         messages = self._video_messages(fps=8.0, t_seconds=t_seconds)
         timing = derive_video_timing_metadata(messages)
         kwargs = build_video_processor_kwargs(messages, timing)
-        self.assertIn("fps", kwargs)
-        self.assertEqual(kwargs["fps"], 8.0)
-        self.assertNotEqual(kwargs["fps"], _QWEN3VL_DEFAULT_FPS)
+        # fps must be carried in video_metadata, not as a standalone key,
+        # because Qwen3-VL reads metadata.fps for timestamp-token construction
+        # while the standalone fps kwarg is only used during frame sampling.
+        self.assertNotIn("fps", kwargs,
+                         "fps must not be a standalone key; "
+                         "use video_metadata[i].fps for timestamp-token fidelity")
+        self.assertIn("video_metadata", kwargs)
+        meta = kwargs["video_metadata"]
+        self.assertEqual(len(meta), 1)
+        self.assertIsInstance(meta[0], VideoMetadataLike)
+        self.assertEqual(meta[0].fps, 8.0)
+        self.assertNotEqual(meta[0].fps, _QWEN3VL_DEFAULT_FPS)
 
     def test_build_video_kwargs_no_fps_no_fps_key(self):
-        """Video without fps → fps key absent from kwargs (no silent 24-FPS injection)."""
+        """Video without fps → video_metadata[0].fps is None; no silent 24-FPS injection."""
         # fps is absent from the content object; derive_video_timing returns None.
         # build_video_processor_kwargs must NOT inject fps=24 on behalf of the caller.
         messages = self._video_messages(fps=None)
@@ -968,6 +1002,10 @@ class TestTrainingConfig(unittest.TestCase):
         self.assertNotIn("fps", kwargs)
         # do_sample_frames must still be False (video content present)
         self.assertFalse(kwargs["do_sample_frames"])
+        # video_metadata entry must exist but its fps field is None (not 24)
+        self.assertIn("video_metadata", kwargs)
+        self.assertIsNone(kwargs["video_metadata"][0].fps,
+                          "fps must not be silently set to 24.0 when absent from provenance")
 
     def test_processor_spy_both_calls_receive_identical_kwargs(self):
         """
@@ -976,14 +1014,20 @@ class TestTrainingConfig(unittest.TestCase):
         in both the full-example and prompt-only apply_chat_template calls.
 
         This is a CPU-testable regression guard: if the two calls diverge
-        (e.g. full call gets processor_kwargs with fps=8.0 while prompt-only
-        falls back to 24 FPS), prompt_len will be computed from a different
-        token sequence and the wrong label tokens will be masked.
+        (e.g. full call gets processor_kwargs with video_metadata.fps=8.0 while
+        prompt-only has no video_metadata, causing 24-FPS fallback), prompt_len
+        will be computed from a different token sequence and the wrong label
+        tokens will be masked.
 
         Also guards the correct call contract: fps / do_sample_frames must
         arrive inside processor_kwargs={}, NOT as top-level kwargs.  Top-level
         fps is silently ignored by the Transformers apply_chat_template API,
         causing the processor to default to 24 FPS and re-sample the frames.
+
+        The key regression: an 8-FPS exported sample must have
+        video_metadata[0].fps == 8.0 (not merely processor_kwargs["fps"] == 8.0)
+        in BOTH the full-example and prompt-only calls, so timestamp-token
+        construction uses the actual capture rate rather than the 24-FPS default.
         """
         import unittest.mock as mock
 
@@ -996,13 +1040,15 @@ class TestTrainingConfig(unittest.TestCase):
 
         def spy_apply_chat_template(msgs, **kwargs):
             # Record the processor_kwargs dict passed for inspection.
-            # The contract requires fps/do_sample_frames to be inside
-            # processor_kwargs, NOT at the top level.
+            # The contract requires fps/do_sample_frames/video_metadata to be
+            # inside processor_kwargs, NOT at the top level.
             proc_kwargs = kwargs.get("processor_kwargs") or {}
+            vm = proc_kwargs.get("video_metadata")
             call_kwargs_list.append({
-                k: proc_kwargs[k] for k in ("fps", "do_sample_frames") if k in proc_kwargs
+                "do_sample_frames": proc_kwargs.get("do_sample_frames"),
+                "video_metadata_fps": vm[0].fps if vm else None,
             })
-            # Also assert fps/do_sample_frames are NOT top-level kwargs —
+            # Assert fps/do_sample_frames are NOT top-level kwargs —
             # they would be silently ignored there.
             assert "fps" not in kwargs, (
                 "fps must be inside processor_kwargs={}, not a top-level kwarg"
@@ -1029,16 +1075,19 @@ class TestTrainingConfig(unittest.TestCase):
 
         self.assertEqual(len(call_kwargs_list), 2, "Expected exactly two apply_chat_template calls")
         full_kw, prompt_kw = call_kwargs_list
-        # Both calls must carry identical fps and do_sample_frames.
+        # Both calls must carry identical metadata.
         self.assertEqual(full_kw, prompt_kw,
                          f"Processor kwargs diverged between full and prompt-only call: "
                          f"{full_kw!r} vs {prompt_kw!r}")
-        # Regression: fps must be 8.0 in both calls.
-        self.assertEqual(full_kw.get("fps"), 8.0)
-        self.assertNotEqual(full_kw.get("fps"), _QWEN3VL_DEFAULT_FPS)
+        # Regression: video_metadata.fps must be 8.0 in both calls —
+        # NOT _QWEN3VL_DEFAULT_FPS (24.0).  This is the timestamp-token
+        # fidelity invariant: an 8-FPS sample must train with 8-FPS anchors.
+        self.assertEqual(full_kw["video_metadata_fps"], 8.0,
+                         "video_metadata[0].fps must be 8.0, not the 24-FPS default")
+        self.assertNotEqual(full_kw["video_metadata_fps"], _QWEN3VL_DEFAULT_FPS)
         # do_sample_frames must be False in both calls.
-        self.assertFalse(full_kw.get("do_sample_frames"))
-        self.assertFalse(prompt_kw.get("do_sample_frames"))
+        self.assertFalse(full_kw["do_sample_frames"])
+        self.assertFalse(prompt_kw["do_sample_frames"])
 
 
 # ---------------------------------------------------------------------------
