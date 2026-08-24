@@ -364,6 +364,126 @@ def validate_multimodal_messages(messages: list) -> None:
             pass
 
 
+_QWEN3VL_DEFAULT_FPS: float = 24.0
+"""
+Qwen3-VL processor default FPS used when no fps can be inferred from the
+video content object.  Any sample whose true capture rate differs from this
+would be silently mis-timed if the fps field is omitted.
+"""
+
+_FPS_CONSISTENCY_TOLERANCE: float = 0.10
+"""
+Maximum fractional deviation (10 %) between consecutive frame intervals and
+``1 / fps`` before a sample is classified as irregular-FPS and rejected.
+"""
+
+
+def derive_video_timing_metadata(messages: list) -> dict:
+    """
+    Extract and validate video timing metadata from a structured message list.
+
+    For each ``{"type": "video", "path": [...], ...}`` content object this
+    function checks that:
+
+    1. If ``t_seconds`` is present, ``fps`` must also be present.  Without an
+       explicit ``fps`` the Qwen3-VL processor defaults to
+       ``_QWEN3VL_DEFAULT_FPS`` (24 FPS), which would silently misrepresent
+       the temporal spacing of samples captured at any other rate.
+
+    2. If both ``fps`` and ``t_seconds`` are present, the inter-frame intervals
+       derived from ``t_seconds`` must be consistent with ``1 / fps`` within
+       ``_FPS_CONSISTENCY_TOLERANCE`` (10 %).  Irregular spacing cannot be
+       faithfully represented via a single FPS value and the sample must be
+       resampled or excluded rather than approximated.
+
+    Returns
+    -------
+    dict with keys:
+
+    * ``fps``         – ``float`` or ``None`` — effective FPS recorded in the
+                        first video content object found; ``None`` means no
+                        video content was found or fps was not set.
+    * ``t_seconds``   – ``list[float]`` or ``None`` — per-frame timestamps
+                        from the first video content object.
+    * ``video_count`` – ``int`` — number of ``type: "video"`` content objects
+                        found across all messages.
+
+    Raises
+    ------
+    ValueError
+        If a video content object has ``t_seconds`` but no ``fps``.
+    ValueError
+        If a video content object has ``fps`` and ``t_seconds`` whose spacing
+        is inconsistent with ``1 / fps`` (irregular-FPS sample).
+
+    Notes
+    -----
+    This function has **no** heavy dependencies and runs in CPU-only CI without
+    a GPU or model weights.  It is called by ``_tokenize`` (inside
+    ``run_training``) before the processor forward pass so that timing errors
+    surface early rather than producing silently mis-timed training examples.
+    """
+    result: dict = {"fps": None, "t_seconds": None, "video_count": 0}
+
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "video":
+                continue
+            result["video_count"] += 1
+
+            fps = part.get("fps")
+            t_seconds = part.get("t_seconds")
+
+            # Rule 1 – t_seconds without fps → processor would default to 24 FPS.
+            if t_seconds is not None and fps is None:
+                raise ValueError(
+                    "Video content object carries per-frame 't_seconds' but no "
+                    f"'fps' field.  Without an explicit fps the Qwen3-VL processor "
+                    f"defaults to {_QWEN3VL_DEFAULT_FPS} FPS, which would "
+                    "misrepresent the temporal spacing of this sample.  Set 'fps' "
+                    "in the video content object (or in Provenance.effective_fps "
+                    "before exporting) to preserve the actual capture rate."
+                )
+
+            if fps is not None:
+                # Record the fps from the first video object encountered.
+                if result["fps"] is None:
+                    result["fps"] = float(fps)
+
+            if t_seconds is not None:
+                ts = [float(t) for t in t_seconds]
+                if result["t_seconds"] is None:
+                    result["t_seconds"] = ts
+
+                # Rule 2 – fps/t_seconds consistency check.
+                if fps is not None and len(ts) >= 2:
+                    expected_dt = 1.0 / float(fps)
+                    irregular = [
+                        (i, ts[i + 1] - ts[i])
+                        for i in range(len(ts) - 1)
+                        if abs((ts[i + 1] - ts[i]) - expected_dt) / expected_dt
+                        > _FPS_CONSISTENCY_TOLERANCE
+                    ]
+                    if irregular:
+                        bad = ", ".join(
+                            f"frames[{i}→{i+1}]: {dt:.4f}s" for i, dt in irregular[:3]
+                        )
+                        raise ValueError(
+                            f"Video content 't_seconds' has irregular frame spacing "
+                            f"inconsistent with fps={fps} "
+                            f"(expected ~{expected_dt:.4f}s ±10%, got: {bad}).  "
+                            "Irregular-FPS samples cannot be faithfully represented "
+                            "via a single FPS value.  Either resample to a uniform "
+                            "rate or exclude this sample from training rather than "
+                            "approximating the temporal structure."
+                        )
+
+    return result
+
+
 def run_training(
     config: TrainingConfig,
     dry_run: bool = False,
@@ -563,10 +683,24 @@ def run_training(
 
     def _tokenize(example):
         messages = example.get("messages", [])
-        # Guard: ensure image/video content objects are structured dicts, not
+        # Guard 1: ensure image/video content objects are structured dicts, not
         # stringified text.  Runs on every training example and catches any
         # export-side regression before the model forward pass.
         validate_multimodal_messages(messages)
+        # Guard 2: validate video timing metadata.  For video content objects,
+        # derive_video_timing_metadata checks that:
+        #   (a) fps is explicitly set — without it, Qwen3-VL defaults to 24 FPS
+        #       and would silently mis-time samples captured at any other rate.
+        #   (b) fps is consistent with the per-frame t_seconds spacing (±10 %).
+        #       Irregular-FPS samples are rejected rather than approximated.
+        # The returned timing dict is passed to apply_chat_template as
+        # video_fps so the processor uses the sample's actual capture rate.
+        timing = derive_video_timing_metadata(messages)
+        # Build processor kwargs: pass fps explicitly for video samples so the
+        # Qwen3-VL processor does not substitute its internal 24-FPS default.
+        processor_video_kwargs: dict = {}
+        if timing["fps"] is not None:
+            processor_video_kwargs["fps"] = timing["fps"]
         # Use the processor's multimodal chat-template path:
         #   apply_chat_template(tokenize=True, return_dict=True)
         # This resolves <image> / <video> placeholder tokens and produces
@@ -584,6 +718,8 @@ def run_training(
             max_length=config.max_seq_length,
             padding="max_length",
             add_generation_prompt=False,
+            **({} if not processor_video_kwargs
+               else {"videos_kwargs": processor_video_kwargs}),
         )
         # Verify that the processor produced multimodal output (pixel_values or
         # pixel_values_videos).  This assertion surfaces processor mismatches

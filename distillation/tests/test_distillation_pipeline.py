@@ -46,7 +46,7 @@ from distillation.validator import (
     VALIDATORS,
 )
 from distillation.dataset import split_dataset, export_sft_dataset
-from distillation.training import TrainingConfig, run_training, validate_multimodal_messages, assert_collated_features_multimodal
+from distillation.training import TrainingConfig, run_training, validate_multimodal_messages, assert_collated_features_multimodal, derive_video_timing_metadata, _QWEN3VL_DEFAULT_FPS
 from distillation.evaluation import (
     EvaluationReport,
     evaluate_batch,
@@ -850,6 +850,80 @@ class TestTrainingConfig(unittest.TestCase):
         }
         with self.assertRaises(AssertionError):
             assert_collated_features_multimodal(features, sample_id="text-only")
+
+    # ------------------------------------------------------------------
+    # derive_video_timing_metadata
+    # ------------------------------------------------------------------
+
+    def _video_messages(self, fps=None, t_seconds=None, frame_paths=None):
+        """Helper: build a message list with one video content object."""
+        frame_paths = frame_paths or [f"f{i}.jpg" for i in range(8)]
+        video_part = {"type": "video", "path": frame_paths}
+        if fps is not None:
+            video_part["fps"] = fps
+        if t_seconds is not None:
+            video_part["t_seconds"] = t_seconds
+        return [
+            {"role": "system", "content": "You are a VLM."},
+            {"role": "user", "content": [video_part, {"type": "text", "text": "Describe."}]},
+        ]
+
+    def test_derive_video_timing_no_video(self):
+        """Image-only messages return video_count=0 and None fps/t_seconds."""
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image", "url": "f0.jpg"},
+                {"type": "text", "text": "Describe."},
+            ]}
+        ]
+        result = derive_video_timing_metadata(messages)
+        self.assertEqual(result["video_count"], 0)
+        self.assertIsNone(result["fps"])
+        self.assertIsNone(result["t_seconds"])
+
+    def test_derive_video_timing_8fps_uniform(self):
+        """8-FPS sample with consistent t_seconds returns fps=8.0 (not 24)."""
+        t_seconds = [i / 8.0 for i in range(8)]  # 0.0, 0.125, ..., 0.875
+        messages = self._video_messages(fps=8.0, t_seconds=t_seconds)
+        result = derive_video_timing_metadata(messages)
+        self.assertEqual(result["video_count"], 1)
+        # Regression: fps must be 8.0, NOT the Qwen3-VL default 24.0
+        self.assertEqual(result["fps"], 8.0)
+        self.assertNotEqual(result["fps"], _QWEN3VL_DEFAULT_FPS)
+        self.assertEqual(result["t_seconds"], t_seconds)
+
+    def test_derive_video_timing_fps_only_no_t_seconds(self):
+        """Video with fps but no t_seconds: fps is returned, no error."""
+        messages = self._video_messages(fps=15.0)
+        result = derive_video_timing_metadata(messages)
+        self.assertEqual(result["fps"], 15.0)
+        self.assertIsNone(result["t_seconds"])
+
+    def test_derive_video_timing_t_seconds_without_fps_raises(self):
+        """t_seconds present without fps must raise ValueError (would default to 24)."""
+        t_seconds = [i / 8.0 for i in range(8)]
+        messages = self._video_messages(fps=None, t_seconds=t_seconds)
+        with self.assertRaises(ValueError) as ctx:
+            derive_video_timing_metadata(messages)
+        self.assertIn("24", str(ctx.exception))
+
+    def test_derive_video_timing_irregular_fps_raises(self):
+        """t_seconds inconsistent with fps (irregular spacing) must raise ValueError."""
+        # Declare 8 FPS (expected dt=0.125) but inject a large gap at frame 4→5
+        t_seconds = [0.0, 0.125, 0.25, 0.375, 0.5, 1.0, 1.125, 1.25]  # 0.5s gap
+        messages = self._video_messages(fps=8.0, t_seconds=t_seconds)
+        with self.assertRaises(ValueError) as ctx:
+            derive_video_timing_metadata(messages)
+        self.assertIn("irregular", str(ctx.exception).lower())
+
+    def test_derive_video_timing_within_tolerance(self):
+        """t_seconds within ±10% of 1/fps are accepted as uniform."""
+        # 8 FPS → expected_dt=0.125; nudge each interval by ~9% (< 10% threshold)
+        t_seconds = [0.0, 0.1362, 0.2725, 0.4087, 0.5450, 0.6812, 0.8175, 0.9537]
+        messages = self._video_messages(fps=8.0, t_seconds=t_seconds)
+        result = derive_video_timing_metadata(messages)
+        self.assertEqual(result["fps"], 8.0)
+        self.assertEqual(result["t_seconds"], t_seconds)
 
 
 # ---------------------------------------------------------------------------
