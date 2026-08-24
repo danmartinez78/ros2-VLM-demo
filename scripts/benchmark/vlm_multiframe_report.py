@@ -614,14 +614,14 @@ def format_text_report(report: dict[str, Any]) -> str:
         fixed_fields = ["model", "engines", "precision", "prompt text"]
     if len(max_output_tokens_values) == 1:
         fixed_fields.append(f"max_output_tokens={max_output_tokens_values[0]}")
+    elif not max_output_tokens_values:
+        fixed_fields.append("max_output_tokens=unknown")
     lines.append(f"  Fixed: {', '.join(fixed_fields)}")
     if len(max_output_tokens_values) > 1:
         mixed_values = ", ".join(str(value) for value in max_output_tokens_values)
         lines.append(
             f"  Mixed request config: max_output_tokens varies across records ({mixed_values})"
         )
-    elif not max_output_tokens_values:
-        lines.append("  Request config: max_output_tokens=unknown")
     lines.append("  Prompt policy: compact temporal JSON (one structured result for full sequence)")
 
     # ── Frame-scaling table ───────────────────────────────────────────────
