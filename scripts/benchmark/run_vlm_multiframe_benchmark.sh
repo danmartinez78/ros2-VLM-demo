@@ -120,6 +120,11 @@ RESOLVED_ENGINE_PROFILE_ID="${EDGE_VLM_ENGINE_PROFILE_ID:-}"
 RESOLVED_LLM_ENGINE_DIR="${EDGE_VLM_LLM_ENGINE_DIR:-}"
 RESOLVED_MULTIMODAL_ENGINE_DIR="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}"
 ENGINE_PROVENANCE_JSON="{}"
+IPC_RESOLVED_MODEL_NAME="${EDGE_VLM_MODEL_NAME:-unknown}"
+IPC_RESOLVED_ENGINE_PROFILE_ID="${EDGE_VLM_ENGINE_PROFILE_ID:-}"
+IPC_RESOLVED_LLM_ENGINE_DIR="${EDGE_VLM_LLM_ENGINE_DIR:-}"
+IPC_RESOLVED_MULTIMODAL_ENGINE_DIR="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}"
+IPC_ENGINE_PROVENANCE_JSON="{}"
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 
@@ -202,6 +207,35 @@ _resolve_engine_provenance() {
     RESOLVED_LLM_ENGINE_DIR="${_resolved_lines[2]:-${EDGE_VLM_LLM_ENGINE_DIR:-}}"
     RESOLVED_MULTIMODAL_ENGINE_DIR="${_resolved_lines[3]:-${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}}"
     ENGINE_PROVENANCE_JSON="${_resolved_lines[4]:-\{\}}"
+}
+
+_resolve_ipc_engine_provenance() {
+    local socket_path="${EDGE_VLM_WORKER_SOCKET:-/tmp/edge_vlm.sock}"
+    local resolved
+    if ! resolved="$(
+        python3 "${SCRIPT_DIR}/benchmark_metadata.py" \
+            --server-socket-path "${socket_path}" \
+            --model-name "${RESOLVED_MODEL_NAME:-${EDGE_VLM_MODEL_NAME:-unknown}}" \
+            --engine-profile-id "${RESOLVED_ENGINE_PROFILE_ID:-${EDGE_VLM_ENGINE_PROFILE_ID:-}}" \
+            --output-provenance-lines
+    )"; then
+        echo "ERROR: could not resolve authoritative IPC engine provenance from running edge_vlm_server on ${socket_path}" >&2
+        echo "       Start or restart edge_vlm_server with the intended engine paths before benchmarking IPC." >&2
+        exit 1
+    fi
+    mapfile -t _resolved_lines <<< "${resolved}"
+    IPC_RESOLVED_MODEL_NAME="${_resolved_lines[0]:-${RESOLVED_MODEL_NAME:-${EDGE_VLM_MODEL_NAME:-unknown}}}"
+    IPC_RESOLVED_ENGINE_PROFILE_ID="${_resolved_lines[1]:-${RESOLVED_ENGINE_PROFILE_ID:-${EDGE_VLM_ENGINE_PROFILE_ID:-}}}"
+    IPC_RESOLVED_LLM_ENGINE_DIR="${_resolved_lines[2]:-${RESOLVED_LLM_ENGINE_DIR:-${EDGE_VLM_LLM_ENGINE_DIR:-}}}"
+    IPC_RESOLVED_MULTIMODAL_ENGINE_DIR="${_resolved_lines[3]:-${RESOLVED_MULTIMODAL_ENGINE_DIR:-${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}}}"
+    IPC_ENGINE_PROVENANCE_JSON="${_resolved_lines[4]:-\{\}}"
+
+    if [[ "${IPC_RESOLVED_LLM_ENGINE_DIR}" != "${RESOLVED_LLM_ENGINE_DIR}" \
+       || "${IPC_RESOLVED_MULTIMODAL_ENGINE_DIR}" != "${RESOLVED_MULTIMODAL_ENGINE_DIR}" ]]; then
+        echo "WARNING: caller-shell engine paths differ from the running edge_vlm_server." >&2
+        echo "         Direct records will use caller-shell runtime paths; IPC records will use server-process paths." >&2
+        echo "         The generated report will be marked with mixed engine provenance and should be treated as non-comparable." >&2
+    fi
 }
 
 _write_record() {
@@ -801,8 +835,8 @@ PYEOF
                 export _BM_OUTPUT_TEXT="${ipc_output_text}"
                 export _BM_OUTPUT_WORDS="${ipc_output_words}"
                 export _BM_IPC_RESULT_PATH="${ipc_result_path_json}"
-                export _BM_MODEL_NAME="${RESOLVED_MODEL_NAME:-unknown}"
-                export _BM_ENGINE_PROVENANCE="${ENGINE_PROVENANCE_JSON}"
+                export _BM_MODEL_NAME="${IPC_RESOLVED_MODEL_NAME:-unknown}"
+                export _BM_ENGINE_PROVENANCE="${IPC_ENGINE_PROVENANCE_JSON}"
                 export _BM_ITERATION="${iter_idx}"
                 export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
                 PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
@@ -816,6 +850,9 @@ PYEOF
 # ── main ──────────────────────────────────────────────────────────────────────
 
 _resolve_engine_provenance
+if [[ ",${PATHS}," == *",ipc,"* && "${DRY_RUN}" != "true" ]]; then
+    _resolve_ipc_engine_provenance
+fi
 
 echo "================================================================"
 echo "  VLM Multi-Frame Latency Characterization Benchmark"
@@ -827,6 +864,11 @@ echo "  Paths: ${PATHS}"
 echo "  Engine: ${RESOLVED_MODEL_NAME:-unknown} ${RESOLVED_ENGINE_PROFILE_ID:+(${RESOLVED_ENGINE_PROFILE_ID})}"
 echo "  LLM engine dir: ${RESOLVED_LLM_ENGINE_DIR:-unset}"
 echo "  Multimodal dir: ${RESOLVED_MULTIMODAL_ENGINE_DIR:-unset}"
+if [[ ",${PATHS}," == *",ipc,"* && "${DRY_RUN}" != "true" ]]; then
+    echo "  IPC server engine: ${IPC_RESOLVED_MODEL_NAME:-unknown} ${IPC_RESOLVED_ENGINE_PROFILE_ID:+(${IPC_RESOLVED_ENGINE_PROFILE_ID})}"
+    echo "  IPC server LLM dir: ${IPC_RESOLVED_LLM_ENGINE_DIR:-unset}"
+    echo "  IPC server multimodal dir: ${IPC_RESOLVED_MULTIMODAL_ENGINE_DIR:-unset}"
+fi
 echo "  Warmup: ${WARMUP}  Iterations: ${ITERATIONS}"
 echo "  Output dir: ${OUTPUT_DIR}"
 echo "================================================================"

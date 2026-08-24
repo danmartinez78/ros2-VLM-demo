@@ -122,9 +122,23 @@ resolve_engine_provenance() {
   ENGINE_PROVENANCE_JSON="${_resolved_lines[4]:-\{\}}"
 }
 
+canonical_path() {
+  python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve(strict=False))' "$1"
+}
+
 resolve_engine_provenance
 
-VISUAL_ENGINE_DIR="${EDGE_VLM_VISUAL_ENGINE_DIR:-${RESOLVED_MULTIMODAL_ENGINE_DIR}/visual}"
+EXPECTED_VISUAL_ENGINE_DIR="$(canonical_path "${RESOLVED_MULTIMODAL_ENGINE_DIR}/visual")"
+VISUAL_ENGINE_DIR="${EXPECTED_VISUAL_ENGINE_DIR}"
+if [[ -n "${EDGE_VLM_VISUAL_ENGINE_DIR:-}" ]]; then
+  OVERRIDE_VISUAL_ENGINE_DIR="$(canonical_path "${EDGE_VLM_VISUAL_ENGINE_DIR}")"
+  if [[ "${OVERRIDE_VISUAL_ENGINE_DIR}" != "${EXPECTED_VISUAL_ENGINE_DIR}" ]]; then
+    echo "ERROR: EDGE_VLM_VISUAL_ENGINE_DIR must resolve to ${EXPECTED_VISUAL_ENGINE_DIR}" >&2
+    echo "       Refusing to benchmark visual.engine from ${OVERRIDE_VISUAL_ENGINE_DIR} while provenance records ${RESOLVED_MULTIMODAL_ENGINE_DIR}." >&2
+    exit 1
+  fi
+  VISUAL_ENGINE_DIR="${OVERRIDE_VISUAL_ENGINE_DIR}"
+fi
 
 if [[ "${DRY_RUN}" == "false" ]]; then
   if [[ ! -x "${LLM_BENCH}" ]]; then

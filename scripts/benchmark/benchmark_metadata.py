@@ -115,6 +115,32 @@ def _candidate_manifest_paths(llm_engine_dir: str, multimodal_engine_dir: str) -
     return deduped
 
 
+def _socket_listener_pid(socket_path: str) -> int | None:
+    canonical_socket = _canonical_path(socket_path)
+    if not canonical_socket:
+        return None
+    output = _run(["ss", "-lxnp"])
+    if not output:
+        return None
+    for line in output.splitlines():
+        if canonical_socket not in line:
+            continue
+        match = re.search(r"pid=(\d+)", line)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _proc_argv(pid: int, index: int) -> str:
+    try:
+        parts = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return ""
+    if index < 0 or index >= len(parts):
+        return ""
+    return parts[index].decode("utf-8", errors="replace").strip()
+
+
 def collect_engine_provenance(
     llm_engine_dir: str = "",
     multimodal_engine_dir: str = "",
@@ -235,6 +261,38 @@ def collect_engine_provenance(
         )
         provenance["engine_identity"] = f"{identity_model}/{identity_profile}@{fallback_sha[:12]}"
 
+    return provenance
+
+
+def collect_server_engine_provenance(
+    socket_path: str = "",
+    *,
+    model_name: str = "",
+    engine_profile_id: str = "",
+) -> dict[str, Any]:
+    """Return canonical engine provenance for the live edge_vlm_server listener."""
+    requested_socket = socket_path or os.environ.get("EDGE_VLM_WORKER_SOCKET", "/tmp/edge_vlm.sock")
+    server_pid = _socket_listener_pid(requested_socket)
+    if server_pid is None:
+        raise RuntimeError(f"no live edge_vlm_server listener found for socket {requested_socket!r}")
+
+    llm_engine_dir = _proc_argv(server_pid, 1)
+    multimodal_engine_dir = _proc_argv(server_pid, 2)
+    server_socket_path = _proc_argv(server_pid, 4) or requested_socket
+    if not llm_engine_dir or not multimodal_engine_dir:
+        raise RuntimeError(
+            f"could not determine edge_vlm_server engine directories from /proc/{server_pid}/cmdline"
+        )
+
+    provenance = collect_engine_provenance(
+        llm_engine_dir=llm_engine_dir,
+        multimodal_engine_dir=multimodal_engine_dir,
+        model_name=model_name,
+        engine_profile_id=engine_profile_id,
+    )
+    provenance["server_pid"] = server_pid
+    provenance["server_socket_path"] = _canonical_path(server_socket_path)
+    provenance["provenance_source"] = "server_process"
     return provenance
 
 
@@ -427,6 +485,7 @@ def main() -> None:
     parser.add_argument("--engine-profile-id", default="")
     parser.add_argument("--quantization", default="")
     parser.add_argument("--edge-llm-root", default="")
+    parser.add_argument("--server-socket-path", default="")
     parser.add_argument(
         "--output-provenance-lines",
         action="store_true",
@@ -436,12 +495,19 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.output_provenance_lines:
-        provenance = collect_engine_provenance(
-            llm_engine_dir=args.llm_engine_dir,
-            multimodal_engine_dir=args.multimodal_engine_dir,
-            model_name=args.model_name,
-            engine_profile_id=args.engine_profile_id,
-        )
+        if args.server_socket_path:
+            provenance = collect_server_engine_provenance(
+                socket_path=args.server_socket_path,
+                model_name=args.model_name,
+                engine_profile_id=args.engine_profile_id,
+            )
+        else:
+            provenance = collect_engine_provenance(
+                llm_engine_dir=args.llm_engine_dir,
+                multimodal_engine_dir=args.multimodal_engine_dir,
+                model_name=args.model_name,
+                engine_profile_id=args.engine_profile_id,
+            )
         sys.stdout.write((provenance.get("model_name") or "") + "\n")
         sys.stdout.write((provenance.get("engine_profile_id") or "") + "\n")
         sys.stdout.write((provenance.get("llm_engine_dir") or "") + "\n")

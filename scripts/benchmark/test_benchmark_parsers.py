@@ -591,6 +591,51 @@ class TestBenchmarkMetadata(unittest.TestCase):
         self.assertIn("thor-f8", warnings)
         self.assertIn("thor-current", warnings)
 
+    def test_collect_server_engine_provenance_uses_live_server_paths(self):
+        import tempfile
+        from benchmark_metadata import collect_server_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "Cosmos-Reason2-8B" / "engines" / "thor-f8"
+            llm_dir = profile_dir / "llm"
+            llm_dir.mkdir(parents=True)
+            manifest_path = profile_dir / "engine-manifest.json"
+            manifest_path.write_text(json.dumps({
+                "model_name": "Cosmos-Reason2-8B",
+                "engine_profile_id": "thor-f8",
+                "engine_paths": {
+                    "llm_dir": str(llm_dir),
+                    "multimodal_dir": str(profile_dir),
+                },
+            }), encoding="utf-8")
+
+            with patch("benchmark_metadata._socket_listener_pid", return_value=4242), \
+                 patch("benchmark_metadata._proc_argv") as mock_proc_argv:
+                mock_proc_argv.side_effect = lambda pid, index: {
+                    1: str(llm_dir),
+                    2: str(profile_dir),
+                    4: "/tmp/edge_vlm.sock",
+                }.get(index, "")
+                provenance = collect_server_engine_provenance(
+                    socket_path="/tmp/edge_vlm.sock",
+                    model_name="Cosmos-Reason2-8B",
+                    engine_profile_id="thor-f8",
+                )
+
+        self.assertEqual(provenance["engine_manifest_status"], "matched")
+        self.assertEqual(provenance["llm_engine_dir"], str(llm_dir.resolve()))
+        self.assertEqual(provenance["multimodal_engine_dir"], str(profile_dir.resolve()))
+        self.assertEqual(provenance["server_pid"], 4242)
+        self.assertEqual(provenance["server_socket_path"], str(Path("/tmp/edge_vlm.sock").resolve()))
+        self.assertEqual(provenance["provenance_source"], "server_process")
+
+    def test_collect_server_engine_provenance_raises_without_listener(self):
+        from benchmark_metadata import collect_server_engine_provenance
+
+        with patch("benchmark_metadata._socket_listener_pid", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "no live edge_vlm_server listener"):
+                collect_server_engine_provenance(socket_path="/tmp/missing.sock")
+
 
 # ── end-to-end round-trip test ────────────────────────────────────────────────
 
@@ -666,7 +711,7 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
 
     _SCRIPT = Path(__file__).resolve().parent / "run_native_benchmarks.sh"
 
-    def _run_dry(self, extra_args: list[str] | None = None) -> str:
+    def _run_dry(self, extra_args: list[str] | None = None, env_updates: dict[str, str] | None = None) -> str:
         import subprocess
         env = {
             "PATH": "/usr/bin:/bin",
@@ -675,6 +720,8 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
             "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
             "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
         }
+        if env_updates:
+            env.update(env_updates)
         cmd = ["bash", str(self._SCRIPT), "--dry-run"]
         if extra_args:
             cmd.extend(extra_args)
@@ -701,6 +748,33 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
         self.assertIn("--mode visual", out)
         self.assertIn("--engineDir /fake/mm_engine/visual", out)
         self.assertNotIn("--multimodalEngineDir", out)
+
+    def test_visual_override_same_canonical_path_is_allowed(self):
+        out = self._run_dry(
+            ["--skip-prefill", "--skip-decode", "--skip-profile"],
+            env_updates={"EDGE_VLM_VISUAL_ENGINE_DIR": "/fake/mm_engine/subdir/../visual"},
+        )
+        self.assertIn("--engineDir /fake/mm_engine/visual", out)
+
+    def test_visual_override_mismatch_is_rejected(self):
+        import subprocess
+
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "TENSORRT_EDGE_LLM_ROOT": "/fake/edgellm",
+            "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+            "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+            "EDGE_VLM_VISUAL_ENGINE_DIR": "/different/visual",
+            "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
+        }
+        result = subprocess.run(
+            ["bash", str(self._SCRIPT), "--dry-run", "--skip-prefill", "--skip-decode", "--skip-profile"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EDGE_VLM_VISUAL_ENGINE_DIR must resolve to /fake/mm_engine/visual", result.stderr)
 
     def test_llm_bench_uses_warmup_and_iterations_flags(self):
         out = self._run_dry(["--warmup", "5", "--iterations", "20"])

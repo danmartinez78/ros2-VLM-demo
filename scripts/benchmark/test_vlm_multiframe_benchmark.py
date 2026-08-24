@@ -1037,6 +1037,34 @@ class TestBuildReport(unittest.TestCase):
         self.assertIsNone(report["engine_provenance"])
         self.assertGreaterEqual(len(report["engine_provenance_variants"]), 2)
 
+    def test_caller_and_server_provenance_mismatch_marks_report_non_comparable(self):
+        direct_record = _make_record(
+            frame_condition="F8",
+            frame_count=8,
+            path="direct",
+            engine_provenance=_make_engine_provenance(
+                engine_profile_id="thor-f8",
+                llm_engine_dir="/tmp/engines/thor-f8/llm",
+                multimodal_engine_dir="/tmp/engines/thor-f8",
+            ),
+        )
+        ipc_record = _make_record(
+            frame_condition="F8",
+            frame_count=8,
+            path="ipc",
+            engine_provenance=_make_engine_provenance(
+                engine_profile_id="legacy",
+                llm_engine_dir="/tmp/engine/llm",
+                multimodal_engine_dir="/tmp/engine",
+                engine_manifest_path=None,
+                engine_manifest_sha256=None,
+                engine_manifest_status="missing",
+            ),
+        )
+        report = build_report([direct_record, ipc_record])
+        self.assertTrue(report["mixed_engine_provenance"])
+        self.assertIsNone(report["engine_provenance"])
+
 
 # ── text report formatting tests ──────────────────────────────────────────────
 
