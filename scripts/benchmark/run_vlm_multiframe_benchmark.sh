@@ -95,6 +95,10 @@
 #   --warmup N               Warmup iterations per condition (default: 1)
 #   --iterations N           Measured iterations per condition (default: 3)
 #   --paths LIST             Comma-separated paths: direct,ipc (default: direct,ipc)
+#   --sequence-type MODE     images|temporal_images|video (default: images)
+#   --fps N                  Optional FPS metadata for temporal modes
+#   --frame-timestamps-sec   Optional comma-separated per-frame timestamps (seconds)
+#   --render-timestamps      Render visible timestamps on frames (experimental control)
 #   --skip-ipc               Alias for --paths direct
 #   --skip-direct            Alias for --paths ipc
 #   --dry-run                Print commands without executing them
@@ -112,6 +116,10 @@ ITERATIONS=3
 SEQUENCE_DIR=""
 DRY_RUN=false
 PATHS="direct,ipc"
+SEQUENCE_TYPE="images"
+FPS=""
+FRAME_TIMESTAMPS_SEC=""
+RENDER_TIMESTAMPS=false
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -137,6 +145,10 @@ while [[ $# -gt 0 ]]; do
         --warmup)           WARMUP="$2";               shift 2 ;;
         --iterations)       ITERATIONS="$2";           shift 2 ;;
         --paths)            PATHS="$2";                shift 2 ;;
+        --sequence-type)    SEQUENCE_TYPE="$2";        shift 2 ;;
+        --fps)              FPS="$2";                  shift 2 ;;
+        --frame-timestamps-sec) FRAME_TIMESTAMPS_SEC="$2"; shift 2 ;;
+        --render-timestamps) RENDER_TIMESTAMPS=true;   shift ;;
         --skip-ipc)         PATHS="direct";            shift ;;
         --skip-direct)      PATHS="ipc";               shift ;;
         --dry-run)          DRY_RUN=true;              shift ;;
@@ -154,6 +166,11 @@ fi
 
 if [[ ! -d "${SEQUENCE_DIR}" ]]; then
     echo "ERROR: sequence directory does not exist: ${SEQUENCE_DIR}" >&2
+    exit 1
+fi
+
+if [[ "${SEQUENCE_TYPE}" != "images" && "${SEQUENCE_TYPE}" != "temporal_images" && "${SEQUENCE_TYPE}" != "video" ]]; then
+    echo "ERROR: --sequence-type must be one of: images, temporal_images, video" >&2
     exit 1
 fi
 
@@ -235,6 +252,14 @@ _resolve_ipc_engine_provenance() {
         echo "WARNING: caller-shell engine paths differ from the running edge_vlm_server." >&2
         echo "         Direct records will use caller-shell runtime paths; IPC records will use server-process paths." >&2
         echo "         The generated report will be marked with mixed engine provenance and should be treated as non-comparable." >&2
+    fi
+}
+
+_runtime_temporal_encoding_for_direct() {
+    if [[ "${SEQUENCE_TYPE}" == "images" ]]; then
+        echo "ordered_multi_image_no_native_temporal_metadata"
+    else
+        echo "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm"
     fi
 }
 
@@ -559,9 +584,21 @@ _run_ipc_inference() {
         image_args+=(--image "${img}")
     done
 
+    local temporal_args=(--sequence-type "${SEQUENCE_TYPE}")
+    if [[ -n "${FPS}" ]]; then
+        temporal_args+=(--fps "${FPS}")
+    fi
+    if [[ -n "${FRAME_TIMESTAMPS_SEC}" ]]; then
+        temporal_args+=(--frame-timestamps-sec "${FRAME_TIMESTAMPS_SEC}")
+    fi
+    if [[ "${RENDER_TIMESTAMPS}" == "true" ]]; then
+        temporal_args+=(--render-timestamps)
+    fi
+
     _run ros2 run edge_vlm_ros vlm_multi_frame_client \
         --socket "${EDGE_VLM_WORKER_SOCKET:-/tmp/edge_vlm.sock}" \
         "${image_args[@]}" \
+        "${temporal_args[@]}" \
         --prompt "${PROMPT_TEXT}" \
         --max-tokens "${MAX_OUTPUT_TOKENS}" \
         --output "${result_json_path}" \
@@ -601,6 +638,20 @@ _run_condition() {
 
     local prompt_hash_val
     prompt_hash_val=$(_sha256_string "${PROMPT_TEXT}")
+    local frame_timestamps_json="null"
+    local frame_timestamp_policy='"none"'
+    if [[ -n "${FRAME_TIMESTAMPS_SEC}" ]]; then
+        frame_timestamps_json=$(
+            python3 - "${FRAME_TIMESTAMPS_SEC}" <<'PYEOF'
+import json, sys
+items = [x.strip() for x in sys.argv[1].split(",") if x.strip()]
+print(json.dumps([float(x) for x in items]))
+PYEOF
+        )
+        frame_timestamp_policy='"explicit"'
+    elif [[ -n "${FPS}" && "${SEQUENCE_TYPE}" != "images" ]]; then
+        frame_timestamp_policy='"implicit_uniform_from_fps"'
+    fi
 
     # ── direct path ────────────────────────────────────────────────────────────
     if [[ ",${PATHS}," == *",direct,"* ]]; then
@@ -718,6 +769,13 @@ print('\t'.join([
             export _BM_PROFILE_PATH="${profile_path}"
             export _BM_MODEL_NAME="${RESOLVED_MODEL_NAME:-unknown}"
             export _BM_ENGINE_PROVENANCE="${ENGINE_PROVENANCE_JSON}"
+            export _BM_SEQUENCE_TYPE="\"${SEQUENCE_TYPE}\""
+            export _BM_FPS="$([ -n "${FPS}" ] && echo "${FPS}" || echo 'null')"
+            export _BM_FRAME_TIMESTAMPS_SEC="${frame_timestamps_json}"
+            export _BM_FRAME_TIMESTAMP_POLICY="${frame_timestamp_policy}"
+            export _BM_RENDERED_TIMESTAMPS="$([ "${RENDER_TIMESTAMPS}" = 'true' ] && echo 'true' || echo 'false')"
+            export _BM_RUNTIME_TEMPORAL_ENCODING="\"$(_runtime_temporal_encoding_for_direct)\""
+            export _BM_TEMPORAL_FALLBACK_USED="$([ "${SEQUENCE_TYPE}" = 'images' ] && echo 'false' || echo 'true')"
             export _BM_ITERATION="${iter_idx}"
             export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
             PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
@@ -784,6 +842,12 @@ print('\t'.join([
             local ipc_output_text="null"
             local ipc_output_words="null"
             local ipc_inference_seconds="null"
+            local ipc_requested_sequence_type="null"
+            local ipc_runtime_temporal_encoding="null"
+            local ipc_temporal_fallback_used="null"
+            local ipc_rendered_timestamps="$([ "${RENDER_TIMESTAMPS}" = 'true' ] && echo 'true' || echo 'false')"
+            local ipc_sequence_type_json
+            ipc_sequence_type_json="\"${SEQUENCE_TYPE}\""
             local ipc_actual_latency_ms
             if [[ "${ipc_success}" == "true" && "${DRY_RUN}" != "true" && -f "${result_json_path}" ]]; then
                 local ipc_fields
@@ -797,14 +861,19 @@ try:
     ow = json.dumps(r.get("output_words"))
     iv = r.get("inference_seconds")
     inf = json.dumps(float(iv) if iv is not None else None)
+    rq = json.dumps(r.get("requested_sequence_type"))
+    enc = json.dumps(r.get("runtime_temporal_encoding"))
+    tfb = json.dumps(r.get("temporal_fallback_used"))
+    sts = json.dumps(r.get("sequence_type"))
+    rts = json.dumps(r.get("rendered_timestamps"))
     cv = r.get("client_latency_ms")
     lms = str(int(cv)) if cv is not None else fallback_ms
 except Exception:
-    ot, ow, inf, lms = "null", "null", "null", fallback_ms
-print(f"{ot}\t{ow}\t{inf}\t{lms}")
+    ot, ow, inf, rq, enc, tfb, sts, rts, lms = "null", "null", "null", "null", "null", "null", "null", "null", fallback_ms
+print(f"{ot}\t{ow}\t{inf}\t{rq}\t{enc}\t{tfb}\t{sts}\t{rts}\t{lms}")
 PYEOF
-                2>/dev/null || printf 'null\tnull\tnull\t%s' "${total_latency_ms}")
-                IFS=$'\t' read -r ipc_output_text ipc_output_words ipc_inference_seconds ipc_actual_latency_ms <<< "${ipc_fields}"
+                2>/dev/null || printf 'null\tnull\tnull\tnull\tnull\tnull\tnull\tnull\t%s' "${total_latency_ms}")
+                IFS=$'\t' read -r ipc_output_text ipc_output_words ipc_inference_seconds ipc_requested_sequence_type ipc_runtime_temporal_encoding ipc_temporal_fallback_used ipc_sequence_type_json ipc_rendered_timestamps ipc_actual_latency_ms <<< "${ipc_fields}"
             else
                 ipc_actual_latency_ms="${total_latency_ms}"
             fi
@@ -837,6 +906,14 @@ PYEOF
                 export _BM_IPC_RESULT_PATH="${ipc_result_path_json}"
                 export _BM_MODEL_NAME="${IPC_RESOLVED_MODEL_NAME:-unknown}"
                 export _BM_ENGINE_PROVENANCE="${IPC_ENGINE_PROVENANCE_JSON}"
+                export _BM_SEQUENCE_TYPE="${ipc_sequence_type_json}"
+                export _BM_FPS="$([ -n "${FPS}" ] && echo "${FPS}" || echo 'null')"
+                export _BM_FRAME_TIMESTAMPS_SEC="${frame_timestamps_json}"
+                export _BM_FRAME_TIMESTAMP_POLICY="${frame_timestamp_policy}"
+                export _BM_RENDERED_TIMESTAMPS="${ipc_rendered_timestamps}"
+                export _BM_REQUESTED_SEQUENCE_TYPE="${ipc_requested_sequence_type}"
+                export _BM_RUNTIME_TEMPORAL_ENCODING="${ipc_runtime_temporal_encoding}"
+                export _BM_TEMPORAL_FALLBACK_USED="${ipc_temporal_fallback_used}"
                 export _BM_ITERATION="${iter_idx}"
                 export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
                 PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
@@ -860,6 +937,10 @@ echo "  Timestamp: ${TIMESTAMP}"
 echo "  Sequence dir: ${SEQUENCE_DIR}"
 echo "  Frame counts: ${FRAME_COUNTS}"
 echo "  Max output tokens: ${MAX_OUTPUT_TOKENS}"
+echo "  Sequence type: ${SEQUENCE_TYPE}"
+echo "  FPS: ${FPS:-unset}"
+echo "  Frame timestamps sec: ${FRAME_TIMESTAMPS_SEC:-unset}"
+echo "  Render timestamps: ${RENDER_TIMESTAMPS}"
 echo "  Paths: ${PATHS}"
 echo "  Engine: ${RESOLVED_MODEL_NAME:-unknown} ${RESOLVED_ENGINE_PROFILE_ID:+(${RESOLVED_ENGINE_PROFILE_ID})}"
 echo "  LLM engine dir: ${RESOLVED_LLM_ENGINE_DIR:-unset}"

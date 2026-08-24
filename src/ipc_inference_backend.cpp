@@ -95,6 +95,7 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   if (request.extra_images.size() > ipc::kMaxExtraImages) {
     throw std::runtime_error("IPC request exceeds maximum extra image count");
   }
+  detail::validate_temporal_metadata(request);
 
   const size_t max_image_bytes = std::min(
     config_.max_image_bytes, static_cast<size_t>(ipc::kMaxImageBytes));
@@ -156,6 +157,12 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   if (has_extra) {
     schema_flags |= ipc::kSchemaFlagMultiImage;
   }
+  if (request.fps.has_value()) {
+    schema_flags |= ipc::kSchemaFlagHasFps;
+  }
+  if (!request.frame_timestamps_sec.empty()) {
+    schema_flags |= ipc::kSchemaFlagHasFrameTimestamps;
+  }
 
   ipc::RequestHeader header;
   header.request_id = next_request_id_++;
@@ -172,6 +179,9 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   header.system_bytes = static_cast<uint32_t>(request.system_message.size());
   header.history_count = static_cast<uint32_t>(request.history.size());
   header.image_count = has_extra ? static_cast<uint32_t>(1 + packed_extra.size()) : 0U;
+  header.sequence_type = static_cast<uint32_t>(request.sequence_type);
+  header.fps = request.fps.value_or(0.0);
+  header.timestamp_count = static_cast<uint32_t>(request.frame_timestamps_sec.size());
 
   ipc::ResponseHeader response_header;
   try {
@@ -192,6 +202,12 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
       for (const auto & ei : packed_extra) {
         ipc::write_all(socket_fd_, ei.data, ei.total() * ei.elemSize());
       }
+    }
+    if (!request.frame_timestamps_sec.empty()) {
+      ipc::write_all(
+        socket_fd_,
+        request.frame_timestamps_sec.data(),
+        request.frame_timestamps_sec.size() * sizeof(double));
     }
     if (has_structured && !request.system_message.empty()) {
       ipc::write_all(socket_fd_, request.system_message.data(), request.system_message.size());
@@ -215,7 +231,8 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   if (response_header.magic != ipc::kMagic || response_header.version != ipc::kVersion ||
     response_header.request_id != header.request_id ||
     response_header.text_bytes > ipc::kMaxTextBytes ||
-    response_header.error_bytes > ipc::kMaxTextBytes)
+    response_header.error_bytes > ipc::kMaxTextBytes ||
+    response_header.temporal_encoding_bytes > ipc::kMaxTextBytes)
   {
     close_connection();
     throw std::runtime_error("invalid inference worker response");
@@ -226,9 +243,15 @@ InferenceResponse IpcInferenceBackend::infer(InferenceRequest const & request)
   response.inference_seconds = response_header.inference_seconds;
   response.text.resize(response_header.text_bytes);
   response.error.resize(response_header.error_bytes);
+  response.runtime_temporal_encoding.resize(response_header.temporal_encoding_bytes);
+  response.temporal_fallback_used = response_header.temporal_fallback_used != 0U;
+  response.requested_sequence_type = temporal_sequence_type_to_string(request.sequence_type);
   try {
     ipc::read_all(socket_fd_, response.text.data(), response.text.size());
     ipc::read_all(socket_fd_, response.error.data(), response.error.size());
+    ipc::read_all(
+      socket_fd_, response.runtime_temporal_encoding.data(),
+      response.runtime_temporal_encoding.size());
   } catch (...) {
     close_connection();
     throw;

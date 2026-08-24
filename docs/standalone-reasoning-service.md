@@ -53,12 +53,37 @@ source "$HOME/ros2_ws/install/setup.bash"
 "$HOME/ros2_ws/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_cli" \
   --socket /tmp/edge_vlm.sock \
   --image /absolute/path/to/image.jpg \
+  --sequence-type images \
   --prompt "Describe the current scene concisely." \
   --max-generate-length 64
 ```
 
 Run the command again with another image to verify that the service remains
 loaded across client connections.
+
+For multi-frame temporal contracts:
+
+```bash
+"$HOME/ros2_ws/install/edge_vlm_ros/lib/edge_vlm_ros/edge_vlm_cli" \
+  --socket /tmp/edge_vlm.sock \
+  --image /abs/frame_000.jpg \
+  --image /abs/frame_001.jpg \
+  --sequence-type temporal_images \
+  --fps 8 \
+  --frame-timestamps-sec 0.0,0.125 \
+  --prompt "Summarize scene changes as compact JSON." \
+  --max-generate-length 64
+```
+
+The current pinned TensorRT Edge-LLM runtime path used by this repository
+accepts ordered image buffers and text messages, but does not expose native
+video tensors or explicit FPS/timestamp fields to `LLMGenerationRequest`.
+When `sequence_type` is `temporal_images` or `video`, the server reports this
+as an explicit ordered-image fallback via:
+
+- `Requested sequence type: ...`
+- `Runtime temporal encoding: ...`
+- `Temporal fallback used: true|false`
 
 For a one-command Thor smoke test that starts the service, invokes two sequential
 clients, verifies that the service PID remains unchanged, and cleans up:
@@ -98,7 +123,7 @@ Before deleting a stale socket, confirm that no worker process owns it.
 The standalone boundary is intentionally established before changing transport.
 Future versions can add:
 
-- ordered image/video frames with source timestamps;
+- native runtime video/FPS/timestamp encoding once exposed by TensorRT Edge-LLM;
 - explicit session creation, continuation, reset, and close operations;
 - capability and model metadata queries;
 - structured result schemas;

@@ -42,6 +42,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -79,6 +80,97 @@ def _parse_inference_seconds(stderr: str) -> float | None:
             except (IndexError, ValueError):
                 pass
     return None
+
+
+def _parse_temporal_fields(stderr: str) -> tuple[str | None, str | None, bool | None]:
+    requested: str | None = None
+    runtime_encoding: str | None = None
+    fallback: bool | None = None
+    for line in stderr.splitlines():
+        if line.startswith("Requested sequence type:"):
+            requested = line.split(":", 1)[1].strip() or None
+        elif line.startswith("Runtime temporal encoding:"):
+            runtime_encoding = line.split(":", 1)[1].strip() or None
+        elif line.startswith("Temporal fallback used:"):
+            val = line.split(":", 1)[1].strip().lower()
+            if val in {"true", "false"}:
+                fallback = val == "true"
+    return requested, runtime_encoding, fallback
+
+
+def _parse_timestamps_csv(value: str) -> list[float]:
+    if not value.strip():
+        return []
+    out: list[float] = []
+    for item in value.split(","):
+        token = item.strip()
+        if not token:
+            raise ValueError("empty timestamp item in --frame-timestamps-sec")
+        out.append(float(token))
+    return out
+
+
+def _validate_temporal_contract(
+    sequence_type: str,
+    fps: float | None,
+    frame_timestamps_sec: list[float],
+    frame_count: int,
+) -> None:
+    if sequence_type == "images" and (fps is not None or frame_timestamps_sec):
+        raise ValueError("sequence_type=images must not include --fps or --frame-timestamps-sec")
+    if fps is not None and fps <= 0:
+        raise ValueError("--fps must be > 0")
+    if frame_timestamps_sec:
+        if len(frame_timestamps_sec) != frame_count:
+            raise ValueError(
+                f"--frame-timestamps-sec length ({len(frame_timestamps_sec)}) must match frame count ({frame_count})"
+            )
+        for i in range(1, len(frame_timestamps_sec)):
+            if not frame_timestamps_sec[i] > frame_timestamps_sec[i - 1]:
+                raise ValueError("--frame-timestamps-sec must be strictly increasing")
+    if fps is not None and len(frame_timestamps_sec) >= 2:
+        expected_dt = 1.0 / fps
+        for i in range(1, len(frame_timestamps_sec)):
+            dt = frame_timestamps_sec[i] - frame_timestamps_sec[i - 1]
+            if abs(dt - expected_dt) > 1e-3:
+                raise ValueError(
+                    f"--fps conflicts with --frame-timestamps-sec spacing at index {i}"
+                )
+
+
+def _render_timestamps(
+    image_paths: list[str],
+    frame_timestamps_sec: list[float],
+) -> tuple[list[str], tempfile.TemporaryDirectory[str]]:
+    try:
+        import cv2  # type: ignore
+    except Exception as exc:  # pragma: no cover - exercised only when rendering enabled
+        raise RuntimeError("timestamp rendering requested but OpenCV (cv2) is unavailable") from exc
+
+    tmpdir = tempfile.TemporaryDirectory(prefix="vlm_rendered_ts_")
+    rendered_paths: list[str] = []
+    for idx, image_path in enumerate(image_paths):
+        img = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if img is None:
+            tmpdir.cleanup()
+            raise RuntimeError(f"failed to decode image for timestamp rendering: {image_path}")
+        ts_text = f"{frame_timestamps_sec[idx]:.2f} s"
+        cv2.putText(
+            img,
+            ts_text,
+            (16, 32),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.85,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        out_path = Path(tmpdir.name) / f"frame_{idx:04d}.jpg"
+        if not cv2.imwrite(str(out_path), img):
+            tmpdir.cleanup()
+            raise RuntimeError(f"failed to write rendered timestamp frame: {out_path}")
+        rendered_paths.append(str(out_path))
+    return rendered_paths, tmpdir
 
 
 def main() -> int:
@@ -122,7 +214,44 @@ def main() -> int:
         metavar="N",
         help="Abort after N seconds (default: 120)",
     )
+    parser.add_argument(
+        "--sequence-type",
+        choices=["images", "temporal_images", "video"],
+        default="images",
+        help="Input sequence contract (default: images)",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Optional FPS metadata for temporal_images/video requests",
+    )
+    parser.add_argument(
+        "--frame-timestamps-sec",
+        default=None,
+        help="Optional comma-separated per-frame timestamps in seconds",
+    )
+    parser.add_argument(
+        "--render-timestamps",
+        action="store_true",
+        help="Render visible timestamps on frames (experimental control)",
+    )
     args = parser.parse_args()
+    try:
+        explicit_timestamps = (
+            _parse_timestamps_csv(args.frame_timestamps_sec)
+            if args.frame_timestamps_sec is not None
+            else []
+        )
+        _validate_temporal_contract(
+            sequence_type=args.sequence_type,
+            fps=args.fps,
+            frame_timestamps_sec=explicit_timestamps,
+            frame_count=len(args.images),
+        )
+    except ValueError as exc:
+        print(f"vlm_multi_frame_client: {exc}", file=sys.stderr)
+        return 2
 
     try:
         cli = _find_edge_vlm_cli()
@@ -130,14 +259,38 @@ def main() -> int:
         print(f"vlm_multi_frame_client: {exc}", file=sys.stderr)
         return 2
 
+    effective_timestamps = list(explicit_timestamps)
+    if args.render_timestamps and not effective_timestamps:
+        if args.fps is not None:
+            effective_timestamps = [i / args.fps for i in range(len(args.images))]
+        else:
+            effective_timestamps = [float(i) for i in range(len(args.images))]
+
+    images_for_inference = list(args.images)
+    render_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+    if args.render_timestamps:
+        try:
+            images_for_inference, render_tmpdir = _render_timestamps(
+                images_for_inference,
+                effective_timestamps if effective_timestamps else [float(i) for i in range(len(args.images))],
+            )
+        except RuntimeError as exc:
+            print(f"vlm_multi_frame_client: {exc}", file=sys.stderr)
+            return 2
+
     # Build command: one --image per frame so edge_vlm_cli sends a single
     # kSchemaFlagMultiImage IPC request carrying all frames together.
     cmd = [
         cli,
         "--socket", args.socket,
     ]
-    for img_path in args.images:
+    for img_path in images_for_inference:
         cmd += ["--image", img_path]
+    cmd += ["--sequence-type", args.sequence_type]
+    if args.fps is not None:
+        cmd += ["--fps", str(args.fps)]
+    if explicit_timestamps:
+        cmd += ["--frame-timestamps-sec", ",".join(f"{ts:.9g}" for ts in explicit_timestamps)]
     cmd += [
         "--prompt", args.prompt,
         "--max-generate-length", str(args.max_tokens),
@@ -152,6 +305,8 @@ def main() -> int:
             timeout=args.timeout,
         )
     except subprocess.TimeoutExpired:
+        if render_tmpdir is not None:
+            render_tmpdir.cleanup()
         elapsed_ms = round((time.monotonic() - t_start) * 1000.0)
         result: dict = {
             "success": False,
@@ -162,6 +317,13 @@ def main() -> int:
             "inference_seconds": None,
             "client_latency_ms": elapsed_ms,
             "frame_count": len(args.images),
+            "sequence_type": args.sequence_type,
+            "fps": args.fps,
+            "frame_timestamps_sec": explicit_timestamps or None,
+            "rendered_timestamps": args.render_timestamps,
+            "requested_sequence_type": None,
+            "runtime_temporal_encoding": None,
+            "temporal_fallback_used": None,
         }
         Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
         print(
@@ -171,6 +333,8 @@ def main() -> int:
         return 1
 
     elapsed_ms = round((time.monotonic() - t_start) * 1000.0)
+    if render_tmpdir is not None:
+        render_tmpdir.cleanup()
     success = proc.returncode == 0
     output_text: str | None = proc.stdout.strip() if success else None
     # output_tokens: real token count from backend when available; null otherwise.
@@ -179,6 +343,9 @@ def main() -> int:
     # output_words: whitespace-delimited word count — stored separately, not as token count.
     output_words: int | None = len(output_text.split()) if output_text else None
     inference_seconds = _parse_inference_seconds(proc.stderr)
+    requested_sequence_type, runtime_temporal_encoding, temporal_fallback_used = _parse_temporal_fields(
+        proc.stderr
+    )
 
     error_msg: str | None
     if success:
@@ -196,6 +363,13 @@ def main() -> int:
         "inference_seconds": inference_seconds,
         "client_latency_ms": elapsed_ms,
         "frame_count": len(args.images),
+        "sequence_type": args.sequence_type,
+        "fps": args.fps,
+        "frame_timestamps_sec": explicit_timestamps or None,
+        "rendered_timestamps": args.render_timestamps,
+        "requested_sequence_type": requested_sequence_type,
+        "runtime_temporal_encoding": runtime_temporal_encoding,
+        "temporal_fallback_used": temporal_fallback_used,
     }
     Path(args.output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
 

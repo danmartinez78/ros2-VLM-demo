@@ -6,6 +6,8 @@
 #include <cstdlib>
 #include <exception>
 #include <iostream>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -18,6 +20,8 @@ void usage(char const * program)
     << "Usage: " << program
     << " --socket PATH --image PATH [--image PATH ...] [--prompt TEXT]"
     << " [--max-generate-length N] [--temperature F] [--top-p F] [--top-k N]\n"
+    << " [--sequence-type images|temporal_images|video]"
+    << " [--fps F] [--frame-timestamps-sec CSV]\n"
     << "  --image may be specified multiple times for multi-frame requests.\n";
 }
 
@@ -27,6 +31,39 @@ std::string require_value(int argc, char ** argv, int & index)
     throw std::runtime_error(std::string("missing value for ") + argv[index]);
   }
   return argv[++index];
+}
+
+edge_vlm_ros::TemporalSequenceType parse_sequence_type(const std::string & value)
+{
+  if (value == "images") {
+    return edge_vlm_ros::TemporalSequenceType::kImages;
+  }
+  if (value == "temporal_images") {
+    return edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  }
+  if (value == "video") {
+    return edge_vlm_ros::TemporalSequenceType::kVideo;
+  }
+  throw std::runtime_error(
+          "invalid --sequence-type value: " + value +
+          " (expected images|temporal_images|video)");
+}
+
+std::vector<double> parse_timestamp_csv(const std::string & csv)
+{
+  std::vector<double> out;
+  if (csv.empty()) {
+    return out;
+  }
+  std::stringstream ss(csv);
+  std::string token;
+  while (std::getline(ss, token, ',')) {
+    if (token.empty()) {
+      throw std::runtime_error("invalid --frame-timestamps-sec CSV (empty item)");
+    }
+    out.push_back(std::stod(token));
+  }
+  return out;
 }
 }  // namespace
 
@@ -61,6 +98,12 @@ int main(int argc, char ** argv)
         request.top_p = std::stof(require_value(argc, argv, index));
       } else if (option == "--top-k") {
         request.top_k = std::stoi(require_value(argc, argv, index));
+      } else if (option == "--sequence-type") {
+        request.sequence_type = parse_sequence_type(require_value(argc, argv, index));
+      } else if (option == "--fps") {
+        request.fps = std::stod(require_value(argc, argv, index));
+      } else if (option == "--frame-timestamps-sec") {
+        request.frame_timestamps_sec = parse_timestamp_csv(require_value(argc, argv, index));
       } else {
         throw std::runtime_error("unknown option: " + option);
       }
@@ -78,6 +121,7 @@ int main(int argc, char ** argv)
     if (request.max_generate_length <= 0) {
       throw std::runtime_error("--max-generate-length must be positive");
     }
+    edge_vlm_ros::detail::validate_temporal_metadata(request);
 
     // Load primary image.
     request.image = cv::imread(image_paths[0], cv::IMREAD_COLOR);
@@ -104,6 +148,10 @@ int main(int argc, char ** argv)
 
     std::cout << response.text << '\n';
     std::cerr << "Inference time: " << response.inference_seconds << " seconds\n";
+    std::cerr << "Requested sequence type: " << response.requested_sequence_type << '\n';
+    std::cerr << "Runtime temporal encoding: " << response.runtime_temporal_encoding << '\n';
+    std::cerr << "Temporal fallback used: " << (response.temporal_fallback_used ? "true" : "false")
+              << '\n';
     return 0;
   } catch (std::exception const & error) {
     std::cerr << "edge_vlm_cli: " << error.what() << '\n';

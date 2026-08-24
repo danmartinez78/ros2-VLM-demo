@@ -134,6 +134,18 @@ void TensorRTEdgeLLMBackend::initialize()
 InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request)
 {
   InferenceResponse resp;
+  resp.requested_sequence_type = temporal_sequence_type_to_string(request.sequence_type);
+  if (request.sequence_type == TemporalSequenceType::kImages) {
+    resp.runtime_temporal_encoding = "ordered_multi_image_no_native_temporal_metadata";
+    resp.temporal_fallback_used = false;
+  } else {
+    // The pinned TensorRT Edge-LLM request API used here accepts imageBuffers + message
+    // contents only; it does not expose native per-frame timestamps/FPS/video tensors.
+    // We therefore preserve ordered frames but explicitly report temporal fallback.
+    resp.runtime_temporal_encoding =
+      "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm";
+    resp.temporal_fallback_used = true;
+  }
   auto t0 = std::chrono::steady_clock::now();
 
   // ── Encode OpenCV Mat → JPEG bytes ────────────────────────────────────

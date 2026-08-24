@@ -120,15 +120,16 @@ C++ ABIs into the production process is unnecessary and unsafe.
 
 The socket defaults to `/tmp/edge_vlm.sock`. Requests and responses use
 fixed, trivially-copyable headers followed by bounded byte payloads.
-The current schema version is **2** (`kVersion = 2`).
+The current schema version is **3** (`kVersion = 3`).
 
-### Request (v2)
+### Request (v3)
 
 | Field group | Contents |
 | --- | --- |
-| Identity | magic, protocol version (2), monotonically increasing request ID |
+| Identity | magic, protocol version (3), monotonically increasing request ID |
 | Image | encoding ID, width, height, packed step, byte length, BGR8 bytes |
 | Schema | `schema_flags` (delivery mode bits), `system_bytes`, `history_count` |
+| Temporal contract | `sequence_type` (`images`, `temporal_images`, `video`), optional `fps`, optional per-frame timestamps |
 | Task | user-message text length and bytes |
 | Generation | maximum tokens, temperature, top-p, top-k |
 
@@ -140,6 +141,11 @@ The current schema version is **2** (`kVersion = 2`).
 | `1` | `kSchemaFlagStructured` | `[system_bytes bytes][prompt_bytes bytes][history_count × entry]` |
 | `3` | `kSchemaFlagStructured \| kSchemaFlagSysCache` | structured + request system-prompt caching |
 
+Temporal metadata bits:
+
+- `kSchemaFlagHasFps`: `RequestHeader.fps` is populated.
+- `kSchemaFlagHasFrameTimestamps`: `timestamp_count` doubles follow the image payload.
+
 Each history entry is preceded by a `HistoryEntryHeader` containing
 `user_bytes` and `asst_bytes`, followed immediately by the user text and
 assistant text bytes:
@@ -149,6 +155,21 @@ assistant text bytes:
 
 Prior assistant outputs are carried as untrusted observations in the history
 user/assistant turn pairs. They are **never** promoted to system-role authority.
+
+### Temporal representation status
+
+The request contract now distinguishes:
+
+- `images`: ordered independent images (legacy behavior);
+- `temporal_images`: ordered images plus explicit temporal metadata;
+- `video`: caller requests native video semantics.
+
+For the pinned TensorRT Edge-LLM path currently used in this repository, the
+backend API exposes ordered image buffers and chat-message content but does not
+expose native video tensors or explicit FPS/timestamp fields in
+`LLMGenerationRequest`. Temporal/video requests are therefore represented as
+ordered images with explicit fallback reporting (`runtime_temporal_encoding`,
+`temporal_fallback_used`) rather than silent downgrade.
 
 #### System-prompt cache (`kSchemaFlagSysCache`)
 
@@ -338,7 +359,10 @@ process boundary has not regressed.
 
 ## Known limitations and follow-ups
 
-- Independent frames rather than temporal video windows: issue #8.
+- Temporal contracts (`images`, `temporal_images`, `video`) are now carried
+  end-to-end, but the pinned TensorRT Edge-LLM runtime path still reaches
+  inference as ordered image buffers and reports temporal/video requests as
+  explicit fallback representations.
 - Formal latency/resource benchmarks: issue #7.
 - Model portability and measured optimization: issue #9.
 - RViz2 visualization: issue #10.

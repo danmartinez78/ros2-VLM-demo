@@ -23,6 +23,7 @@
 #include "edge_vlm_ros/tensorrt_edge_llm_backend.hpp"
 
 #include <cstddef>
+#include <stdexcept>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -160,6 +161,39 @@ TEST(TrtBackendMultiframe, ContentCountConsistency)
       detail::user_message_content_count(req))
       << "extra_count=" << extra;
   }
+}
+
+TEST(TrtBackendMultiframe, TemporalImagesAllowConsistentFpsAndTimestamps)
+{
+  auto req = make_request(1);
+  req.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  req.fps = 4.0;
+  req.frame_timestamps_sec = {0.0, 0.25};
+  EXPECT_NO_THROW(edge_vlm_ros::detail::validate_temporal_metadata(req));
+}
+
+TEST(TrtBackendMultiframe, ImagesRejectTemporalMetadata)
+{
+  auto req = make_request(0);
+  req.fps = 8.0;
+  EXPECT_THROW(edge_vlm_ros::detail::validate_temporal_metadata(req), std::runtime_error);
+}
+
+TEST(TrtBackendMultiframe, RejectsTimestampCountMismatch)
+{
+  auto req = make_request(2);
+  req.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  req.frame_timestamps_sec = {0.0, 0.1};
+  EXPECT_THROW(edge_vlm_ros::detail::validate_temporal_metadata(req), std::runtime_error);
+}
+
+TEST(TrtBackendMultiframe, RejectsFpsTimestampConflict)
+{
+  auto req = make_request(1);
+  req.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  req.fps = 10.0;
+  req.frame_timestamps_sec = {0.0, 0.2};
+  EXPECT_THROW(edge_vlm_ros::detail::validate_temporal_metadata(req), std::runtime_error);
 }
 
 }  // namespace

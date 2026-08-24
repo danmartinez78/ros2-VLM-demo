@@ -542,8 +542,10 @@ The production node accepts `bgr8`, `rgb8`, and `mono8` raw images.
 
 ## Known limitations
 
-- Independent sampled images, not temporal video windows
-  ([#8](https://github.com/danmartinez78/ros2-VLM-demo/issues/8)).
+- Temporal contracts are explicit (`images`, `temporal_images`, `video`), but the
+  pinned TensorRT Edge-LLM runtime path currently reaches the model as ordered
+  image buffers; `temporal_images`/`video` are reported as explicit fallback
+  representations until native temporal metadata is exposed.
 - Batch size one; batching has not been shown beneficial for this live path.
 - Raw `sensor_msgs/msg/Image` only; compressed streams require decoding first.
 - Task-level evaluation requires curated run outputs plus rubric review

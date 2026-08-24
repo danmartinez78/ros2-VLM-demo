@@ -88,6 +88,14 @@ def _make_record(
     path: str = "direct",
     frame_paths: list[dict] | None = None,
     prompt_hash_val: str = "abc123def456",
+    sequence_type: str = "images",
+    fps: float | None = None,
+    frame_timestamps_sec: list[float] | None = None,
+    frame_timestamp_policy: str = "none",
+    rendered_timestamps: bool = False,
+    requested_sequence_type: str | None = "images",
+    runtime_temporal_encoding: str | None = "ordered_multi_image_no_native_temporal_metadata",
+    temporal_fallback_used: bool | None = False,
     max_output_tokens: int = MAX_OUTPUT_TOKENS,
     actual_output_tokens: int | None = 12,
     total_image_tokens: int | None = None,
@@ -125,6 +133,14 @@ def _make_record(
         "path": path,
         "frame_paths": frame_paths,
         "prompt_hash": prompt_hash_val,
+        "sequence_type": sequence_type,
+        "fps": fps,
+        "frame_timestamps_sec": frame_timestamps_sec,
+        "frame_timestamp_policy": frame_timestamp_policy,
+        "rendered_timestamps": rendered_timestamps,
+        "requested_sequence_type": requested_sequence_type,
+        "runtime_temporal_encoding": runtime_temporal_encoding,
+        "temporal_fallback_used": temporal_fallback_used,
         "max_output_tokens": max_output_tokens,
         "actual_output_tokens": actual_output_tokens,
         "total_image_tokens": total_image_tokens,
@@ -972,6 +988,7 @@ class TestBuildReport(unittest.TestCase):
             "schema_version", "generated_at", "source_file",
             "run_ids", "model_names", "n_total_records", "n_measured_records",
             "engine_provenance", "engine_provenance_variants", "mixed_engine_provenance",
+            "temporal_config_variants",
             "frame_conditions", "frame_scaling_table", "ipc_artifact_table", "raw_records",
         ]:
             self.assertIn(key, report)
@@ -1284,6 +1301,8 @@ class TestShellSyntax(unittest.TestCase):
         self.assertIn("--socket", content)
         # Must pass multiple --image arguments for multi-frame support
         self.assertIn("--image", content)
+        self.assertIn("--sequence-type", content)
+        self.assertIn("--render-timestamps", content)
         # Must NOT use vlm_single_shot_client (single-image only)
         self.assertNotIn("vlm_single_shot_client", content)
 
@@ -1402,6 +1421,13 @@ def _direct_env(
     frame_count: int = 1,
     frame_hashes: list | None = None,
     prompt_hash: str = "abc123def456",
+    sequence_type: str = '"images"',
+    fps: str = "null",
+    frame_timestamps_sec: str = "null",
+    frame_timestamp_policy: str = '"none"',
+    rendered_timestamps: str = "false",
+    runtime_temporal_encoding: str = '"ordered_multi_image_no_native_temporal_metadata"',
+    temporal_fallback_used: str = "false",
     max_output_tokens: int = 32,
     actual_output_tokens: str = "null",
     total_image_tokens: str = "null",
@@ -1431,6 +1457,13 @@ def _direct_env(
         "_BM_FRAME_COUNT": str(frame_count),
         "_BM_FRAME_HASHES": json.dumps(frame_hashes),
         "_BM_PROMPT_HASH": prompt_hash,
+        "_BM_SEQUENCE_TYPE": sequence_type,
+        "_BM_FPS": fps,
+        "_BM_FRAME_TIMESTAMPS_SEC": frame_timestamps_sec,
+        "_BM_FRAME_TIMESTAMP_POLICY": frame_timestamp_policy,
+        "_BM_RENDERED_TIMESTAMPS": rendered_timestamps,
+        "_BM_RUNTIME_TEMPORAL_ENCODING": runtime_temporal_encoding,
+        "_BM_TEMPORAL_FALLBACK_USED": temporal_fallback_used,
         "_BM_MAX_OUTPUT_TOKENS": str(max_output_tokens),
         "_BM_ACTUAL_OUTPUT_TOKENS": actual_output_tokens,
         "_BM_TOTAL_IMAGE_TOKENS": total_image_tokens,
@@ -1460,6 +1493,14 @@ def _ipc_env(
     frame_count: int = 1,
     frame_hashes: list | None = None,
     prompt_hash: str = "abc123def456",
+    sequence_type: str = '"images"',
+    fps: str = "null",
+    frame_timestamps_sec: str = "null",
+    frame_timestamp_policy: str = '"none"',
+    rendered_timestamps: str = "false",
+    requested_sequence_type: str = '"images"',
+    runtime_temporal_encoding: str = '"ordered_multi_image_no_native_temporal_metadata"',
+    temporal_fallback_used: str = "false",
     max_output_tokens: int = 32,
     success: str = "true",
     error: str = "null",
@@ -1483,6 +1524,14 @@ def _ipc_env(
         "_BM_FRAME_COUNT": str(frame_count),
         "_BM_FRAME_HASHES": json.dumps(frame_hashes),
         "_BM_PROMPT_HASH": prompt_hash,
+        "_BM_SEQUENCE_TYPE": sequence_type,
+        "_BM_FPS": fps,
+        "_BM_FRAME_TIMESTAMPS_SEC": frame_timestamps_sec,
+        "_BM_FRAME_TIMESTAMP_POLICY": frame_timestamp_policy,
+        "_BM_RENDERED_TIMESTAMPS": rendered_timestamps,
+        "_BM_REQUESTED_SEQUENCE_TYPE": requested_sequence_type,
+        "_BM_RUNTIME_TEMPORAL_ENCODING": runtime_temporal_encoding,
+        "_BM_TEMPORAL_FALLBACK_USED": temporal_fallback_used,
         "_BM_MAX_OUTPUT_TOKENS": str(max_output_tokens),
         "_BM_SUCCESS": success,
         "_BM_ERROR": error,
@@ -1621,6 +1670,27 @@ class TestRecordSerializer(unittest.TestCase):
         self.assertEqual(obj["schema_version"], "1")
         self.assertEqual(obj["record_type"], "inference")
 
+    def test_direct_temporal_metadata_fields(self):
+        rec = json.loads(build_direct_record(_direct_env(
+            sequence_type='"temporal_images"',
+            fps="8.0",
+            frame_timestamps_sec="[0.0, 0.125]",
+            frame_timestamp_policy='"explicit"',
+            rendered_timestamps="true",
+            runtime_temporal_encoding='"ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm"',
+            temporal_fallback_used="true",
+        )))
+        self.assertEqual(rec["sequence_type"], "temporal_images")
+        self.assertAlmostEqual(rec["fps"], 8.0)
+        self.assertEqual(rec["frame_timestamps_sec"], [0.0, 0.125])
+        self.assertEqual(rec["frame_timestamp_policy"], "explicit")
+        self.assertIs(rec["rendered_timestamps"], True)
+        self.assertEqual(
+            rec["runtime_temporal_encoding"],
+            "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm",
+        )
+        self.assertIs(rec["temporal_fallback_used"], True)
+
     # ── IPC record ────────────────────────────────────────────────────────
 
     def test_ipc_success_true(self):
@@ -1708,6 +1778,23 @@ class TestRecordSerializer(unittest.TestCase):
         obj = json.loads(raw)
         self.assertEqual(obj["schema_version"], "1")
         self.assertEqual(obj["record_type"], "inference")
+
+    def test_ipc_temporal_metadata_fields(self):
+        rec = json.loads(build_ipc_record(_ipc_env(
+            sequence_type='"video"',
+            fps="15.0",
+            frame_timestamps_sec="[0.0, 0.0666667]",
+            frame_timestamp_policy='"explicit"',
+            rendered_timestamps="false",
+            requested_sequence_type='"video"',
+            runtime_temporal_encoding='"ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm"',
+            temporal_fallback_used="true",
+        )))
+        self.assertEqual(rec["sequence_type"], "video")
+        self.assertEqual(rec["requested_sequence_type"], "video")
+        self.assertAlmostEqual(rec["fps"], 15.0)
+        self.assertEqual(rec["frame_timestamp_policy"], "explicit")
+        self.assertIs(rec["temporal_fallback_used"], True)
 
     # ── shell-level serialiser test ────────────────────────────────────────
     # Exercises the env-var → Python path as the shell script does it, using

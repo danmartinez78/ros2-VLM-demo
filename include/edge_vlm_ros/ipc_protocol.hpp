@@ -18,7 +18,8 @@ constexpr uint32_t kMagic = 0x45564C4D;  // EVLM
 /// IPC schema version.
 /// v1: prompt_bytes only, single inline user message.
 /// v2: schema_flags, system_bytes, history_count — adds structured message roles.
-constexpr uint32_t kVersion = 2;
+/// v3: sequence_type/fps/frame_timestamps metadata + response temporal encoding fields.
+constexpr uint32_t kVersion = 3;
 constexpr uint32_t kEncodingBgr8 = 1;
 constexpr uint32_t kMaxTextBytes = 1024 * 1024;
 constexpr uint32_t kMaxImageBytes = 256 * 1024 * 1024;
@@ -36,13 +37,19 @@ constexpr uint32_t kSchemaFlagInline = 0U;
 constexpr uint32_t kSchemaFlagStructured = 1U << 0;
 constexpr uint32_t kSchemaFlagSysCache = 1U << 1;
 /// kSchemaFlagMultiImage: request carries multiple images in temporal order.
-/// When set, RequestHeader._reserved holds the total image count (>= 2).
+/// When set, RequestHeader.image_count holds the total image count (>= 2).
 /// Wire format after RequestHeader:
 ///   [image_count-1 × PerImageHeader]          — headers for extra images (index 1..N-1)
 ///   [image_0_bytes]                            — raw BGR data for image 0 (primary)
 ///   [image_1_bytes .. image_{N-1}_bytes]       — raw BGR data for extra images
+///   [timestamp_count × double]                 — optional frame timestamps (when flagged)
 ///   [system_bytes][prompt_bytes][history ...]  — normal structured/inline payload
 constexpr uint32_t kSchemaFlagMultiImage = 1U << 2;
+/// kSchemaFlagHasFps: RequestHeader.fps is populated with a finite value > 0.
+constexpr uint32_t kSchemaFlagHasFps = 1U << 3;
+/// kSchemaFlagHasFrameTimestamps: request carries `timestamp_count` doubles after
+/// image payload (and before prompt/system/history payload).
+constexpr uint32_t kSchemaFlagHasFrameTimestamps = 1U << 4;
 constexpr uint32_t kMaxExtraImages = 31U;  ///< Maximum extra images beyond the primary.
 
 struct RequestHeader
@@ -70,9 +77,17 @@ struct RequestHeader
   /// Single-image requests: 0 (reserved).
   /// Multi-image requests (kSchemaFlagMultiImage set): total image count including primary (>= 2).
   uint32_t image_count{0};
+  /// Requested sequence semantics: 0=images, 1=temporal_images, 2=video.
+  uint32_t sequence_type{0U};
+  /// Optional fps value. Valid when kSchemaFlagHasFps is set.
+  double fps{0.0};
+  /// Number of entries in frame_timestamps_sec sent on the wire after image payload.
+  uint32_t timestamp_count{0U};
+  /// Reserved for forward-compatible protocol extension.
+  uint32_t reserved{0U};
 };
 
-/// Fixed-size header preceding each history entry in the v2 wire format.
+/// Fixed-size header preceding each history entry in the structured wire format.
 /// Layout per entry: [HistoryEntryHeader][user_bytes bytes][asst_bytes bytes]
 struct HistoryEntryHeader
 {
@@ -100,6 +115,8 @@ struct ResponseHeader
   uint32_t success{0};
   uint32_t text_bytes{0};
   uint32_t error_bytes{0};
+  uint32_t temporal_encoding_bytes{0};
+  uint32_t temporal_fallback_used{0};
   double inference_seconds{0.0};
 };
 
