@@ -52,39 +52,41 @@ InferenceRequest make_request(std::size_t extra_count)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// image_content_count
+// media_content_count
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST(TrtBackendMultiframe, SingleFrameHasOneImageContentItem)
 {
   auto req = make_request(0);
-  EXPECT_EQ(detail::image_content_count(req), 1u);
+  EXPECT_EQ(detail::media_content_count(req), 1u);
 }
 
 TEST(TrtBackendMultiframe, TwoFramesHaveTwoImageContentItems)
 {
   auto req = make_request(1);  // primary + 1 extra = F2
-  EXPECT_EQ(detail::image_content_count(req), 2u);
+  EXPECT_EQ(detail::media_content_count(req), 2u);
 }
 
 TEST(TrtBackendMultiframe, FourFramesHaveFourImageContentItems)
 {
   auto req = make_request(3);  // primary + 3 extra = F4
-  EXPECT_EQ(detail::image_content_count(req), 4u);
+  EXPECT_EQ(detail::media_content_count(req), 4u);
 }
 
 TEST(TrtBackendMultiframe, EightFramesHaveEightImageContentItems)
 {
   auto req = make_request(7);  // primary + 7 extra = F8
-  EXPECT_EQ(detail::image_content_count(req), 8u);
+  EXPECT_EQ(detail::media_content_count(req), 8u);
 }
 
-// image_content_count == imageBuffers count (one buffer per frame)
+// media_content_count == imageBuffers count
 TEST(TrtBackendMultiframe, ImageContentCountMatchesExpectedBufferCount)
 {
   for (std::size_t extra : {0u, 1u, 3u, 7u}) {
     auto req = make_request(extra);
-    EXPECT_EQ(detail::image_content_count(req), extra + 1u)
+    EXPECT_EQ(detail::media_content_count(req), extra + 1u)
+      << "extra_count=" << extra;
+    EXPECT_EQ(detail::image_buffer_count(req), extra + 1u)
       << "extra_count=" << extra;
   }
 }
@@ -157,10 +159,40 @@ TEST(TrtBackendMultiframe, ContentCountConsistency)
   for (std::size_t extra : {0u, 1u, 2u, 3u, 4u, 7u}) {
     auto req = make_request(extra);
     EXPECT_EQ(
-      detail::image_content_count(req) + 1u,
+      detail::media_content_count(req) + 1u,
       detail::user_message_content_count(req))
       << "extra_count=" << extra;
   }
+}
+
+TEST(TrtBackendMultiframe, TemporalSequenceUsesSingleVideoContentAndBuffer)
+{
+  auto req = make_request(3);  // F4 request
+  req.sequence_type = edge_vlm_ros::TemporalSequenceType::kVideo;
+  EXPECT_TRUE(detail::uses_native_video_encoding(req));
+  EXPECT_EQ(detail::media_content_count(req), 1u);
+  EXPECT_EQ(detail::image_buffer_count(req), 1u);
+  EXPECT_STREQ(detail::media_content_type(req), "video");
+  EXPECT_EQ(detail::user_message_content_count(req), 2u);  // one video + one text
+}
+
+TEST(TrtBackendMultiframe, TemporalSequenceCarriesEffectiveNativeVideoFps)
+{
+  auto req = make_request(1);  // F2 request
+  req.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
+  req.fps = 8.0;
+  req.frame_timestamps_sec = {0.0, 0.125};
+  ASSERT_TRUE(detail::infer_effective_video_fps(req).has_value());
+  EXPECT_DOUBLE_EQ(*detail::infer_effective_video_fps(req), 8.0);
+}
+
+TEST(TrtBackendMultiframe, TemporalSequenceDerivesFpsFromTimestampsWhenNotProvided)
+{
+  auto req = make_request(2);  // F3 request
+  req.sequence_type = edge_vlm_ros::TemporalSequenceType::kVideo;
+  req.frame_timestamps_sec = {0.0, 0.1, 0.2};
+  ASSERT_TRUE(detail::infer_effective_video_fps(req).has_value());
+  EXPECT_NEAR(*detail::infer_effective_video_fps(req), 10.0, 1e-9);
 }
 
 TEST(TrtBackendMultiframe, TemporalImagesAllowConsistentFpsAndTimestamps)

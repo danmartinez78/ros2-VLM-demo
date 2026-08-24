@@ -75,11 +75,15 @@ For multi-frame temporal contracts:
   --max-generate-length 64
 ```
 
-The current pinned TensorRT Edge-LLM runtime path used by this repository
-accepts ordered image buffers and text messages, but does not expose native
-video tensors or explicit FPS/timestamp fields to `LLMGenerationRequest`.
-When `sequence_type` is `temporal_images` or `video`, the server reports this
-as an explicit ordered-image fallback via:
+At the pinned TensorRT Edge-LLM commit used by this repository:
+
+- `sequence_type=images` uses N independent `image` content items and N image
+  buffers;
+- `sequence_type=temporal_images|video` uses one native `video` content item
+  and one stacked `ImageData` (`[T,H,W,3]`, `isVideo=true`, effective fps,
+  optional timestamps).
+
+The server reports effective runtime representation via:
 
 - `Requested sequence type: ...`
 - `Runtime temporal encoding: ...`
@@ -123,7 +127,6 @@ Before deleting a stale socket, confirm that no worker process owns it.
 The standalone boundary is intentionally established before changing transport.
 Future versions can add:
 
-- native runtime video/FPS/timestamp encoding once exposed by TensorRT Edge-LLM;
 - explicit session creation, continuation, reset, and close operations;
 - capability and model metadata queries;
 - structured result schemas;

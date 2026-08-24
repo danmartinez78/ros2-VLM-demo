@@ -477,15 +477,14 @@ TEST(IpcInferenceBackend, ParsesTemporalEncodingFieldsFromWorkerResponse)
     std::string prompt;
     read_request_frame(client_fd, request_header, image, prompt);
 
-    const std::string encoding =
-      "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm";
+    const std::string encoding = "native_qwen3vl_video_imagedata_mrope_timestamps";
     ipc::ResponseHeader response;
     response.request_id = request_header.request_id;
     response.success = 1;
     response.text_bytes = 2;
     response.error_bytes = 0;
     response.temporal_encoding_bytes = static_cast<uint32_t>(encoding.size());
-    response.temporal_fallback_used = 1U;
+    response.temporal_fallback_used = 0U;
     ipc::write_all(client_fd, &response, sizeof(response));
     const std::string text = "ok";
     ipc::write_all(client_fd, text.data(), text.size());
@@ -505,8 +504,8 @@ TEST(IpcInferenceBackend, ParsesTemporalEncodingFieldsFromWorkerResponse)
   EXPECT_EQ(response.text, "ok");
   EXPECT_EQ(
     response.runtime_temporal_encoding,
-    "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm");
-  EXPECT_TRUE(response.temporal_fallback_used);
+    "native_qwen3vl_video_imagedata_mrope_timestamps");
+  EXPECT_FALSE(response.temporal_fallback_used);
   EXPECT_EQ(response.requested_sequence_type, "images");
   worker.join_and_rethrow();
 }

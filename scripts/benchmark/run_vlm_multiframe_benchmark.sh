@@ -259,7 +259,7 @@ _runtime_temporal_encoding_for_direct() {
     if [[ "${SEQUENCE_TYPE}" == "images" ]]; then
         echo "ordered_multi_image_no_native_temporal_metadata"
     else
-        echo "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm"
+        echo "native_qwen3vl_video_imagedata_mrope_timestamps"
     fi
 }
 
@@ -775,7 +775,7 @@ print('\t'.join([
             export _BM_FRAME_TIMESTAMP_POLICY="${frame_timestamp_policy}"
             export _BM_RENDERED_TIMESTAMPS="$([ "${RENDER_TIMESTAMPS}" = 'true' ] && echo 'true' || echo 'false')"
             export _BM_RUNTIME_TEMPORAL_ENCODING="\"$(_runtime_temporal_encoding_for_direct)\""
-            export _BM_TEMPORAL_FALLBACK_USED="$([ "${SEQUENCE_TYPE}" = 'images' ] && echo 'false' || echo 'true')"
+            export _BM_TEMPORAL_FALLBACK_USED="false"
             export _BM_ITERATION="${iter_idx}"
             export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
             PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \

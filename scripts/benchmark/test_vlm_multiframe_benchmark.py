@@ -1677,8 +1677,8 @@ class TestRecordSerializer(unittest.TestCase):
             frame_timestamps_sec="[0.0, 0.125]",
             frame_timestamp_policy='"explicit"',
             rendered_timestamps="true",
-            runtime_temporal_encoding='"ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm"',
-            temporal_fallback_used="true",
+            runtime_temporal_encoding='"native_qwen3vl_video_imagedata_mrope_timestamps"',
+            temporal_fallback_used="false",
         )))
         self.assertEqual(rec["sequence_type"], "temporal_images")
         self.assertAlmostEqual(rec["fps"], 8.0)
@@ -1687,9 +1687,9 @@ class TestRecordSerializer(unittest.TestCase):
         self.assertIs(rec["rendered_timestamps"], True)
         self.assertEqual(
             rec["runtime_temporal_encoding"],
-            "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm",
+            "native_qwen3vl_video_imagedata_mrope_timestamps",
         )
-        self.assertIs(rec["temporal_fallback_used"], True)
+        self.assertIs(rec["temporal_fallback_used"], False)
 
     # ── IPC record ────────────────────────────────────────────────────────
 
@@ -1787,14 +1787,14 @@ class TestRecordSerializer(unittest.TestCase):
             frame_timestamp_policy='"explicit"',
             rendered_timestamps="false",
             requested_sequence_type='"video"',
-            runtime_temporal_encoding='"ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm"',
-            temporal_fallback_used="true",
+            runtime_temporal_encoding='"native_qwen3vl_video_imagedata_mrope_timestamps"',
+            temporal_fallback_used="false",
         )))
         self.assertEqual(rec["sequence_type"], "video")
         self.assertEqual(rec["requested_sequence_type"], "video")
         self.assertAlmostEqual(rec["fps"], 15.0)
         self.assertEqual(rec["frame_timestamp_policy"], "explicit")
-        self.assertIs(rec["temporal_fallback_used"], True)
+        self.assertIs(rec["temporal_fallback_used"], False)
 
     # ── shell-level serialiser test ────────────────────────────────────────
     # Exercises the env-var → Python path as the shell script does it, using

@@ -21,6 +21,7 @@
 #include "edge_vlm_ros/tensorrt_edge_llm_backend.hpp"
 
 #include <chrono>
+#include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <iterator>
@@ -34,6 +35,72 @@
 
 namespace edge_vlm_ros
 {
+namespace
+{
+
+double effective_video_fps_or_throw(const InferenceRequest & request)
+{
+  const auto fps = detail::infer_effective_video_fps(request);
+  if (!fps.has_value() || !std::isfinite(*fps) || *fps <= 0.0) {
+    throw std::runtime_error("unable to derive effective video fps for temporal/video request");
+  }
+  return *fps;
+}
+
+trt_edgellm::rt::imageUtils::ImageData build_native_video_imagedata(
+  const std::vector<trt_edgellm::rt::imageUtils::ImageData> & frames, double fps,
+  const std::vector<double> & timestamps)
+{
+  if (frames.empty()) {
+    throw std::runtime_error("native video construction requires at least one frame");
+  }
+
+  const int64_t height = frames[0].height;
+  const int64_t width = frames[0].width;
+  const int64_t channels = frames[0].channels;
+  if (height <= 0 || width <= 0 || channels != 3) {
+    throw std::runtime_error("decoded primary frame has invalid dimensions for native video");
+  }
+
+  const int64_t frame_bytes = height * width * channels;
+  const std::size_t frame_copy_bytes = static_cast<std::size_t>(frame_bytes);
+  const int64_t total_frames = static_cast<int64_t>(frames.size());
+  trt_edgellm::rt::Tensor stacked(
+    {total_frames, height, width, channels},
+    trt_edgellm::rt::DeviceType::kCPU,
+    nvinfer1::DataType::kUINT8,
+    "edge_vlm_ros::TensorRTEdgeLLMBackend::native_video_stacked");
+  auto * dst = stacked.dataPointer<unsigned char>();
+
+  for (std::size_t i = 0; i < frames.size(); ++i) {
+    const auto & frame = frames[i];
+    if (!frame.buffer) {
+      throw std::runtime_error("decoded frame " + std::to_string(i) + " has null buffer");
+    }
+    if (frame.height != height || frame.width != width || frame.channels != channels) {
+      throw std::runtime_error(
+              "native video requires all frames to share identical dimensions/channels");
+    }
+    if (frame.bytesPerFrame() != frame_bytes) {
+      throw std::runtime_error("decoded frame has unexpected byte size for native video copy");
+    }
+    std::memcpy(
+      dst + static_cast<std::size_t>(i) * frame_copy_bytes,
+      frame.data(),
+      frame_copy_bytes);
+  }
+
+  trt_edgellm::rt::imageUtils::ImageData video(std::move(stacked));
+  video.fps = fps;
+  video.isVideo = true;
+  if (!timestamps.empty()) {
+    video.timestamps = timestamps;
+  }
+  return video;
+}
+
+}  // namespace
+
 
 TensorRTEdgeLLMBackend::TensorRTEdgeLLMBackend(TensorRTEdgeLLMConfig config)
 : config_(std::move(config)),
@@ -135,17 +202,14 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
 {
   InferenceResponse resp;
   resp.requested_sequence_type = temporal_sequence_type_to_string(request.sequence_type);
-  if (request.sequence_type == TemporalSequenceType::kImages) {
-    resp.runtime_temporal_encoding = "ordered_multi_image_no_native_temporal_metadata";
-    resp.temporal_fallback_used = false;
-  } else {
-    // The pinned TensorRT Edge-LLM request API used here accepts imageBuffers + message
-    // contents only; it does not expose native per-frame timestamps/FPS/video tensors.
-    // We therefore preserve ordered frames but explicitly report temporal fallback.
-    resp.runtime_temporal_encoding =
-      "ordered_multi_image_fallback_no_native_video_fps_timestamp_api_in_pinned_edgellm";
-    resp.temporal_fallback_used = true;
+  try {
+    detail::validate_temporal_metadata(request);
+  } catch (const std::exception & e) {
+    resp.success = false;
+    resp.error = e.what();
+    return resp;
   }
+  const bool use_native_video = detail::uses_native_video_encoding(request);
   auto t0 = std::chrono::steady_clock::now();
 
   // ── Encode OpenCV Mat → JPEG bytes ────────────────────────────────────
@@ -187,8 +251,15 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
   }
 
   // Encode extra images (indices 1 … N) and fail clearly on any invalid input.
+  std::vector<trt_edgellm::rt::imageUtils::ImageData> decoded_frames;
+  if (use_native_video) {
+    decoded_frames.reserve(1U + request.extra_images.size());
+    decoded_frames.push_back(std::move(primary_data));
+  }
   std::vector<trt_edgellm::rt::imageUtils::ImageData> extra_data;
-  extra_data.reserve(request.extra_images.size());
+  if (!use_native_video) {
+    extra_data.reserve(request.extra_images.size());
+  }
   for (std::size_t i = 0; i < request.extra_images.size(); ++i) {
     if (request.extra_images[i].empty()) {
       resp.success = false;
@@ -199,7 +270,11 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
     if (!ok_i) {
       return resp;
     }
-    extra_data.push_back(std::move(data_i));
+    if (use_native_video) {
+      decoded_frames.push_back(std::move(data_i));
+    } else {
+      extra_data.push_back(std::move(data_i));
+    }
   }
 
   // ── Build multimodal generation request ──────────────────────────────
@@ -244,25 +319,24 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
     inner_req.messages.push_back(std::move(hist_asst_msg));
   }
 
-  // ── Current user message (all frames in temporal order + task text) ──
-  // One "image" content item per frame, followed by the text prompt item.
-  // imageBuffers are pushed in the same order: primary first, then extras.
-  // This matches the validated Thor multi-image message contract.
+  // ── Current user message (media item(s) + task text) ───────────────────
   trt_edgellm::rt::Message user_msg;
   user_msg.role = "user";
 
-  // Helper to append one image placeholder content item.
-  auto push_image_content = [&]() {
+  auto push_media_content = [&](const char * type, const char * placeholder) {
     trt_edgellm::rt::Message::MessageContent c;
-    c.type = "image";
-    c.content = "<image>";  // placeholder; actual data in imageBuffers
+    c.type = type;
+    c.content = placeholder;
     user_msg.contents.push_back(c);
   };
 
-  // Primary frame, then extra frames in temporal order.
-  push_image_content();
-  for (std::size_t i = 0; i < request.extra_images.size(); ++i) {
-    push_image_content();
+  if (use_native_video) {
+    push_media_content("video", "<video>");
+  } else {
+    push_media_content("image", "<image>");
+    for (std::size_t i = 0; i < request.extra_images.size(); ++i) {
+      push_media_content("image", "<image>");
+    }
   }
 
   trt_edgellm::rt::Message::MessageContent text_content;
@@ -272,12 +346,30 @@ InferenceResponse TensorRTEdgeLLMBackend::infer(const InferenceRequest & request
 
   inner_req.messages.push_back(std::move(user_msg));
 
-  // imageBuffers: primary first, then extra frames in temporal order.
-  inner_req.imageBuffers.push_back(std::move(primary_data));
-  inner_req.imageBuffers.insert(
-    inner_req.imageBuffers.end(),
-    std::make_move_iterator(extra_data.begin()),
-    std::make_move_iterator(extra_data.end()));
+  if (use_native_video) {
+    try {
+      auto video = build_native_video_imagedata(
+        decoded_frames,
+        effective_video_fps_or_throw(request),
+        request.frame_timestamps_sec);
+      inner_req.imageBuffers.push_back(std::move(video));
+    } catch (const std::exception & e) {
+      resp.success = false;
+      resp.error = std::string("failed to represent temporal/video request natively: ") + e.what();
+      return resp;
+    }
+    resp.runtime_temporal_encoding = "native_qwen3vl_video_imagedata_mrope_timestamps";
+    resp.temporal_fallback_used = false;
+  } else {
+    // imageBuffers: primary first, then extra frames in temporal order.
+    inner_req.imageBuffers.push_back(std::move(primary_data));
+    inner_req.imageBuffers.insert(
+      inner_req.imageBuffers.end(),
+      std::make_move_iterator(extra_data.begin()),
+      std::make_move_iterator(extra_data.end()));
+    resp.runtime_temporal_encoding = "ordered_multi_image_no_native_temporal_metadata";
+    resp.temporal_fallback_used = false;
+  }
 
   trt_edgellm::rt::LLMGenerationRequest gen_req;
   gen_req.requests.push_back(std::move(inner_req));

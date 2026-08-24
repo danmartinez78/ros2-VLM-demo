@@ -164,12 +164,17 @@ The request contract now distinguishes:
 - `temporal_images`: ordered images plus explicit temporal metadata;
 - `video`: caller requests native video semantics.
 
-For the pinned TensorRT Edge-LLM path currently used in this repository, the
-backend API exposes ordered image buffers and chat-message content but does not
-expose native video tensors or explicit FPS/timestamp fields in
-`LLMGenerationRequest`. Temporal/video requests are therefore represented as
-ordered images with explicit fallback reporting (`runtime_temporal_encoding`,
-`temporal_fallback_used`) rather than silent downgrade.
+For the pinned TensorRT Edge-LLM commit used in this repository, the backend
+maps:
+
+- `images` to one `image` content item + one `ImageData` buffer per frame;
+- `temporal_images`/`video` to one `video` content item + one native stacked
+  `ImageData` (`[T,H,W,3]`, `isVideo=true`, effective `fps`, optional
+  `timestamps`).
+
+If a temporal/video request cannot be represented natively (for example mixed
+frame dimensions), inference fails clearly rather than silently degrading to
+independent images.
 
 #### System-prompt cache (`kSchemaFlagSysCache`)
 
@@ -359,10 +364,10 @@ process boundary has not regressed.
 
 ## Known limitations and follow-ups
 
-- Temporal contracts (`images`, `temporal_images`, `video`) are now carried
-  end-to-end, but the pinned TensorRT Edge-LLM runtime path still reaches
-  inference as ordered image buffers and reports temporal/video requests as
-  explicit fallback representations.
+- Temporal contracts (`images`, `temporal_images`, `video`) are carried
+  end-to-end and mapped natively at runtime. Rendered timestamps remain an
+  explicit A/B control for prompt-level experiments, not the primary temporal
+  transport mechanism.
 - Formal latency/resource benchmarks: issue #7.
 - Model portability and measured optimization: issue #9.
 - RViz2 visualization: issue #10.
