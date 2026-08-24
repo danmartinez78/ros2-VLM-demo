@@ -108,8 +108,8 @@ resolve_engine_provenance() {
   local resolved
   resolved="$(
     python3 "${SCRIPT_DIR}/benchmark_metadata.py" \
-      --llm-engine-dir "${EDGE_VLM_LLM_ENGINE_DIR}" \
-      --multimodal-engine-dir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
+      --llm-engine-dir "${EDGE_VLM_LLM_ENGINE_DIR:-}" \
+      --multimodal-engine-dir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}" \
       --model-name "${EDGE_VLM_MODEL_NAME:-}" \
       --engine-profile-id "${EDGE_VLM_ENGINE_PROFILE_ID:-}" \
       --output-provenance-lines
