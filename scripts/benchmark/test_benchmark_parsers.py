@@ -491,6 +491,195 @@ class TestBenchmarkMetadata(unittest.TestCase):
         self.assertIn("task_profile", meta)
         self.assertEqual(meta["task_profile"], "scene_description")
 
+    def test_collect_engine_provenance_managed_manifest(self):
+        import tempfile
+        from benchmark_metadata import collect_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "Cosmos-Reason2-8B" / "engines" / "thor-f8"
+            llm_dir = profile_dir / "llm"
+            llm_dir.mkdir(parents=True)
+            manifest_path = profile_dir / "engine-manifest.json"
+            manifest_path.write_text(json.dumps({
+                "model_name": "Cosmos-Reason2-8B",
+                "engine_profile_id": "thor-f8",
+                "engine_paths": {
+                    "llm_dir": str(llm_dir),
+                    "multimodal_dir": str(profile_dir),
+                },
+            }), encoding="utf-8")
+
+            provenance = collect_engine_provenance(
+                llm_engine_dir=str(llm_dir / ".." / "llm"),
+                multimodal_engine_dir=str(profile_dir / "."),
+                model_name="Cosmos-Reason2-8B",
+                engine_profile_id="thor-f8",
+            )
+
+        self.assertEqual(provenance["engine_manifest_status"], "matched")
+        self.assertEqual(provenance["engine_profile_id"], "thor-f8")
+        self.assertEqual(provenance["llm_engine_dir"], str(llm_dir.resolve()))
+        self.assertEqual(provenance["multimodal_engine_dir"], str(profile_dir.resolve()))
+        self.assertEqual(provenance["engine_manifest_path"], str(manifest_path.resolve()))
+        self.assertTrue(provenance["engine_identity"].startswith("Cosmos-Reason2-8B/thor-f8@"))
+
+    def test_collect_engine_provenance_legacy_fallback(self):
+        import tempfile
+        from benchmark_metadata import collect_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            legacy_root = Path(tmpdir) / "Cosmos-Reason2-8B" / "engine"
+            llm_dir = legacy_root / "llm"
+            llm_dir.mkdir(parents=True)
+            provenance = collect_engine_provenance(
+                llm_engine_dir=str(llm_dir),
+                multimodal_engine_dir=str(legacy_root),
+                model_name="Cosmos-Reason2-8B",
+            )
+
+        self.assertEqual(provenance["engine_profile_id"], "legacy")
+        self.assertIsNone(provenance["engine_manifest_path"])
+        self.assertIsNone(provenance["engine_manifest_sha256"])
+        self.assertTrue(provenance["engine_identity"].startswith("Cosmos-Reason2-8B/legacy@"))
+
+    def test_collect_engine_provenance_missing_manifest_managed_layout(self):
+        import tempfile
+        from benchmark_metadata import collect_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "Cosmos-Reason2-8B" / "engines" / "thor-f8"
+            llm_dir = profile_dir / "llm"
+            llm_dir.mkdir(parents=True)
+            provenance = collect_engine_provenance(
+                llm_engine_dir=str(llm_dir),
+                multimodal_engine_dir=str(profile_dir),
+            )
+
+        self.assertEqual(provenance["engine_profile_id"], "thor-f8")
+        self.assertEqual(provenance["engine_manifest_status"], "missing")
+        self.assertTrue(any("no engine-manifest" in w for w in provenance["provenance_warnings"]))
+
+    def test_collect_engine_provenance_manifest_mismatch(self):
+        import tempfile
+        from benchmark_metadata import collect_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "Cosmos-Reason2-8B" / "engines" / "thor-f8"
+            llm_dir = profile_dir / "llm"
+            llm_dir.mkdir(parents=True)
+            other_profile_dir = Path(tmpdir) / "other"
+            other_profile_dir.mkdir()
+            manifest_path = profile_dir / "engine-manifest.json"
+            manifest_path.write_text(json.dumps({
+                "model_name": "Cosmos-Reason2-8B",
+                "engine_profile_id": "thor-current",
+                "engine_paths": {
+                    "llm_dir": str(other_profile_dir / "llm"),
+                    "multimodal_dir": str(other_profile_dir),
+                },
+            }), encoding="utf-8")
+
+            provenance = collect_engine_provenance(
+                llm_engine_dir=str(llm_dir),
+                multimodal_engine_dir=str(profile_dir),
+                model_name="Cosmos-Reason2-8B",
+                engine_profile_id="thor-f8",
+            )
+
+        self.assertEqual(provenance["engine_manifest_status"], "mismatch")
+        warnings = "\n".join(provenance["provenance_warnings"])
+        self.assertIn("thor-f8", warnings)
+        self.assertIn("thor-current", warnings)
+
+    def test_collect_server_engine_provenance_uses_live_server_paths(self):
+        import tempfile
+        from benchmark_metadata import collect_server_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "Cosmos-Reason2-8B" / "engines" / "thor-f8"
+            llm_dir = profile_dir / "llm"
+            llm_dir.mkdir(parents=True)
+            manifest_path = profile_dir / "engine-manifest.json"
+            manifest_path.write_text(json.dumps({
+                "model_name": "Cosmos-Reason2-8B",
+                "engine_profile_id": "thor-f8",
+                "engine_paths": {
+                    "llm_dir": str(llm_dir),
+                    "multimodal_dir": str(profile_dir),
+                },
+            }), encoding="utf-8")
+
+            with patch("benchmark_metadata._socket_listener_pid", return_value=4242), \
+                 patch("benchmark_metadata._proc_argv") as mock_proc_argv:
+                def _mock_proc_argv(pid, index):
+                    self.assertEqual(pid, 4242)
+                    return {
+                        1: str(llm_dir),
+                        2: str(profile_dir),
+                        4: "/tmp/edge_vlm.sock",
+                    }.get(index, "")
+
+                mock_proc_argv.side_effect = _mock_proc_argv
+                provenance = collect_server_engine_provenance(
+                    socket_path="/tmp/edge_vlm.sock",
+                    model_name="Cosmos-Reason2-8B",
+                    engine_profile_id="thor-f8",
+                )
+
+        self.assertEqual(provenance["engine_manifest_status"], "matched")
+        self.assertEqual(provenance["llm_engine_dir"], str(llm_dir.resolve()))
+        self.assertEqual(provenance["multimodal_engine_dir"], str(profile_dir.resolve()))
+        self.assertEqual(provenance["server_pid"], 4242)
+        self.assertEqual(provenance["server_socket_path"], str(Path("/tmp/edge_vlm.sock").resolve()))
+        self.assertEqual(provenance["provenance_source"], "server_process")
+
+    def test_collect_server_engine_provenance_raises_without_listener(self):
+        import tempfile
+        from benchmark_metadata import collect_server_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_socket = Path(tmpdir) / "missing.sock"
+            with patch("benchmark_metadata._socket_listener_pid", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "no live edge_vlm_server listener"):
+                    collect_server_engine_provenance(socket_path=str(missing_socket))
+
+    def test_collect_server_engine_provenance_existing_socket_without_identified_listener(self):
+        import tempfile
+        from benchmark_metadata import collect_server_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            socket_path = Path(tmpdir) / "edge_vlm.sock"
+            socket_path.write_text("", encoding="utf-8")
+            with patch("benchmark_metadata._socket_listener_pid", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "could be identified"):
+                    collect_server_engine_provenance(socket_path=str(socket_path))
+
+    def test_collect_server_engine_provenance_missing_manifest(self):
+        import tempfile
+        from benchmark_metadata import collect_server_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_dir = Path(tmpdir) / "Cosmos-Reason2-8B" / "engines" / "thor-f8"
+            llm_dir = profile_dir / "llm"
+            llm_dir.mkdir(parents=True)
+
+            with patch("benchmark_metadata._socket_listener_pid", return_value=4242), \
+                 patch("benchmark_metadata._proc_argv") as mock_proc_argv:
+                def _mock_proc_argv(pid, index):
+                    self.assertEqual(pid, 4242)
+                    return {
+                        1: str(llm_dir),
+                        2: str(profile_dir),
+                        4: "/tmp/edge_vlm.sock",
+                    }.get(index, "")
+
+                mock_proc_argv.side_effect = _mock_proc_argv
+                provenance = collect_server_engine_provenance(socket_path="/tmp/edge_vlm.sock")
+
+        self.assertEqual(provenance["engine_manifest_status"], "missing")
+        self.assertEqual(provenance["engine_profile_id"], "thor-f8")
+        self.assertTrue(any("no engine-manifest" in w for w in provenance["provenance_warnings"]))
+
 
 # ── end-to-end round-trip test ────────────────────────────────────────────────
 
@@ -566,7 +755,7 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
 
     _SCRIPT = Path(__file__).resolve().parent / "run_native_benchmarks.sh"
 
-    def _run_dry(self, extra_args: list[str] | None = None) -> str:
+    def _run_dry(self, extra_args: list[str] | None = None, env_updates: dict[str, str] | None = None) -> str:
         import subprocess
         env = {
             "PATH": "/usr/bin:/bin",
@@ -575,6 +764,8 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
             "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
             "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
         }
+        if env_updates:
+            env.update(env_updates)
         cmd = ["bash", str(self._SCRIPT), "--dry-run"]
         if extra_args:
             cmd.extend(extra_args)
@@ -601,6 +792,33 @@ class TestNativeBenchmarkDryRun(unittest.TestCase):
         self.assertIn("--mode visual", out)
         self.assertIn("--engineDir /fake/mm_engine/visual", out)
         self.assertNotIn("--multimodalEngineDir", out)
+
+    def test_visual_override_same_canonical_path_is_allowed(self):
+        out = self._run_dry(
+            ["--skip-prefill", "--skip-decode", "--skip-profile"],
+            env_updates={"EDGE_VLM_VISUAL_ENGINE_DIR": "/fake/mm_engine/subdir/../visual"},
+        )
+        self.assertIn("--engineDir /fake/mm_engine/visual", out)
+
+    def test_visual_override_mismatch_is_rejected(self):
+        import subprocess
+
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "TENSORRT_EDGE_LLM_ROOT": "/fake/edgellm",
+            "EDGE_VLM_LLM_ENGINE_DIR": "/fake/llm_engine",
+            "EDGE_VLM_MULTIMODAL_ENGINE_DIR": "/fake/mm_engine",
+            "EDGE_VLM_VISUAL_ENGINE_DIR": "/different/visual",
+            "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
+        }
+        result = subprocess.run(
+            ["bash", str(self._SCRIPT), "--dry-run", "--skip-prefill", "--skip-decode", "--skip-profile"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EDGE_VLM_VISUAL_ENGINE_DIR must resolve to /fake/mm_engine/visual", result.stderr)
 
     def test_llm_bench_uses_warmup_and_iterations_flags(self):
         out = self._run_dry(["--warmup", "5", "--iterations", "20"])
@@ -869,6 +1087,118 @@ class TestManifestArrayTypes(unittest.TestCase):
         self.assertIn("decode", manifest["skipped_modes"])
         self.assertIn("visual", manifest["skipped_modes"])
         self.assertIn("profile", manifest["skipped_modes"])
+
+    def test_manifest_includes_engine_provenance(self):
+        import subprocess
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_build = Path(tmpdir) / "build" / "examples" / "llm"
+            fake_build.mkdir(parents=True)
+            for name in ("llm_bench", "llm_inference"):
+                binary = fake_build / name
+                binary.write_text("#!/bin/sh\necho 'ok'\n", encoding="utf-8")
+                binary.chmod(0o755)
+
+            profile_dir = Path(tmpdir) / "workspace" / "Cosmos-Reason2-8B" / "engines" / "thor-f8"
+            llm_dir = profile_dir / "llm"
+            llm_dir.mkdir(parents=True)
+            manifest_path = profile_dir / "engine-manifest.json"
+            manifest_path.write_text(json.dumps({
+                "model_name": "Cosmos-Reason2-8B",
+                "engine_profile_id": "thor-f8",
+                "engine_paths": {
+                    "llm_dir": str(llm_dir),
+                    "multimodal_dir": str(profile_dir),
+                },
+            }), encoding="utf-8")
+
+            out_dir = Path(tmpdir) / "bench_out"
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "TENSORRT_EDGE_LLM_ROOT": tmpdir,
+                "EDGE_VLM_MODEL_NAME": "Cosmos-Reason2-8B",
+                "EDGE_VLM_ENGINE_PROFILE_ID": "thor-f8",
+                "EDGE_VLM_LLM_ENGINE_DIR": str(llm_dir),
+                "EDGE_VLM_MULTIMODAL_ENGINE_DIR": str(profile_dir),
+                "EDGELLM_PLUGIN_PATH": "/fake/plugin.so",
+            }
+            subprocess.run(
+                [
+                    "bash", str(self._SCRIPT),
+                    "--skip-decode", "--skip-visual", "--skip-profile",
+                    "--output-dir", str(out_dir),
+                ],
+                env=env, capture_output=True, text=True, check=False,
+            )
+
+            manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["engine_provenance"]["engine_profile_id"], "thor-f8")
+        self.assertEqual(
+            manifest["engine_provenance"]["llm_engine_dir"],
+            str(llm_dir.resolve()),
+        )
+
+
+class TestComparisonMetadata(unittest.TestCase):
+    def test_generate_comparison_preserves_engine_provenance_fields(self):
+        ros_report = {
+            "metadata": {
+                "model_name": "Cosmos-Reason2-8B",
+                "engine_profile_id": "thor-f8",
+                "llm_engine_dir": "/workspace/engines/thor-f8/llm",
+                "multimodal_engine_dir": "/workspace/engines/thor-f8",
+                "engine_manifest_path": "/workspace/engines/thor-f8/engine-manifest.json",
+                "engine_manifest_sha256": "a" * 64,
+                "engine_identity": "Cosmos-Reason2-8B/thor-f8@aaaaaaaaaaaa",
+                "engine_provenance": {"engine_identity": "Cosmos-Reason2-8B/thor-f8@aaaaaaaaaaaa"},
+            },
+            "aggregate": {
+                "inference_ms": {"mean": 100.0, "p50": 100.0, "p95": 100.0},
+                "ros_overhead_ms": {"mean": 20.0, "p50": 20.0, "p95": 20.0},
+                "ipc_overhead_ms": {"mean": 10.0, "p50": 10.0},
+                "image_convert_ms": {"mean": 5.0, "p50": 5.0},
+                "publication_ms": {"mean": 5.0, "p50": 5.0},
+                "total_worker_ms": {"mean": 120.0, "p50": 120.0, "p95": 120.0},
+                "total_dropped": 0,
+                "failed_frames": 0,
+                "ready_to_first_frame_ms": 0.0,
+            },
+        }
+
+        comparison = generate_comparison(ros_report, None)
+        meta = comparison["metadata"]
+        self.assertEqual(meta["engine_profile_id"], "thor-f8")
+        self.assertEqual(meta["engine_identity"], "Cosmos-Reason2-8B/thor-f8@aaaaaaaaaaaa")
+        self.assertEqual(meta["llm_engine_dir"], "/workspace/engines/thor-f8/llm")
+
+    def test_format_text_report_includes_engine_identity(self):
+        comparison = {
+            "generated_at": "2025-01-01T00:00:00Z",
+            "metadata": {
+                "model_name": "Cosmos-Reason2-8B",
+                "engine_profile_id": "thor-f8",
+                "quantization": "fp8",
+                "engine_identity": "Cosmos-Reason2-8B/thor-f8@aaaaaaaaaaaa",
+                "llm_engine_dir": "/workspace/engines/thor-f8/llm",
+                "multimodal_engine_dir": "/workspace/engines/thor-f8",
+                "edge_llm_commit": "abc123",
+                "max_generate_length": 64,
+                "image_max_width": 1280,
+                "jpeg_quality": 90,
+                "warmup_frames": 0,
+                "measured_frames": 1,
+                "sample_period_seconds": 1.0,
+                "platform": {},
+            },
+            "native_engine": {"source": "", "inference_ms_mean": 1, "inference_ms_p50": 1, "inference_ms_p95": 1},
+            "ros_overhead": {"source": "", "image_convert_ms_mean": 1, "image_convert_ms_p50": 1, "ipc_overhead_ms_mean": 1, "ipc_overhead_ms_p50": 1, "publication_ms_mean": 1, "publication_ms_p50": 1, "ros_overhead_ms_mean": 1, "ros_overhead_ms_p50": 1, "ros_overhead_ms_p95": 1, "total_dropped": 0, "failed_frames": 0, "ready_to_first_frame_ms": 0},
+            "pipeline_total": {"total_worker_ms_mean": 1, "total_worker_ms_p50": 1, "total_worker_ms_p95": 1, "ros_fraction_of_total": 0.5, "engine_fraction_of_total": 0.5},
+        }
+        text = format_text_report(comparison)
+        self.assertIn("Engine identity", text)
+        self.assertIn("thor-f8", text)
 
 
 class TestQueueDelayMetric(unittest.TestCase):

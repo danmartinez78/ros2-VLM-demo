@@ -214,6 +214,66 @@ class ThorSetupDryRunTests(unittest.TestCase):
             )
             self.assertFalse(env_file.exists())
 
+    def test_generated_env_file_sources_active_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="edge-vlm-runtime-env-") as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            workspace = tmpdir_path / "workspace"
+            state_dir = workspace / ".edge-vlm"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_file = state_dir / "active-profile.json"
+            state_file.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "model_id": "cosmos-reason2-8b",
+                        "model_name": "Cosmos-Reason2-8B",
+                        "engine_profile_id": "thor-f8",
+                        "llm_engine_dir": str(workspace / "Cosmos-Reason2-8B" / "engines" / "thor-f8" / "llm"),
+                        "multimodal_engine_dir": str(workspace / "Cosmos-Reason2-8B" / "engines" / "thor-f8"),
+                        "plugin_path": str(tmpdir_path / "libNvInfer_edgellm_plugin.so"),
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env_file = tmpdir_path / "edge_vlm_env.sh"
+            env = os.environ.copy()
+            env["EDGE_VLM_ENV_FILE"] = str(env_file)
+            env["EDGE_VLM_WORKSPACE_DIR"] = str(workspace)
+
+            subprocess.run(
+                [
+                    str(SETUP_SCRIPT),
+                    "--skip-edge-llm",
+                    "--skip-model",
+                    "--skip-rtdetr",
+                    "--skip-data",
+                ],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=True,
+            )
+
+            sourced = subprocess.run(
+                [
+                    "bash",
+                    "-lc",
+                    f'source "{env_file}" && printf "%s|%s|%s" "$EDGE_VLM_MODEL_ID" "$EDGE_VLM_ENGINE_PROFILE_ID" "$EDGE_VLM_LLM_ENGINE_DIR"',
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(sourced.returncode, 0, msg=sourced.stderr)
+            self.assertEqual(
+                sourced.stdout,
+                "cosmos-reason2-8b|thor-f8|"
+                + str(workspace / "Cosmos-Reason2-8B" / "engines" / "thor-f8" / "llm"),
+            )
+
     def test_quantized_workspace_skips_quantize_stage(self) -> None:
         with tempfile.TemporaryDirectory(prefix="edge-vlm-quantized-only-") as tmpdir:
             workspace = Path(tmpdir) / "workspace"

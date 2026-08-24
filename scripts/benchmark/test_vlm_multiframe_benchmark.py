@@ -58,6 +58,29 @@ from vlm_multiframe_report import (  # noqa: E402
 _RUN_ID = "20250101_120000"
 
 
+def _make_engine_provenance(
+    *,
+    model_name: str = "TestModel-8B",
+    engine_profile_id: str = "thor-f8",
+    llm_engine_dir: str = "/tmp/engines/thor-f8/llm",
+    multimodal_engine_dir: str = "/tmp/engines/thor-f8",
+    engine_manifest_path: str | None = "/tmp/engines/thor-f8/engine-manifest.json",
+    engine_manifest_sha256: str | None = "1" * 64,
+    engine_manifest_status: str = "matched",
+) -> dict[str, Any]:
+    return {
+        "model_name": model_name,
+        "engine_profile_id": engine_profile_id,
+        "llm_engine_dir": llm_engine_dir,
+        "multimodal_engine_dir": multimodal_engine_dir,
+        "engine_manifest_path": engine_manifest_path,
+        "engine_manifest_sha256": engine_manifest_sha256,
+        "engine_identity": f"{model_name}/{engine_profile_id}@{(engine_manifest_sha256 or '0' * 12)[:12]}",
+        "engine_manifest_status": engine_manifest_status,
+        "provenance_warnings": [],
+    }
+
+
 def _make_record(
     *,
     frame_condition: str = "F1",
@@ -88,6 +111,7 @@ def _make_record(
     iteration: int = 0,
     warmup: bool = False,
     model_name: str | None = "TestModel-8B",
+    engine_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if frame_paths is None:
         frame_paths = [{"path": f"/tmp/frame_{i:03d}.jpg", "sha256": "a" * 64} for i in range(frame_count)]
@@ -122,6 +146,7 @@ def _make_record(
         "native_profile_path": native_profile_path,
         "ipc_result_path": ipc_result_path,
         "model_name": model_name,
+        "engine_provenance": engine_provenance or _make_engine_provenance(model_name=model_name or "TestModel-8B"),
         "iteration": iteration,
         "warmup": warmup,
     }
@@ -946,6 +971,7 @@ class TestBuildReport(unittest.TestCase):
         for key in [
             "schema_version", "generated_at", "source_file",
             "run_ids", "model_names", "n_total_records", "n_measured_records",
+            "engine_provenance", "engine_provenance_variants", "mixed_engine_provenance",
             "frame_conditions", "frame_scaling_table", "ipc_artifact_table", "raw_records",
         ]:
             self.assertIn(key, report)
@@ -984,6 +1010,60 @@ class TestBuildReport(unittest.TestCase):
         records = self._make_full_records()
         report = build_report(records)
         self.assertIn("TestModel-8B", report["model_names"])
+
+    def test_unique_engine_provenance_promoted(self):
+        report = build_report(self._make_full_records())
+        self.assertFalse(report["mixed_engine_provenance"])
+        self.assertEqual(report["engine_provenance"]["engine_profile_id"], "thor-f8")
+        self.assertEqual(len(report["engine_provenance_variants"]), 1)
+
+    def test_mixed_engine_provenance_flagged(self):
+        records = self._make_full_records()
+        records.append(_make_record(
+            frame_condition="F8",
+            frame_count=8,
+            path="ipc",
+            engine_provenance=_make_engine_provenance(
+                engine_profile_id="legacy",
+                llm_engine_dir="/tmp/engine/llm",
+                multimodal_engine_dir="/tmp/engine",
+                engine_manifest_path=None,
+                engine_manifest_sha256=None,
+                engine_manifest_status="missing",
+            ),
+        ))
+        report = build_report(records)
+        self.assertTrue(report["mixed_engine_provenance"])
+        self.assertIsNone(report["engine_provenance"])
+        self.assertGreaterEqual(len(report["engine_provenance_variants"]), 2)
+
+    def test_caller_and_server_provenance_mismatch_marks_report_non_comparable(self):
+        direct_record = _make_record(
+            frame_condition="F8",
+            frame_count=8,
+            path="direct",
+            engine_provenance=_make_engine_provenance(
+                engine_profile_id="thor-f8",
+                llm_engine_dir="/tmp/engines/thor-f8/llm",
+                multimodal_engine_dir="/tmp/engines/thor-f8",
+            ),
+        )
+        ipc_record = _make_record(
+            frame_condition="F8",
+            frame_count=8,
+            path="ipc",
+            engine_provenance=_make_engine_provenance(
+                engine_profile_id="legacy",
+                llm_engine_dir="/tmp/engine/llm",
+                multimodal_engine_dir="/tmp/engine",
+                engine_manifest_path=None,
+                engine_manifest_sha256=None,
+                engine_manifest_status="missing",
+            ),
+        )
+        report = build_report([direct_record, ipc_record])
+        self.assertTrue(report["mixed_engine_provenance"])
+        self.assertIsNone(report["engine_provenance"])
 
 
 # ── text report formatting tests ──────────────────────────────────────────────
@@ -1032,6 +1112,45 @@ class TestFormatTextReport(unittest.TestCase):
         text = format_text_report(self._full_report())
         self.assertIn("Cold-Start", text)
 
+    def test_report_contains_engine_provenance_section(self):
+        text = format_text_report(self._full_report())
+        self.assertIn("Engine provenance", text)
+        self.assertIn("thor-f8", text)
+
+    def test_report_keeps_single_engine_32_token_fixed_summary(self):
+        text = format_text_report(self._full_report())
+        self.assertIn(
+            "Fixed: model, engines, precision, prompt text, max_output_tokens=32",
+            text,
+        )
+        self.assertNotIn("Mixed request config", text)
+
+    def test_report_renders_actual_max_output_tokens(self):
+        records = [
+            _make_record(frame_condition="F1", frame_count=1, path="direct", max_output_tokens=8),
+            _make_record(frame_condition="F1", frame_count=1, path="ipc", max_output_tokens=8),
+        ]
+        text = format_text_report(build_report(records))
+        self.assertIn("max_output_tokens=8", text)
+        self.assertNotIn("max_output_tokens=32", text)
+
+    def test_report_flags_mixed_max_output_tokens(self):
+        records = [
+            _make_record(frame_condition="F1", frame_count=1, path="direct", max_output_tokens=8),
+            _make_record(frame_condition="F1", frame_count=1, path="ipc", max_output_tokens=32),
+        ]
+        text = format_text_report(build_report(records))
+        self.assertIn(
+            "Mixed request config: max_output_tokens varies across records (8, 32)",
+            text,
+        )
+
+    def test_report_marks_missing_max_output_tokens_unknown(self):
+        record = _make_record(frame_condition="F1", frame_count=1, path="direct")
+        record.pop("max_output_tokens", None)
+        text = format_text_report(build_report([record]))
+        self.assertIn("Fixed: model, engines, precision, prompt text, max_output_tokens=unknown", text)
+
     def test_report_contains_ipc_artifact_section(self):
         text = format_text_report(self._full_report())
         self.assertIn("IPC Result Artifacts", text)
@@ -1041,6 +1160,35 @@ class TestFormatTextReport(unittest.TestCase):
         text = format_text_report(self._full_report())
         self.assertIn("cold-start", text.lower())
         self.assertIn("steady-state", text.lower())
+
+    def test_report_flags_mixed_engine_provenance(self):
+        report = build_report([
+            _make_record(
+                model_name="Cosmos-Reason2-8B",
+                engine_provenance=_make_engine_provenance(model_name="Cosmos-Reason2-8B"),
+            ),
+            _make_record(
+                model_name="Cosmos-Reason2-2B",
+                engine_provenance=_make_engine_provenance(
+                    model_name="Cosmos-Reason2-2B",
+                    engine_profile_id="legacy",
+                    llm_engine_dir="/tmp/engine/llm",
+                    multimodal_engine_dir="/tmp/engine",
+                    engine_manifest_path=None,
+                    engine_manifest_sha256=None,
+                    engine_manifest_status="missing",
+                ),
+            ),
+        ])
+        text = format_text_report(report)
+        self.assertIn("MIXED", text)
+        self.assertIn(
+            "Mixed/non-comparable: model/engine configuration varies across records",
+            text,
+        )
+        self.assertNotIn("Fixed: model, engines", text)
+        self.assertIn("Cosmos-Reason2-8B", text)
+        self.assertIn("Cosmos-Reason2-2B", text)
 
     def test_report_serializable_as_json(self):
         report = self._full_report()
@@ -1269,6 +1417,7 @@ def _direct_env(
     response_path: str = "/tmp/resp.json",
     profile_path: str = "/tmp/prof.json",
     model_name: str = "TestModel",
+    engine_provenance: dict[str, Any] | None = None,
     iteration: int = 0,
     is_warmup: str = "false",
 ) -> dict[str, str]:
@@ -1297,6 +1446,7 @@ def _direct_env(
         "_BM_RESPONSE_PATH": response_path,
         "_BM_PROFILE_PATH": profile_path,
         "_BM_MODEL_NAME": model_name,
+        "_BM_ENGINE_PROVENANCE": json.dumps(engine_provenance or _make_engine_provenance(model_name=model_name)),
         "_BM_ITERATION": str(iteration),
         "_BM_IS_WARMUP": is_warmup,
     }
@@ -1319,6 +1469,7 @@ def _ipc_env(
     output_words: str = "null",
     ipc_result_path: str = "null",
     model_name: str = "TestModel",
+    engine_provenance: dict[str, Any] | None = None,
     iteration: int = 0,
     is_warmup: str = "false",
 ) -> dict[str, str]:
@@ -1341,6 +1492,7 @@ def _ipc_env(
         "_BM_OUTPUT_WORDS": output_words,
         "_BM_IPC_RESULT_PATH": ipc_result_path,
         "_BM_MODEL_NAME": model_name,
+        "_BM_ENGINE_PROVENANCE": json.dumps(engine_provenance or _make_engine_provenance(model_name=model_name)),
         "_BM_ITERATION": str(iteration),
         "_BM_IS_WARMUP": is_warmup,
     }
@@ -1451,6 +1603,11 @@ class TestRecordSerializer(unittest.TestCase):
         self.assertEqual(rec["native_profile_path"], "/bench/F1/direct/measured_iter_0/profile.json")
         self.assertEqual(rec["model_name"], "Cosmos-Reason2-8B")
 
+    def test_direct_engine_provenance_round_trip(self):
+        provenance = _make_engine_provenance(model_name="Cosmos-Reason2-8B")
+        rec = json.loads(build_direct_record(_direct_env(engine_provenance=provenance)))
+        self.assertEqual(rec["engine_provenance"]["engine_identity"], provenance["engine_identity"])
+
     def test_direct_frame_hashes_json_array_round_trip(self):
         """frame_paths JSON array is deserialised correctly."""
         hashes = [{"path": "/tmp/a.jpg", "sha256": "a" * 64}, {"path": "/tmp/b.jpg", "sha256": "b" * 64}]
@@ -1480,6 +1637,11 @@ class TestRecordSerializer(unittest.TestCase):
         self.assertIs(rec["success"], False)
         self.assertEqual(rec["error"], "ipc client exited with code 1")
         self.assertIsNone(rec["total_latency_ms"])
+
+    def test_ipc_engine_provenance_round_trip(self):
+        provenance = _make_engine_provenance(model_name="Cosmos-Reason2-8B")
+        rec = json.loads(build_ipc_record(_ipc_env(engine_provenance=provenance)))
+        self.assertEqual(rec["engine_provenance"]["engine_profile_id"], "thor-f8")
 
     def test_ipc_warmup_true(self):
         """IPC warmup=true serialises as boolean true."""

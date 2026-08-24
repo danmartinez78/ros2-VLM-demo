@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "models": {
+    "cosmos-reason2-8b": {
+      "display_name": "Cosmos-Reason2-8B",
+      "manifest_model_key": "Cosmos-Reason2-8B",
+      "family": "cosmos-reason2",
+      "preparation_strategy": "cosmos_reason2",
+      "build_strategy": "cosmos_reason2"
+    },
+    "cosmos-reason2-2b": {
+      "display_name": "Cosmos-Reason2-2B",
+      "manifest_model_key": "Cosmos-Reason2-2B",
+      "family": "cosmos-reason2",
+      "preparation_strategy": "cosmos_reason2",
+      "build_strategy": "cosmos_reason2"
+    },
+    "qwen3-vl-2b-instruct": {
+      "display_name": "Qwen3-VL-2B-Instruct",
+      "manifest_model_key": "Qwen3-VL-2B-Instruct",
+      "family": "qwen3-vl",
+      "preparation_strategy": "external_layout",
+      "build_strategy": "external_layout"
+    }
+  }
+}

@@ -40,6 +40,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # ── defaults ─────────────────────────────────────────────────────────────────
 
 TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
@@ -58,6 +60,11 @@ SKIP_DECODE=false
 SKIP_VISUAL=false
 SKIP_PROFILE=false
 DRY_RUN=false
+RESOLVED_MODEL_NAME="${EDGE_VLM_MODEL_NAME:-}"
+RESOLVED_ENGINE_PROFILE_ID="${EDGE_VLM_ENGINE_PROFILE_ID:-}"
+RESOLVED_LLM_ENGINE_DIR="${EDGE_VLM_LLM_ENGINE_DIR:-}"
+RESOLVED_MULTIMODAL_ENGINE_DIR="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}"
+ENGINE_PROVENANCE_JSON="{}"
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 
@@ -96,7 +103,42 @@ done
 
 LLM_BENCH="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_bench"
 LLM_INFERENCE="${TENSORRT_EDGE_LLM_ROOT}/build/examples/llm/llm_inference"
-VISUAL_ENGINE_DIR="${EDGE_VLM_VISUAL_ENGINE_DIR:-${EDGE_VLM_MULTIMODAL_ENGINE_DIR}/visual}"
+
+resolve_engine_provenance() {
+  local resolved
+  resolved="$(
+    python3 "${SCRIPT_DIR}/benchmark_metadata.py" \
+      --llm-engine-dir "${EDGE_VLM_LLM_ENGINE_DIR:-}" \
+      --multimodal-engine-dir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}" \
+      --model-name "${EDGE_VLM_MODEL_NAME:-}" \
+      --engine-profile-id "${EDGE_VLM_ENGINE_PROFILE_ID:-}" \
+      --output-provenance-lines
+  )"
+  mapfile -t _resolved_lines <<< "${resolved}"
+  RESOLVED_MODEL_NAME="${_resolved_lines[0]:-${EDGE_VLM_MODEL_NAME:-}}"
+  RESOLVED_ENGINE_PROFILE_ID="${_resolved_lines[1]:-${EDGE_VLM_ENGINE_PROFILE_ID:-}}"
+  RESOLVED_LLM_ENGINE_DIR="${_resolved_lines[2]:-${EDGE_VLM_LLM_ENGINE_DIR:-}}"
+  RESOLVED_MULTIMODAL_ENGINE_DIR="${_resolved_lines[3]:-${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}}"
+  ENGINE_PROVENANCE_JSON="${_resolved_lines[4]:-\{\}}"
+}
+
+canonical_path() {
+  python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve(strict=False))' "$1"
+}
+
+resolve_engine_provenance
+
+EXPECTED_VISUAL_ENGINE_DIR="$(canonical_path "${RESOLVED_MULTIMODAL_ENGINE_DIR}/visual")"
+VISUAL_ENGINE_DIR="${EXPECTED_VISUAL_ENGINE_DIR}"
+if [[ -n "${EDGE_VLM_VISUAL_ENGINE_DIR:-}" ]]; then
+  OVERRIDE_VISUAL_ENGINE_DIR="$(canonical_path "${EDGE_VLM_VISUAL_ENGINE_DIR}")"
+  if [[ "${OVERRIDE_VISUAL_ENGINE_DIR}" != "${EXPECTED_VISUAL_ENGINE_DIR}" ]]; then
+    echo "ERROR: EDGE_VLM_VISUAL_ENGINE_DIR must resolve to ${EXPECTED_VISUAL_ENGINE_DIR}" >&2
+    echo "       Refusing to benchmark visual.engine from ${OVERRIDE_VISUAL_ENGINE_DIR} while provenance records ${RESOLVED_MULTIMODAL_ENGINE_DIR}." >&2
+    exit 1
+  fi
+  VISUAL_ENGINE_DIR="${OVERRIDE_VISUAL_ENGINE_DIR}"
+fi
 
 if [[ "${DRY_RUN}" == "false" ]]; then
   if [[ ! -x "${LLM_BENCH}" ]]; then
@@ -138,27 +180,19 @@ INFERENCE_OUT=""
 # ── metadata collection ───────────────────────────────────────────────────────
 
 collect_metadata() {
-  local arch kernel jetpack cuda trt gpu_cc gpu_name edge_llm_commit edge_llm_tag nvpmodel
-  arch=$(uname -m 2>/dev/null || echo "unknown")
-  kernel=$(uname -r 2>/dev/null || echo "unknown")
-  jetpack=$(dpkg-query -W -f='${Version}' nvidia-jetpack 2>/dev/null || echo "")
-  cuda=$(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' || echo "")
-  trt=$(dpkg-query -W -f='${Version}' libnvinfer-dev 2>/dev/null || echo "")
-  gpu_cc=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || echo "")
-  gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "")
-  edge_llm_commit=$(git -C "${TENSORRT_EDGE_LLM_ROOT}" rev-parse --short HEAD 2>/dev/null || echo "")
-  edge_llm_tag=$(git -C "${TENSORRT_EDGE_LLM_ROOT}" describe --tags --abbrev=0 2>/dev/null || echo "")
-  nvpmodel=$(nvpmodel -q 2>/dev/null | head -1 || echo "")
+  BASE_METADATA_JSON="$(
+  python3 "${SCRIPT_DIR}/benchmark_metadata.py" \
+    --llm-engine-dir "${RESOLVED_LLM_ENGINE_DIR}" \
+    --multimodal-engine-dir "${RESOLVED_MULTIMODAL_ENGINE_DIR}" \
+    --model-name "${RESOLVED_MODEL_NAME}" \
+    --engine-profile-id "${RESOLVED_ENGINE_PROFILE_ID}" \
+    --edge-llm-root "${TENSORRT_EDGE_LLM_ROOT}" \
+    --output -
+  )"
 
   # Pass all values via environment variables to avoid shell interpolation inside
   # Python source code.  The single-quoted heredoc prevents any expansion.
-  ARCH="${arch}" KERNEL="${kernel}" JETPACK="${jetpack}" CUDA="${cuda}" \
-  TRT="${trt}" GPU_CC="${gpu_cc}" GPU_NAME="${gpu_name}" \
-  EDGE_LLM_COMMIT="${edge_llm_commit}" EDGE_LLM_TAG="${edge_llm_tag}" \
-  NVPMODEL="${nvpmodel}" \
-  MODEL_NAME="${EDGE_VLM_MODEL_NAME:-}" \
-  LLM_ENGINE_DIR="${EDGE_VLM_LLM_ENGINE_DIR}" \
-  MULTIMODAL_ENGINE_DIR="${EDGE_VLM_MULTIMODAL_ENGINE_DIR}" \
+  _BASE_METADATA_JSON="${BASE_METADATA_JSON}" \
   BATCH_SIZE_V="${BATCH_SIZE}" \
   INPUT_LEN_V="${INPUT_LEN}" \
   PAST_KV_LEN_V="${PAST_KV_LEN}" \
@@ -180,20 +214,8 @@ def _i(v):
     except (TypeError, ValueError):
         return 0
 
-print(json.dumps({
-    "arch": os.environ.get("ARCH", "unknown"),
-    "kernel": os.environ.get("KERNEL", "unknown"),
-    "jetpack_version": _n(os.environ.get("JETPACK")),
-    "cuda_version": _n(os.environ.get("CUDA")),
-    "tensorrt_version": _n(os.environ.get("TRT")),
-    "gpu_compute_capability": _n(os.environ.get("GPU_CC")),
-    "gpu_name": _n(os.environ.get("GPU_NAME")),
-    "edge_llm_commit": _n(os.environ.get("EDGE_LLM_COMMIT")),
-    "edge_llm_version_tag": _n(os.environ.get("EDGE_LLM_TAG")),
-    "nvpmodel_mode": _n(os.environ.get("NVPMODEL")),
-    "model_name": _n(os.environ.get("MODEL_NAME")),
-    "llm_engine_dir": os.environ.get("LLM_ENGINE_DIR", ""),
-    "multimodal_engine_dir": os.environ.get("MULTIMODAL_ENGINE_DIR", ""),
+metadata = json.loads(os.environ.get("_BASE_METADATA_JSON", "{}"))
+metadata.update({
     "batch_size": _i(os.environ.get("BATCH_SIZE_V")),
     "input_len": _i(os.environ.get("INPUT_LEN_V")),
     "past_kv_len": _i(os.environ.get("PAST_KV_LEN_V")),
@@ -203,7 +225,8 @@ print(json.dumps({
     "measured_iterations": _i(os.environ.get("ITERATIONS_V")),
     "inference_warmup_runs": _i(os.environ.get("INFERENCE_WARMUP_V")),
     "input_vlm_json": _n(os.environ.get("INPUT_VLM_JSON_V")),
-}, indent=2, sort_keys=True))
+})
+print(json.dumps(metadata, indent=2, sort_keys=True))
 PYEOF
 }
 
@@ -215,7 +238,7 @@ else
   PREFILL_CMD=(
     "${LLM_BENCH}"
     --mode prefill
-    --engineDir "${EDGE_VLM_LLM_ENGINE_DIR}"
+    --engineDir "${RESOLVED_LLM_ENGINE_DIR}"
     --batchSize "${BATCH_SIZE}"
     --inputLen "${INPUT_LEN}"
     --warmup "${WARMUP}"
@@ -248,7 +271,7 @@ else
   DECODE_CMD=(
     "${LLM_BENCH}"
     --mode decode
-    --engineDir "${EDGE_VLM_LLM_ENGINE_DIR}"
+    --engineDir "${RESOLVED_LLM_ENGINE_DIR}"
     --batchSize "${BATCH_SIZE}"
     --pastKVLen "${PAST_KV_LEN}"
     --warmup "${WARMUP}"
@@ -324,8 +347,8 @@ else
 
   PROFILE_CMD=(
     "${LLM_INFERENCE}"
-    --engineDir "${EDGE_VLM_LLM_ENGINE_DIR}"
-    --multimodalEngineDir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR}"
+    --engineDir "${RESOLVED_LLM_ENGINE_DIR}"
+    --multimodalEngineDir "${RESOLVED_MULTIMODAL_ENGINE_DIR}"
     --inputFile "${INPUT_VLM_JSON}"
     --outputFile "${INFERENCE_OUT}"
     --maxGenerateLength "${MAX_GENERATE_LENGTH}"
@@ -398,6 +421,7 @@ manifest = {
     "run_id": os.environ["_RUN_ID"],
     "recorded_at": os.environ["_RECORDED_AT"],
     "metadata": metadata,
+    "engine_provenance": metadata.get("engine_provenance"),
     "llm_bench_prefill": _nullable_basename(os.environ.get("_PREFILL_OUT")),
     "llm_bench_decode": _nullable_basename(os.environ.get("_DECODE_OUT")),
     "llm_bench_visual": _nullable_basename(os.environ.get("_VISUAL_OUT")),

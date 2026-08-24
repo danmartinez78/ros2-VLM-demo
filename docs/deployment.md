@@ -154,7 +154,11 @@ If Docker group membership changes, log out and back in before continuing.
 
 ## 5. Configure paths
 
-Setup generates `scripts/edge_vlm_env.sh` from setup-produced paths.
+Setup generates `scripts/edge_vlm_env.sh` from setup-produced paths. The file
+keeps exporting the runtime paths expected by the current ROS stack, but the
+active model/profile selection now comes from workspace state managed by
+`./scripts/modelctl` instead of treating the env file itself as the source of
+truth.
 
 A typical Thor configuration is:
 
@@ -163,12 +167,30 @@ export ROS_DISTRO="jazzy"
 export ROS_WORKSPACE="$HOME/ros2_ws"
 export TENSORRT_EDGE_LLM_ROOT="$HOME/TensorRT-Edge-LLM"
 export TENSORRT_EDGE_LLM_BUILD_DIR="$TENSORRT_EDGE_LLM_ROOT/build"
-export EDGE_VLM_MODEL_NAME="Cosmos-Reason2-8B"
 export EDGE_VLM_WORKSPACE_DIR="$HOME/tensorrt-edgellm-workspace"
-export EDGE_VLM_LLM_ENGINE_DIR="$EDGE_VLM_WORKSPACE_DIR/$EDGE_VLM_MODEL_NAME/engine/llm"
-export EDGE_VLM_MULTIMODAL_ENGINE_DIR="$EDGE_VLM_WORKSPACE_DIR/$EDGE_VLM_MODEL_NAME/engine"
 export EDGELLM_PLUGIN_PATH="$TENSORRT_EDGE_LLM_BUILD_DIR/libNvInfer_edgellm_plugin.so"
+export EDGE_VLM_RUNTIME_STATE_FILE="$EDGE_VLM_WORKSPACE_DIR/.edge-vlm/active-profile.json"
 ```
+
+Common management flow:
+
+```bash
+./scripts/modelctl list
+./scripts/modelctl status cosmos-reason2-8b thor-current
+./scripts/modelctl build cosmos-reason2-8b thor-f8
+./scripts/modelctl validate cosmos-reason2-8b thor-f8
+./scripts/modelctl activate cosmos-reason2-8b thor-f8
+./scripts/modelctl current
+```
+
+- `prepare` reuses `scripts/prepare_thor_jp72_assets.sh` and stops after
+  checkpoint/quantized/ONNX artifacts are ready.
+- Managed engines live under `${MODEL}/engines/<profile-id>/`.
+- `thor-current` preserves the existing `${MODEL}/engine/` control engine and
+  activates it without moving or deleting the legacy directory.
+- Add a new model by extending `scripts/models/models.json` plus the matching
+  entry in `scripts/thor/jp72_manifest.json`; add a new deployment profile in
+  `scripts/models/engine_profiles.json`.
 
 ## 6. Build and verify
 

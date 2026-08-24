@@ -38,6 +38,25 @@
         "visual/preprocessor_config.json"
       ]
     },
+    "Cosmos-Reason2-2B": {
+      "hf_model_id": "nvidia/Cosmos-Reason2-2B",
+      "quantization": "nvfp4",
+      "pytorch_container": "nvcr.io/nvidia/pytorch:26.05-py3",
+      "modelopt_version": "0.45.0",
+      "required_llm_artifacts": [
+        "llm.engine",
+        "embedding.safetensors",
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "processed_chat_template.json"
+      ],
+      "required_visual_artifacts": [
+        "visual/visual.engine",
+        "visual/config.json",
+        "visual/preprocessor_config.json"
+      ]
+    },
     "Qwen3-VL-2B-Instruct": {
       "required_directories": [
         "quantized",

@@ -6,9 +6,25 @@ export ROS_DISTRO="jazzy"
 export ROS_WORKSPACE="${HOME}/ros2_ws"
 export TENSORRT_EDGE_LLM_ROOT="${HOME}/TensorRT-Edge-LLM"
 export TENSORRT_EDGE_LLM_BUILD_DIR="${TENSORRT_EDGE_LLM_ROOT}/build"
-
-export EDGE_VLM_MODEL_NAME="Cosmos-Reason2-8B"
 export EDGE_VLM_WORKSPACE_DIR="${HOME}/tensorrt-edgellm-workspace"
-export EDGE_VLM_LLM_ENGINE_DIR="${EDGE_VLM_WORKSPACE_DIR}/${EDGE_VLM_MODEL_NAME}/engine/llm"
-export EDGE_VLM_MULTIMODAL_ENGINE_DIR="${EDGE_VLM_WORKSPACE_DIR}/${EDGE_VLM_MODEL_NAME}/engine"
 export EDGELLM_PLUGIN_PATH="${TENSORRT_EDGE_LLM_BUILD_DIR}/libNvInfer_edgellm_plugin.so"
+export EDGE_VLM_RUNTIME_STATE_FILE="${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/active-profile.json"
+
+_edge_vlm_env_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+export EDGE_VLM_MODELCTL_PATH="${_edge_vlm_env_script_dir}/models/modelctl.py"
+if [[ "${EDGE_VLM_RUNTIME_STATE_FILE}" == "${EDGE_VLM_WORKSPACE_DIR}/.edge-vlm/"* ]] && [[ -f "${EDGE_VLM_RUNTIME_STATE_FILE}" ]]; then
+  while IFS= read -r -d '' _edge_vlm_key && IFS= read -r -d '' _edge_vlm_value; do
+    case "${_edge_vlm_key}" in
+      EDGE_VLM_MODEL_NAME|EDGE_VLM_MODEL_ID|EDGE_VLM_ENGINE_PROFILE_ID|EDGE_VLM_LLM_ENGINE_DIR|EDGE_VLM_MULTIMODAL_ENGINE_DIR|EDGELLM_PLUGIN_PATH)
+        printf -v "${_edge_vlm_key}" '%s' "${_edge_vlm_value}"
+        export "${_edge_vlm_key}"
+        ;;
+    esac
+  done < <(python3 "${EDGE_VLM_MODELCTL_PATH}" print-env-pairs --state-file "${EDGE_VLM_RUNTIME_STATE_FILE}")
+  unset _edge_vlm_key _edge_vlm_value
+else
+  export EDGE_VLM_MODEL_NAME="Cosmos-Reason2-8B"
+  export EDGE_VLM_LLM_ENGINE_DIR="${EDGE_VLM_WORKSPACE_DIR}/${EDGE_VLM_MODEL_NAME}/engine/llm"
+  export EDGE_VLM_MULTIMODAL_ENGINE_DIR="${EDGE_VLM_WORKSPACE_DIR}/${EDGE_VLM_MODEL_NAME}/engine"
+fi
+unset _edge_vlm_env_script_dir

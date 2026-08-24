@@ -65,6 +65,16 @@ MULTIFRAME_PROMPT_TEXT = (
 )
 
 MAX_OUTPUT_TOKENS = 32
+ENGINE_PROVENANCE_KEYS = (
+    "model_name",
+    "engine_profile_id",
+    "llm_engine_dir",
+    "multimodal_engine_dir",
+    "engine_manifest_path",
+    "engine_manifest_sha256",
+    "engine_identity",
+    "engine_manifest_status",
+)
 
 
 # ── statistics helpers ────────────────────────────────────────────────────────
@@ -432,6 +442,54 @@ def compute_ipc_artifact_table(
     return rows
 
 
+def normalize_engine_provenance(provenance: Any) -> dict[str, Any] | None:
+    """Normalize a raw provenance object from benchmark records."""
+    if not isinstance(provenance, dict):
+        return None
+    normalized = {key: provenance.get(key) for key in ENGINE_PROVENANCE_KEYS}
+    warnings = provenance.get("provenance_warnings")
+    normalized["provenance_warnings"] = list(warnings) if isinstance(warnings, list) else []
+    if not any(value for key, value in normalized.items() if key != "provenance_warnings"):
+        return None
+    return normalized
+
+
+def collect_unique_engine_provenance(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect distinct normalized provenance objects from raw records."""
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        normalized = normalize_engine_provenance(record.get("engine_provenance"))
+        if normalized is None:
+            continue
+        key = json.dumps(normalized, sort_keys=True)
+        if key in seen:
+            continue
+        unique.append(normalized)
+        seen.add(key)
+    return unique
+
+
+def collect_unique_max_output_tokens(records: list[dict[str, Any]]) -> list[int | str]:
+    """Collect distinct max_output_tokens values from raw records."""
+    unique: list[int | str] = []
+    seen: set[str] = set()
+    for record in records:
+        value = record.get("max_output_tokens")
+        if value is None:
+            continue
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        key = json.dumps(value, sort_keys=True)
+        if key in seen:
+            continue
+        unique.append(value)
+        seen.add(key)
+    if all(isinstance(value, int) and not isinstance(value, bool) for value in unique):
+        unique.sort()
+    return unique
+
+
 # ── full report generation ────────────────────────────────────────────────────
 
 
@@ -457,6 +515,8 @@ def build_report(
 
     run_ids = list({r.get("run_id", "") for r in records if r.get("run_id")})
     model_names = list({r.get("model_name", "") for r in records if r.get("model_name")})
+    provenance_variants = collect_unique_engine_provenance(records)
+    mixed_engine_provenance = len(provenance_variants) > 1
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -468,6 +528,9 @@ def build_report(
         "n_measured_records": sum(
             1 for r in records if not r.get("warmup", False) and r.get("success", False)
         ),
+        "engine_provenance": provenance_variants[0] if len(provenance_variants) == 1 else None,
+        "engine_provenance_variants": provenance_variants,
+        "mixed_engine_provenance": mixed_engine_provenance,
         "frame_conditions": conditions_summary,
         "frame_scaling_table": compute_frame_scaling_table(by_condition_path),
         "ipc_artifact_table": compute_ipc_artifact_table(by_condition_path),
@@ -500,18 +563,66 @@ def format_text_report(report: dict[str, Any]) -> str:
 
     model_names = report.get("model_names") or []
     run_ids = report.get("run_ids") or []
+    max_output_tokens_values = collect_unique_max_output_tokens(report.get("raw_records") or [])
+    mixed_model_or_engine = report.get("mixed_engine_provenance") or len(model_names) > 1
     if model_names:
         lines += ["", f"  Model(s): {', '.join(model_names)}"]
     if run_ids:
         lines += [f"  Run ID(s): {', '.join(run_ids)}"]
+    provenance = report.get("engine_provenance")
+    provenance_variants = report.get("engine_provenance_variants") or []
+    if provenance:
+        lines += [
+            "",
+            "  Engine provenance:",
+            f"    Identity: {provenance.get('engine_identity') or 'unknown'}",
+            f"    Model/profile: {provenance.get('model_name') or 'unknown'} / {provenance.get('engine_profile_id') or 'unknown'}",
+            f"    LLM engine dir: {provenance.get('llm_engine_dir') or 'n/a'}",
+            f"    Multimodal dir: {provenance.get('multimodal_engine_dir') or 'n/a'}",
+        ]
+        if provenance.get("engine_manifest_path"):
+            lines.append(f"    Engine manifest: {provenance.get('engine_manifest_path')}")
+        if provenance.get("engine_manifest_sha256"):
+            lines.append(f"    Manifest SHA256: {provenance.get('engine_manifest_sha256')}")
+        if provenance.get("engine_manifest_status"):
+            lines.append(f"    Manifest status: {provenance.get('engine_manifest_status')}")
+        for warning in provenance.get("provenance_warnings") or []:
+            lines.append(f"    WARNING: {warning}")
+    elif report.get("mixed_engine_provenance"):
+        lines += [
+            "",
+            "  Engine provenance: MIXED",
+            "    Multiple engine identities were recorded in this JSONL file.",
+        ]
+        for item in provenance_variants:
+            lines.append(
+                f"    - {item.get('engine_identity') or 'unknown'}"
+                f" ({item.get('llm_engine_dir') or 'n/a'} | {item.get('multimodal_engine_dir') or 'n/a'})"
+            )
     lines += [
         f"  Total records: {report.get('n_total_records', 'n/a')}",
         f"  Measured (non-warmup, success): {report.get('n_measured_records', 'n/a')}",
         "",
         "  Frame-count conditions: F1=1 frame, F2=2 frames, F4=4 frames, F8=8 frames",
-        "  Fixed: model, engines, precision, prompt text, max_output_tokens=32",
-        "  Prompt policy: compact temporal JSON (one structured result for full sequence)",
     ]
+    if mixed_model_or_engine:
+        lines.append(
+            "  Mixed/non-comparable: model/engine configuration varies across records"
+        )
+        fixed_fields = ["precision", "prompt text"]
+    else:
+        fixed_fields = ["model", "engines", "precision", "prompt text"]
+    if len(max_output_tokens_values) == 1:
+        fixed_fields.append(f"max_output_tokens={max_output_tokens_values[0]}")
+    elif not max_output_tokens_values:
+        fixed_fields.append("max_output_tokens=unknown")
+    lines.append(f"  Fixed: {', '.join(fixed_fields)}")
+    if len(max_output_tokens_values) > 1:
+        mixed_values = ", ".join(str(value) for value in max_output_tokens_values)
+        lines.append(
+            f"  Mixed request config: max_output_tokens varies across records ({mixed_values})"
+        )
+    lines.append("  Prompt policy: compact temporal JSON (one structured result for full sequence)")
 
     # ── Frame-scaling table ───────────────────────────────────────────────
     scaling = report.get("frame_scaling_table") or []
@@ -707,6 +818,7 @@ def build_direct_record(env: dict[str, str] | None = None) -> str:
     _BM_RESPONSE_PATH         plain string path
     _BM_PROFILE_PATH          plain string path
     _BM_MODEL_NAME            plain string
+    _BM_ENGINE_PROVENANCE     JSON object
     _BM_ITERATION             JSON integer
     _BM_IS_WARMUP             JSON bool
     """
@@ -743,6 +855,7 @@ def build_direct_record(env: dict[str, str] | None = None) -> str:
         "native_profile_path": _js(env, "_BM_PROFILE_PATH"),
         "ipc_result_path": None,
         "model_name": _js(env, "_BM_MODEL_NAME"),
+        "engine_provenance": _jl(env, "_BM_ENGINE_PROVENANCE"),
         "iteration": _jl(env, "_BM_ITERATION"),
         "warmup": _jl(env, "_BM_IS_WARMUP"),
     })
@@ -768,6 +881,7 @@ def build_ipc_record(env: dict[str, str] | None = None) -> str:
     _BM_OUTPUT_WORDS       JSON integer or null
     _BM_IPC_RESULT_PATH    JSON string or null  (path to result artifact)
     _BM_MODEL_NAME         plain string
+    _BM_ENGINE_PROVENANCE  JSON object
     _BM_ITERATION          JSON integer
     _BM_IS_WARMUP          JSON bool
     """
@@ -804,6 +918,7 @@ def build_ipc_record(env: dict[str, str] | None = None) -> str:
         "native_profile_path": None,
         "ipc_result_path": _jl(env, "_BM_IPC_RESULT_PATH"),
         "model_name": _js(env, "_BM_MODEL_NAME"),
+        "engine_provenance": _jl(env, "_BM_ENGINE_PROVENANCE"),
         "iteration": _jl(env, "_BM_ITERATION"),
         "warmup": _jl(env, "_BM_IS_WARMUP"),
     })
