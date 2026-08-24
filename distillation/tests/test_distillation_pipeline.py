@@ -972,13 +972,18 @@ class TestTrainingConfig(unittest.TestCase):
     def test_processor_spy_both_calls_receive_identical_kwargs(self):
         """
         Processor spy: verify that the video_kwargs returned by
-        build_video_processor_kwargs are identical between the full-example
-        and prompt-only apply_chat_template calls.
+        build_video_processor_kwargs are passed as processor_kwargs= identically
+        in both the full-example and prompt-only apply_chat_template calls.
 
         This is a CPU-testable regression guard: if the two calls diverge
-        (e.g. full call gets fps=8.0 while prompt-only falls back to 24 FPS),
-        prompt_len will be computed from a different token sequence and the
-        wrong label tokens will be masked.
+        (e.g. full call gets processor_kwargs with fps=8.0 while prompt-only
+        falls back to 24 FPS), prompt_len will be computed from a different
+        token sequence and the wrong label tokens will be masked.
+
+        Also guards the correct call contract: fps / do_sample_frames must
+        arrive inside processor_kwargs={}, NOT as top-level kwargs.  Top-level
+        fps is silently ignored by the Transformers apply_chat_template API,
+        causing the processor to default to 24 FPS and re-sample the frames.
         """
         import unittest.mock as mock
 
@@ -990,10 +995,21 @@ class TestTrainingConfig(unittest.TestCase):
         call_kwargs_list = []
 
         def spy_apply_chat_template(msgs, **kwargs):
-            # Record only the video-related kwargs for inspection.
+            # Record the processor_kwargs dict passed for inspection.
+            # The contract requires fps/do_sample_frames to be inside
+            # processor_kwargs, NOT at the top level.
+            proc_kwargs = kwargs.get("processor_kwargs") or {}
             call_kwargs_list.append({
-                k: kwargs[k] for k in ("fps", "do_sample_frames") if k in kwargs
+                k: proc_kwargs[k] for k in ("fps", "do_sample_frames") if k in proc_kwargs
             })
+            # Also assert fps/do_sample_frames are NOT top-level kwargs —
+            # they would be silently ignored there.
+            assert "fps" not in kwargs, (
+                "fps must be inside processor_kwargs={}, not a top-level kwarg"
+            )
+            assert "do_sample_frames" not in kwargs, (
+                "do_sample_frames must be inside processor_kwargs={}, not a top-level kwarg"
+            )
             # Return a minimal stub so callers don't crash.
             return {"input_ids": [[1, 2, 3]], "attention_mask": [[1, 1, 1]],
                     "pixel_values_videos": [[0.0]]}
@@ -1001,11 +1017,15 @@ class TestTrainingConfig(unittest.TestCase):
         processor_stub = mock.MagicMock()
         processor_stub.apply_chat_template.side_effect = spy_apply_chat_template
 
-        # Simulate what _tokenize does: call apply_chat_template twice with the
-        # *same* video_kwargs for both the full example and the prompt prefix.
-        processor_stub.apply_chat_template(messages, add_generation_prompt=False, **video_kwargs)
+        # Simulate what _tokenize does: call apply_chat_template twice with
+        # processor_kwargs= for both the full example and the prompt prefix.
+        processor_stub.apply_chat_template(
+            messages, add_generation_prompt=False, processor_kwargs=video_kwargs or None
+        )
         prompt_messages = [m for m in messages if m.get("role") != "assistant"]
-        processor_stub.apply_chat_template(prompt_messages, add_generation_prompt=True, **video_kwargs)
+        processor_stub.apply_chat_template(
+            prompt_messages, add_generation_prompt=True, processor_kwargs=video_kwargs or None
+        )
 
         self.assertEqual(len(call_kwargs_list), 2, "Expected exactly two apply_chat_template calls")
         full_kw, prompt_kw = call_kwargs_list
