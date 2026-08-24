@@ -46,7 +46,7 @@ from distillation.validator import (
     VALIDATORS,
 )
 from distillation.dataset import split_dataset, export_sft_dataset
-from distillation.training import TrainingConfig, run_training, validate_multimodal_messages, assert_collated_features_multimodal, derive_video_timing_metadata, _QWEN3VL_DEFAULT_FPS
+from distillation.training import TrainingConfig, run_training, validate_multimodal_messages, assert_collated_features_multimodal, derive_video_timing_metadata, build_video_processor_kwargs, _QWEN3VL_DEFAULT_FPS
 from distillation.evaluation import (
     EvaluationReport,
     evaluate_batch,
@@ -924,6 +924,101 @@ class TestTrainingConfig(unittest.TestCase):
         result = derive_video_timing_metadata(messages)
         self.assertEqual(result["fps"], 8.0)
         self.assertEqual(result["t_seconds"], t_seconds)
+
+    # build_video_processor_kwargs
+    # ------------------------------------------------------------------
+
+    def test_build_video_kwargs_no_video_returns_empty(self):
+        """Image-only messages → empty kwargs dict (no video processing)."""
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image", "url": "f0.jpg"},
+                {"type": "text", "text": "Describe."},
+            ]}
+        ]
+        timing = derive_video_timing_metadata(messages)
+        kwargs = build_video_processor_kwargs(messages, timing)
+        self.assertEqual(kwargs, {})
+
+    def test_build_video_kwargs_sets_do_sample_frames_false(self):
+        """Video messages always include do_sample_frames=False."""
+        messages = self._video_messages(fps=8.0)
+        timing = derive_video_timing_metadata(messages)
+        kwargs = build_video_processor_kwargs(messages, timing)
+        self.assertIn("do_sample_frames", kwargs)
+        self.assertFalse(kwargs["do_sample_frames"])
+
+    def test_build_video_kwargs_8fps_not_default(self):
+        """8-FPS video → fps=8.0 in kwargs, not _QWEN3VL_DEFAULT_FPS=24."""
+        t_seconds = [i / 8.0 for i in range(8)]
+        messages = self._video_messages(fps=8.0, t_seconds=t_seconds)
+        timing = derive_video_timing_metadata(messages)
+        kwargs = build_video_processor_kwargs(messages, timing)
+        self.assertIn("fps", kwargs)
+        self.assertEqual(kwargs["fps"], 8.0)
+        self.assertNotEqual(kwargs["fps"], _QWEN3VL_DEFAULT_FPS)
+
+    def test_build_video_kwargs_no_fps_no_fps_key(self):
+        """Video without fps → fps key absent from kwargs (no silent 24-FPS injection)."""
+        # fps is absent from the content object; derive_video_timing returns None.
+        # build_video_processor_kwargs must NOT inject fps=24 on behalf of the caller.
+        messages = self._video_messages(fps=None)
+        timing = derive_video_timing_metadata(messages)
+        kwargs = build_video_processor_kwargs(messages, timing)
+        self.assertNotIn("fps", kwargs)
+        # do_sample_frames must still be False (video content present)
+        self.assertFalse(kwargs["do_sample_frames"])
+
+    def test_processor_spy_both_calls_receive_identical_kwargs(self):
+        """
+        Processor spy: verify that the video_kwargs returned by
+        build_video_processor_kwargs are identical between the full-example
+        and prompt-only apply_chat_template calls.
+
+        This is a CPU-testable regression guard: if the two calls diverge
+        (e.g. full call gets fps=8.0 while prompt-only falls back to 24 FPS),
+        prompt_len will be computed from a different token sequence and the
+        wrong label tokens will be masked.
+        """
+        import unittest.mock as mock
+
+        t_seconds = [i / 8.0 for i in range(8)]
+        messages = self._video_messages(fps=8.0, t_seconds=t_seconds)
+        timing = derive_video_timing_metadata(messages)
+        video_kwargs = build_video_processor_kwargs(messages, timing)
+
+        call_kwargs_list = []
+
+        def spy_apply_chat_template(msgs, **kwargs):
+            # Record only the video-related kwargs for inspection.
+            call_kwargs_list.append({
+                k: kwargs[k] for k in ("fps", "do_sample_frames") if k in kwargs
+            })
+            # Return a minimal stub so callers don't crash.
+            return {"input_ids": [[1, 2, 3]], "attention_mask": [[1, 1, 1]],
+                    "pixel_values_videos": [[0.0]]}
+
+        processor_stub = mock.MagicMock()
+        processor_stub.apply_chat_template.side_effect = spy_apply_chat_template
+
+        # Simulate what _tokenize does: call apply_chat_template twice with the
+        # *same* video_kwargs for both the full example and the prompt prefix.
+        processor_stub.apply_chat_template(messages, add_generation_prompt=False, **video_kwargs)
+        prompt_messages = [m for m in messages if m.get("role") != "assistant"]
+        processor_stub.apply_chat_template(prompt_messages, add_generation_prompt=True, **video_kwargs)
+
+        self.assertEqual(len(call_kwargs_list), 2, "Expected exactly two apply_chat_template calls")
+        full_kw, prompt_kw = call_kwargs_list
+        # Both calls must carry identical fps and do_sample_frames.
+        self.assertEqual(full_kw, prompt_kw,
+                         f"Processor kwargs diverged between full and prompt-only call: "
+                         f"{full_kw!r} vs {prompt_kw!r}")
+        # Regression: fps must be 8.0 in both calls.
+        self.assertEqual(full_kw.get("fps"), 8.0)
+        self.assertNotEqual(full_kw.get("fps"), _QWEN3VL_DEFAULT_FPS)
+        # do_sample_frames must be False in both calls.
+        self.assertFalse(full_kw.get("do_sample_frames"))
+        self.assertFalse(prompt_kw.get("do_sample_frames"))
 
 
 # ---------------------------------------------------------------------------

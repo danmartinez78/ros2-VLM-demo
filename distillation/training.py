@@ -484,6 +484,57 @@ def derive_video_timing_metadata(messages: list) -> dict:
     return result
 
 
+def build_video_processor_kwargs(messages: list, timing: dict) -> dict:
+    """
+    Build the set of processor kwargs that must be passed identically to every
+    ``apply_chat_template`` call for a given example (both the full-example call
+    and the prompt-only call used to compute ``prompt_len`` for label masking).
+
+    For frame-list video examples (``type: "video"`` with ``"path": [...]``),
+    the Qwen3-VL processor must be told **not** to re-sample the frames
+    (``do_sample_frames=False``) because the list already contains the exact
+    pre-sampled frames from the export step.  Allowing the processor to sample
+    again would silently produce a different number of frames and invalidate the
+    temporal metadata.  The source FPS is passed via ``fps=`` directly (the
+    supported Qwen3-VL ``apply_chat_template`` keyword) rather than nested inside
+    ``videos_kwargs``; the current Transformers/Qwen3-VL implementation reads the
+    top-level ``fps`` kwarg and its upstream tests pass it at this level.
+
+    For image-sequence (``type: "image"``) and text-only examples, no video
+    kwargs are needed and an empty dict is returned.
+
+    Parameters
+    ----------
+    messages : list of message dicts
+    timing   : result of ``derive_video_timing_metadata(messages)``
+
+    Returns
+    -------
+    dict — keyword arguments to be unpacked (``**kwargs``) into every
+    ``processor.apply_chat_template(...)`` call for this example.
+
+    Notes
+    -----
+    * This function has **no** heavy dependencies and runs in CPU-only CI.
+    * Both the full-example and prompt-only ``apply_chat_template`` calls in
+      ``_tokenize`` must receive exactly the kwargs returned here; divergence
+      makes ``prompt_len`` unreliable and can mask the wrong label tokens.
+    """
+    if timing["video_count"] == 0:
+        return {}
+    kwargs: dict = {
+        # Disable processor-side re-sampling: the content object already
+        # carries exactly the pre-sampled frame paths from the export step.
+        "do_sample_frames": False,
+    }
+    if timing["fps"] is not None:
+        # Pass fps as a top-level kwarg — the processor-supported API.
+        # This prevents Qwen3-VL from substituting its internal 24-FPS
+        # default for samples captured at a different rate.
+        kwargs["fps"] = timing["fps"]
+    return kwargs
+
+
 def run_training(
     config: TrainingConfig,
     dry_run: bool = False,
@@ -696,11 +747,13 @@ def run_training(
         # The returned timing dict is passed to apply_chat_template as
         # video_fps so the processor uses the sample's actual capture rate.
         timing = derive_video_timing_metadata(messages)
-        # Build processor kwargs: pass fps explicitly for video samples so the
-        # Qwen3-VL processor does not substitute its internal 24-FPS default.
-        processor_video_kwargs: dict = {}
-        if timing["fps"] is not None:
-            processor_video_kwargs["fps"] = timing["fps"]
+        # Build the processor kwargs that must be passed identically to both
+        # the full-example and prompt-only apply_chat_template calls.
+        # - do_sample_frames=False: frames are already pre-sampled; prevent
+        #   the processor from re-sampling and invalidating frame count/timing.
+        # - fps=<N>: pass the actual capture rate directly so the processor
+        #   does not substitute the Qwen3-VL default of 24 FPS.
+        video_kwargs = build_video_processor_kwargs(messages, timing)
         # Use the processor's multimodal chat-template path:
         #   apply_chat_template(tokenize=True, return_dict=True)
         # This resolves <image> / <video> placeholder tokens and produces
@@ -718,8 +771,7 @@ def run_training(
             max_length=config.max_seq_length,
             padding="max_length",
             add_generation_prompt=False,
-            **({} if not processor_video_kwargs
-               else {"videos_kwargs": processor_video_kwargs}),
+            **video_kwargs,
         )
         # Verify that the processor produced multimodal output (pixel_values or
         # pixel_values_videos).  This assertion surfaces processor mismatches
@@ -738,6 +790,12 @@ def run_training(
         input_ids = features["input_ids"][0]  # [seq_len]
         # Build prompt-only message list (exclude the last assistant turn).
         prompt_messages = [m for m in messages if m.get("role") != "assistant"]
+        # IMPORTANT: use *exactly* the same video_kwargs here so that the
+        # processor applies identical timing/sampling preprocessing to both
+        # the full example and the prompt-only prefix.  Without this the
+        # resolved token sequence for the prompt can differ (e.g. wrong frame
+        # count or 24-FPS timestamps), making prompt_len unreliable and
+        # causing the wrong label tokens to be masked.
         prompt_features = processor.apply_chat_template(
             prompt_messages,
             tokenize=True,
@@ -747,6 +805,7 @@ def run_training(
             max_length=config.max_seq_length,
             padding=False,
             add_generation_prompt=True,
+            **video_kwargs,
         )
         prompt_len = prompt_features["input_ids"].shape[1]
         labels = input_ids.clone()
