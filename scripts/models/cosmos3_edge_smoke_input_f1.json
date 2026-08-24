@@ -1,0 +1,18 @@
+{
+  "_comment": "Phase-2 smoke-test input for nvidia/Cosmos3-Edge single-image (F1) path.  Follows the documented image message format from TRT Edge-LLM 0.10.0.  Replace '<absolute_path_to_image>' with the path to a real image file before running on hardware.",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "image",
+          "image": "<absolute_path_to_image>"
+        },
+        {
+          "type": "text",
+          "text": "Describe the scene in the image."
+        }
+      ]
+    }
+  ]
+}

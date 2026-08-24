@@ -237,6 +237,54 @@ class Cosmos3EdgeDryRunCommandTests(unittest.TestCase):
         self.assertIn("1", cmd)
         self.assertIn("2048", cmd)
 
+    def test_build_llm_command_onnx_dir_is_reasoning_llm(self) -> None:
+        """LLM build must consume onnx/reasoning/llm, not onnx/llm."""
+        cmd = c3_commands.build_llm_command(self.ctx, self.model, self.profile)
+        onnx_idx = cmd.index("--onnxDir")
+        onnx_path = cmd[onnx_idx + 1]
+        self.assertTrue(
+            onnx_path.endswith("onnx/reasoning/llm"),
+            f"Expected --onnxDir to end with 'onnx/reasoning/llm', got: {onnx_path}",
+        )
+        # Must not point at the generic onnx/llm/ path (trailing slash avoids
+        # false match on the 'onnx/reasoning/llm' suffix itself).
+        self.assertNotIn("/onnx/llm/", onnx_path + "/")
+
+    def test_build_visual_command_onnx_dir_is_reasoning_visual(self) -> None:
+        """Visual build must consume onnx/reasoning/visual, not onnx/visual."""
+        cmd = c3_commands.build_visual_command(self.ctx, self.model, self.profile)
+        onnx_idx = cmd.index("--onnxDir")
+        onnx_path = cmd[onnx_idx + 1]
+        self.assertTrue(
+            onnx_path.endswith("onnx/reasoning/visual"),
+            f"Expected --onnxDir to end with 'onnx/reasoning/visual', got: {onnx_path}",
+        )
+        # Must not point at the generic onnx/visual/ path.
+        self.assertNotIn("/onnx/visual/", onnx_path + "/")
+
+    def test_build_commands_onnx_dirs_are_under_export_output(self) -> None:
+        """LLM and visual --onnxDir values must be sub-trees of the export output directory."""
+        export_cmd = c3_commands.export_command(self.ctx, self.model)
+        # export_command argv is [binary, checkpoint, onnx_dir/reasoning, --task, reasoning]
+        export_onnx_dir = export_cmd[2]  # <model_root>/onnx/reasoning
+
+        llm_cmd = c3_commands.build_llm_command(self.ctx, self.model, self.profile)
+        llm_onnx_idx = llm_cmd.index("--onnxDir")
+        llm_onnx_path = llm_cmd[llm_onnx_idx + 1]
+
+        vis_cmd = c3_commands.build_visual_command(self.ctx, self.model, self.profile)
+        vis_onnx_idx = vis_cmd.index("--onnxDir")
+        vis_onnx_path = vis_cmd[vis_onnx_idx + 1]
+
+        self.assertTrue(
+            llm_onnx_path.startswith(export_onnx_dir),
+            f"LLM --onnxDir '{llm_onnx_path}' must be under export output '{export_onnx_dir}'",
+        )
+        self.assertTrue(
+            vis_onnx_path.startswith(export_onnx_dir),
+            f"Visual --onnxDir '{vis_onnx_path}' must be under export output '{export_onnx_dir}'",
+        )
+
     def test_build_visual_command_includes_image_token_limits(self) -> None:
         cmd = c3_commands.build_visual_command(self.ctx, self.model, self.profile)
         self.assertIn("--maxImageTokens", cmd)
@@ -268,6 +316,32 @@ class Cosmos3EdgeDryRunCommandTests(unittest.TestCase):
         self.assertNotIn("--frameCount", cmd)
         self.assertNotIn("--inputPrompt", cmd)
         self.assertNotIn("--llmEngineDir", cmd)
+
+    def test_smoke_inference_input_file_is_committed_fixture(self) -> None:
+        """--inputFile must point to the committed fixture, which must exist on disk."""
+        cmd = c3_commands.smoke_inference_command(self.ctx, self.model, self.profile, 1)
+        input_idx = cmd.index("--inputFile")
+        input_path = Path(cmd[input_idx + 1])
+        self.assertTrue(
+            input_path.is_file(),
+            f"Smoke-input fixture does not exist: {input_path}",
+        )
+        # The fixture must be valid JSON
+        with input_path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        self.assertIn("messages", data, "Smoke-input fixture must contain a 'messages' key")
+
+    def test_smoke_inference_input_fixture_uses_image_message_format(self) -> None:
+        """Fixture must follow the documented image message format (role/content with type=image)."""
+        with c3_commands.SMOKE_INPUT_FIXTURE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        messages = data["messages"]
+        self.assertTrue(len(messages) >= 1, "Fixture must have at least one message")
+        first_msg = messages[0]
+        self.assertIn("role", first_msg)
+        self.assertIn("content", first_msg)
+        content_types = [item.get("type") for item in first_msg["content"] if isinstance(item, dict)]
+        self.assertIn("image", content_types, "Fixture message content must contain an image item")
 
     def test_build_procedure_contains_required_steps(self) -> None:
         steps = c3_commands.build_procedure(self.ctx, self.model, self.profile)

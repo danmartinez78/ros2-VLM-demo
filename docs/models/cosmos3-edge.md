@@ -42,8 +42,12 @@ here.
 `nvidia/Cosmos3-Edge` is a video-native multimodal VLM.  Key architecture
 properties:
 
-- **Modality:** native video (natively video-aware; not a list of independent
-  still images).
+- **Modality:** The underlying model is natively video-aware.  However, the
+  exposed reasoning contract in TRT Edge-LLM 0.10.0 is **image + prompt →
+  text** (standard image message format); the multi-frame / native-video
+  input contract for the reasoning path has not been confirmed at this
+  revision.  Multi-image or native-video support will be added in a
+  subsequent phase after the reasoner input contract is verified on hardware.
 - **Runtime class:** standard Edge-LLM VLM multimodal runtime
   (`standard_vlm`), the same `llm_inference` / `edge_vlm_server` path used
   for Cosmos-Reason2.  This is **not** the Cosmos3 policy runtime
@@ -140,10 +144,13 @@ Phase 2 smoke tests therefore start with the documented single-image (F1) path:
 
 ```
 llm_inference --engineDir <llm_dir> --multimodalEngineDir <visual_dir> \
-              --inputFile <smoke_input_f1.json> --outputFile <smoke_output_f1.json>
+              --inputFile scripts/models/cosmos3_edge_smoke_input_f1.json \
+              --outputFile <model_root>/smoke_output_f1.json
 ```
 
-where `smoke_input_f1.json` uses the documented image message format.
+where `cosmos3_edge_smoke_input_f1.json` is the committed fixture that follows
+the documented image message format.  Replace `<absolute_path_to_image>` in the
+fixture with a real image path before executing on hardware.
 
 Multi-image or native-video smoke tests will be added in a subsequent phase
 after the Cosmos3 reasoner parser/runner contract is confirmed on hardware.
@@ -206,7 +213,9 @@ alone:
 
 - Actual engine file sizes and build time on Thor.
 - Actual latency for F4/F8 video inputs.
-- Exact stage names emitted by `cosmos3_edge_vlm` runtime profiling.
+- Exact stage names emitted by `standard_vlm` runtime profiling for
+  Cosmos3-Edge (which may differ from the `vision`, `prefill`, `generation`
+  labels used for Cosmos-Reason2).
 - Whether NVFP4 quantization is lossless for scene-understanding tasks at our
   target resolution and frame counts.
 - Maximum supported frame count before context-length overflow.

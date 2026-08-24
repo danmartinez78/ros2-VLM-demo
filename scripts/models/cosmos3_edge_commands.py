@@ -49,6 +49,17 @@ SMOKE_FRAME_COUNTS = [1]
 # HuggingFace model identifier (no secrets — public model card).
 HF_MODEL_ID = "nvidia/Cosmos3-Edge"
 
+# Committed smoke-input fixture relative to this file's directory.
+# The Phase-2 operator must replace <absolute_path_to_image> with a real
+# image path before executing on hardware.
+SMOKE_INPUT_FIXTURE = THIS_FILE.parent / "cosmos3_edge_smoke_input_f1.json"
+
+# Sub-directory written by tensorrt-edgellm-export under <model_root>/onnx/.
+# Per the pinned TRT Edge-LLM 0.10.0 guide the export command is:
+#   tensorrt-edgellm-export <checkpoint> <onnx_dir/reasoning> --task reasoning
+# producing two sub-trees: reasoning/llm and reasoning/visual.
+EXPORT_SUBDIR = "reasoning"
+
 
 def _ctx() -> "_modelctl.RuntimeContext":  # type: ignore[name-defined]
     return _modelctl._runtime_context()
@@ -106,8 +117,28 @@ def build_llm_command(
     model: "_modelctl.ModelRecord",
     profile: "_modelctl.ProfileRecord",
 ) -> list[str]:
-    """Step 3a: build LLM TensorRT engine."""
-    return _modelctl.build_llm_command(model, profile, ctx)
+    """Step 3a: build LLM TensorRT engine.
+
+    Reads the exported ONNX from the Cosmos3-Edge reasoner export path
+    ``<model_root>/onnx/reasoning/llm``, which is the layout written by
+    ``tensorrt-edgellm-export … --task reasoning``.
+    """
+    paths = _modelctl.engine_paths(model, profile, ctx)
+    model_root = _modelctl.model_root(model, ctx)
+    onnx_llm_dir = model_root / "onnx" / EXPORT_SUBDIR / "llm"
+    return [
+        str(Path(ctx.edge_build) / "examples" / "llm" / "llm_build"),
+        "--onnxDir",
+        str(onnx_llm_dir),
+        "--engineDir",
+        str(paths.llm_dir),
+        "--maxBatchSize",
+        str(profile.llm["maxBatchSize"]),
+        "--maxInputLen",
+        str(profile.llm["maxInputLen"]),
+        "--maxKVCacheCapacity",
+        str(profile.llm["maxKVCacheCapacity"]),
+    ]
 
 
 def build_visual_command(
@@ -115,8 +146,27 @@ def build_visual_command(
     model: "_modelctl.ModelRecord",
     profile: "_modelctl.ProfileRecord",
 ) -> list[str]:
-    """Step 3b: build visual TensorRT engine."""
-    return _modelctl.build_visual_command(model, profile, ctx)
+    """Step 3b: build visual TensorRT engine.
+
+    Reads the exported ONNX from the Cosmos3-Edge reasoner export path
+    ``<model_root>/onnx/reasoning/visual``, which is the layout written by
+    ``tensorrt-edgellm-export … --task reasoning``.
+    """
+    paths = _modelctl.engine_paths(model, profile, ctx)
+    model_root = _modelctl.model_root(model, ctx)
+    onnx_visual_dir = model_root / "onnx" / EXPORT_SUBDIR / "visual"
+    command = [
+        str(Path(ctx.edge_build) / "examples" / "multimodal" / "visual_build"),
+        "--onnxDir",
+        str(onnx_visual_dir),
+        "--engineDir",
+        str(paths.multimodal_dir),
+    ]
+    if profile.visual.get("maxImageTokens") is not None:
+        command.extend(["--maxImageTokens", str(profile.visual["maxImageTokens"])])
+    if profile.visual.get("maxImageTokensPerImage") is not None:
+        command.extend(["--maxImageTokensPerImage", str(profile.visual["maxImageTokensPerImage"])])
+    return command
 
 
 def smoke_inference_command(
@@ -142,7 +192,6 @@ def smoke_inference_command(
     on hardware.
     """
     paths = _modelctl.engine_paths(model, profile, ctx)
-    model_root = _modelctl.model_root(model, ctx)
     label = f"f{frame_count}"
     return [
         str(Path(ctx.edge_build) / "examples" / "llm" / "llm_inference"),
@@ -151,9 +200,9 @@ def smoke_inference_command(
         "--multimodalEngineDir",
         str(paths.multimodal_dir),
         "--inputFile",
-        str(model_root / f"smoke_input_{label}.json"),
+        str(SMOKE_INPUT_FIXTURE),
         "--outputFile",
-        str(model_root / f"smoke_output_{label}.json"),
+        str(_modelctl.model_root(model, ctx) / f"smoke_output_{label}.json"),
     ]
 
 
