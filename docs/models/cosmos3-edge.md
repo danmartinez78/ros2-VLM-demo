@@ -149,8 +149,9 @@ llm_inference --engineDir <llm_dir> --multimodalEngineDir <visual_dir> \
 ```
 
 where `cosmos3_edge_smoke_input_f1.json` is the committed fixture that follows
-the documented image message format.  Replace `<absolute_path_to_image>` in the
-fixture with a real image path before executing on hardware.
+the documented `llm_inference` input schema (`{ "requests": [{ "messages": [...] }] }`
+top-level shape).  Replace `<absolute_path_to_image>` in the fixture with a real
+image path before executing on hardware.
 
 Multi-image or native-video smoke tests will be added in a subsequent phase
 after the Cosmos3 reasoner parser/runner contract is confirmed on hardware.

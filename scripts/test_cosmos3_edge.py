@@ -326,22 +326,38 @@ class Cosmos3EdgeDryRunCommandTests(unittest.TestCase):
             input_path.is_file(),
             f"Smoke-input fixture does not exist: {input_path}",
         )
-        # The fixture must be valid JSON
+        # The fixture must be valid JSON with the documented top-level 'requests' shape.
         with input_path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        self.assertIn("messages", data, "Smoke-input fixture must contain a 'messages' key")
+        self.assertIn(
+            "requests",
+            data,
+            "Smoke-input fixture must use top-level 'requests' array (llm_inference input schema)",
+        )
+        # Must NOT use the incorrect root-level 'messages' shape.
+        self.assertNotIn(
+            "messages",
+            data,
+            "Smoke-input fixture must not place 'messages' at root; use 'requests[].messages'",
+        )
 
-    def test_smoke_inference_input_fixture_uses_image_message_format(self) -> None:
-        """Fixture must follow the documented image message format (role/content with type=image)."""
+    def test_smoke_inference_input_fixture_uses_requests_schema(self) -> None:
+        """Fixture must follow the documented llm_inference input schema: top-level 'requests'
+        array where each request contains a 'messages' array with at least one image item."""
         with c3_commands.SMOKE_INPUT_FIXTURE.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
-        messages = data["messages"]
-        self.assertTrue(len(messages) >= 1, "Fixture must have at least one message")
+        requests = data["requests"]
+        self.assertIsInstance(requests, list, "'requests' must be a list")
+        self.assertTrue(len(requests) >= 1, "Fixture must have at least one request")
+        first_request = requests[0]
+        self.assertIn("messages", first_request, "Each request must have a 'messages' key")
+        messages = first_request["messages"]
+        self.assertTrue(len(messages) >= 1, "Request must have at least one message")
         first_msg = messages[0]
         self.assertIn("role", first_msg)
         self.assertIn("content", first_msg)
         content_types = [item.get("type") for item in first_msg["content"] if isinstance(item, dict)]
-        self.assertIn("image", content_types, "Fixture message content must contain an image item")
+        self.assertIn("image", content_types, "Request message content must contain an image item")
 
     def test_build_procedure_contains_required_steps(self) -> None:
         steps = c3_commands.build_procedure(self.ctx, self.model, self.profile)
