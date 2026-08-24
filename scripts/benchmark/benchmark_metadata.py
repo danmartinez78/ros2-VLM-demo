@@ -29,6 +29,7 @@ from typing import Any
 #
 _EDGE_VLM_SERVER_ARGV_LLM_DIR = 1
 _EDGE_VLM_SERVER_ARGV_MULTIMODAL_DIR = 2
+# argv[3] is the plugin path and is intentionally not used for provenance.
 _EDGE_VLM_SERVER_ARGV_SOCKET_PATH = 4
 
 
@@ -130,8 +131,9 @@ def _socket_listener_pid(socket_path: str) -> int | None:
     output = _run(["ss", "-lxnp"])
     if not output:
         return None
+    socket_pattern = re.compile(rf"(^|\s){re.escape(canonical_socket)}(\s|$)")
     for line in output.splitlines():
-        if canonical_socket not in line:
+        if not socket_pattern.search(line):
             continue
         match = re.search(r"pid=(\d+)", line)
         if match:
