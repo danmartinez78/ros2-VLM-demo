@@ -241,10 +241,10 @@ This generates, in order:
 2. ONNX export / quantization (ModelOpt container).
 3. LLM engine build (`llm_build`).
 4. Visual engine build (`visual_build`).
-5. Smoke inference (`llm_inference`, single frame).
-6. F4 native-video smoke (`llm_inference`, 4 frames).
-7. F8 native-video smoke (`llm_inference`, 8 frames).
-8. Provenance / manifest capture (`modelctl`).
+4. Smoke inference, single frame (F1) (`llm_inference --frameCount 1`).
+4. Smoke inference, F4 native-video (`llm_inference --frameCount 4`).
+4. Smoke inference, F8 native-video (`llm_inference --frameCount 8`).
+5. Provenance / manifest capture (`modelctl`).
 
 No large downloads or builds are performed on CI.  All commands are printed
 to stdout and validated for structural correctness only.

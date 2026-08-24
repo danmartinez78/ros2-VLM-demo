@@ -3,8 +3,8 @@
 
 This module emits the exact sequence of commands required to acquire,
 export, build, and smoke-test the Cosmos3-Edge checkpoint on Jetson AGX
-Thor.  All commands are printed to stdout when ``--dry-run`` is passed
-(the default) and validated for structural correctness on CPU-only CI.
+Thor.  Commands are printed to stdout and validated for structural
+correctness on CPU-only CI; nothing is executed.
 
 No large downloads, TensorRT engine builds, or hardware operations are
 performed.  Workspace paths are read from the runtime context (environment
@@ -12,8 +12,9 @@ or jp72_manifest.json defaults) and printed but never created here.
 
 Usage::
 
-    python3 scripts/models/cosmos3_edge_commands.py --dry-run
+    python3 scripts/models/cosmos3_edge_commands.py
     python3 scripts/models/cosmos3_edge_commands.py --validate
+    python3 scripts/models/cosmos3_edge_commands.py --json
 """
 
 from __future__ import annotations
@@ -193,21 +194,24 @@ def build_procedure(
 
 # ── validation ────────────────────────────────────────────────────────────────
 
-_REQUIRED_FLAGS: dict[str, list[str]] = {
-    "1. Checkpoint acquisition": ["huggingface-cli", "--local-dir"],
-    "3a. LLM engine build": ["llm_build", "--onnxDir", "--engineDir", "--maxBatchSize"],
-    "3b. Visual engine build": ["visual_build", "--onnxDir", "--engineDir"],
-    "4. Smoke inference (F4)": ["llm_inference", "--frameCount"],
-    "4. Smoke inference (F8)": ["llm_inference", "--frameCount"],
-    "5. Provenance / manifest capture": ["modelctl.py", "validate"],
-}
+def _required_flags() -> dict[str, list[str]]:
+    """Build the required-step/token map dynamically from SMOKE_FRAME_COUNTS."""
+    flags: dict[str, list[str]] = {
+        "1. Checkpoint acquisition": ["huggingface-cli", "--local-dir"],
+        "3a. LLM engine build": ["llm_build", "--onnxDir", "--engineDir", "--maxBatchSize"],
+        "3b. Visual engine build": ["visual_build", "--onnxDir", "--engineDir"],
+        "5. Provenance / manifest capture": ["modelctl.py", "validate"],
+    }
+    for n in SMOKE_FRAME_COUNTS:
+        flags[f"4. Smoke inference (F{n})"] = ["llm_inference", "--frameCount"]
+    return flags
 
 
 def validate_procedure(steps: list[tuple[str, list[str]]]) -> list[str]:
     """Return a list of validation errors; empty list means all checks passed."""
     errors: list[str] = []
 
-    for required_label, required_tokens in _REQUIRED_FLAGS.items():
+    for required_label, required_tokens in _required_flags().items():
         matched_steps = [(label, cmd) for label, cmd in steps if label == required_label]
         if not matched_steps:
             errors.append(f"Missing required step: '{required_label}'")
@@ -253,13 +257,8 @@ def validate_procedure(steps: list[tuple[str, list[str]]]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Emit or validate the Phase 2 Thor bring-up commands for nvidia/Cosmos3-Edge."
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=True,
-        help="Print commands to stdout without executing anything (default).",
+        description="Emit or validate the Phase 2 Thor bring-up commands for nvidia/Cosmos3-Edge. "
+        "Commands are printed to stdout only; nothing is executed."
     )
     parser.add_argument(
         "--validate",
