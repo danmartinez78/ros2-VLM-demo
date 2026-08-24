@@ -232,6 +232,45 @@ class TrainingConfig:
 # Dry-run launcher
 # ---------------------------------------------------------------------------
 
+def assert_collated_features_multimodal(features: dict, sample_id: str = "") -> None:
+    """
+    CPU-testable assertion: verify that a collated feature dict produced by the
+    multimodal processor contains at least one of the expected visual tensor
+    keys for Qwen3-VL / Cosmos-Reason2.
+
+    Expected keys (at least one must be present):
+      - ``pixel_values``           – image patch tensor
+      - ``pixel_values_videos``    – video patch tensor
+      - ``image_grid_thw``         – Qwen3-VL image grid metadata
+      - ``video_grid_thw``         – Qwen3-VL video grid metadata
+
+    Raises ``AssertionError`` if none of these keys are present, which
+    indicates that the processor consumed only the text path and dropped all
+    visual content.
+
+    This function has *no* heavy dependencies and can be called in CI without
+    a GPU or model weights by passing a synthetic dict that mimics what the
+    real processor would produce.
+
+    Parameters
+    ----------
+    features : dict returned by the multimodal processor
+    sample_id : optional sample identifier for diagnostic messages
+    """
+    visual_keys = {"pixel_values", "pixel_values_videos", "image_grid_thw", "video_grid_thw"}
+    present = visual_keys & features.keys()
+    if not present:
+        label = f" (sample {sample_id!r})" if sample_id else ""
+        raise AssertionError(
+            f"Collated features{label} contain no multimodal visual tensor keys. "
+            f"Expected at least one of {sorted(visual_keys)} but got: "
+            f"{sorted(features.keys())[:20]}. "
+            "The processor likely consumed only the text path and discarded visual "
+            "content — ensure apply_chat_template is called with tokenize=True, "
+            "return_dict=True and that image/video objects are passed as dicts."
+        )
+
+
 def validate_multimodal_messages(messages: list) -> None:
     """
     CPU-testable guard: verify that a message list preserves multimodal image
@@ -447,23 +486,67 @@ def run_training(
 
     def _tokenize(example):
         messages = example.get("messages", [])
-        # Guard: ensure image content objects are structured dicts, not
-        # stringified text.  This runs on every training example and catches
-        # any export-side regression before the model forward pass.
+        # Guard: ensure image/video content objects are structured dicts, not
+        # stringified text.  Runs on every training example and catches any
+        # export-side regression before the model forward pass.
         validate_multimodal_messages(messages)
-        # Use the processor's chat template so that image tokens are correctly
-        # inserted and the visual encoder receives properly shaped inputs.
-        text = processor.apply_chat_template(
+        # Use the processor's multimodal chat-template path:
+        #   apply_chat_template(tokenize=True, return_dict=True)
+        # This resolves <image> / <video> placeholder tokens and produces
+        # pixel_values / pixel_values_videos alongside input_ids, so the visual
+        # encoder receives properly shaped inputs rather than stringified URLs.
+        # (The two-step `apply_chat_template(tokenize=False)` then
+        #  `processor(text=...)` path only processes text and silently drops
+        #  all visual content.)
+        features = processor.apply_chat_template(
             messages,
-            tokenize=False,
-            add_generation_prompt=False,
-        )
-        return processor(
-            text=text,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
             truncation=True,
             max_length=config.max_seq_length,
             padding="max_length",
+            add_generation_prompt=False,
         )
+        # Verify that the processor produced multimodal output (pixel_values or
+        # pixel_values_videos).  This assertion surfaces processor mismatches
+        # before any model forward pass.
+        assert_collated_features_multimodal(
+            {k: v for k, v in features.items()},
+            sample_id=example.get("sample_id", ""),
+        )
+        # SFT label construction: train only on the assistant response tokens.
+        # 1. Start with a full copy of input_ids as labels.
+        # 2. Build the prompt-only text (user+system turns, no assistant) and
+        #    tokenize it to find the prompt length.
+        # 3. Mask (set to -100) all prompt and padding positions so the loss
+        #    is computed only over the assistant output tokens.
+        import torch  # type: ignore[import-untyped]
+        input_ids = features["input_ids"][0]  # [seq_len]
+        # Build prompt-only message list (exclude the last assistant turn).
+        prompt_messages = [m for m in messages if m.get("role") != "assistant"]
+        prompt_features = processor.apply_chat_template(
+            prompt_messages,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            truncation=True,
+            max_length=config.max_seq_length,
+            padding=False,
+            add_generation_prompt=True,
+        )
+        prompt_len = prompt_features["input_ids"].shape[1]
+        labels = input_ids.clone()
+        # Mask prompt tokens and any padding (pad_token_id) from the loss.
+        labels[:prompt_len] = -100
+        pad_id = getattr(processor, "pad_token_id", None) or getattr(
+            processor.tokenizer, "pad_token_id", None
+        )
+        if pad_id is not None:
+            labels[labels == pad_id] = -100
+        features["labels"] = labels.unsqueeze(0)
+        # Flatten tensors to lists for HF datasets serialization.
+        return {k: v.squeeze(0).tolist() for k, v in features.items()}
 
     tokenized = raw_datasets.map(_tokenize, batched=False)
 
@@ -486,12 +569,26 @@ def run_training(
         report_to="none",
     )
 
+    # Use DataCollatorForSeq2Seq so that SFT labels are correctly handled:
+    # prompt tokens are masked (label=-100) in _tokenize; the collator pads
+    # and stacks label tensors alongside input tensors.  The plain Trainer
+    # with no collator does not create a "labels" column, so no loss is
+    # ever computed.
+    from transformers import DataCollatorForSeq2Seq  # type: ignore[import-untyped]
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=processor,
+        model=model,
+        label_pad_token_id=-100,
+        pad_to_multiple_of=8,
+    )
+
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["validation"],
         tokenizer=processor,
+        data_collator=data_collator,
     )
     trainer.train(resume_from_checkpoint=config.resume_from_checkpoint or None)
     trainer.save_model(str(resolved_out / "final_adapter"))

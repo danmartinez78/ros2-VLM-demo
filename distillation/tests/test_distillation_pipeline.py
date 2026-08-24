@@ -46,7 +46,7 @@ from distillation.validator import (
     VALIDATORS,
 )
 from distillation.dataset import split_dataset, export_sft_dataset
-from distillation.training import TrainingConfig, run_training, validate_multimodal_messages
+from distillation.training import TrainingConfig, run_training, validate_multimodal_messages, assert_collated_features_multimodal
 from distillation.evaluation import (
     EvaluationReport,
     evaluate_batch,
@@ -554,6 +554,83 @@ class TestDataset(unittest.TestCase):
                 self.assertIn("messages", obj)
                 self.assertIn("sample_id", obj)
 
+    def test_export_image_sequence_uses_image_url(self):
+        """image_sequence samples are exported as independent image_url objects."""
+        s = _make_sample("img-seq-0", n_frames=4)
+        s.target = _make_target(evidence_start_s=0.0, evidence_end_s=0.75)
+        s.validation_status = "accepted"
+        s.provenance = Provenance(
+            sequence_type="image_sequence",
+            runtime_temporal_encoding="independent_images",
+        )
+        train, val, test = split_dataset([s], seed=42)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "sft"
+            export_sft_dataset(train, val, test, out)
+            # Find the split that contains the sample
+            for split_name in ("train", "val", "test"):
+                lines = (out / f"{split_name}.jsonl").read_text().splitlines()
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    user_parts = obj["messages"][1]["content"]
+                    image_parts = [p for p in user_parts if p.get("type") == "image_url"]
+                    self.assertEqual(len(image_parts), 4)
+                    self.assertEqual(obj["metadata"]["export_modality"], "image_sequence")
+
+    def test_export_video_sample_uses_video_url(self):
+        """video samples are exported as a single video_url content object."""
+        s = _make_sample("vid-0", n_frames=4)
+        s.target = _make_target(evidence_start_s=0.0, evidence_end_s=0.75)
+        s.validation_status = "accepted"
+        s.provenance = Provenance(
+            sequence_type="video",
+            runtime_temporal_encoding="video_tensor",
+            effective_fps=4.0,
+        )
+        train, val, test = split_dataset([s], seed=42)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "sft"
+            export_sft_dataset(train, val, test, out)
+            for split_name in ("train", "val", "test"):
+                lines = (out / f"{split_name}.jsonl").read_text().splitlines()
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    user_parts = obj["messages"][1]["content"]
+                    video_parts = [p for p in user_parts if p.get("type") == "video_url"]
+                    image_parts = [p for p in user_parts if p.get("type") == "image_url"]
+                    self.assertEqual(len(video_parts), 1)
+                    self.assertEqual(len(image_parts), 0)
+                    self.assertEqual(obj["metadata"]["export_modality"], "video")
+                    # video_url payload should carry frame paths and timestamps
+                    vurl = video_parts[0]["video_url"]
+                    self.assertIn("frame_paths", vurl)
+                    self.assertEqual(len(vurl["frame_paths"]), 4)
+
+    def test_export_legacy_unspecified_uses_image_url(self):
+        """Legacy/unspecified-provenance samples fall back to image_url export."""
+        s = _make_sample("legacy-0", n_frames=3)
+        s.target = _make_target(evidence_start_s=0.0, evidence_end_s=0.5)
+        s.validation_status = "accepted"
+        # Default Provenance: sequence_type="" / runtime_temporal_encoding=""
+        train, val, test = split_dataset([s], seed=42)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "sft"
+            export_sft_dataset(train, val, test, out)
+            for split_name in ("train", "val", "test"):
+                lines = (out / f"{split_name}.jsonl").read_text().splitlines()
+                for line in lines:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    user_parts = obj["messages"][1]["content"]
+                    image_parts = [p for p in user_parts if p.get("type") == "image_url"]
+                    self.assertEqual(len(image_parts), 3)
+                    self.assertEqual(obj["metadata"]["export_modality"], "image_sequence")
+
 
 # ---------------------------------------------------------------------------
 # 5. Training config and dry-run launcher
@@ -671,6 +748,32 @@ class TestTrainingConfig(unittest.TestCase):
         ]
         with self.assertRaises(ValueError):
             validate_multimodal_messages(messages)
+
+    def test_assert_collated_features_multimodal_accepts_pixel_values(self):
+        """A features dict with pixel_values must pass the assertion."""
+        features = {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+            "pixel_values": [[0.0] * 3],  # synthetic
+        }
+        # Must not raise.
+        assert_collated_features_multimodal(features)
+
+    def test_assert_collated_features_multimodal_accepts_video_keys(self):
+        """A features dict with pixel_values_videos or grid keys must pass."""
+        for key in ("pixel_values_videos", "image_grid_thw", "video_grid_thw"):
+            features = {"input_ids": [1, 2, 3], key: [1, 2, 3]}
+            assert_collated_features_multimodal(features, sample_id="test")
+
+    def test_assert_collated_features_multimodal_rejects_text_only(self):
+        """A text-only features dict must raise AssertionError."""
+        features = {
+            "input_ids": [1, 2, 3],
+            "attention_mask": [1, 1, 1],
+            "labels": [1, 2, 3],
+        }
+        with self.assertRaises(AssertionError):
+            assert_collated_features_multimodal(features, sample_id="text-only")
 
 
 # ---------------------------------------------------------------------------

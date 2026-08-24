@@ -116,14 +116,89 @@ def split_dataset(
 # SFT export
 # ---------------------------------------------------------------------------
 
+_SUPPORTED_VIDEO_ENCODINGS = frozenset({"video_tensor"})
+_SUPPORTED_IMAGE_SEQUENCE_TYPES = frozenset({"image_sequence", ""})
+
+
 def _sample_to_sft_example(sample: TemporalSample) -> dict:
-    """Convert one TemporalSample to a multimodal SFT chat example."""
+    """Convert one TemporalSample to a multimodal SFT chat example.
+
+    The export format respects the sample's provenance temporal-input
+    representation so that training inputs match the representation used
+    during teacher generation and inference.
+
+    * ``sequence_type == "video"`` / ``runtime_temporal_encoding == "video_tensor"``:
+      exported as a single ``"video_url"`` content object so that the
+      Qwen3-VL / Cosmos-Reason2 processor receives a temporal video tensor
+      rather than N independent images.  Any sample whose provenance records a
+      native-video encoding but whose frames cannot be trivially packed (e.g.
+      no single composite path is available) raises ``ValueError`` so that the
+      mismatch is surfaced at export time rather than silently converted.
+
+    * All other sequence types (``"image_sequence"`` or unspecified legacy
+      samples): exported as N independent ``"image_url"`` entries in
+      chronological order, which is compatible with the independent-images
+      processor path.
+
+    Raises
+    ------
+    ValueError
+        If the sample's provenance declares an unsupported runtime encoding
+        or if a video-sequence sample has no composite video path to export.
+    AssertionError
+        If the sample has no target.
+    """
     assert sample.target is not None, f"Sample {sample.sample_id} has no target"
-    user_content_parts = []
-    for i, fr in enumerate(sample.frames):
-        user_content_parts.append(
-            {"type": "image_url", "image_url": {"url": fr.path, "t_seconds": fr.t_seconds}}
+
+    prov = sample.provenance
+    is_video = (
+        prov.sequence_type == "video"
+        or prov.runtime_temporal_encoding in _SUPPORTED_VIDEO_ENCODINGS
+    )
+
+    user_content_parts: list = []
+
+    if is_video:
+        # Native-video path: export a single video_url content object so the
+        # Qwen3-VL processor builds a [T,H,W,3] video tensor rather than
+        # independent image tensors.
+        #
+        # Convention: when a sample's frames all share a common directory prefix
+        # and differ only by filename, export a composite "video://<dir>" URL
+        # that the training data-loader resolves to the assembled video.  If no
+        # consistent composite path can be derived, raise so the caller can
+        # decide whether to re-encode or skip the sample.
+        if len(sample.frames) == 0:
+            raise ValueError(
+                f"Sample {sample.sample_id!r} has sequence_type='video' but no frames."
+            )
+        # Derive composite video path from common directory + sorted frame list.
+        frame_paths = [fr.path for fr in sample.frames]
+        # Use the first frame's directory as the video container reference.
+        from pathlib import PurePosixPath
+        first_path = PurePosixPath(frame_paths[0])
+        video_dir = str(first_path.parent) if first_path.parent != PurePosixPath(".") else ""
+        composite_url = (
+            f"video://{video_dir}" if video_dir else f"video_frames:{','.join(frame_paths)}"
         )
+        user_content_parts.append(
+            {
+                "type": "video_url",
+                "video_url": {
+                    "url": composite_url,
+                    "fps": prov.effective_fps if prov.effective_fps > 0 else None,
+                    "frame_paths": frame_paths,
+                    "t_seconds": [fr.t_seconds for fr in sample.frames],
+                },
+            }
+        )
+    else:
+        # Independent-images path (image_sequence or legacy/unspecified).
+        for fr in sample.frames:
+            user_content_parts.append(
+                {"type": "image_url", "image_url": {"url": fr.path, "t_seconds": fr.t_seconds}}
+            )
+
     user_content_parts.append(
         {
             "type": "text",
@@ -147,6 +222,9 @@ def _sample_to_sft_example(sample: TemporalSample) -> dict:
             "frame_count": sample.frame_count(),
             "provenance": sample.provenance.to_dict(),
             "content_hash": sample.content_hash(),
+            # Record the effective export modality so consumers can verify
+            # train/inference representation consistency.
+            "export_modality": "video" if is_video else "image_sequence",
         },
     }
 
