@@ -37,9 +37,15 @@
         "gpu_compute_capability": {"type": ["string", "null"]},
         "nvpmodel_mode": {"type": ["string", "null"]},
         "model_name": {"type": ["string", "null"]},
+        "engine_profile_id": {"type": ["string", "null"]},
         "quantization": {"type": ["string", "null"]},
         "llm_engine_dir": {"type": ["string", "null"]},
         "multimodal_engine_dir": {"type": ["string", "null"]},
+        "engine_manifest_path": {"type": ["string", "null"]},
+        "engine_manifest_sha256": {"type": ["string", "null"]},
+        "engine_identity": {"type": ["string", "null"]},
+        "engine_manifest_status": {"type": ["string", "null"]},
+        "engine_provenance": {"type": ["object", "null"]},
         "edge_llm_commit": {"type": ["string", "null"]},
         "edge_llm_version_tag": {"type": ["string", "null"]},
         "max_generate_length": {"type": ["integer", "null"]},
@@ -48,6 +54,10 @@
         "input_image_path": {"type": ["string", "null"]},
         "input_vlm_json": {"type": ["string", "null"]}
       }
+    },
+    "engine_provenance": {
+      "type": ["object", "null"],
+      "description": "Canonical engine provenance resolved before benchmark execution."
     },
     "llm_bench_prefill": {
       "type": ["string", "null"],

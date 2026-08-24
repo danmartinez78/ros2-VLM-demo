@@ -15,6 +15,7 @@ import platform
 import re
 import subprocess
 import sys
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,198 @@ def _read_file(path: str) -> str:
         return Path(path).read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return ""
+
+
+def _canonical_path(path: str) -> str:
+    if not path:
+        return ""
+    return str(Path(path).expanduser().resolve(strict=False))
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _json_digest(payload: dict[str, Any]) -> str:
+    text = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _infer_profile_id(llm_engine_dir: str, multimodal_engine_dir: str) -> str | None:
+    llm_path = Path(llm_engine_dir) if llm_engine_dir else None
+    multimodal_path = Path(multimodal_engine_dir) if multimodal_engine_dir else None
+    if not llm_path or not multimodal_path:
+        return None
+    if multimodal_path.name == "engine" and llm_path == multimodal_path / "llm":
+        return "legacy"
+    if multimodal_path.parent.name == "engines" and llm_path == multimodal_path / "llm":
+        return multimodal_path.name
+    return None
+
+
+def _infer_model_name(
+    llm_engine_dir: str,
+    multimodal_engine_dir: str,
+    *,
+    fallback: str = "",
+) -> str:
+    if fallback:
+        return fallback
+    multimodal_path = Path(multimodal_engine_dir) if multimodal_engine_dir else None
+    if not multimodal_path:
+        return ""
+    if multimodal_path.name == "engine":
+        return multimodal_path.parent.name
+    if multimodal_path.parent.name == "engines":
+        return multimodal_path.parent.parent.name
+    return multimodal_path.parent.name
+
+
+def _candidate_manifest_paths(llm_engine_dir: str, multimodal_engine_dir: str) -> list[Path]:
+    candidates: list[Path] = []
+    llm_path = Path(llm_engine_dir) if llm_engine_dir else None
+    multimodal_path = Path(multimodal_engine_dir) if multimodal_engine_dir else None
+    if multimodal_path:
+        candidates.append(multimodal_path / "engine-manifest.json")
+    if llm_path and llm_path.name == "llm":
+        candidates.append(llm_path.parent / "engine-manifest.json")
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            deduped.append(candidate)
+            seen.add(candidate)
+    return deduped
+
+
+def collect_engine_provenance(
+    llm_engine_dir: str = "",
+    multimodal_engine_dir: str = "",
+    *,
+    model_name: str = "",
+    engine_profile_id: str = "",
+) -> dict[str, Any]:
+    """Return canonical engine provenance for the runtime paths in use."""
+    canonical_llm = _canonical_path(llm_engine_dir or os.environ.get("EDGE_VLM_LLM_ENGINE_DIR", ""))
+    canonical_multimodal = _canonical_path(
+        multimodal_engine_dir or os.environ.get("EDGE_VLM_MULTIMODAL_ENGINE_DIR", "")
+    )
+    requested_model_name = model_name or os.environ.get("EDGE_VLM_MODEL_NAME", "")
+    requested_profile_id = engine_profile_id or os.environ.get("EDGE_VLM_ENGINE_PROFILE_ID", "")
+
+    provenance: dict[str, Any] = {
+        "model_name": requested_model_name,
+        "engine_profile_id": requested_profile_id,
+        "llm_engine_dir": canonical_llm,
+        "multimodal_engine_dir": canonical_multimodal,
+        "engine_manifest_path": None,
+        "engine_manifest_sha256": None,
+        "engine_identity": None,
+        "engine_manifest_status": "missing",
+        "provenance_warnings": [],
+    }
+
+    manifest_path: Path | None = None
+    for candidate in _candidate_manifest_paths(canonical_llm, canonical_multimodal):
+        if candidate.is_file():
+            manifest_path = candidate.resolve(strict=False)
+            break
+
+    manifest_payload: dict[str, Any] | None = None
+    if manifest_path is not None:
+        provenance["engine_manifest_path"] = str(manifest_path)
+        provenance["engine_manifest_sha256"] = _sha256_file(manifest_path)
+        try:
+            manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            provenance["engine_manifest_status"] = "matched"
+        except (OSError, json.JSONDecodeError) as exc:
+            provenance["engine_manifest_status"] = "invalid"
+            provenance["provenance_warnings"].append(
+                f"engine-manifest.json could not be parsed: {exc}"
+            )
+
+    if isinstance(manifest_payload, dict):
+        manifest_model_name = str(manifest_payload.get("model_name") or "")
+        manifest_profile_id = str(manifest_payload.get("engine_profile_id") or "")
+        if manifest_model_name:
+            provenance["model_name"] = manifest_model_name
+        elif not provenance["model_name"]:
+            provenance["model_name"] = _infer_model_name(
+                canonical_llm,
+                canonical_multimodal,
+                fallback=requested_model_name,
+            )
+        if manifest_profile_id:
+            provenance["engine_profile_id"] = manifest_profile_id
+        elif not provenance["engine_profile_id"]:
+            inferred_profile = _infer_profile_id(canonical_llm, canonical_multimodal)
+            provenance["engine_profile_id"] = inferred_profile or requested_profile_id
+
+        engine_paths = manifest_payload.get("engine_paths")
+        manifest_llm = ""
+        manifest_multimodal = ""
+        if isinstance(engine_paths, dict):
+            manifest_llm = _canonical_path(str(engine_paths.get("llm_dir") or ""))
+            manifest_multimodal = _canonical_path(str(engine_paths.get("multimodal_dir") or ""))
+        if manifest_llm and manifest_llm != canonical_llm:
+            provenance["engine_manifest_status"] = "mismatch"
+            provenance["provenance_warnings"].append(
+                f"engine-manifest llm_dir {manifest_llm} does not match runtime path {canonical_llm}"
+            )
+        if manifest_multimodal and manifest_multimodal != canonical_multimodal:
+            provenance["engine_manifest_status"] = "mismatch"
+            provenance["provenance_warnings"].append(
+                "engine-manifest multimodal_dir "
+                f"{manifest_multimodal} does not match runtime path {canonical_multimodal}"
+            )
+        if requested_model_name and manifest_model_name and requested_model_name != manifest_model_name:
+            provenance["engine_manifest_status"] = "mismatch"
+            provenance["provenance_warnings"].append(
+                f"requested model_name {requested_model_name!r} does not match manifest model_name {manifest_model_name!r}"
+            )
+        if requested_profile_id and manifest_profile_id and requested_profile_id != manifest_profile_id:
+            provenance["engine_manifest_status"] = "mismatch"
+            provenance["provenance_warnings"].append(
+                "requested engine_profile_id "
+                f"{requested_profile_id!r} does not match manifest engine_profile_id {manifest_profile_id!r}"
+            )
+    else:
+        inferred_profile = _infer_profile_id(canonical_llm, canonical_multimodal)
+        provenance["engine_profile_id"] = inferred_profile or requested_profile_id or "legacy"
+        provenance["model_name"] = _infer_model_name(
+            canonical_llm,
+            canonical_multimodal,
+            fallback=requested_model_name,
+        )
+        if inferred_profile and inferred_profile != "legacy":
+            provenance["provenance_warnings"].append(
+                "managed-style engine layout has no engine-manifest.json"
+            )
+
+    identity_model = provenance["model_name"] or "unknown-model"
+    identity_profile = provenance["engine_profile_id"] or "unknown-profile"
+    manifest_sha = provenance.get("engine_manifest_sha256")
+    if manifest_sha:
+        provenance["engine_identity"] = f"{identity_model}/{identity_profile}@{manifest_sha[:12]}"
+    else:
+        fallback_sha = _json_digest(
+            {
+                "model_name": identity_model,
+                "engine_profile_id": identity_profile,
+                "llm_engine_dir": canonical_llm,
+                "multimodal_engine_dir": canonical_multimodal,
+            }
+        )
+        provenance["engine_identity"] = f"{identity_model}/{identity_profile}@{fallback_sha[:12]}"
+
+    return provenance
 
 
 # ── platform ─────────────────────────────────────────────────────────────────
@@ -105,15 +298,28 @@ def collect_model_metadata(
     multimodal_engine_dir: str = "",
     *,
     model_name: str = "",
+    engine_profile_id: str = "",
     quantization: str = "",
     edge_llm_root: str = "",
 ) -> dict[str, Any]:
     """Return model/engine/token-budget configuration fields."""
+    provenance = collect_engine_provenance(
+        llm_engine_dir=llm_engine_dir,
+        multimodal_engine_dir=multimodal_engine_dir,
+        model_name=model_name,
+        engine_profile_id=engine_profile_id,
+    )
     meta: dict[str, Any] = {
-        "model_name": model_name or os.environ.get("EDGE_VLM_MODEL_NAME", ""),
+        "model_name": provenance["model_name"],
+        "engine_profile_id": provenance["engine_profile_id"],
         "quantization": quantization or "",
-        "llm_engine_dir": llm_engine_dir,
-        "multimodal_engine_dir": multimodal_engine_dir,
+        "llm_engine_dir": provenance["llm_engine_dir"],
+        "multimodal_engine_dir": provenance["multimodal_engine_dir"],
+        "engine_manifest_path": provenance["engine_manifest_path"],
+        "engine_manifest_sha256": provenance["engine_manifest_sha256"],
+        "engine_identity": provenance["engine_identity"],
+        "engine_manifest_status": provenance["engine_manifest_status"],
+        "engine_provenance": provenance,
     }
 
     # TensorRT Edge-LLM git commit / version
@@ -132,7 +338,8 @@ def collect_model_metadata(
         meta["edge_llm_version_tag"] = None
 
     # Engine config.json if present
-    config_path = Path(llm_engine_dir) / "config.json" if llm_engine_dir else None
+    llm_dir = provenance["llm_engine_dir"]
+    config_path = Path(llm_dir) / "config.json" if llm_dir else None
     if config_path and config_path.exists():
         try:
             engine_cfg = json.loads(config_path.read_text(encoding="utf-8"))
@@ -185,6 +392,7 @@ def collect_all_metadata(**kwargs: Any) -> dict[str, Any]:
             llm_engine_dir=kwargs.get("llm_engine_dir", ""),
             multimodal_engine_dir=kwargs.get("multimodal_engine_dir", ""),
             model_name=kwargs.get("model_name", ""),
+            engine_profile_id=kwargs.get("engine_profile_id", ""),
             quantization=kwargs.get("quantization", ""),
             edge_llm_root=kwargs.get("edge_llm_root", ""),
         )
@@ -216,6 +424,7 @@ def main() -> None:
     parser.add_argument("--llm-engine-dir", default="")
     parser.add_argument("--multimodal-engine-dir", default="")
     parser.add_argument("--model-name", default="")
+    parser.add_argument("--engine-profile-id", default="")
     parser.add_argument("--quantization", default="")
     parser.add_argument("--edge-llm-root", default="")
     parser.add_argument("--output", default="-", help="Output JSON path (- for stdout)")
@@ -225,6 +434,7 @@ def main() -> None:
         llm_engine_dir=args.llm_engine_dir,
         multimodal_engine_dir=args.multimodal_engine_dir,
         model_name=args.model_name,
+        engine_profile_id=args.engine_profile_id,
         quantization=args.quantization,
         edge_llm_root=args.edge_llm_root,
     )

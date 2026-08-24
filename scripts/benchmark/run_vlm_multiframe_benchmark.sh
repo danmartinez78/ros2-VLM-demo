@@ -42,7 +42,8 @@
 # -------------------
 # Uses the Thor-validated TensorRT Edge-LLM VLM request shape:
 #   requests -> messages -> content[]   (role: user)
-# Multiple image content items {"type":"image","image":path} are placed in
+# Multiple image content items {"type":"image","image":path}
+# are placed in
 # temporal order, followed by one text item.  SHA-256 content hashes are
 # stored in JSONL benchmark metadata (frame_paths field), not in the model
 # message payload.
@@ -115,6 +116,11 @@ PATHS="direct,ipc"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RESOLVED_MODEL_NAME="${EDGE_VLM_MODEL_NAME:-unknown}"
+RESOLVED_ENGINE_PROFILE_ID="${EDGE_VLM_ENGINE_PROFILE_ID:-}"
+RESOLVED_LLM_ENGINE_DIR="${EDGE_VLM_LLM_ENGINE_DIR:-}"
+RESOLVED_MULTIMODAL_ENGINE_DIR="${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}"
+ENGINE_PROVENANCE_JSON="{}"
 
 # ── argument parsing ──────────────────────────────────────────────────────────
 
@@ -179,6 +185,35 @@ _sha256_file() {
 _sha256_string() {
     # Return first 12 hex chars of SHA-256 of a string.
     printf '%s' "$1" | sha256sum | cut -c1-12
+}
+
+_resolve_engine_provenance() {
+    local resolved
+    resolved="$(
+        PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" python3 - <<'PY'
+import json
+import os
+from benchmark_metadata import collect_engine_provenance
+
+provenance = collect_engine_provenance(
+    llm_engine_dir=os.environ.get("EDGE_VLM_LLM_ENGINE_DIR", ""),
+    multimodal_engine_dir=os.environ.get("EDGE_VLM_MULTIMODAL_ENGINE_DIR", ""),
+    model_name=os.environ.get("EDGE_VLM_MODEL_NAME", ""),
+    engine_profile_id=os.environ.get("EDGE_VLM_ENGINE_PROFILE_ID", ""),
+)
+print(provenance.get("model_name", "") or "")
+print(provenance.get("engine_profile_id", "") or "")
+print(provenance.get("llm_engine_dir", "") or "")
+print(provenance.get("multimodal_engine_dir", "") or "")
+print(json.dumps(provenance, sort_keys=True))
+PY
+    )"
+    mapfile -t _resolved_lines <<< "${resolved}"
+    RESOLVED_MODEL_NAME="${_resolved_lines[0]:-${EDGE_VLM_MODEL_NAME:-unknown}}"
+    RESOLVED_ENGINE_PROFILE_ID="${_resolved_lines[1]:-${EDGE_VLM_ENGINE_PROFILE_ID:-}}"
+    RESOLVED_LLM_ENGINE_DIR="${_resolved_lines[2]:-${EDGE_VLM_LLM_ENGINE_DIR:-}}"
+    RESOLVED_MULTIMODAL_ENGINE_DIR="${_resolved_lines[3]:-${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}}"
+    ENGINE_PROVENANCE_JSON="${_resolved_lines[4]:-\{\}}"
 }
 
 _write_record() {
@@ -326,8 +361,8 @@ _run_direct_inference() {
 
     local exit_code=0
     _run "${llm_bin}" \
-        --engineDir "${EDGE_VLM_LLM_ENGINE_DIR:-}" \
-        --multimodalEngineDir "${EDGE_VLM_MULTIMODAL_ENGINE_DIR:-}" \
+        --engineDir "${RESOLVED_LLM_ENGINE_DIR:-}" \
+        --multimodalEngineDir "${RESOLVED_MULTIMODAL_ENGINE_DIR:-}" \
         --maxGenerateLength "${MAX_OUTPUT_TOKENS}" \
         --inputFile "${request_json_path}" \
         --outputFile "${response_path}" \
@@ -659,7 +694,8 @@ print('\t'.join([
             export _BM_LLM_GEN_GPU_MS="${llm_gen_gpu_ms}"
             export _BM_RESPONSE_PATH="${response_path}"
             export _BM_PROFILE_PATH="${profile_path}"
-            export _BM_MODEL_NAME="${EDGE_VLM_MODEL_NAME:-unknown}"
+            export _BM_MODEL_NAME="${RESOLVED_MODEL_NAME:-unknown}"
+            export _BM_ENGINE_PROVENANCE="${ENGINE_PROVENANCE_JSON}"
             export _BM_ITERATION="${iter_idx}"
             export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
             PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
@@ -777,7 +813,8 @@ PYEOF
                 export _BM_OUTPUT_TEXT="${ipc_output_text}"
                 export _BM_OUTPUT_WORDS="${ipc_output_words}"
                 export _BM_IPC_RESULT_PATH="${ipc_result_path_json}"
-                export _BM_MODEL_NAME="${EDGE_VLM_MODEL_NAME:-unknown}"
+                export _BM_MODEL_NAME="${RESOLVED_MODEL_NAME:-unknown}"
+                export _BM_ENGINE_PROVENANCE="${ENGINE_PROVENANCE_JSON}"
                 export _BM_ITERATION="${iter_idx}"
                 export _BM_IS_WARMUP="$([ "${is_warmup}" = 'true' ] && echo 'true' || echo 'false')"
                 PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH:-}" \
@@ -790,6 +827,8 @@ PYEOF
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+_resolve_engine_provenance
+
 echo "================================================================"
 echo "  VLM Multi-Frame Latency Characterization Benchmark"
 echo "  Timestamp: ${TIMESTAMP}"
@@ -797,6 +836,9 @@ echo "  Sequence dir: ${SEQUENCE_DIR}"
 echo "  Frame counts: ${FRAME_COUNTS}"
 echo "  Max output tokens: ${MAX_OUTPUT_TOKENS}"
 echo "  Paths: ${PATHS}"
+echo "  Engine: ${RESOLVED_MODEL_NAME:-unknown} ${RESOLVED_ENGINE_PROFILE_ID:+(${RESOLVED_ENGINE_PROFILE_ID})}"
+echo "  LLM engine dir: ${RESOLVED_LLM_ENGINE_DIR:-unset}"
+echo "  Multimodal dir: ${RESOLVED_MULTIMODAL_ENGINE_DIR:-unset}"
 echo "  Warmup: ${WARMUP}  Iterations: ${ITERATIONS}"
 echo "  Output dir: ${OUTPUT_DIR}"
 echo "================================================================"
@@ -848,4 +890,3 @@ echo "  JSON:   ${REPORT_JSON}"
 echo "  Text:   ${REPORT_TXT}"
 echo ""
 echo "Done."
-
