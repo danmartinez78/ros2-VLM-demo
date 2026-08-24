@@ -45,17 +45,15 @@ The design goal is not to maximize the number of frames presented to the model. 
 
 ### Validated/current
 
-The repository already uses a persistent ROS-free GPU worker separated from the ROS process. That process boundary is documented in [`../architecture.md`](../architecture.md) and is required on the validated Thor stack.
+The repository uses a persistent ROS-free GPU worker separated from the ROS process. That process boundary is documented in [`../architecture.md`](../architecture.md) and is required on the validated Thor stack.
 
-The multi-frame benchmark work has also established that Cosmos-Reason2 can consume ordered multi-image inputs with relatively modest latency growth as frame count increases.
+The multi-frame benchmark work established that Cosmos-Reason2 can consume ordered multi-image inputs with relatively modest latency growth as frame count increases.
 
-PR #74 adds an explicit temporal sequence contract and a native Qwen3-VL/Cosmos-Reason2 video path. On Thor, smoke testing demonstrated:
+PR #74, now merged into `main`, added the explicit temporal sequence contract and native Qwen3-VL/Cosmos-Reason2 video path. On Thor, smoke testing demonstrated:
 
 - F4 native video requests succeed without temporal fallback;
 - F8 native video requests succeed without temporal fallback;
 - the runtime reports `native_qwen3vl_video_imagedata_mrope_timestamps` as the effective encoding.
-
-Until PR #74 is merged, those statements describe a validated implementation branch, not `main`.
 
 ### Target design
 
@@ -133,9 +131,9 @@ Properties:
 - preserves order in the request;
 - does not, by itself, provide native video timing semantics;
 - useful as a baseline and compatibility path;
-- runtime representation should report ordered multi-image semantics explicitly.
+- runtime representation reports ordered multi-image semantics explicitly.
 
-Expected runtime provenance label after PR #74:
+Current runtime provenance label:
 
 ```text
 ordered_multi_image_no_native_temporal_metadata
@@ -185,7 +183,7 @@ The Qwen3-VL/Cosmos-Reason2 runner uses the video path to build temporal visual 
 - timestamp text associated with temporal groups;
 - interleaved multimodal rotary position handling (MRoPE).
 
-The implementation must not infer success merely because multiple frames were accepted. The response must report the **effective runtime temporal encoding**.
+The implementation must not infer success merely because multiple frames were accepted. The response reports the **effective runtime temporal encoding**.
 
 ## No-silent-fallback invariant
 
