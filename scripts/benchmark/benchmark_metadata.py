@@ -282,14 +282,19 @@ def collect_server_engine_provenance(
     model_name: str = "",
     engine_profile_id: str = "",
 ) -> dict[str, Any]:
-    """Return canonical engine provenance for the live edge_vlm_server listener."""
+    """Return canonical engine provenance for the live edge_vlm_server listener.
+
+    Raises RuntimeError when the socket has no live listener or the benchmark
+    runner cannot identify the server PID from `ss -lxnp`.
+    """
     requested_socket = socket_path or os.environ.get("EDGE_VLM_WORKER_SOCKET", "/tmp/edge_vlm.sock")
     server_pid = _socket_listener_pid(requested_socket)
     if server_pid is None:
         if Path(requested_socket).exists():
             raise RuntimeError(
                 "socket exists but no live edge_vlm_server listener could be identified for "
-                f"{requested_socket!r}; ensure 'ss' can inspect the running server process"
+                f"{requested_socket!r}; ensure 'ss' can inspect the running server process "
+                "and reveal its pid to the benchmark runner"
             )
         raise RuntimeError(f"no live edge_vlm_server listener found for socket {requested_socket!r}")
 

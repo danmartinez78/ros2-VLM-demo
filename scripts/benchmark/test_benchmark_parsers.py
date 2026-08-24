@@ -634,11 +634,25 @@ class TestBenchmarkMetadata(unittest.TestCase):
         self.assertEqual(provenance["provenance_source"], "server_process")
 
     def test_collect_server_engine_provenance_raises_without_listener(self):
+        import tempfile
         from benchmark_metadata import collect_server_engine_provenance
 
-        with patch("benchmark_metadata._socket_listener_pid", return_value=None):
-            with self.assertRaisesRegex(RuntimeError, "no live edge_vlm_server listener"):
-                collect_server_engine_provenance(socket_path="/tmp/missing.sock")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_socket = Path(tmpdir) / "missing.sock"
+            with patch("benchmark_metadata._socket_listener_pid", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "no live edge_vlm_server listener"):
+                    collect_server_engine_provenance(socket_path=str(missing_socket))
+
+    def test_collect_server_engine_provenance_existing_socket_without_identified_listener(self):
+        import tempfile
+        from benchmark_metadata import collect_server_engine_provenance
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            socket_path = Path(tmpdir) / "edge_vlm.sock"
+            socket_path.write_text("", encoding="utf-8")
+            with patch("benchmark_metadata._socket_listener_pid", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "could be identified"):
+                    collect_server_engine_provenance(socket_path=str(socket_path))
 
     def test_collect_server_engine_provenance_missing_manifest(self):
         import tempfile
