@@ -46,7 +46,7 @@ from distillation.validator import (
     VALIDATORS,
 )
 from distillation.dataset import split_dataset, export_sft_dataset
-from distillation.training import TrainingConfig, run_training
+from distillation.training import TrainingConfig, run_training, validate_multimodal_messages
 from distillation.evaluation import (
     EvaluationReport,
     evaluate_batch,
@@ -186,6 +186,51 @@ class TestSchemaRoundTrip(unittest.TestCase):
         del d["input_representation"]
         restored = Provenance.from_dict(d)
         self.assertEqual(restored.input_representation, "")
+
+    def test_provenance_temporal_fields_round_trip(self):
+        """New temporal provenance fields survive to_dict / from_dict."""
+        p = Provenance(
+            sequence_type="image_sequence",
+            timestamp_policy="capture_time_s",
+            effective_fps=10.0,
+            rendered_timestamp_control=True,
+            runtime_temporal_encoding="independent_images",
+        )
+        restored = Provenance.from_dict(p.to_dict())
+        self.assertEqual(restored.sequence_type, "image_sequence")
+        self.assertEqual(restored.timestamp_policy, "capture_time_s")
+        self.assertAlmostEqual(restored.effective_fps, 10.0)
+        self.assertTrue(restored.rendered_timestamp_control)
+        self.assertEqual(restored.runtime_temporal_encoding, "independent_images")
+
+    def test_provenance_temporal_fields_default_values(self):
+        """Legacy samples without new temporal fields get sensible defaults."""
+        p = Provenance()
+        d = p.to_dict()
+        for new_field in (
+            "sequence_type", "timestamp_policy",
+            "effective_fps", "rendered_timestamp_control",
+            "runtime_temporal_encoding",
+        ):
+            del d[new_field]
+        restored = Provenance.from_dict(d)
+        self.assertEqual(restored.sequence_type, "")
+        self.assertEqual(restored.timestamp_policy, "")
+        self.assertAlmostEqual(restored.effective_fps, 0.0)
+        self.assertFalse(restored.rendered_timestamp_control)
+        self.assertEqual(restored.runtime_temporal_encoding, "")
+
+    def test_native_video_input_representation_round_trip(self):
+        """Native video provenance round-trips correctly."""
+        p = Provenance(
+            input_representation="native_video",
+            sequence_type="video",
+            runtime_temporal_encoding="video_tensor",
+        )
+        restored = Provenance.from_dict(p.to_dict())
+        self.assertEqual(restored.input_representation, "native_video")
+        self.assertEqual(restored.sequence_type, "video")
+        self.assertEqual(restored.runtime_temporal_encoding, "video_tensor")
 
 
 # ---------------------------------------------------------------------------
@@ -598,6 +643,35 @@ class TestTrainingConfig(unittest.TestCase):
         with self.assertRaises((ImportError, FileNotFoundError)):
             run_training(cfg, dry_run=False)
 
+    def test_validate_multimodal_messages_accepts_clean_messages(self):
+        """Text-only and properly structured image_url messages must pass."""
+        messages = [
+            {"role": "user", "content": "describe the scene"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}},
+                ],
+            },
+        ]
+        # Must not raise.
+        validate_multimodal_messages(messages)
+
+    def test_validate_multimodal_messages_rejects_stringified_image_url(self):
+        """A stringified image_url dict inside a content list must be rejected."""
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "caption:"},
+                    '{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abc"}}',
+                ],
+            }
+        ]
+        with self.assertRaises(ValueError):
+            validate_multimodal_messages(messages)
+
 
 # ---------------------------------------------------------------------------
 # 6. Evaluation
@@ -734,6 +808,48 @@ class TestEvaluation(unittest.TestCase):
         gt = self._gt_sample("s0")
         derived = evaluator._derive_control_target(gt, "chronological")
         self.assertIs(derived, gt)
+
+    def test_reversed_control_evidence_times_remapped(self):
+        """Regression: reversed-control evidence times are remapped to the
+        normalized monotonic timeline, not left at original values."""
+        # 4-frame sequence: t=0,1,2,3; late evidence at t=2.5-3.0 (>66%)
+        frames = [FrameRef(f"f{i}.jpg", float(i)) for i in range(4)]
+        target = TemporalTarget(
+            change_detected=True, change="approaching",
+            state_start="far", state_end="close",
+            evidence_start_s=2.5, evidence_end_s=3.0,
+            confidence=0.9, odd_observation="test",
+        )
+        gt = TemporalSample(sample_id="s0", frames=frames, target=target)
+        evaluator = ControlledSequenceEvaluator()
+        derived = evaluator._derive_control_target(gt, "reversed")
+        self.assertIsNotNone(derived.target)
+        # remap(2.5) = 3+0-2.5 = 0.5; remap(3.0) = 3+0-3.0 = 0.0
+        # After min/max normalization: start=0.0, end=0.5
+        self.assertAlmostEqual(derived.target.evidence_start_s, 0.0)
+        self.assertAlmostEqual(derived.target.evidence_end_s, 0.5)
+        # Control GT frames should be sorted (monotonic) for correct bucketing.
+        ts = [f.t_seconds for f in derived.frames]
+        self.assertEqual(ts, sorted(ts))
+
+    def test_reversed_control_symmetric_mid_event_preserved(self):
+        """A mid-bucket event symmetric around the timeline midpoint stays mid
+        after reversal because its remapped start falls exactly at the 1/3 mark."""
+        from distillation.evaluation import _evidence_bucket
+        frames = [FrameRef(f"f{i}.jpg", float(i)) for i in range(4)]  # 0,1,2,3
+        # evidence [1.0, 2.0]: remap(1.0)=2.0, remap(2.0)=1.0 → [1.0, 2.0] → mid
+        target = TemporalTarget(
+            change_detected=True, change="approaching",
+            state_start="far", state_end="close",
+            evidence_start_s=1.0, evidence_end_s=2.0,
+            confidence=0.9, odd_observation="test",
+        )
+        gt = TemporalSample(sample_id="s0", frames=frames, target=target)
+        evaluator = ControlledSequenceEvaluator()
+        derived = evaluator._derive_control_target(gt, "reversed")
+        self.assertAlmostEqual(derived.target.evidence_start_s, 1.0)
+        bucket = _evidence_bucket(derived.target.evidence_start_s, 0.0, 3.0)
+        self.assertEqual(bucket, "mid")
 
 
 # ---------------------------------------------------------------------------

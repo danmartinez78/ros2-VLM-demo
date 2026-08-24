@@ -310,10 +310,20 @@ class ControlledSequenceEvaluator:
         Derive the expected ground-truth sample for control-scoring purposes.
 
         For ``reversed``: invert the temporal direction of the change label
-        (e.g. approaching → receding) and swap state_start/state_end.
+        (e.g. approaching → receding), swap state_start/state_end, remap
+        evidence times into the reversed monotonic timeline, and sort the
+        control GT frames so that the timeline used by ``compare_sample`` is
+        monotonically increasing.  The remapping uses::
+
+            t_remapped = t_max + t_min - t_original
+
+        which maps a late-original event to early-reversed and vice versa,
+        preserving the fractional position relative to the sequence duration.
+
         For ``shuffled``: change_detected semantics are ambiguous for arbitrary
         orderings, so the sample is marked as control-only (no expected change
         direction), and only schema/hallucination metrics are meaningful.
+
         All other transforms: return the original unchanged.
         """
         import copy
@@ -322,13 +332,39 @@ class ControlledSequenceEvaluator:
             s = copy.deepcopy(original)
             t = s.target
             inverted_dir = self._REVERSE_DIRECTION_MAP.get(t.change, t.change)
+
+            # Remap evidence times into the reversed (but normalized monotonic)
+            # timeline so that event-bucket scoring is semantically correct.
+            # Sorting the control GT frames ensures t_min < t_max.
+            if s.frames:
+                times = sorted(f.t_seconds for f in s.frames)
+                t_min, t_max = times[0], times[-1]
+                duration = t_max - t_min
+                if duration > 0:
+                    new_start = min(
+                        t_max + t_min - t.evidence_start_s,
+                        t_max + t_min - t.evidence_end_s,
+                    )
+                    new_end = max(
+                        t_max + t_min - t.evidence_start_s,
+                        t_max + t_min - t.evidence_end_s,
+                    )
+                else:
+                    new_start = t.evidence_start_s
+                    new_end = t.evidence_end_s
+                # Sort frames so compare_sample sees a monotonic timeline.
+                s.frames = sorted(s.frames, key=lambda f: f.t_seconds)
+            else:
+                new_start = t.evidence_start_s
+                new_end = t.evidence_end_s
+
             s.target = TemporalTarget(
                 change_detected=t.change_detected,
                 change=inverted_dir,
                 state_start=t.state_end,
                 state_end=t.state_start,
-                evidence_start_s=t.evidence_start_s,
-                evidence_end_s=t.evidence_end_s,
+                evidence_start_s=new_start,
+                evidence_end_s=new_end,
                 confidence=t.confidence,
                 odd_observation=t.odd_observation,
             )

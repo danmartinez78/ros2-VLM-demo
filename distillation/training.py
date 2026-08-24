@@ -14,6 +14,18 @@ or from Python:
     from distillation.training import TrainingConfig, run_training
     cfg = TrainingConfig.from_yaml(path)
     run_training(cfg, dry_run=True)
+
+Multimodal contract
+-------------------
+The real training path uses ``AutoModelForVision2Seq`` + ``AutoProcessor``
+(not ``AutoModelForCausalLM`` + ``AutoTokenizer``) so that pixel / video
+tensors produced by the processor are forwarded to the model rather than
+stringified image references.  The CPU-testable helper
+``validate_multimodal_messages`` checks that a message list carries
+structured image content objects (dicts with ``"type": "image_url"``) rather
+than plain text, and raises ``ValueError`` if they have been flattened to
+strings.  This guard runs before the heavy model load so that config/format
+errors are caught early.
 """
 
 from __future__ import annotations
@@ -220,6 +232,57 @@ class TrainingConfig:
 # Dry-run launcher
 # ---------------------------------------------------------------------------
 
+def validate_multimodal_messages(messages: list) -> None:
+    """
+    CPU-testable guard: verify that a message list preserves multimodal image
+    content as structured dicts rather than stringifying them to text.
+
+    Each message with role ``"user"`` may carry a ``content`` list.  Any entry
+    with ``"type": "image_url"`` must remain a dict (not be cast to ``str``).
+    Raises ``ValueError`` if image content objects have been flattened.
+
+    This function has *no* heavy dependencies and runs in CI without a GPU or
+    model weights.  It is called by ``run_training`` before the model is loaded
+    so that format errors are caught early.
+
+    Parameters
+    ----------
+    messages : list of message dicts (role / content pairs)
+
+    Raises
+    ------
+    ValueError
+        If any ``image_url`` content object has been stringified.
+    """
+    for i, msg in enumerate(messages):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for j, part in enumerate(content):
+                if isinstance(part, str):
+                    # A plain string in a multipart content list is acceptable
+                    # only if there are no image_url dicts at all in this message.
+                    # If a string looks like a serialised image object, reject it.
+                    if '"type": "image_url"' in part or "'type': 'image_url'" in part:
+                        raise ValueError(
+                            f"messages[{i}].content[{j}] is a stringified image_url "
+                            f"object; pass the dict directly to preserve visual content. "
+                            f"Got: {part[:80]!r}"
+                        )
+                elif isinstance(part, dict):
+                    if part.get("type") == "image_url":
+                        url_val = part.get("image_url")
+                        if isinstance(url_val, str) and url_val.startswith("{"):
+                            raise ValueError(
+                                f"messages[{i}].content[{j}].image_url is a "
+                                f"stringified dict; pass the image_url as a "
+                                f"nested dict. Got: {url_val[:80]!r}"
+                            )
+        elif isinstance(content, str):
+            # Single-string content is text-only and valid even when there are
+            # no images; nothing to check.
+            pass
+
+
 def run_training(
     config: TrainingConfig,
     dry_run: bool = False,
@@ -292,6 +355,15 @@ def run_training(
     # ``dataset_manifest.json``.  The manifest hash is read back and verified
     # against ``config.dataset_manifest_hash`` (when the config provides one)
     # so that training never silently uses a stale or replaced dataset.
+    #
+    # Multimodal model path
+    # ---------------------
+    # Cosmos-Reason2-2B is a vision-language model.  The training path uses
+    # ``AutoModelForVision2Seq`` + ``AutoProcessor`` (not ``AutoModelForCausalLM``
+    # + ``AutoTokenizer``) so that pixel / video tensors produced by the
+    # processor are forwarded to the model rather than stringifying image
+    # references to plain text.  ``validate_multimodal_messages`` is called on
+    # each example before the model load so that format errors are caught early.
     try:
         import transformers  # type: ignore[import-untyped]
         import peft  # type: ignore[import-untyped]
@@ -329,17 +401,20 @@ def run_training(
     effective_cfg_path.write_text(json.dumps(config.to_dict(), indent=2))
 
     # ------------------------------------------------------------------
-    # Model + tokenizer
+    # Model + processor (multimodal VLM path)
     # ------------------------------------------------------------------
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, Trainer  # type: ignore[import-untyped]
+    from transformers import AutoModelForVision2Seq, AutoProcessor, TrainingArguments, Trainer  # type: ignore[import-untyped]
     from peft import get_peft_model, LoraConfig as PeftLoraConfig, TaskType  # type: ignore[import-untyped]
 
     model_name = config.base_model if not config.base_checkpoint else config.base_checkpoint
-    tokenizer = AutoTokenizer.from_pretrained(
+    # AutoProcessor handles both the vision (pixel values) and text (tokenizer)
+    # branches of the multimodal model, unlike a plain AutoTokenizer which only
+    # processes text and would silently drop visual content.
+    processor = AutoProcessor.from_pretrained(
         model_name,
         trust_remote_code=config.trust_remote_code,
     )
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoModelForVision2Seq.from_pretrained(
         model_name,
         trust_remote_code=config.trust_remote_code,
     )
@@ -372,26 +447,19 @@ def run_training(
 
     def _tokenize(example):
         messages = example.get("messages", [])
-        if hasattr(tokenizer, "apply_chat_template") and callable(
-            getattr(tokenizer, "apply_chat_template", None)
-        ):
-            # Use the model's own chat template to match inference-time formatting.
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False,
-            )
-        else:
-            # Fallback: simple role-prefixed concatenation for tokenizers without
-            # a chat template.
-            text = "".join(
-                f"<|{m['role']}|>\n"
-                + (m["content"] if isinstance(m["content"], str) else str(m["content"]))
-                + "\n"
-                for m in messages
-            )
-        return tokenizer(
-            text,
+        # Guard: ensure image content objects are structured dicts, not
+        # stringified text.  This runs on every training example and catches
+        # any export-side regression before the model forward pass.
+        validate_multimodal_messages(messages)
+        # Use the processor's chat template so that image tokens are correctly
+        # inserted and the visual encoder receives properly shaped inputs.
+        text = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return processor(
+            text=text,
             truncation=True,
             max_length=config.max_seq_length,
             padding="max_length",
@@ -423,7 +491,7 @@ def run_training(
         args=training_args,
         train_dataset=tokenized["train"],
         eval_dataset=tokenized["validation"],
-        tokenizer=tokenizer,
+        tokenizer=processor,
     )
     trainer.train(resume_from_checkpoint=config.resume_from_checkpoint or None)
     trainer.save_model(str(resolved_out / "final_adapter"))

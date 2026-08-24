@@ -130,17 +130,48 @@ class Provenance:
     teacher_prompt_version: str = ""
     validation_version: str = ""
     generated_at_utc: str = ""
+
+    # ---------------------------------------------------------------------------
+    # Temporal input representation fields (aligned with #70/#72 contract)
+    # ---------------------------------------------------------------------------
+    # These fields together uniquely identify the model-input encoding so that
+    # two sequences sharing the same frame bytes but delivered differently are
+    # not confused with each other during training or evaluation.
+
     input_representation: str = ""
-    # Temporal input representation used when the sample was generated.
-    # Possible values (aligned with #72 distinctions):
+    # High-level input encoding used at generation time.
+    # Possible values:
     #   "ordered_images"        – frames passed as an ordered image list
     #   "rendered_timestamps"   – timestamps rendered into the image or prompt
     #   "temporal_images_meta"  – frames with temporal-images metadata block
     #   "native_video"          – frames encoded as a native video segment
-    #   ""                      – unspecified / legacy (pre-provenance)
-    #
-    # Two samples sharing the same frame/timestamp provenance but different
-    # input_representation values represent materially different model inputs.
+    #   ""                      – unspecified / legacy
+
+    sequence_type: str = ""
+    # Modality of the sequence input.
+    # Possible values: "image_sequence" | "video" | "" (unspecified)
+
+    timestamp_policy: str = ""
+    # How frame timestamps are represented in the model input.
+    # Possible values:
+    #   "capture_time_s"   – absolute capture time in seconds
+    #   "frame_index"      – integer frame index only
+    #   "rendered"         – timestamp string rendered into image/prompt
+    #   ""                 – unspecified
+
+    effective_fps: float = 0.0
+    # Source or effective sampling rate in frames-per-second; 0.0 = unspecified.
+
+    rendered_timestamp_control: bool = False
+    # True if timestamp text was rendered into image pixels or injected into
+    # the prompt, giving the model an explicit time signal per frame.
+
+    runtime_temporal_encoding: str = ""
+    # How frames were encoded at runtime for the actual forward pass.
+    # Possible values:
+    #   "independent_images"  – each frame is a separate image input
+    #   "video_tensor"        – frames concatenated into a [T,H,W,3] video tensor
+    #   ""                    – unspecified
 
     def to_dict(self) -> dict:
         return {
@@ -151,11 +182,31 @@ class Provenance:
             "validation_version": self.validation_version,
             "generated_at_utc": self.generated_at_utc,
             "input_representation": self.input_representation,
+            "sequence_type": self.sequence_type,
+            "timestamp_policy": self.timestamp_policy,
+            "effective_fps": self.effective_fps,
+            "rendered_timestamp_control": self.rendered_timestamp_control,
+            "runtime_temporal_encoding": self.runtime_temporal_encoding,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Provenance":
-        return cls(**{k: d.get(k, "") for k in cls.__dataclass_fields__})  # type: ignore[attr-defined]
+        # Derive defaults from the dataclass field definitions so that new
+        # fields added to the class are automatically handled without requiring
+        # manual updates to this method.
+        import dataclasses
+        kwargs: dict = {}
+        for f in dataclasses.fields(cls):
+            if f.name not in d:
+                # Use the field's declared default.
+                kwargs[f.name] = f.default
+            elif f.type == "float" or f.default == 0.0:
+                kwargs[f.name] = float(d[f.name])
+            elif f.type == "bool" or isinstance(f.default, bool):
+                kwargs[f.name] = bool(d[f.name])
+            else:
+                kwargs[f.name] = d[f.name]
+        return cls(**kwargs)
 
 
 @dataclass
