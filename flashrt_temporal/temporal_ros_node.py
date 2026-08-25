@@ -18,7 +18,6 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
-from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from edge_vlm_ros.msg import VlmResult
@@ -278,6 +277,10 @@ class FlashRtTemporalNode(Node):
                 )
             except Exception as exc:
                 success, text, error, infer_s, encoding = False, "", str(exc), 0.0, ""
+
+            if not self.running or not rclpy.ok():
+                return
+
             result = VlmResult()
             result.header = latest.header
             result.source_topic = self.image_topic
@@ -296,7 +299,12 @@ class FlashRtTemporalNode(Node):
             result.source_sequence = 0
             result.success = success
             result.error = error
-            self.publisher.publish(result)
+            try:
+                self.publisher.publish(result)
+            except Exception:
+                if not self.running or not rclpy.ok():
+                    return
+                raise
             if success:
                 self.get_logger().info(
                     f"[window ending frame {latest.sequence} | {len(window)} frames | "
@@ -313,9 +321,12 @@ def main() -> None:
     node = FlashRtTemporalNode()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
