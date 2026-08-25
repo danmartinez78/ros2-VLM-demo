@@ -4,14 +4,18 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from distillation.evaluation import ControlledSequenceEvaluator, compare_sample
-from distillation.schema import FrameRef, TemporalSample, TemporalTarget
-from distillation.teacher import FakeTeacherRuntime, TeacherLabelGenerator
-from distillation.validator import validate_sample
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT))
+
+from distillation.evaluation import ControlledSequenceEvaluator, compare_sample  # noqa: E402
+from distillation.schema import FrameRef, TemporalSample, TemporalTarget  # noqa: E402
+from distillation.teacher import FakeTeacherRuntime, TeacherLabelGenerator  # noqa: E402
+from distillation.validator import validate_sample  # noqa: E402
 
 
 def frames(n: int = 4) -> list[FrameRef]:
