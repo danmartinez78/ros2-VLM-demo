@@ -174,14 +174,23 @@ class FlashRtTemporalNode(Node):
         self.declare_parameter("temporal_window_frames", 8)
         self.declare_parameter("temporal_require_full_window", True)
         self.declare_parameter("max_generate_length", 256)
-        self.declare_parameter("task_profile", "temporal_scene_change")
-        self.declare_parameter("prompt_version", "flashrt-video-v1")
+        self.declare_parameter("task_profile", "temporal_change")
+        self.declare_parameter("prompt_version", "flashrt-temporal-change-v2")
         self.declare_parameter(
             "prompt",
-            "Analyze this chronological camera window. Describe important scene changes, "
-            "objects or hazards that appear/disappear, motion trends, and any evidence that "
-            "the operating environment is approaching or leaving its expected domain. "
-            "Use only visually supported evidence.",
+            "Analyze these frames as one chronological video sequence.\n"
+            "Report only changes directly supported across the frames.\n"
+            "For each dynamic object or scene element, identify what changed and the "
+            "direction or trend. State whether it appeared, disappeared, approached, "
+            "receded, or moved laterally when supported. Do not describe static objects "
+            "unless needed to explain a change. Do not infer motion from a single frame. "
+            "Do not speculate when temporal evidence is insufficient.\n"
+            "Return exactly this compact format:\n"
+            "CHANGES:\n"
+            "- <object>: <temporal change>\n"
+            "CAMERA_MOTION: <stationary|forward|backward|pan_left|pan_right|uncertain>\n"
+            "SUMMARY: <one sentence describing the most important temporal event>\n"
+            "If there are no supported changes, write '- none' under CHANGES.",
         )
 
         self.image_topic = self.get_parameter("image_topic").value
