@@ -50,6 +50,9 @@ from ipc_protocol import (
 )
 
 
+VIDEO_METADATA_TIMEBASE_HZ = 1000.0
+
+
 @dataclass
 class ParsedRequest:
     header: RequestHeader
@@ -220,6 +223,38 @@ def effective_fps(req: ParsedRequest) -> float:
     return 1.0
 
 
+def build_video_metadata(req: ParsedRequest) -> tuple[dict, float]:
+    """Build Qwen3-VL metadata for frames that were already sampled upstream."""
+    if req.timestamps:
+        t0 = req.timestamps[0]
+        relative = [max(0.0, ts - t0) for ts in req.timestamps]
+        indices = [int(round(ts * VIDEO_METADATA_TIMEBASE_HZ)) for ts in relative]
+        for i in range(1, len(indices)):
+            if indices[i] <= indices[i - 1]:
+                indices[i] = indices[i - 1] + 1
+        span = relative[-1] if len(relative) > 1 else 0.0
+        metadata = {
+            "total_num_frames": indices[-1] + 1,
+            "fps": VIDEO_METADATA_TIMEBASE_HZ,
+            "duration": span,
+            "frames_indices": indices,
+            "video_backend": "edge_vlm_ipc_timestamps",
+        }
+        return metadata, span
+
+    fps = effective_fps(req)
+    indices = list(range(len(req.frames)))
+    span = (len(req.frames) - 1) / fps if len(req.frames) > 1 else 0.0
+    metadata = {
+        "total_num_frames": len(req.frames),
+        "fps": fps,
+        "duration": span,
+        "frames_indices": indices,
+        "video_backend": "edge_vlm_ipc_fps",
+    }
+    return metadata, span
+
+
 def build_messages(req: ParsedRequest):
     messages: list[dict] = []
     if req.system_message:
@@ -232,7 +267,6 @@ def build_messages(req: ParsedRequest):
         media = {
             "type": "video",
             "video": req.frames,
-            "fps": effective_fps(req),
         }
         content = [media, {"type": "text", "text": req.prompt}]
     else:
@@ -240,6 +274,19 @@ def build_messages(req: ParsedRequest):
         content.append({"type": "text", "text": req.prompt})
     messages.append({"role": "user", "content": content})
     return messages
+
+
+def _render_no_think_prompt(processor, messages) -> str:
+    tokenizer = getattr(processor, "tokenizer", processor)
+    kwargs = {
+        "tokenize": False,
+        "add_generation_prompt": True,
+        "enable_thinking": False,
+    }
+    chat_template = getattr(processor, "chat_template", None)
+    if chat_template is not None:
+        kwargs["chat_template"] = chat_template
+    return tokenizer.apply_chat_template(messages, **kwargs)
 
 
 def infer(engine, processor, req: ParsedRequest, engine_max_new_tokens: int):
@@ -253,17 +300,45 @@ def infer(engine, processor, req: ParsedRequest, engine_max_new_tokens: int):
 
     start = time.perf_counter()
     messages = build_messages(req)
-    pin = processor.apply_chat_template(
-        messages,
-        tokenize=True,
-        add_generation_prompt=True,
-        return_tensors="pt",
-        return_dict=True,
-    )
+    is_video = req.header.sequence_type in (SEQUENCE_TEMPORAL_IMAGES, SEQUENCE_VIDEO)
+
+    if is_video:
+        metadata, span = build_video_metadata(req)
+        rendered_prompt = _render_no_think_prompt(processor, messages)
+        video = np.stack(
+            [np.asarray(frame.convert("RGB"), dtype=np.uint8) for frame in req.frames],
+            axis=0,
+        )
+        pin = processor(
+            text=rendered_prompt,
+            videos=video,
+            video_metadata=metadata,
+            do_sample_frames=False,
+            return_tensors="pt",
+        )
+        grid = pin["video_grid_thw"]
+        grid_list = grid.tolist() if hasattr(grid, "tolist") else grid
+        print(
+            f"flashrt_video_request id={req.header.request_id} "
+            f"input_frames={len(req.frames)} effective_fps={effective_fps(req):.3f} "
+            f"timestamp_span={span:.3f}s metadata_fps={metadata['fps']:.1f} "
+            f"frames_indices={metadata['frames_indices']} video_grid_thw={grid_list} "
+            f"thinking=false",
+            flush=True,
+        )
+    else:
+        pin = processor.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+
     input_ids = pin["input_ids"].reshape(-1)
 
     kwargs = {}
-    if req.header.sequence_type in (SEQUENCE_TEMPORAL_IMAGES, SEQUENCE_VIDEO):
+    if is_video:
         kwargs = {
             "pixel_values": pin["pixel_values_videos"],
             "grid_thw": pin["video_grid_thw"],
