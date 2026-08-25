@@ -2,16 +2,18 @@
 """Capture and replay controlled Cosmos3 temporal chronology tests.
 
 The harness captures contiguous sampled ROS image windows, ranks them by simple
-pixel-change score, saves the best candidate, then sends three controlled
-variants to the existing FlashRT IPC worker:
+pixel-change score, saves the best candidate, then sends controlled variants to
+the existing FlashRT IPC worker:
 
-  forward       F1 F2 ... F8 as native video
-  reverse       F8 F7 ... F1 with the same monotonic timestamp schedule
-  terminal_only F8 as a true single-image request
+  forward         F1 F2 ... F8 as native video
+  reverse         F8 F7 ... F1 with the same monotonic timestamp schedule
+  shuffled        deterministic non-chronological ordering, same schedule
+  static_terminal F8 F8 ... F8 as native video, same schedule
+  terminal_only   F8 as a true single-image diagnostic request
 
-Keeping the timestamp schedule fixed for forward/reverse isolates frame order as
-the experimental variable. A saved capture can be replayed later without ROS bag
-playback by passing --load-capture.
+Forward, reverse, shuffled, and static_terminal all use the same frame count,
+monotonic timestamp schedule, prompt, and native-video path. A saved capture can
+be replayed later without ROS bag playback by passing --load-capture.
 """
 from __future__ import annotations
 
@@ -68,6 +70,20 @@ def window_motion_score(frames: list[CapturedFrame]) -> float:
         diff = np.max(np.abs(b - a), axis=2)
         pair_scores.append(float(np.mean(diff >= 20)))
     return float(np.mean(pair_scores))
+
+
+def shuffled_frame_order(n: int) -> list[int]:
+    """Return a deterministic strongly non-chronological permutation."""
+    order: list[int] = []
+    left = 0
+    right = n - 1
+    while left <= right:
+        order.append(left)
+        left += 1
+        if left <= right:
+            order.append(right)
+            right -= 1
+    return order
 
 
 class WindowCaptureNode(Node):
@@ -209,7 +225,7 @@ def save_capture(
     timestamps = [item.stamp_sec for item in frames]
     t0 = timestamps[0]
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "image_topic": args.image_topic,
         "sample_period_seconds": args.sample_period_seconds,
@@ -325,6 +341,26 @@ def run_experiment(
             ),
             run_variant(
                 client,
+                "shuffled",
+                frames,
+                shuffled_frame_order(n),
+                timestamps,
+                prompt,
+                args.max_generate_length,
+                SEQUENCE_VIDEO,
+            ),
+            run_variant(
+                client,
+                "static_terminal",
+                frames,
+                [n - 1] * n,
+                timestamps,
+                prompt,
+                args.max_generate_length,
+                SEQUENCE_VIDEO,
+            ),
+            run_variant(
+                client,
                 "terminal_only",
                 frames,
                 [n - 1],
@@ -344,9 +380,9 @@ def run_experiment(
         "motion_score": window_motion_score(frames),
         "prompt": prompt,
         "experimental_control": (
-            "forward and reverse use identical monotonic timestamp schedules; "
-            "only frame order changes; terminal_only uses the final frame through "
-            "the true single-image IPC path"
+            "forward, reverse, shuffled, and static_terminal use identical monotonic "
+            "timestamp schedules, frame counts, prompts, and native-video encoding; "
+            "terminal_only is retained only as a single-image diagnostic"
         ),
         "results": results,
     }
@@ -358,7 +394,7 @@ def run_experiment(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="Capture and replay forward/reverse/terminal-only Cosmos3 tests"
+        description="Capture and replay controlled Cosmos3 chronology tests"
     )
     ap.add_argument("--image-topic", default="/camera0/color/image_raw")
     ap.add_argument("--sample-period-seconds", type=float, default=0.25)
