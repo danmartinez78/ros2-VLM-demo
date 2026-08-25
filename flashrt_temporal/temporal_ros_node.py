@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from edge_vlm_ros.msg import VlmResult
@@ -212,7 +214,12 @@ class FlashRtTemporalNode(Node):
         self.running = True
         self.worker = threading.Thread(target=self._worker_loop, daemon=True)
         self.publisher = self.create_publisher(VlmResult, self.result_topic, 10)
-        self.subscription = self.create_subscription(Image, self.image_topic, self._image_callback, 1)
+        self.subscription = self.create_subscription(
+            Image,
+            self.image_topic,
+            self._image_callback,
+            qos_profile_sensor_data,
+        )
         self.worker.start()
         self.get_logger().info(
             f"FlashRT temporal node: topic={self.image_topic} window={self.window_frames} "
