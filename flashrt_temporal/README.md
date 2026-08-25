@@ -79,10 +79,11 @@ encoding and frame count.
 
 ## Runtime semantics
 
-- ROS message timestamps determine sampling and are sent with every frame.
+- ROS message timestamps determine sampling and are sent with every temporal frame window.
 - The worker derives effective video FPS from those timestamps when an explicit FPS is absent, avoiding assumptions about camera publish rate or bag replay speed.
 - `sequence_type=video` and `sequence_type=temporal_images` both use Cosmos3's native video media path in this FlashRT worker.
-- `sequence_type=images` remains an image/multi-image request.
+- `sequence_type=images` remains an image/multi-image request; timing metadata is not used by the image preprocessing path.
+- The generic C++ request validator forbids FPS/timestamps on `sequence_type=images`. The experiment-only `terminal_only` chronology control currently carries a one-element timestamp through the Python IPC client; the FlashRT worker accepts it but does not use it. Do not rely on that as a portable image-mode contract.
 - FlashRT's current Thor reasoner path is greedy. The IPC sampling fields remain on the wire for compatibility, but temperature/top-p/top-k are not applied by this worker.
 - The worker has a process-level deadline guard. If a CUDA call wedges beyond the configured deadline, the process exits so an external supervisor can restart it.
 
