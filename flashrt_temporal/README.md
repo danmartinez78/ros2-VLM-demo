@@ -5,6 +5,8 @@ This directory contains the first repo-integrated Cosmos3 native-video path for
 Edge-LLM node/worker remains the single-frame and ordered-multi-image baseline,
 while this path uses FlashRT for a rolling temporal window.
 
+For the complete shared IPC request format, field meanings, sequence modes, prompt/message roles, and a side-by-side description of how Edge-LLM and FlashRT invoke inference, see [`docs/inference-request-contract.md`](../docs/inference-request-contract.md).
+
 ## Why this exists
 
 Thor validation established that:
