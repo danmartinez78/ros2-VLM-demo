@@ -10,6 +10,7 @@ The validated Jetson AGX Thor path uses separate ROS and GPU-runtime processes. 
 
 This document is the source of truth for the currently deployed ROS/IPC runtime architecture. Broader temporal and evaluation design is documented separately:
 
+- [Inference request contract](inference-request-contract.md)
 - [Architecture design map](architecture/README.md)
 - [Temporal VLM architecture](architecture/temporal-vlm-architecture.md)
 - [Temporal evidence/results matrix](architecture/temporal-results-matrix.md)
@@ -83,6 +84,8 @@ The versioned Unix-socket protocol carries:
 - result text, errors, inference timing, and runtime temporal-encoding provenance.
 
 The transport is intentionally independent of a specific VLM so alternate workers can implement the same contract.
+
+For the field-by-field wire format, sequence-mode semantics, prompt/message roles, generation controls, and the exact mapping performed by the TensorRT Edge-LLM and FlashRT workers, see [Inference request contract](inference-request-contract.md).
 
 ## Scheduling and backpressure
 
