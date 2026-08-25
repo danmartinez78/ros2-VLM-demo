@@ -21,7 +21,7 @@ flowchart LR
 
 The ROS and GPU runtimes intentionally run in separate processes. This keeps ROS/DDS dependencies isolated from accelerator/runtime libraries, allows the model worker to remain loaded while clients reconnect, and lets a failed worker restart without restarting the ROS graph.
 
-The versioned IPC contract supports single images, ordered image sequences, native temporal/video requests, exact frame timestamps, prompts, and structured result metadata.
+The versioned IPC contract supports single images, ordered image sequences, native temporal/video requests, exact frame timestamps, prompts, and structured result metadata. See [docs/inference-request-contract.md](docs/inference-request-contract.md) for the field-by-field request format and the exact Edge-LLM and FlashRT runtime mappings.
 
 ## What this demo includes
 
@@ -262,6 +262,7 @@ Temporal evaluation should preserve the exact representation used by the model: 
 ## Documentation map
 
 - [Architecture](docs/architecture.md)
+- [Inference request contract](docs/inference-request-contract.md)
 - [Architecture design map](docs/architecture/README.md)
 - [Temporal VLM architecture](docs/architecture/temporal-vlm-architecture.md)
 - [Temporal evidence/results matrix](docs/architecture/temporal-results-matrix.md)
