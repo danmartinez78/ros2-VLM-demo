@@ -173,6 +173,7 @@ class FlashRtTemporalNode(Node):
         self.declare_parameter("sample_period_seconds", 0.5)
         self.declare_parameter("temporal_window_frames", 8)
         self.declare_parameter("temporal_require_full_window", True)
+        self.declare_parameter("temporal_max_gap_seconds", 1.25)
         self.declare_parameter("max_generate_length", 256)
         self.declare_parameter("task_profile", "temporal_change")
         self.declare_parameter("prompt_version", "flashrt-temporal-change-v2")
@@ -198,6 +199,7 @@ class FlashRtTemporalNode(Node):
         self.sample_period = float(self.get_parameter("sample_period_seconds").value)
         self.window_frames = int(self.get_parameter("temporal_window_frames").value)
         self.require_full = bool(self.get_parameter("temporal_require_full_window").value)
+        self.max_gap = float(self.get_parameter("temporal_max_gap_seconds").value)
         self.max_tokens = int(self.get_parameter("max_generate_length").value)
         self.prompt = str(self.get_parameter("prompt").value)
         self.task_profile = str(self.get_parameter("task_profile").value)
@@ -210,6 +212,10 @@ class FlashRtTemporalNode(Node):
             raise ValueError("sample_period_seconds must be >= 0")
         if self.window_frames < 1 or self.window_frames > 32:
             raise ValueError("temporal_window_frames must be in [1, 32]")
+        if self.max_gap <= 0.0:
+            raise ValueError("temporal_max_gap_seconds must be > 0")
+        if self.sample_period > 0.0 and self.max_gap <= self.sample_period:
+            raise ValueError("temporal_max_gap_seconds must be greater than sample_period_seconds")
         if self.max_tokens <= 0:
             raise ValueError("max_generate_length must be > 0")
 
@@ -231,7 +237,8 @@ class FlashRtTemporalNode(Node):
         self.worker.start()
         self.get_logger().info(
             f"FlashRT temporal node: topic={self.image_topic} window={self.window_frames} "
-            f"sample_period={self.sample_period:.3f}s socket={socket_path}"
+            f"sample_period={self.sample_period:.3f}s max_gap={self.max_gap:.3f}s "
+            f"socket={socket_path}"
         )
 
     def destroy_node(self):
@@ -243,13 +250,27 @@ class FlashRtTemporalNode(Node):
         self.client.close()
         super().destroy_node()
 
+    def _reset_temporal_window(self, reason: str) -> None:
+        self.buffer.clear()
+        self.last_sampled = None
+        with self.cv:
+            self.pending = None
+        self.get_logger().warning(reason)
+
     def _image_callback(self, msg: Image) -> None:
         stamp = stamp_to_sec(msg.header.stamp)
         if self.last_sampled is not None:
             elapsed = stamp - self.last_sampled
             if elapsed < 0.0:
-                self.buffer.clear()
-                self.last_sampled = None
+                self._reset_temporal_window(
+                    f"temporal discontinuity: timestamp moved backward by {-elapsed:.3f}s; "
+                    "resetting window"
+                )
+            elif elapsed > self.max_gap:
+                self._reset_temporal_window(
+                    f"temporal discontinuity: gap={elapsed:.3f}s > {self.max_gap:.3f}s; "
+                    "resetting window"
+                )
             elif elapsed < self.sample_period:
                 return
         try:
