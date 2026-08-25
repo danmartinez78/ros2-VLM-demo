@@ -1,16 +1,5 @@
 // Copyright 2025 edge_vlm_ros contributors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: MIT
 
 /// Tests for timestamp-based frame sampling logic.
 ///
@@ -58,7 +47,6 @@ static rclcpp::NodeOptions node_options_no_trt(double period = 2.0)
   return opts;
 }
 
-// Publish messages and spin until the callback has processed them.
 static void publish_and_spin(
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub,
   rclcpp::Node::SharedPtr node,
@@ -72,8 +60,6 @@ static void publish_and_spin(
     std::this_thread::sleep_for(5ms);
   }
 }
-
-// ─── Test fixture ─────────────────────────────────────────────────────────────
 
 class FrameSamplingTest : public ::testing::Test
 {
@@ -94,20 +80,15 @@ protected:
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr make_pub()
   {
-    // Use best_effort to match the subscription QoS
     rclcpp::QoS qos{rclcpp::KeepLast(10)};
     qos.best_effort();
     return node_->create_publisher<sensor_msgs::msg::Image>("/camera/image_raw", qos);
   }
 };
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
-/// The first frame is always sampled regardless of the period.
 TEST_F(FrameSamplingTest, FirstFrameAlwaysSampled)
 {
   auto pub = make_pub();
-  // Small sleep to let DDS discover the subscription
   std::this_thread::sleep_for(50ms);
 
   publish_and_spin(pub, node_, make_image(rclcpp::Time(0, 0, RCL_ROS_TIME)));
@@ -115,51 +96,42 @@ TEST_F(FrameSamplingTest, FirstFrameAlwaysSampled)
   EXPECT_GE(node_->sampled_count(), 1u);
 }
 
-/// Frames within the sample period are NOT sampled.
 TEST_F(FrameSamplingTest, FramesWithinPeriodAreNotSampled)
 {
   auto pub = make_pub();
   std::this_thread::sleep_for(50ms);
 
-  // t=0 → sampled
   publish_and_spin(pub, node_, make_image(rclcpp::Time(0, 0, RCL_ROS_TIME)));
   uint64_t after_first = node_->sampled_count();
   EXPECT_GE(after_first, 1u) << "First frame should be sampled";
 
-  // t=1 s < 2 s period → NOT sampled
   publish_and_spin(pub, node_, make_image(rclcpp::Time(1, 0, RCL_ROS_TIME)));
 
   EXPECT_EQ(node_->sampled_count(), after_first)
     << "Frame within period should not increment sampled_count";
 }
 
-/// Frames at or beyond the sample period ARE sampled.
 TEST_F(FrameSamplingTest, FramesAtPeriodAreSampled)
 {
   auto pub = make_pub();
   std::this_thread::sleep_for(50ms);
 
-  // t=0 → sampled
   publish_and_spin(pub, node_, make_image(rclcpp::Time(0, 0, RCL_ROS_TIME)));
   EXPECT_GE(node_->sampled_count(), 1u);
 
-  // t=2 s == 2 s period → sampled
   publish_and_spin(pub, node_, make_image(rclcpp::Time(2, 0, RCL_ROS_TIME)));
   EXPECT_GE(node_->sampled_count(), 2u);
 
-  // t=4 s → sampled
   publish_and_spin(pub, node_, make_image(rclcpp::Time(4, 0, RCL_ROS_TIME)));
   EXPECT_GE(node_->sampled_count(), 3u);
 }
 
-/// Sampling is deterministic with bag timestamps.
 TEST_F(FrameSamplingTest, SamplingIsDeterministicWithBagTimestamps)
 {
   auto pub = make_pub();
   std::this_thread::sleep_for(50ms);
 
   const std::vector<int64_t> secs = {0, 1, 2, 3, 4, 5};
-  // With period=2, expected sampled: t=0, t=2, t=4 → 3 frames
   for (int64_t s : secs) {
     publish_and_spin(pub, node_, make_image(rclcpp::Time(s, 0, RCL_ROS_TIME)));
   }
@@ -168,7 +140,6 @@ TEST_F(FrameSamplingTest, SamplingIsDeterministicWithBagTimestamps)
     << "With period=2s, timestamps 0,1,2,3,4,5 should yield 3 sampled frames";
 }
 
-/// The first frame after a rosbag loop or simulation reset is sampled.
 TEST_F(FrameSamplingTest, BackwardTimestampResetsSampler)
 {
   auto pub = make_pub();
@@ -178,8 +149,6 @@ TEST_F(FrameSamplingTest, BackwardTimestampResetsSampler)
   const uint64_t before_rewind = node_->sampled_count();
   ASSERT_GE(before_rewind, 1u);
 
-  // A looped bag restarts at an earlier timestamp. This frame begins a new
-  // sampling epoch and must not be suppressed by the previous loop's time.
   publish_and_spin(pub, node_, make_image(rclcpp::Time(1, 0, RCL_ROS_TIME)));
   EXPECT_EQ(node_->sampled_count(), before_rewind + 1);
 }
