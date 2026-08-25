@@ -4,12 +4,12 @@
   <name>edge_vlm_ros</name>
   <version>0.1.0</version>
   <description>
-    ROS 2 Jazzy pipeline for NVIDIA Jetson AGX Thor that samples camera frames,
-    sends them to an isolated TensorRT Edge-LLM worker,
-    and publishes structured inference results.
+    Generic ROS 2 Jazzy VLM pipeline demo for NVIDIA Jetson platforms that samples camera frames,
+    sends them to an isolated inference worker,
+    and publishes structured vision-language results.
   </description>
   <maintainer email="dan@shadowhounddrones.com">Dan Martinez</maintainer>
-  <license>Apache-2.0</license>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>
