@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Capture and replay controlled Cosmos3 temporal chronology tests.
 
-The harness captures one contiguous sampled ROS image window, saves the exact
-frames and ROS timestamps, then sends three controlled variants to the existing
-FlashRT IPC worker:
+The harness captures contiguous sampled ROS image windows, ranks them by simple
+pixel-change score, saves the best candidate, then sends three controlled
+variants to the existing FlashRT IPC worker:
 
-  forward       F1 F2 ... F8
-  reverse       F8 F7 ... F1, using the same monotonic timestamp schedule
-  terminal_only F8 only
+  forward       F1 F2 ... F8 as native video
+  reverse       F8 F7 ... F1 with the same monotonic timestamp schedule
+  terminal_only F8 as a true single-image request
 
 Keeping the timestamp schedule fixed for forward/reverse isolates frame order as
 the experimental variable. A saved capture can be replayed later without ROS bag
@@ -30,6 +30,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
+from ipc_protocol import SEQUENCE_IMAGES, SEQUENCE_VIDEO
 from temporal_ros_node import IpcClient, ros_image_to_bgr, stamp_to_sec
 
 
@@ -56,6 +57,19 @@ class CapturedFrame:
     stamp_sec: float
 
 
+def window_motion_score(frames: list[CapturedFrame]) -> float:
+    """Rank windows by fraction of pixels changing strongly between samples."""
+    if len(frames) < 2:
+        return 0.0
+    pair_scores: list[float] = []
+    for a_item, b_item in zip(frames, frames[1:]):
+        a = a_item.image[::4, ::4].astype(np.int16)
+        b = b_item.image[::4, ::4].astype(np.int16)
+        diff = np.max(np.abs(b - a), axis=2)
+        pair_scores.append(float(np.mean(diff >= 20)))
+    return float(np.mean(pair_scores))
+
+
 class WindowCaptureNode(Node):
     def __init__(
         self,
@@ -63,14 +77,19 @@ class WindowCaptureNode(Node):
         sample_period: float,
         window_frames: int,
         max_gap: float,
+        candidate_windows: int,
     ) -> None:
         super().__init__("flashrt_temporal_capture")
         self.image_topic = image_topic
         self.sample_period = sample_period
         self.window_frames = window_frames
         self.max_gap = max_gap
+        self.candidate_windows = candidate_windows
         self.buffer: deque[CapturedFrame] = deque(maxlen=window_frames)
         self.last_sampled: float | None = None
+        self.candidate_count = 0
+        self.best_score = -1.0
+        self.best_window: list[CapturedFrame] | None = None
         self.captured: list[CapturedFrame] | None = None
         self.subscription = self.create_subscription(
             Image,
@@ -80,13 +99,34 @@ class WindowCaptureNode(Node):
         )
         self.get_logger().info(
             f"capturing topic={image_topic} window={window_frames} "
-            f"sample_period={sample_period:.3f}s max_gap={max_gap:.3f}s"
+            f"sample_period={sample_period:.3f}s max_gap={max_gap:.3f}s "
+            f"candidates={candidate_windows}"
         )
 
     def _reset(self, reason: str) -> None:
         self.buffer.clear()
         self.last_sampled = None
         self.get_logger().warning(f"capture window reset: {reason}")
+
+    def _consider_candidate(self) -> None:
+        candidate = list(self.buffer)
+        score = window_motion_score(candidate)
+        self.candidate_count += 1
+        if score > self.best_score:
+            self.best_score = score
+            self.best_window = candidate
+            span = candidate[-1].stamp_sec - candidate[0].stamp_sec
+            self.get_logger().info(
+                f"new best candidate {self.candidate_count}/{self.candidate_windows}: "
+                f"motion_score={score:.6f} span={span:.3f}s"
+            )
+        if self.candidate_count >= self.candidate_windows and self.best_window is not None:
+            self.captured = self.best_window
+            span = self.captured[-1].stamp_sec - self.captured[0].stamp_sec
+            self.get_logger().info(
+                f"selected best of {self.candidate_count} windows: "
+                f"motion_score={self.best_score:.6f} span={span:.3f}s"
+            )
 
     def _image_callback(self, msg: Image) -> None:
         if self.captured is not None:
@@ -111,11 +151,7 @@ class WindowCaptureNode(Node):
         self.last_sampled = stamp
         self.buffer.append(CapturedFrame(frame, stamp))
         if len(self.buffer) == self.window_frames:
-            self.captured = list(self.buffer)
-            span = self.captured[-1].stamp_sec - self.captured[0].stamp_sec
-            self.get_logger().info(
-                f"captured {self.window_frames} contiguous frames spanning {span:.3f}s"
-            )
+            self._consider_candidate()
 
 
 def capture_window(args) -> list[CapturedFrame]:
@@ -125,15 +161,22 @@ def capture_window(args) -> list[CapturedFrame]:
         args.sample_period_seconds,
         args.window_frames,
         args.max_gap_seconds,
+        args.capture_candidates,
     )
     deadline = time.monotonic() + args.capture_timeout_seconds
     try:
         while node.captured is None and time.monotonic() < deadline:
             rclpy.spin_once(node, timeout_sec=0.1)
         if node.captured is None:
-            raise TimeoutError(
-                f"no contiguous {args.window_frames}-frame window captured within "
-                f"{args.capture_timeout_seconds:.1f}s"
+            if node.best_window is None:
+                raise TimeoutError(
+                    f"no contiguous {args.window_frames}-frame window captured within "
+                    f"{args.capture_timeout_seconds:.1f}s"
+                )
+            node.captured = node.best_window
+            node.get_logger().warning(
+                f"capture timeout after {node.candidate_count} candidates; "
+                f"using best motion_score={node.best_score:.6f}"
             )
         return node.captured
     finally:
@@ -166,11 +209,13 @@ def save_capture(
     timestamps = [item.stamp_sec for item in frames]
     t0 = timestamps[0]
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "image_topic": args.image_topic,
         "sample_period_seconds": args.sample_period_seconds,
         "max_gap_seconds": args.max_gap_seconds,
+        "capture_candidates": args.capture_candidates,
+        "motion_score": window_motion_score(frames),
         "frame_count": len(frames),
         "frame_files": frame_files,
         "ros_timestamps_sec": timestamps,
@@ -207,6 +252,7 @@ def run_variant(
     timestamp_schedule: list[float],
     prompt: str,
     max_tokens: int,
+    sequence_type: int,
 ) -> dict:
     images = [source_frames[i].image for i in frame_order]
     success, text, error, infer_s, encoding = client.infer(
@@ -214,6 +260,7 @@ def run_variant(
         timestamp_schedule,
         prompt,
         max_tokens,
+        sequence_type=sequence_type,
     )
     base = timestamp_schedule[0]
     result = {
@@ -221,6 +268,7 @@ def run_variant(
         "success": success,
         "frame_order": frame_order,
         "relative_timestamps_sec": [ts - base for ts in timestamp_schedule],
+        "ipc_sequence_type": int(sequence_type),
         "inference_seconds": infer_s,
         "temporal_encoding": encoding,
         "response": text,
@@ -263,6 +311,7 @@ def run_experiment(
                 timestamps,
                 prompt,
                 args.max_generate_length,
+                SEQUENCE_VIDEO,
             ),
             run_variant(
                 client,
@@ -272,6 +321,7 @@ def run_experiment(
                 timestamps,
                 prompt,
                 args.max_generate_length,
+                SEQUENCE_VIDEO,
             ),
             run_variant(
                 client,
@@ -281,6 +331,7 @@ def run_experiment(
                 [timestamps[-1]],
                 prompt,
                 args.max_generate_length,
+                SEQUENCE_IMAGES,
             ),
         ]
     finally:
@@ -290,10 +341,12 @@ def run_experiment(
         "capture_dir": str(capture_dir),
         "worker_socket_path": args.worker_socket_path,
         "max_generate_length": args.max_generate_length,
+        "motion_score": window_motion_score(frames),
         "prompt": prompt,
         "experimental_control": (
             "forward and reverse use identical monotonic timestamp schedules; "
-            "only frame order changes"
+            "only frame order changes; terminal_only uses the final frame through "
+            "the true single-image IPC path"
         ),
         "results": results,
     }
@@ -305,12 +358,18 @@ def run_experiment(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="Capture and replay forward/reverse/terminal-only Cosmos3 video tests"
+        description="Capture and replay forward/reverse/terminal-only Cosmos3 tests"
     )
     ap.add_argument("--image-topic", default="/camera0/color/image_raw")
     ap.add_argument("--sample-period-seconds", type=float, default=0.25)
     ap.add_argument("--window-frames", type=int, default=8)
     ap.add_argument("--max-gap-seconds", type=float, default=1.25)
+    ap.add_argument(
+        "--capture-candidates",
+        type=int,
+        default=60,
+        help="Number of sliding contiguous windows to rank by pixel-change score",
+    )
     ap.add_argument("--capture-timeout-seconds", type=float, default=60.0)
     ap.add_argument("--worker-socket-path", default="/tmp/edge_vlm_flashrt.sock")
     ap.add_argument("--worker-timeout-seconds", type=float, default=90.0)
@@ -333,6 +392,8 @@ def main() -> None:
         raise ValueError("--window-frames must be >= 2")
     if args.max_gap_seconds <= 0.0:
         raise ValueError("--max-gap-seconds must be > 0")
+    if args.capture_candidates <= 0:
+        raise ValueError("--capture-candidates must be > 0")
     if args.capture_timeout_seconds <= 0.0:
         raise ValueError("--capture-timeout-seconds must be > 0")
     if args.max_generate_length <= 0:
@@ -344,13 +405,17 @@ def main() -> None:
         prompt = args.prompt if args.prompt != DEFAULT_PROMPT else manifest.get("prompt", DEFAULT_PROMPT)
         print(
             f"loaded capture {capture_dir} with {len(frames)} frames; "
-            f"span={frames[-1].stamp_sec - frames[0].stamp_sec:.3f}s"
+            f"span={frames[-1].stamp_sec - frames[0].stamp_sec:.3f}s "
+            f"motion_score={window_motion_score(frames):.6f}"
         )
     else:
         frames = capture_window(args)
         prompt = args.prompt
         capture_dir = save_capture(frames, args, prompt).resolve()
-        print(f"saved capture to {capture_dir}")
+        print(
+            f"saved capture to {capture_dir}; "
+            f"motion_score={window_motion_score(frames):.6f}"
+        )
 
     run_experiment(frames, capture_dir, args, prompt)
     print(f"\nresults saved to {capture_dir / 'chronology_results.json'}")
