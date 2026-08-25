@@ -26,6 +26,7 @@ from ipc_protocol import (
     MAGIC,
     SCHEMA_FLAG_HAS_FRAME_TIMESTAMPS,
     SCHEMA_FLAG_MULTI_IMAGE,
+    SEQUENCE_IMAGES,
     SEQUENCE_VIDEO,
     VERSION,
     PerImageHeader,
@@ -69,11 +70,20 @@ class IpcClient:
         self.sock = sock
         return sock
 
-    def infer(self, frames: list[np.ndarray], timestamps: list[float], prompt: str, max_tokens: int):
+    def infer(
+        self,
+        frames: list[np.ndarray],
+        timestamps: list[float],
+        prompt: str,
+        max_tokens: int,
+        sequence_type: int = SEQUENCE_VIDEO,
+    ):
         if not frames:
             raise ValueError("temporal request requires at least one frame")
         if len(frames) != len(timestamps):
             raise ValueError("timestamps must match frame count")
+        if sequence_type not in (SEQUENCE_IMAGES, SEQUENCE_VIDEO):
+            raise ValueError("unsupported IPC sequence type")
         sock = self._connect()
         request_id = self.next_request_id
         self.next_request_id += 1
@@ -106,7 +116,7 @@ class IpcClient:
             header.image_count = len(all_frames)
         else:
             header.image_count = 0
-        header.sequence_type = SEQUENCE_VIDEO
+        header.sequence_type = sequence_type
         header.fps = 0.0
         header.timestamp_count = len(timestamps)
 
