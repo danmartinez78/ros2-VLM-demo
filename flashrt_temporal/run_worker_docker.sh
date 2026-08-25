@@ -3,7 +3,15 @@ set -euo pipefail
 
 # Run from the ros2-VLM-demo repository root. The caller may prefix this script
 # with sudo when Docker socket permissions require it on Thor.
-CHECKPOINT=${CHECKPOINT:-$HOME/tensorrt-edgellm-workspace/Cosmos3-Edge/hf_checkpoint}
+user_home=$HOME
+if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  resolved_home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+  if [[ -n "$resolved_home" ]]; then
+    user_home=$resolved_home
+  fi
+fi
+
+CHECKPOINT=${CHECKPOINT:-$user_home/tensorrt-edgellm-workspace/Cosmos3-Edge/hf_checkpoint}
 IMAGE=${FLASHRT_IMAGE:-flashrt:cosmos3-video}
 SOCKET_PATH=${WORKER_SOCKET_PATH:-/tmp/edge_vlm_flashrt.sock}
 QUANT=${FLASHRT_QUANT:-bf16}
