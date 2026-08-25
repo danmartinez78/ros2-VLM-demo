@@ -5,13 +5,11 @@ Tracking: #8, #72 / PR #74, #75
 
 ## Purpose
 
-The temporal VLM path exists to answer a different question from single-frame image reasoning:
+The temporal VLM path answers a different question from single-frame image reasoning:
 
-> Given a bounded recent visual history, what changed, in what direction, and when did it become relevant?
+> Given a bounded recent visual history, what changed, in what direction, and when did it become evident?
 
-The architecture therefore treats **temporal context construction** and **temporal model representation** as explicit subsystems rather than as incidental details of a prompt.
-
-The intended end-to-end path is:
+Temporal context construction and temporal model representation are therefore explicit subsystems rather than incidental prompt details.
 
 ```text
 camera / rosbag
@@ -20,412 +18,152 @@ camera / rosbag
 bounded rolling window + sampling/backpressure
     |
     v
-explicit sequence request
-(images | temporal_images | video)
+explicit sequence representation + timestamps
     |
     v
-versioned IPC contract
+model/runtime adapter
     |
     v
-persistent Edge-LLM runtime
-    |
-    v
-Qwen3-VL / Cosmos-Reason2 temporal processing
-    |
-    v
-temporal assessment
-    |
-    +--> task-level evaluation
-    +--> ODD-axis estimator / downstream observation consumer
+structured temporal observation
 ```
 
-The design goal is not to maximize the number of frames presented to the model. It is to maximize **useful recent temporal evidence per unit latency and compute**, while making the representation used for every experiment observable and reproducible.
+## Architectural boundaries
 
-## Current and target boundaries
+### Acquisition and sampling
 
-### Validated/current
+The ROS side owns sensor subscription, sampling interval, continuity checks, and backpressure. These policies should not be embedded inside a particular model runtime.
 
-The repository uses a persistent ROS-free GPU worker separated from the ROS process. That process boundary is documented in [`../architecture.md`](../architecture.md) and is required on the validated Thor stack.
+A live temporal window must remain bounded. If inference is slower than the camera stream, the scheduler keeps the newest useful pending window rather than building an unbounded queue.
 
-The multi-frame benchmark work established that Cosmos-Reason2 can consume ordered multi-image inputs with relatively modest latency growth as frame count increases.
+### Continuity
 
-PR #74, now merged into `main`, added the explicit temporal sequence contract and native Qwen3-VL/Cosmos-Reason2 video path. On Thor, smoke testing demonstrated:
+A temporal sequence is only meaningful if the source interval is continuous enough for the task.
 
-- F4 native video requests succeed without temporal fallback;
-- F8 native video requests succeed without temporal fallback;
-- the runtime reports `native_qwen3vl_video_imagedata_mrope_timestamps` as the effective encoding.
+The current ROS temporal node resets its window when:
 
-### Target design
+- timestamps move backward;
+- a forward gap exceeds the configured maximum;
+- a replay loop crosses back to an earlier source timestamp.
 
-Issue #8 owns live rolling-window construction and backpressure. The runtime should receive an already-selected bounded sequence; it should not grow an unbounded camera queue or make hidden scheduling choices.
+This prevents unrelated bursts from being silently presented to the model as one continuous clip.
 
-The downstream ODD architecture is described separately in [`odd-observation-system.md`](odd-observation-system.md).
+### Representation
 
-## Three different rates
+The runtime contract distinguishes at least:
 
-Temporal experiments must distinguish three rates that are often incorrectly collapsed into a single "FPS" value.
+- single image;
+- ordered independent images;
+- temporal image sequence;
+- native video.
 
-### Camera FPS
+Those are different model-input conditions. A benchmark should never relabel ordered images as video without verifying that the processor/runtime path actually changes.
 
-The physical or replayed sensor production rate.
+### Timing
 
-Example:
+Frame timing is part of temporal semantics. Exact capture timestamps are preferred when available.
+
+For pre-sampled frames, an average FPS is not automatically equivalent to the source timing. Irregularly spaced frames should either retain exact timestamps, be explicitly resampled to a uniform timeline, or be rejected for experiments that require controlled timing.
+
+### Runtime adapter
+
+The model adapter converts the generic IPC request into the processor-specific representation expected by the selected VLM. It is responsible for recording the actual runtime temporal encoding in provenance.
+
+For the FlashRT/Cosmos3 path, native video requests are delivered as one video tensor with explicit video metadata derived from the supplied timestamps.
+
+## Scheduling model
+
+The live pipeline uses latest-only scheduling:
 
 ```text
-camera_fps = 30 Hz
+camera frames
+    -> sampled frame/window
+    -> [active inference]
+       while busy: replace pending input with newest candidate
+    -> next inference uses newest pending input
 ```
 
-This describes how frequently frames become available. It does **not** imply that 30 frames should be sent to the VLM every second.
+This is intentional. The pipeline is designed for bounded semantic observation, not for guaranteeing inference on every camera frame.
 
-### Context FPS
+## Output contract
 
-The effective sampling density represented inside one VLM request.
+Temporal model output should be normalized into fields that can be scored mechanically. Useful concepts include:
 
-For `N` frames covering duration `D`:
+- whether change was detected;
+- object or scene element involved;
+- direction/trend;
+- start/end state;
+- evidence interval;
+- camera motion;
+- confidence or uncertainty;
+- runtime/model provenance.
 
-```text
-context_fps ~= N / D
-```
+Free-form summaries can remain useful for humans but should not be the sole evaluation signal because they are harder to score and may contradict structured fields.
 
-A request may therefore contain eight frames representing one recent second even if the source camera runs at 30 Hz.
+## Provenance requirements
 
-### Inference FPS
+Every controlled temporal result should record:
 
-The rate at which complete VLM requests can be serialized through the current worker/model configuration.
+- ordered source frame identifiers;
+- exact timestamps or explicit resampling policy;
+- frame count and window span;
+- sequence type;
+- input representation;
+- runtime temporal encoding;
+- model and engine identity;
+- quantization/profile;
+- prompt version and prompt hash when available;
+- generation limit and sampling configuration;
+- inference/client latency.
 
-If one request requires 600 ms end-to-end, serialized inference throughput is roughly:
+Without those fields, two apparently identical frame sequences can represent materially different experiments.
 
-```text
-1 / 0.6 s ~= 1.67 requests/s
-```
+## Controlled temporal evaluation
 
-This is independent of the context density inside each request.
+The minimum chronology suite is:
 
-A useful operating point may therefore look like:
+1. **chronological** — original frame order;
+2. **reversed** — exact same images reversed, with the same monotonic timestamp schedule;
+3. **shuffled** — deterministic non-chronological order;
+4. **repeated static** — one source frame repeated across the full native-video schedule;
+5. **single terminal frame** — diagnostic for action-state inference from appearance.
 
-```text
-camera:       30 Hz
-context:       8 Hz inside each rolling window
-VLM requests: ~1.5 Hz
-```
+Additional useful controls include dropped frames, sparse sampling, different window lengths, camera-only motion, and multiple independent moving objects.
 
-The rolling-window scheduler must keep the context **fresh** even when inference is much slower than the source camera.
+The controlled Cosmos3 result from 2026-08-25 demonstrated chronology sensitivity on one motion-rich sequence: reversing the exact same eight images reversed the reported lateral motion direction. The shuffled control still produced a plausible motion story, so general temporal-coherence reliability remains open.
 
-## Sequence representation contract
+See [`../temporal-chronology-results.md`](../temporal-chronology-results.md).
 
-The model input representation is part of the experiment definition. Identical JPEG bytes delivered through different representations are not assumed to be equivalent examples.
+## Model comparison strategy
 
-### `images`
+Once a native-video path works for one model, model-specific prompt tuning should pause long enough to compare other video-capable models on identical saved captures.
 
-Ordered independent image content items.
+A shared benchmark should score:
 
-```text
-frame 0 -> image item
-frame 1 -> image item
-frame 2 -> image item
-...
-```
+- forward direction/change accuracy;
+- reverse consistency;
+- static false-change rate;
+- shuffled-sequence rejection or uncertainty;
+- camera-motion accuracy;
+- structured-output compliance;
+- contradiction rate;
+- inference latency;
+- memory/engine footprint.
 
-Properties:
+This keeps the repository focused on a reusable ROS 2 VLM pipeline rather than optimizing around one model's quirks.
 
-- preserves order in the request;
-- does not, by itself, provide native video timing semantics;
-- useful as a baseline and compatibility path;
-- runtime representation reports ordered multi-image semantics explicitly.
+## Distillation and specialization
 
-Current runtime provenance label:
+Teacher/student training must preserve the temporal representation used to create labels. If the teacher saw native video with exact timing, training/evaluation should not silently convert those examples into independent still images and claim equivalent semantics.
 
-```text
-ordered_multi_image_no_native_temporal_metadata
-```
+Specialization is most useful after comparative evaluation identifies a model/representation with a promising baseline quality/latency tradeoff.
 
-### `temporal_images`
+## Design invariants
 
-A sequence of already-decoded/sampled image frames intentionally delivered through the model's native video representation rather than as independent images.
-
-This mode exists because a live ROS camera naturally produces frames, not MP4 files. Native video semantics should not require creating a temporary encoded video container.
-
-Conceptually:
-
-```text
-JPEG/RGB frame list
-    -> decode
-    -> stack [T,H,W,C]
-    -> one ImageData
-       isVideo = true
-       fps = ...
-       timestamps = ...
-    -> one video content item
-```
-
-### `video`
-
-A sequence explicitly declared as video. Depending on the entry path, this may be built from a frame list or an encoded media source, but the effective runtime representation must still be reported.
-
-For the repository's pre-sampled frame use case, `video` and `temporal_images` can converge on the same Edge-LLM `ImageData` representation while retaining distinct request intent/provenance.
-
-## Native Qwen3-VL / Cosmos-Reason2 temporal representation
-
-At the pinned TensorRT Edge-LLM revision used by the project, `ImageData` can represent a frame stack:
-
-```text
-buffer:     [T,H,W,C] uint8
-frames:     T
-fps:        source/effective FPS
-isVideo:    true
-timestamps: optional explicit frame timestamps
-```
-
-The Qwen3-VL/Cosmos-Reason2 runner uses the video path to build temporal visual groups and model timing information. The relevant temporal behavior includes:
-
-- temporal patch grouping rather than treating every frame as an unrelated image;
-- video-specific chat-template placeholders;
-- timestamp text associated with temporal groups;
-- interleaved multimodal rotary position handling (MRoPE).
-
-The implementation must not infer success merely because multiple frames were accepted. The response reports the **effective runtime temporal encoding**.
-
-## No-silent-fallback invariant
-
-A temporal request must never be reported as native temporal/video processing if the runtime actually delivered independent images.
-
-Every temporal inference result should preserve at least:
-
-```text
-requested_sequence_type
-effective/runtime_temporal_encoding
-temporal_fallback_used
-fps or timestamp policy
-frame count
-```
-
-The experiment harness must treat a fallback as a representation change, not as an implementation detail.
-
-For example:
-
-```text
-requested_sequence_type = video
-runtime_temporal_encoding = ordered_multi_image_no_native_temporal_metadata
-temporal_fallback_used = true
-```
-
-is a different experiment from:
-
-```text
-requested_sequence_type = video
-runtime_temporal_encoding = native_qwen3vl_video_imagedata_mrope_timestamps
-temporal_fallback_used = false
-```
-
-## Explicit timestamps versus FPS
-
-Uniformly sampled sequences can be represented by a frame rate:
-
-```text
-t_i = i / fps
-```
-
-Irregularly sampled sequences require explicit timestamps if exact timing matters.
-
-Do not approximate irregular timing with a single average FPS in experiments intended to evaluate temporal reasoning. Either:
-
-1. preserve exact timestamps through a supported processor/runtime path;
-2. deterministically resample to a uniform sequence and record that transformation; or
-3. reject the sample for that experiment.
-
-The distillation pipeline applies the same principle; see [`../distillation-pipeline-design.md`](../distillation-pipeline-design.md).
-
-## Rolling-window ownership (#8)
-
-Issue #8 owns **which frames are selected** for each inference request.
-
-The scheduler should provide:
-
-- timestamp-ordered recent-frame storage;
-- bounded capacity by frame count and/or duration;
-- deterministic sampling/downsampling;
-- freshness guarantees;
-- explicit handling when inference is slower than incoming frames;
-- no unbounded queue;
-- observability for dropped/replaced frames and effective context age.
-
-A representative flow is:
-
-```text
-30 Hz camera
-   |
-   v
-recent frame ring/buffer
-   |
-   +-- old frames age out
-   +-- newest frames replace stale candidates
-   |
-request trigger (~1.5 Hz)
-   |
-   v
-sample recent 8-frame context
-   |
-   v
-#74 temporal representation + IPC
-```
-
-### What #8 does not own
-
-#8 should not:
-
-- decide whether Edge-LLM uses native video or independent image content;
-- construct model-specific MRoPE metadata;
-- hide runtime fallback;
-- own TensorRT engine/profile selection;
-- accumulate every source frame while inference is busy.
-
-Those responsibilities belong to the temporal request/runtime layer or model-management layer.
-
-## Backpressure and freshness
-
-For live observation, freshness is generally more valuable than processing every frame.
-
-If inference is serialized and a request is in flight:
-
-```text
-DO:
-  keep a bounded recent context
-  replace stale pending candidates
-  build the next request from the newest eligible window
-
-DO NOT:
-  append every source frame to an unbounded FIFO
-  process old windows long after the scene has changed
-```
-
-Useful scheduler observability includes:
-
-- newest source timestamp;
-- oldest timestamp in selected context;
-- context duration;
-- selected frame count;
-- context FPS;
-- request trigger timestamp;
-- frame age when inference begins;
-- source frames dropped/replaced since the prior request.
-
-## Latency interpretation
-
-Measured latency must be tied to representation and output workload.
-
-A useful record includes:
-
-```text
-model / engine identity
-frame count
-sequence type
-runtime temporal encoding
-context FPS / timestamp policy
-input resolution
-output token budget
-actual output tokens when available
-vision time
-prefill time
-generation time
-end-to-end latency
-```
-
-Do not infer temporal-representation efficiency from a single run when generated response lengths differ materially.
-
-The existing Cosmos-Reason2 measurements indicate that generation often dominates total latency, while additional frames primarily increase vision and prefill cost. That makes short structured outputs and bounded temporal context important architecture levers.
-
-## Quality evaluation
-
-Temporal reasoning quality must be tested independently of latency.
-
-Core controlled tasks include:
-
-- appears / disappears;
-- approaches / recedes;
-- rain/fog increases or decreases;
-- road becomes blocked / unblocked;
-- construction-zone transition;
-- static/no-change sequences.
-
-Each task should include controls such as:
-
-- chronological sequence;
-- reversed sequence;
-- shuffled sequence;
-- duplicated frame;
-- terminal-frame-only input.
-
-Metrics should emphasize semantic correctness rather than brittle references to frame numbers:
-
-- change-detection accuracy;
-- direction/trend accuracy;
-- event-time bucket accuracy;
-- static false-positive rate;
-- schema adherence;
-- hallucinated frame/entity references;
-- confidence/calibration when the target schema supports it;
-- latency under the same representation.
-
-## Provenance requirement
-
-Every temporal experiment should be reconstructable from its artifacts.
-
-At minimum record:
-
-```text
-repository commit
-model and engine identity
-sequence_type
-runtime_temporal_encoding
-frame paths or source sequence identity
-frame timestamps or timestamp policy
-effective FPS
-frame count
-sampling policy
-rendered timestamp control (if any)
-prompt profile/version
-generation settings
-```
-
-This is necessary because the same source frames can represent different experiments when timing, ordering, or runtime encoding changes.
-
-## Relationship to distillation
-
-The student should be trained on the same temporal semantics it is expected to use at inference time.
-
-Therefore:
-
-```text
-teacher representation
-        ~=
-training processor representation
-        ~=
-student evaluation representation
-        ~=
-target runtime representation
-```
-
-The equality is semantic rather than byte-for-byte, but timing/order information must not silently change. ADR 003 records this decision.
-
-## Deferred / experimental memory approaches
-
-Native short video context is the baseline temporal representation. Longer-horizon memory remains experimental and should be evaluated as separate mechanisms, including:
-
-- recurrent text world-state/history;
-- detector + tracker context upstream of the VLM;
-- learned sequence memory such as a Mamba-style layer;
-- knowledge-graph state with deterministic retrieval into the prompt.
-
-These mechanisms may complement a short native-video window; they should not be conflated with the basic frame-window representation problem.
-
-## Non-goals
-
-This architecture does not claim that:
-
-- a VLM is the best estimator for every ODD axis;
-- more frames always improve quality;
-- native video alone solves long-horizon memory;
-- VLM output should directly trigger a safety maneuver;
-- timestamp text emitted by a model is itself proof that internal timing is correct.
-
-Those questions require task-specific evaluation and, where relevant, separate safety architecture.
+1. Temporal windows are bounded.
+2. Source discontinuities reset the window.
+3. Sequence representation is explicit.
+4. Exact timing is preserved or deliberately transformed and recorded.
+5. Scheduling/backpressure is separate from model preprocessing.
+6. Runtime temporal encoding is recorded in provenance.
+7. Controlled model comparisons use identical saved evidence.
+8. Structured fields are preferred for scoring over free-form narrative text.

@@ -2,389 +2,186 @@
 
 ## Purpose
 
-`edge_vlm_ros` connects a ROS 2 Jazzy raw-image topic to a
-persistent TensorRT Edge-LLM runtime on Jetson AGX Thor.
-It publishes a structured `VlmResult` for each sampled frame.
+`edge_vlm_ros` is a generic ROS 2 VLM pipeline for connecting image streams and optional structured perception context to persistent accelerator-backed model runtimes.
 
-The production design uses two processes. This is a correctness requirement on
-the validated Thor stack, not merely a deployment preference.
+The validated Jetson AGX Thor path uses separate ROS and GPU-runtime processes. That process boundary is a correctness requirement for the tested TensorRT Edge-LLM stack, not merely a deployment preference.
 
-## Broader design documentation
+## Documentation map
 
-This document is the source of truth for the **currently deployed ROS/IPC/Edge-LLM runtime architecture**. The broader temporal-reasoning and ODD-observation design is documented separately so target architecture is not confused with what is already deployed on `main`:
+This document is the source of truth for the currently deployed ROS/IPC runtime architecture. Broader temporal and evaluation design is documented separately:
 
+- [Inference request contract](inference-request-contract.md)
 - [Architecture design map](architecture/README.md)
 - [Temporal VLM architecture](architecture/temporal-vlm-architecture.md)
-- [ODD observation system architecture](architecture/odd-observation-system.md)
-- [Temporal VLM task-distillation pipeline](distillation-pipeline-design.md)
+- [Temporal evidence/results matrix](architecture/temporal-results-matrix.md)
+- [Controlled chronology results](temporal-chronology-results.md)
+- [Temporal task-distillation pipeline](distillation-pipeline-design.md)
 - [Architecture decision records](adr/README.md)
 
-Those documents explicitly label validated/current behavior, implementation in progress, and target design.
-
-## Process topology
+## Standard process architecture
 
 ```mermaid
-flowchart TD
-    SOURCE[ROS bag or live camera] -->|sensor_msgs/Image| NODE
-    subgraph RP[ROS process]
-      NODE[edge_vlm_ros_node]
-      QUEUE[Newest-frame queue]
-      IPC[IpcInferenceBackend]
-      NODE --> QUEUE --> IPC
-    end
-    IPC <-->|versioned Unix socket| SERVER
-    CLI[ROS-free CLI] <-->|same IPC contract| SERVER
-    EXPERIMENT[Evaluation harness] -.->|same IPC contract| SERVER
-    subgraph GP[ROS-free GPU process]
-      SERVER[edge_vlm_server]
-      BACKEND[TensorRTEdgeLLMBackend]
-      ENGINE[Persistent LLM and visual engines]
-      SERVER --> BACKEND --> ENGINE
-    end
-    NODE -->|VlmResult| RESULT[/vlm/result]
+flowchart LR
+    CAMERA[ROS image source] --> NODE[edge_vlm_ros_node]
+    NODE -->|versioned BGR8 IPC| SOCK[(Unix socket)]
+    SOCK --> WORKER[edge_vlm_server]
+    WORKER --> RUNTIME[TensorRT Edge-LLM / model engine]
+    RUNTIME --> WORKER
+    WORKER --> SOCK
+    NODE --> RESULT[/vlm/result]
 ```
 
-### `edge_vlm_ros_node`
+### ROS process responsibilities
 
-The ROS process:
+The ROS process owns:
 
-- subscribes to a raw `sensor_msgs/msg/Image` topic;
-- samples by message timestamp;
-- validates and converts `bgr8`, `rgb8`, or `mono8` to packed BGR8;
-- resizes frames while preserving aspect ratio;
-- keeps at most one pending frame;
-- sends requests to the worker over a Unix-domain socket;
-- publishes results and failure information.
+- subscription to the configured image topic;
+- frame sampling and latest-only scheduling;
+- optional tracked-observation input;
+- request construction and IPC transport;
+- result publication;
+- ROS timestamps and topic provenance;
+- watchdog/reconnect behavior when the inference worker restarts.
 
-It does not link CUDA, TensorRT, Edge-LLM, RMW-specific GPU code, or
-`libedge_vlm_trt_backend.so`.
+It intentionally does not load the TensorRT/CUDA model runtime on the validated Edge-LLM path.
 
-### `edge_vlm_server`
+### Inference worker responsibilities
 
-The worker process:
+The worker owns:
 
-- does not link ROS, RMW, DDS, or `cv_bridge`;
-- loads the Edge-LLM plugin, Cosmos engines, tokenizer, and visual engine once;
-- owns the CUDA context, non-blocking CUDA stream, and TensorRT runtime;
-- converts received BGR8 frames to in-memory JPEG;
-- calls `LLMInferenceRuntime::handleRequest()` serially;
-- returns text, error state, and measured inference duration;
-- remains alive across sequential client connections so ROS and non-ROS tools
-  can share the already-loaded engines.
+- model and engine initialization;
+- image preprocessing;
+- prompt/history application;
+- model inference;
+- response serialization;
+- runtime-specific temporal encoding when the selected backend supports it.
 
-The final worker executable directly links the Edge-LLM core, CuTe DSL AOT
-archive, TensorRT, and CUDA. This ensures the Thor `sm_110a` device-link step
-occurs at the final executable boundary.
+The worker can remain loaded while ROS adapters or command-line experiment clients connect sequentially to the same socket contract.
 
-## Why process isolation is required
+## Why the process boundary exists
 
-During Thor bring-up, native NVIDIA inference succeeded with the same engine
-and image while in-process ROS integrations stalled indefinitely in a
-TensorRT Blackwell fused-attention prefill kernel. The following controls were
-important:
+On Thor, loading ROS 2 transitive native libraries into the same process as TensorRT Edge-LLM produced a reproducible fused-attention prefill stall. Separating the runtimes removes that interaction and also provides operational benefits:
 
-- direct-linked Edge-LLM without ROS libraries: succeeded;
-- the same direct-linked code on a `std::thread`: succeeded;
-- the direct-linked executable merely linked to `rclcpp`, without calling
-  `rclcpp::init()`: reproduced the stall;
-- ROS and Edge-LLM separated into different processes: succeeded repeatedly.
+- worker crashes do not require restarting the ROS graph;
+- model startup cost can be amortized across client reconnects;
+- ROS can remain model/runtime neutral;
+- standalone experiments can reuse the same inference service.
 
-This localizes the trigger to co-loading the ROS 2 transitive native dependency
-set with Edge-LLM on the validated platform. The exact conflicting shared
-object or symbol interaction has not been identified. The process boundary is
-therefore the supported production architecture.
+See [thor-edge-llm-prefill-stall-rca.md](thor-edge-llm-prefill-stall-rca.md) for the investigation.
 
-See [thor-edge-llm-prefill-stall-rca.md](thor-edge-llm-prefill-stall-rca.md)
-for the evidence and discarded hypotheses.
+## IPC contract
 
-## ROS threading and queueing
+The versioned Unix-socket protocol carries:
 
-| Execution context | Responsibility |
-| --- | --- |
-| ROS executor thread | Timestamp sampling and newest-frame enqueue |
-| ROS inference thread | Image conversion, resize, synchronous IPC, publication |
-| Worker main thread | Request validation and TensorRT inference |
-| TensorRT/CUDA streams | Visual preprocessing, prefill, and generation |
+- one or more packed BGR8 frames;
+- image dimensions and stride;
+- sequence type;
+- optional exact frame timestamps;
+- optional FPS metadata;
+- prompt text;
+- optional system/history context;
+- generation configuration;
+- result text, errors, inference timing, and runtime temporal-encoding provenance.
 
-The queue depth is one. If inference is busy and another sampled frame arrives,
-the pending frame is replaced when `drop_old_frames` is enabled. The in-flight
-frame is never cancelled. This avoids unbounded memory use and prevents stale
-video frames from accumulating.
+The transport is intentionally independent of a specific VLM so alternate workers can implement the same contract.
 
-## Image path
+For the field-by-field wire format, sequence-mode semantics, prompt/message roles, generation controls, and the exact mapping performed by the TensorRT Edge-LLM and FlashRT workers, see [Inference request contract](inference-request-contract.md).
 
-1. ROS receives `sensor_msgs/msg/Image`.
-2. The node validates width, height, row stride, payload size, and encoding.
-3. It converts to a packed `CV_8UC3` BGR image without `cv_bridge`.
-4. It optionally resizes to `image_max_width`.
-5. IPC transfers the packed BGR bytes and dimensions.
-6. The worker encodes JPEG in memory using configured `jpeg_quality`.
-7. Edge-LLM parses the JPEG with `loadImageFromMemory()`.
-8. The image buffer is moved into the generation request.
+## Scheduling and backpressure
 
-No per-frame temporary file is used.
+VLM inference is slower than typical camera publication rates. The live pipeline therefore treats inference as an observation service, not a frame-by-frame codec.
 
-Avoiding `cv_bridge` is deliberate. The tested Thor host exposed ROS OpenCV 4.6
-through `libcv_bridge.so` and NVIDIA OpenCV 4.8 through JetPack. Loading both
-C++ ABIs into the production process is unnecessary and unsafe.
+The default scheduling policy is latest-only:
 
-## IPC protocol
+1. sample frames at a configurable interval;
+2. allow at most one active inference request;
+3. while inference is busy, retain only the newest pending observation/window;
+4. submit that newest pending input when the worker becomes available.
 
-The socket defaults to `/tmp/edge_vlm.sock`. Requests and responses use
-fixed, trivially-copyable headers followed by bounded byte payloads.
-The current schema version is **3** (`kVersion = 3`).
+This prevents an unbounded inference queue and keeps output tied to recent sensor evidence.
 
-### Request (v3)
+## Optional tracked-observation path
 
-| Field group | Contents |
-| --- | --- |
-| Identity | magic, protocol version (3), monotonically increasing request ID |
-| Image | encoding ID, width, height, packed step, byte length, BGR8 bytes |
-| Schema | `schema_flags` (delivery mode bits), `system_bytes`, `history_count` |
-| Temporal contract | `sequence_type` (`images`, `temporal_images`, `video`), optional `fps`, optional per-frame timestamps |
-| Task | user-message text length and bytes |
-| Generation | maximum tokens, temperature, top-p, top-k |
+A detector/tracker adapter can provide structured object context independently of the VLM runtime.
 
-#### Delivery modes (`schema_flags`)
-
-| Value | Constant | Wire layout after the image bytes |
-| --- | --- | --- |
-| `0` | `kSchemaFlagInline` | `[prompt_bytes bytes]` — legacy inline delivery |
-| `1` | `kSchemaFlagStructured` | `[system_bytes bytes][prompt_bytes bytes][history_count × entry]` |
-| `3` | `kSchemaFlagStructured \| kSchemaFlagSysCache` | structured + request system-prompt caching |
-
-Temporal metadata bits:
-
-- `kSchemaFlagHasFps`: `RequestHeader.fps` is populated.
-- `kSchemaFlagHasFrameTimestamps`: `timestamp_count` doubles follow the image payload.
-
-Each history entry is preceded by a `HistoryEntryHeader` containing
-`user_bytes` and `asst_bytes`, followed immediately by the user text and
-assistant text bytes:
-```
-[HistoryEntryHeader][user_bytes bytes][asst_bytes bytes]
+```mermaid
+flowchart LR
+    IMAGE[Image] --> VLM[VLM path]
+    DET[Detection2DArray] --> TRACK[tracked_observation_adapter]
+    TRACK --> CONTEXT[TrackedObservation]
+    CONTEXT --> VLM
+    VLM --> RESULT[VlmResult]
 ```
 
-Prior assistant outputs are carried as untrusted observations in the history
-user/assistant turn pairs. They are **never** promoted to system-role authority.
+The detector is replaceable as long as it publishes the expected ROS message contract. This keeps perception components independently testable and avoids hard-coding one detector into the VLM node.
 
-### Temporal representation status
+## Temporal/native-video path
 
-The request contract now distinguishes:
+The `flashrt_temporal/` experiment extends the same design with a bounded rolling frame window and native Cosmos3 video preprocessing.
 
-- `images`: ordered independent images (legacy behavior);
-- `temporal_images`: ordered images plus explicit temporal metadata;
-- `video`: caller requests native video semantics.
-
-For the pinned TensorRT Edge-LLM commit used in this repository, the backend
-maps:
-
-- `images` to one `image` content item + one `ImageData` buffer per frame;
-- `temporal_images`/`video` to one `video` content item + one native stacked
-  `ImageData` (`[T,H,W,3]`, `isVideo=true`, effective `fps`, optional
-  `timestamps`).
-
-If a temporal/video request cannot be represented natively (for example mixed
-frame dimensions), inference fails clearly rather than silently degrading to
-independent images.
-
-#### System-prompt cache (`kSchemaFlagSysCache`)
-
-When `kSchemaFlagSysCache` is set, the worker may attempt system-prompt caching
-for the associated system message using the TensorRT Edge-LLM runtime API.
-Cache eligibility rules:
-
-- The flag is only meaningful when `kSchemaFlagStructured` is also set and
-  `system_bytes > 0`.
-- Caching is only attempted for exact, stable system prompt text.  Any change
-  to the system prompt invalidates the cache key.
-- Cache keys are in-memory only and do not survive worker restart.
-- Multimodal (image-containing) system prompts are not cache-eligible.
-- The flag is **silently ignored** when the runtime or model does not support
-  the feature.  Always falls back to uncached delivery.
-- Enable via `enable_system_prompt_cache: true` in `edge_vlm.yaml`, only
-  valid together with `instruction_delivery_mode: structured`.
-
-> **Thor validation required**: System-prompt caching has not been benchmarked
-> on the validated Jetson AGX Thor stack.  Enable it only after measuring
-> cache-hit TTFT using NVIDIA native profiling and the methodology from
-> issue #7.  To measure: run `edge_vlm_server --benchmark-session` with
-> the cache enabled and disabled across a representative prompt set.
-
-### Response
-
-| Field group | Contents |
-| --- | --- |
-| Identity | magic, protocol version, matching request ID |
-| Result | success flag and inference duration |
-| Payload | bounded response text and error text |
-
-Limits are enforced before allocation or transfer:
-
-- image payload: 256 MiB;
-- prompt, system message, history entry, response, and error text: 1 MiB each;
-- history entries: 256 maximum;
-- socket path: `sockaddr_un::sun_path` capacity.
-
-IPC writes suppress `SIGPIPE`. A transport failure closes the client socket.
-The current frame fails once; the next sampled frame attempts a new connection.
-Requests are not automatically replayed because execution state is uncertain
-after a connection failure.
-
-The protocol uses native POD layout and is intended only for the two binaries
-built from the same package on one host. It is not a network API or a
-cross-version serialization format.
-
-## Startup and service ownership
-
-Two startup modes use the same process boundary and IPC contract.
-
-### Launch-managed mode
-
-This remains the default (`start_worker:=true`):
-
-1. launch starts the worker and ROS process;
-2. worker creates the Unix socket and initializes Edge-LLM;
-3. ROS connects with a 120-second default deadline;
-4. the node creates its camera subscription only after connection succeeds;
-5. launch respawns a worker that exits unexpectedly.
-
-### Standalone-service mode
-
-With `start_worker:=false`, an operator or service manager starts the worker
-first. The ROS launch file starts only the adapter and connects to the existing
-socket. The same service can accept a CLI client before or after the ROS
-adapter without reloading its engines.
-
-Only one connected client is served at a time. This is sufficient for the
-initial decoupling milestone and keeps TensorRT execution serialized. Scheduling
-multiple concurrent clients is deferred until an experiment demonstrates that
-it is needed.
-
-Both modes prevent frames from being consumed before the engines are ready.
-
-The missing optional action engine message is informational for image-only
-Cosmos Reason2 deployments and does not fail initialization.
-
-## Failure and recovery behavior
-
-| Failure | Behavior |
-| --- | --- |
-| Worker fails during startup | ROS initialization fails with a connection timeout |
-| Worker exits after startup | Launch respawns it after two seconds |
-| Socket read/write fails | Current frame fails; client disconnects |
-| Replacement worker becomes ready | Next sampled frame reconnects |
-| Invalid response | Connection is discarded and frame fails |
-| Worker is alive but GPU call is wedged | Worker-side watchdog fires after `worker_inference_deadline_seconds`; worker emits diagnostic and calls `std::_Exit`; client sees EOF and reports one error; launch respawns the worker |
-
-Crash recovery has been validated by killing the worker with `SIGKILL` during
-looping rosbag playback. The ROS node survived, launch created a new worker PID,
-and inference resumed.
-
-## Watchdog recovery for a wedged worker
-
-When the TensorRT call inside the worker does not return within
-`worker_inference_deadline_seconds` (default 60 s), a watchdog thread:
-
-1. emits a structured diagnostic to `stderr`:
-   ```
-   [edge_vlm_server] WATCHDOG: inference deadline (60s) expired request_id=N; self-terminating for clean respawn
-   ```
-2. calls `std::_Exit(1)`, which bypasses **all** C++ destructors, `std::atexit`
-   handlers, and `std::at_quick_exit` handlers. The OS reclaims all file
-   descriptors immediately.
-
-The socket file is not removed by `_Exit`. The replacement worker calls
-`::unlink()` at startup before creating the new listener socket.
-
-### Process-termination primitive: `_Exit` vs `quick_exit`
-
-`std::_Exit` is used instead of `std::quick_exit` for two reasons:
-
-1. **`quick_exit` still invokes `at_quick_exit` handlers.** If the CUDA runtime
-   or TensorRT registers an `at_quick_exit` handler (which is permitted by the
-   SDK), that handler could attempt to tear down the wedged CUDA context and
-   block indefinitely — exactly the hang we are trying to escape.
-
-2. **`_Exit` provides a hard process boundary.** No third-party cleanup code
-   runs; the OS reclaims all resources atomically. This is the correct isolation
-   primitive when the only known-safe action is to exit and let the process
-   supervisor restart a fresh worker.
-
-### Deadline relationship
-
-```
-worker_inference_deadline_seconds  <  worker_request_timeout_seconds
-       (default: 60 s)                       (default: 90 s)
+```mermaid
+flowchart LR
+    CAMERA[ROS image stream] --> SAMPLE[temporal sampler]
+    SAMPLE --> WINDOW[bounded contiguous window]
+    WINDOW --> IPC[versioned IPC + exact timestamps]
+    IPC --> FLASHRT[FlashRT worker]
+    FLASHRT --> VIDEO[Cosmos3 native video]
+    VIDEO --> RESULT[VlmResult]
 ```
 
-The 30-second gap gives the worker time to print the diagnostic and exit before
-the client-side `SO_RCVTIMEO` fires. When the worker exits cleanly, the client
-sees an EOF (`IPC peer closed`) rather than a socket timeout. Either error path
-closes the client connection; only one error is reported for the timed-out
-request, which is not automatically replayed.
+Key invariants:
 
-The deadline constraint is validated at two levels:
-- **Launch time**: `edge_vlm.launch.py` raises a `RuntimeError` before
-  starting either process if `worker_inference_deadline_seconds >= worker_request_timeout_seconds`.
-- **Node startup**: `edge_vlm_ros_node` logs `FATAL` and exits if the constraint
-  is violated (defense-in-depth for non-launch invocations).
+- frame order is explicit;
+- exact capture timestamps are preserved;
+- large forward gaps reset the temporal window;
+- backward timestamps reset the temporal window;
+- a discontinuous source is never silently presented as one continuous video;
+- runtime temporal encoding is recorded in result provenance.
 
-### TensorRT Edge-LLM cancellation API
+The rolling-window scheduler remains outside the model runtime so sampling/backpressure policy can evolve independently of model preprocessing.
 
-The TensorRT Edge-LLM SDK in the pinned version does not expose a supported
-request-cancellation or in-flight deadline API for `LLMInferenceRuntime::handleRequest()`.
-Process termination via `_Exit` is therefore the isolation mechanism. This note
-should be revisited if a future SDK version adds cancellation support.
+## Representation is part of the experiment
 
-## Shutdown
+Ordered still images and native video are not interchangeable labels for the same input. They can exercise different processor/runtime paths and carry different timing semantics.
 
-ROS launch owns both child processes. Normal launch shutdown signals the worker
-and node, then removes the worker socket. The ROS node stops accepting new
-frames, wakes its inference thread, and joins it before destruction.
+Any benchmark or training sample that claims temporal behavior should record at least:
 
-A CUDA call already executing in the worker may not respond promptly to a
-normal signal. Because it is a separate process, it can be escalated to
-`SIGKILL` without wedging ROS shutdown.
+- frame order;
+- frame timestamps or explicit resampling policy;
+- sequence type;
+- runtime temporal encoding;
+- model/engine identity;
+- prompt version;
+- output-token limit.
 
-If the worker self-terminates via the inference deadline watchdog, the socket
-file is left in place until the replacement worker removes it at startup.
-Launch respawns the worker after `respawn_delay` (default 2 s), then the
-replacement worker creates a new socket and becomes ready for the next sampled
-frame.
+See the temporal architecture and results matrix for the corresponding design rules and evidence.
 
-## Build boundaries
+## Fault handling
 
-Production targets:
+The ROS side treats worker failures as recoverable transport/runtime events:
 
-| Target | Role |
-| --- | --- |
-| `vlm_reasoner_node` | Hardware-independent ROS node library |
-| `edge_vlm_ipc_client` | ROS-side Unix-socket client |
-| `edge_vlm_ros_node` | ROS executable; IPC only |
-| `edge_vlm_server` | ROS-free, direct-linked GPU executable |
+- socket errors close the client connection;
+- subsequent requests reconnect;
+- launch can respawn the worker independently;
+- bounded request deadlines prevent indefinite hangs;
+- ROS shutdown avoids publishing after context teardown.
 
-Diagnostic targets retained for RCA and future compatibility work:
+## Output contract
 
-| Target | Role |
-| --- | --- |
-| `edge_vlm_trt_backend` | Shared Edge-LLM backend that reproduced the failing boundary; not used by production launch |
-| `edge_vlm_backend_direct_smoke` | Standalone diagnostic for link and ROS-library-load experiments |
+`edge_vlm_ros/msg/VlmResult` is the common result surface. It carries generated text plus source, prompt, timing, sequence, and optional tracker provenance so downstream tools can compare model behavior without depending on one runtime implementation.
 
-Deployment verification checks dynamic dependencies to ensure the production
-process boundary has not regressed.
+## Design principle
 
-## Known limitations and follow-ups
+The repository keeps four concerns separate:
 
-- Temporal contracts (`images`, `temporal_images`, `video`) are carried
-  end-to-end and mapped natively at runtime. Rendered timestamps remain an
-  explicit A/B control for prompt-level experiments, not the primary temporal
-  transport mechanism.
-- Bounded rolling temporal-window scheduling/backpressure: issue #8.
-- Formal latency/resource benchmarks: issue #7.
-- Model portability and measured optimization: issue #9.
-- RViz2 visualization: issue #10.
-- Task-level quality evaluation: issue #11.
-- System-prompt cache Thor benchmark: requires measuring cache-hit TTFT on the
-  validated stack before enabling `enable_system_prompt_cache` in production
-  (see IPC protocol section above).
+```text
+ROS acquisition/scheduling
+        ->
+representation + IPC
+        ->
+model/runtime adapter
+        ->
+normalized result/evaluation
+```
+
+That separation is the central architectural goal of the demo: models, temporal representations, and upstream perception components can be compared without rewriting the ROS-facing pipeline.

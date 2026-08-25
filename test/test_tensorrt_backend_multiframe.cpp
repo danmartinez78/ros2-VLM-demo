@@ -1,16 +1,5 @@
 // Copyright 2025 edge_vlm_ros contributors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: MIT
 
 /// CPU-only static tests for TensorRT Edge-LLM backend multi-frame request
 /// construction logic.  These tests do NOT require TensorRT, CUDA, or any
@@ -34,8 +23,6 @@ namespace
 using edge_vlm_ros::InferenceRequest;
 namespace detail = edge_vlm_ros::detail;
 
-// ── helper: make a minimal non-empty request with N extra images ──────────
-
 InferenceRequest make_request(std::size_t extra_count)
 {
   InferenceRequest req;
@@ -43,17 +30,11 @@ InferenceRequest make_request(std::size_t extra_count)
   req.prompt = "describe the scene";
   req.max_generate_length = 32;
   for (std::size_t i = 0; i < extra_count; ++i) {
-    // Each extra frame has a distinct pixel value so temporal order is
-    // distinguishable in future integration tests.
     const auto val = static_cast<uint8_t>(i + 50);
     req.extra_images.emplace_back(cv::Mat(4, 4, CV_8UC3, cv::Scalar(val, val, val)));
   }
   return req;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// media_content_count
-// ─────────────────────────────────────────────────────────────────────────────
 
 TEST(TrtBackendMultiframe, SingleFrameHasOneImageContentItem)
 {
@@ -63,23 +44,22 @@ TEST(TrtBackendMultiframe, SingleFrameHasOneImageContentItem)
 
 TEST(TrtBackendMultiframe, TwoFramesHaveTwoImageContentItems)
 {
-  auto req = make_request(1);  // primary + 1 extra = F2
+  auto req = make_request(1);
   EXPECT_EQ(detail::media_content_count(req), 2u);
 }
 
 TEST(TrtBackendMultiframe, FourFramesHaveFourImageContentItems)
 {
-  auto req = make_request(3);  // primary + 3 extra = F4
+  auto req = make_request(3);
   EXPECT_EQ(detail::media_content_count(req), 4u);
 }
 
 TEST(TrtBackendMultiframe, EightFramesHaveEightImageContentItems)
 {
-  auto req = make_request(7);  // primary + 7 extra = F8
+  auto req = make_request(7);
   EXPECT_EQ(detail::media_content_count(req), 8u);
 }
 
-// media_content_count == imageBuffers count
 TEST(TrtBackendMultiframe, ImageContentCountMatchesExpectedBufferCount)
 {
   for (std::size_t extra : {0u, 1u, 3u, 7u}) {
@@ -91,41 +71,29 @@ TEST(TrtBackendMultiframe, ImageContentCountMatchesExpectedBufferCount)
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// user_message_content_count  (image items + 1 text item)
-// ─────────────────────────────────────────────────────────────────────────────
-
 TEST(TrtBackendMultiframe, SingleFrameUserMessageHasTwoContents)
 {
-  // 1 image item + 1 text item
   auto req = make_request(0);
   EXPECT_EQ(detail::user_message_content_count(req), 2u);
 }
 
 TEST(TrtBackendMultiframe, F2UserMessageHasThreeContents)
 {
-  // 2 image items + 1 text item
   auto req = make_request(1);
   EXPECT_EQ(detail::user_message_content_count(req), 3u);
 }
 
 TEST(TrtBackendMultiframe, F4UserMessageHasFiveContents)
 {
-  // 4 image items + 1 text item
   auto req = make_request(3);
   EXPECT_EQ(detail::user_message_content_count(req), 5u);
 }
 
 TEST(TrtBackendMultiframe, F8UserMessageHasNineContents)
 {
-  // 8 image items + 1 text item
   auto req = make_request(7);
   EXPECT_EQ(detail::user_message_content_count(req), 9u);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Temporal order: extra_images[0] is the second frame (index 1)
-// ─────────────────────────────────────────────────────────────────────────────
 
 TEST(TrtBackendMultiframe, ExtraImagesPreserveInsertionOrder)
 {
@@ -134,25 +102,17 @@ TEST(TrtBackendMultiframe, ExtraImagesPreserveInsertionOrder)
   req.prompt = "test";
   req.max_generate_length = 8;
 
-  // Push frames with distinct identifiable values.
   for (int i = 0; i < 3; ++i) {
     req.extra_images.emplace_back(
       cv::Mat(2, 2, CV_8UC3, cv::Scalar(20 + i * 10, 0, 0)));
   }
 
-  // Verify sizes and order preservation via the extra_images vector itself.
   ASSERT_EQ(req.extra_images.size(), 3u);
   EXPECT_EQ(req.extra_images[0].at<cv::Vec3b>(0, 0)[0], 20);
   EXPECT_EQ(req.extra_images[1].at<cv::Vec3b>(0, 0)[0], 30);
   EXPECT_EQ(req.extra_images[2].at<cv::Vec3b>(0, 0)[0], 40);
-
-  // Expected content count: 4 image + 1 text = 5
   EXPECT_EQ(detail::user_message_content_count(req), 5u);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Consistency: image_content_count + 1 == user_message_content_count
-// ─────────────────────────────────────────────────────────────────────────────
 
 TEST(TrtBackendMultiframe, ContentCountConsistency)
 {
@@ -167,18 +127,18 @@ TEST(TrtBackendMultiframe, ContentCountConsistency)
 
 TEST(TrtBackendMultiframe, TemporalSequenceUsesSingleVideoContentAndBuffer)
 {
-  auto req = make_request(3);  // F4 request
+  auto req = make_request(3);
   req.sequence_type = edge_vlm_ros::TemporalSequenceType::kVideo;
   EXPECT_TRUE(detail::uses_native_video_encoding(req));
   EXPECT_EQ(detail::media_content_count(req), 1u);
   EXPECT_EQ(detail::image_buffer_count(req), 1u);
   EXPECT_STREQ(detail::media_content_type(req), "video");
-  EXPECT_EQ(detail::user_message_content_count(req), 2u);  // one video + one text
+  EXPECT_EQ(detail::user_message_content_count(req), 2u);
 }
 
 TEST(TrtBackendMultiframe, TemporalSequenceCarriesEffectiveNativeVideoFps)
 {
-  auto req = make_request(1);  // F2 request
+  auto req = make_request(1);
   req.sequence_type = edge_vlm_ros::TemporalSequenceType::kTemporalImages;
   req.fps = 8.0;
   req.frame_timestamps_sec = {0.0, 0.125};
@@ -188,7 +148,7 @@ TEST(TrtBackendMultiframe, TemporalSequenceCarriesEffectiveNativeVideoFps)
 
 TEST(TrtBackendMultiframe, TemporalSequenceDerivesFpsFromTimestampsWhenNotProvided)
 {
-  auto req = make_request(2);  // F3 request
+  auto req = make_request(2);
   req.sequence_type = edge_vlm_ros::TemporalSequenceType::kVideo;
   req.frame_timestamps_sec = {0.0, 0.1, 0.2};
   ASSERT_TRUE(detail::infer_effective_video_fps(req).has_value());

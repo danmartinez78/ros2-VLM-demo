@@ -28,6 +28,9 @@ __pycache__/
 # Profiling output
 /tmp/cosmos_ros2_profiles/
 
+# Temporal experiment captures
+temporal_captures/
+
 # OS
 .DS_Store
 Thumbs.db

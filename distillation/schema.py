@@ -2,14 +2,14 @@
 Canonical temporal sample / dataset schema for the VLM distillation pipeline.
 
 Every sample that flows through the pipeline (teacher generation, validation,
-export, evaluation) is represented as a ``TemporalSample``.  The representation
+export, evaluation) is represented as a ``TemporalSample``. The representation
 is framework-neutral; training-framework-specific export lives in
 ``distillation.dataset``.
 
 Schema version
 --------------
 ``SCHEMA_VERSION`` is bumped whenever the required field set or semantics
-change.  Stored samples carry the version so that downstream code can detect
+change. Stored samples carry the version so downstream code can detect
 mismatches.
 """
 
@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-SCHEMA_VERSION: str = "temporal_sample_v1"
+SCHEMA_VERSION: str = "temporal_sample_v2"
 
 
 @dataclass
@@ -44,10 +44,7 @@ class FrameRef:
 
 @dataclass
 class TemporalTarget:
-    """
-    Compact structured temporal observation produced by the teacher and used as
-    the student training target.
-    """
+    """Compact structured temporal observation used as a training target."""
 
     change_detected: bool
     change: str
@@ -68,8 +65,8 @@ class TemporalTarget:
     confidence: float
     """Model confidence in [0.0, 1.0]."""
 
-    odd_observation: str
-    """One-line ODD-relevant observation for the downstream consumer."""
+    scene_observation: str
+    """One-line scene observation for downstream consumers."""
 
     def to_dict(self) -> dict:
         return {
@@ -80,13 +77,11 @@ class TemporalTarget:
             "evidence_start_s": self.evidence_start_s,
             "evidence_end_s": self.evidence_end_s,
             "confidence": self.confidence,
-            "odd_observation": self.odd_observation,
+            "scene_observation": self.scene_observation,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "TemporalTarget":
-        # Strict type validation: reject string/non-bool for change_detected so
-        # that bool("false") == True cannot silently corrupt a target.
         cd = d["change_detected"]
         if not isinstance(cd, bool):
             raise TypeError(
@@ -103,7 +98,7 @@ class TemporalTarget:
                 raise TypeError(
                     f"{float_field} must be a JSON number, got {type(v).__name__}: {v!r}"
                 )
-        for str_field in ("change", "state_start", "state_end", "odd_observation"):
+        for str_field in ("change", "state_start", "state_end", "scene_observation"):
             if not isinstance(d[str_field], str):
                 raise TypeError(
                     f"{str_field} must be a JSON string, got {type(d[str_field]).__name__}: {d[str_field]!r}"
@@ -116,7 +111,7 @@ class TemporalTarget:
             evidence_start_s=float(d["evidence_start_s"]),
             evidence_end_s=float(d["evidence_end_s"]),
             confidence=float(d["confidence"]),
-            odd_observation=d["odd_observation"],
+            scene_observation=d["scene_observation"],
         )
 
 
@@ -131,55 +126,19 @@ class Provenance:
     validation_version: str = ""
     generated_at_utc: str = ""
 
-    # ---------------------------------------------------------------------------
-    # Temporal input representation fields (aligned with #70/#72 contract)
-    # ---------------------------------------------------------------------------
-    # These fields together uniquely identify the model-input encoding so that
-    # two sequences sharing the same frame bytes but delivered differently are
-    # not confused with each other during training or evaluation.
-
     input_representation: str = ""
-    # High-level input encoding used at generation time.
-    # Possible values:
-    #   "ordered_images"        – frames passed as an ordered image list
-    #   "rendered_timestamps"   – timestamps rendered into the image or prompt
-    #   "temporal_images_meta"  – frames with temporal-images metadata block
-    #   "native_video"          – frames encoded as a native video segment
-    #   ""                      – unspecified / legacy
+    # Examples: ordered_images, rendered_timestamps, temporal_images_meta,
+    # native_video, or empty for legacy/unspecified data.
 
     sequence_type: str = ""
-    # Modality of the sequence input.
-    # Possible values:
-    #   "image_sequence"  – ordered still images, independent per-frame inputs
-    #   "temporal_images" – ordered frames delivered as a native video ImageData
-    #                       to Qwen3-VL/Cosmos-Reason2 (#74 Edge-LLM video path)
-    #   "video"           – encoded video segment (e.g. MP4/decoded tensor)
-    #   ""                – unspecified / legacy
+    # Examples: image_sequence, temporal_images, video, or empty.
 
     timestamp_policy: str = ""
-    # How frame timestamps are represented in the model input.
-    # Possible values:
-    #   "capture_time_s"   – absolute capture time in seconds
-    #   "frame_index"      – integer frame index only
-    #   "rendered"         – timestamp string rendered into image/prompt
-    #   ""                 – unspecified
+    # Examples: capture_time_s, frame_index, rendered, or empty.
 
     effective_fps: float = 0.0
-    # Source or effective sampling rate in frames-per-second; 0.0 = unspecified.
-
     rendered_timestamp_control: bool = False
-    # True if timestamp text was rendered into image pixels or injected into
-    # the prompt, giving the model an explicit time signal per frame.
-
     runtime_temporal_encoding: str = ""
-    # How frames were encoded at runtime for the actual forward pass.
-    # Possible values:
-    #   "independent_images"                          – each frame is a separate image input
-    #   "video_tensor"                                – frames concatenated into a [T,H,W,3] tensor
-    #   "native_qwen3vl_video_imagedata_mrope_timestamps"
-    #                                                 – #74 Qwen3-VL native video ImageData with
-    #                                                   MRoPE-compatible per-frame timestamps
-    #   ""                                            – unspecified
 
     def to_dict(self) -> dict:
         return {
@@ -199,14 +158,11 @@ class Provenance:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Provenance":
-        # Derive defaults from the dataclass field definitions so that new
-        # fields added to the class are automatically handled without requiring
-        # manual updates to this method.
         import dataclasses
+
         kwargs: dict = {}
         for f in dataclasses.fields(cls):
             if f.name not in d:
-                # Use the field's declared default.
                 kwargs[f.name] = f.default
             elif f.type == "float" or f.default == 0.0:
                 kwargs[f.name] = float(d[f.name])
@@ -219,36 +175,17 @@ class Provenance:
 
 @dataclass
 class TemporalSample:
-    """
-    One fully described temporal training/evaluation sample.
-
-    Fields
-    ------
-    sample_id       : unique identifier derived from the source sequence
-    schema_version  : ``SCHEMA_VERSION`` at creation time
-    frames          : ordered list of frame references
-    prompt_profile  : name of the prompt profile used (e.g. ``temporal_odd_v1``)
-    target          : compact structured temporal target (may be ``None`` before
-                      teacher generation)
-    raw_teacher_response : verbatim teacher output (kept for audit)
-    provenance      : full provenance record
-    validation_status : ``"accepted"``, ``"rejected"``, or ``"pending"``
-    rejection_reasons : list of machine-readable rejection reason strings
-    """
+    """One fully described temporal training/evaluation sample."""
 
     sample_id: str
     schema_version: str = SCHEMA_VERSION
     frames: List[FrameRef] = field(default_factory=list)
-    prompt_profile: str = "temporal_odd_v1"
+    prompt_profile: str = "temporal_observation_v1"
     target: Optional[TemporalTarget] = None
     raw_teacher_response: str = ""
     provenance: Provenance = field(default_factory=Provenance)
     validation_status: str = "pending"
     rejection_reasons: List[str] = field(default_factory=list)
-
-    # ------------------------------------------------------------------
-    # Serialisation
-    # ------------------------------------------------------------------
 
     def to_dict(self) -> dict:
         return {
@@ -270,7 +207,7 @@ class TemporalSample:
             sample_id=d["sample_id"],
             schema_version=d.get("schema_version", SCHEMA_VERSION),
             frames=[FrameRef.from_dict(f) for f in d.get("frames", [])],
-            prompt_profile=d.get("prompt_profile", "temporal_odd_v1"),
+            prompt_profile=d.get("prompt_profile", "temporal_observation_v1"),
             target=TemporalTarget.from_dict(target_d) if target_d else None,
             raw_teacher_response=d.get("raw_teacher_response", ""),
             provenance=Provenance.from_dict(d.get("provenance", {})),
@@ -279,13 +216,8 @@ class TemporalSample:
         )
 
     def content_hash(self) -> str:
-        """SHA-256 prefix over the serialised dict (for manifest)."""
         raw = json.dumps(self.to_dict(), sort_keys=True).encode()
         return hashlib.sha256(raw).hexdigest()[:16]
-
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
 
     def frame_count(self) -> int:
         return len(self.frames)
@@ -295,12 +227,8 @@ class TemporalSample:
         return len(self.frames)
 
 
-# ---------------------------------------------------------------------------
-# Sequence manifest helpers
-# ---------------------------------------------------------------------------
-
 def load_manifest(manifest_path: Path) -> List[TemporalSample]:
-    """Load a JSON-lines or JSON-array manifest into a list of TemporalSamples."""
+    """Load a JSON-lines or JSON-array manifest into TemporalSamples."""
     text = manifest_path.read_text()
     try:
         data = json.loads(text)
@@ -308,7 +236,7 @@ def load_manifest(manifest_path: Path) -> List[TemporalSample]:
             return [TemporalSample.from_dict(d) for d in data]
     except json.JSONDecodeError:
         pass
-    # Try JSONL
+
     samples = []
     for line in text.splitlines():
         line = line.strip()
@@ -319,6 +247,4 @@ def load_manifest(manifest_path: Path) -> List[TemporalSample]:
 
 def save_manifest(samples: List[TemporalSample], manifest_path: Path) -> None:
     """Write samples to a JSON-array manifest file."""
-    manifest_path.write_text(
-        json.dumps([s.to_dict() for s in samples], indent=2)
-    )
+    manifest_path.write_text(json.dumps([s.to_dict() for s in samples], indent=2))
