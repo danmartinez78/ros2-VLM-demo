@@ -333,6 +333,7 @@ def infer(engine, processor, req: ParsedRequest, engine_max_new_tokens: int):
             add_generation_prompt=True,
             return_tensors="pt",
             return_dict=True,
+            enable_thinking=False,
         )
 
     input_ids = pin["input_ids"].reshape(-1)
