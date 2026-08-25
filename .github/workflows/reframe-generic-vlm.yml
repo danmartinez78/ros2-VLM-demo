@@ -1,0 +1,232 @@
+name: Reframe generic VLM demo
+
+on:
+  push:
+    branches:
+      - feature/flashrt-temporal-video
+
+permissions:
+  contents: write
+
+jobs:
+  reframe:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/flashrt-temporal-video
+          fetch-depth: 0
+
+      - name: Reframe repository and update licensing
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path('.')
+
+          # Remove the application-specific architecture document entirely.
+          old_doc = root / 'docs/architecture/odd-observation-system.md'
+          if old_doc.exists():
+              old_doc.unlink()
+
+          # Canonical MIT license for this repository.
+          (root / 'LICENSE').write_text(
+              '''MIT License\n\nCopyright (c) 2026 ros2-VLM-demo contributors\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the "Software"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n''',
+              encoding='utf-8',
+          )
+
+          def replace_apache_header(text: str) -> str:
+              if 'Licensed under the Apache License' not in text:
+                  return text
+              lines = text.splitlines(keepends=True)
+              while True:
+                  license_idx = next(
+                      (i for i, line in enumerate(lines) if 'Licensed under the Apache License' in line),
+                      None,
+                  )
+                  if license_idx is None:
+                      break
+                  start = None
+                  for i in range(license_idx, max(-1, license_idx - 8), -1):
+                      if 'Copyright' in lines[i]:
+                          start = i
+                          break
+                  end = None
+                  for i in range(license_idx, min(len(lines), license_idx + 20)):
+                      if 'limitations under the License.' in lines[i]:
+                          end = i
+                          break
+                  if start is None or end is None:
+                      raise RuntimeError('Could not normalize Apache header')
+                  copyright_line = lines[start]
+                  before = copyright_line.split('Copyright', 1)[0]
+                  newline = '\n' if copyright_line.endswith('\n') else ''
+                  replacement = [
+                      copyright_line,
+                      f'{before}SPDX-License-Identifier: MIT{newline}',
+                  ]
+                  lines[start:end + 1] = replacement
+              return ''.join(lines)
+
+          def genericize(text: str) -> str:
+              # Stable schema/code names first.
+              replacements = [
+                  ('temporal_odd_v1', 'temporal_observation_v1'),
+                  ('odd_observation', 'scene_observation'),
+                  ('ODD-observation', 'scene-observation'),
+                  ('ODD observation', 'scene observation'),
+                  ('ODD-relevant', 'scene-relevant'),
+                  ('ODD relevant', 'scene relevant'),
+                  ('ODD-specific', 'application-specific'),
+                  ('ODD specific', 'application-specific'),
+                  ('ODD-oriented', 'scene-oriented'),
+                  ('ODD oriented', 'scene-oriented'),
+                  ('ODD-aware', 'context-aware'),
+                  ('ODD aware', 'context-aware'),
+                  ('ODD axes', 'scene dimensions'),
+                  ('ODD axis', 'scene dimension'),
+                  ('ODD state', 'scene state'),
+                  ('ODD interpretation', 'scene interpretation'),
+                  ('ODD monitoring', 'scene monitoring'),
+                  ('ODD observer', 'temporal observer'),
+                  ('ODD exit detection', 'operating-condition change detection'),
+                  ('ODD exit', 'operating-condition change'),
+                  ('Operational Design Domain', 'operating context'),
+                  ('operational design domain', 'operating context'),
+              ]
+              for old, new in replacements:
+                  text = text.replace(old, new)
+              text = re.sub(r'\bodd_', 'scene_', text, flags=re.IGNORECASE)
+              text = re.sub(r'\bODD\b', 'operating context', text)
+              text = re.sub(r'\bOdd\b', 'operating context', text)
+              text = re.sub(r'\bodd\b', 'operating context', text)
+              return text
+
+          # Normalize text content repo-wide, including tests and benchmark schemas.
+          for path in root.rglob('*'):
+              if not path.is_file() or '.git' in path.parts:
+                  continue
+              if path == root / 'LICENSE':
+                  continue
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except UnicodeDecodeError:
+                  continue
+              # Remove links/rows to the deleted application-specific document.
+              text = '\n'.join(
+                  line for line in text.split('\n')
+                  if 'odd-observation-system.md' not in line.lower()
+              )
+              text = replace_apache_header(text)
+              text = genericize(text)
+              text = text.replace('<license>Apache-2.0</license>', '<license>MIT</license>')
+              text = text.replace('Apache 2.0. See [LICENSE](LICENSE).', 'MIT. See [LICENSE](LICENSE).')
+              text = text.replace('Apache-2.0', 'MIT')
+              path.write_text(text, encoding='utf-8')
+
+          # Generic architecture index.
+          (root / 'docs/architecture/README.md').write_text(
+              '''# Architecture design map\n\nThis directory contains design-level documentation for the generic ROS 2 VLM pipeline, including single-frame reasoning, bounded temporal windows, native-video inference, model/runtime isolation, and evaluation.\n\nThe existing [`../architecture.md`](../architecture.md) remains the source of truth for the deployed ROS/IPC/runtime process architecture. The documents here describe temporal representation, scheduling boundaries, reproducibility rules, and measured evidence that should remain useful across models and applications.\n\n## Documents\n\n| Document | Purpose |\n| --- | --- |\n| [Temporal VLM architecture](temporal-vlm-architecture.md) | End-to-end temporal context path, representation contract, scheduling/runtime boundaries, timing semantics, and evaluation implications |\n| [Temporal VLM evidence/results matrix](temporal-results-matrix.md) | Compact synthesis of measured latency/runtime evidence, chronology tests, architecture interpretation, and open experiment gaps |\n| [Controlled chronology results](../temporal-chronology-results.md) | Exact forward/reverse/shuffled/static control results from the native-video Cosmos3 experiment on Thor |\n| [`../distillation-pipeline-design.md`](../distillation-pipeline-design.md) | Teacher-to-student temporal task-distillation design with explicit representation-fidelity requirements |\n\n## Architecture decision records\n\n1. [`001-native-video-over-ordered-images.md`](../adr/001-native-video-over-ordered-images.md) — use native video semantics for temporal experiments when the runtime supports them.\n2. [`002-bounded-window-separate-from-vlm-runtime.md`](../adr/002-bounded-window-separate-from-vlm-runtime.md) — keep live-window scheduling/backpressure separate from VLM temporal encoding.\n3. [`003-preserve-teacher-student-temporal-representation.md`](../adr/003-preserve-teacher-student-temporal-representation.md) — preserve temporal representation across teacher generation, training, and evaluation.\n\n## Status language\n\n- **Validated/current** — demonstrated on the supported Thor stack or already implemented.\n- **Implementation in progress** — represented by an open issue or branch and not yet assumed to be generally available.\n- **Target design** — intended architecture that constrains future implementation but may not yet exist.\n\nThe results matrix separates controlled benchmarks/profiles, hardware validation, smoke tests, implementation/API findings, design invariants, and open experiments so evidence strength remains explicit.\n''',
+              encoding='utf-8',
+          )
+
+          # Detailed controlled chronology record from 2026-08-25.
+          (root / 'docs/temporal-chronology-results.md').write_text(
+              '''# Native-video chronology validation\n\nDate: 2026-08-25  \nPlatform: NVIDIA Jetson AGX Thor  \nRuntime: FlashRT + Cosmos3 Edge, BF16  \nTransport: ROS 2 image topic -> sampled temporal window -> versioned IPC -> native-video preprocessing\n\n## Purpose\n\nThis experiment tests whether native-video inference is sensitive to frame chronology rather than merely to the set of visual content supplied. The same captured frames are replayed under controlled order manipulations while frame count, timestamp schedule, prompt, and runtime path are held constant.\n\n## Captured window\n\n- 8 frames\n- relative timestamps: `0.000, 0.267, 0.534, 0.801, 1.067, 1.334, 1.601, 1.868 s`\n- total span: **1.868 s**\n- capture motion score: **0.253653**\n- forward/reverse/shuffled/static variants all used `flashrt_cosmos3_native_video`\n\n## Results\n\n| Variant | Frame order | Inference | Observation |\n| --- | --- | ---: | --- |\n| Forward | `0,1,2,3,4,5,6,7` | **6.192 s** | Person walking **right to left**, moving closer; camera reported panning left |\n| Reverse | `7,6,5,4,3,2,1,0` | **6.139 s** | Person walking **left to right** |\n| Shuffled | `0,7,1,6,2,5,3,4` | **6.137 s** | Model still produced a coherent walking narrative, including right-to-left summary |\n| Static terminal | `7,7,7,7,7,7,7,7` | **6.157 s** | Structured `CHANGES` reported **none**, while the free-form summary still described walking left to right |\n| Terminal only | `7` | **3.854 s** | Single-image diagnostic inferred a walking/forward action from appearance; this is not temporal evidence |\n\n## Interpretation\n\n1. **Chronology sensitivity is demonstrated for this sequence.** Reversing the exact same eight images while preserving the timestamp schedule reversed the inferred lateral motion direction.\n2. **The repeated-frame native-video control correctly reported no temporal change in the structured change field.** This is evidence that the video path does not automatically invent displacement solely because it receives multiple frames.\n3. **Temporal coherence rejection is not established.** The shuffled sequence was temporally incoherent but still produced a plausible motion narrative.\n4. **Free-form summaries are less reliable than structured fields for evaluation.** The repeated-frame control contained a contradiction between `CHANGES: none` and the summary.\n5. **Single-frame action inference should not be scored as temporal motion.** A walking pose can reasonably suggest an action state without proving displacement over time.\n\n## Current conclusion\n\nNative Cosmos3 video inference is a valid temporal baseline: it responds to chronology and preserves exact timestamp semantics. General temporal reliability remains an open evaluation question and should be measured across multiple motion-rich windows and multiple video-capable models using the same saved captures and controls.\n\n## Recommended next benchmark\n\nUse a shared model-agnostic corpus of saved temporal windows and score each model on forward direction accuracy, reverse consistency, static false-change rate, shuffled-sequence rejection, structured-output compliance, and latency.\n''',
+              encoding='utf-8',
+          )
+
+          # Updated evidence matrix, preserving the important prior measurements and today's result.
+          (root / 'docs/architecture/temporal-results-matrix.md').write_text(
+              '''# Temporal VLM evidence and results matrix\n\nStatus: **measured evidence + explicitly open questions**  \nDate: 2026-08-25 (America/Chicago)\n\n## Purpose\n\nThis document summarizes what the repository has actually demonstrated about multi-frame and native-video VLM inference. It is deliberately model- and application-agnostic.\n\nDetailed results remain in:\n\n- [`../multiframe-temporal-latency-results.md`](../multiframe-temporal-latency-results.md)\n- [`../cosmos-reason2-2b-multiframe-results.md`](../cosmos-reason2-2b-multiframe-results.md)\n- [`../temporal-chronology-results.md`](../temporal-chronology-results.md)\n- [`temporal-vlm-architecture.md`](temporal-vlm-architecture.md)\n\n## Results matrix\n\n| Question | Configuration / observation | Result | Evidence level | Current interpretation |\n| --- | --- | --- | --- | --- |\n| Can CR2-8B ingest a short visual history without latency growing linearly with frame count? | Ordered independent images, F1 to F8, Thor `thor-f8` | Mean IPC latency **708.6 -> 957.6 ms**; 8x frames increased latency **35.1%** | Controlled benchmark | Bounded multi-frame context is much cheaper than repeated independent F1 calls |\n| Where does F1-to-F8 cost appear on CR2-8B? | NVIDIA direct profile | Vision **22.0 -> 102.8 ms**; prefill **33.3 -> 87.3 ms**; generation GPU **662.4 -> 683.8 ms** | Controlled profile | Additional frames mainly increase vision/prefill; generation remains dominant |\n| Does model size attack the dominant cost? | CR2-8B vs CR2-2B, ordered-image F8 | Mean IPC **957.6 -> 415.4 ms**, **56.6% reduction** | Controlled benchmark | Decoder/model size is a high-leverage latency control |\n| Can CR2-2B handle F8? | CR2-2B `thor-f8` | Mean IPC **415.4 ms**, p95 **422 ms** | Controlled benchmark | Eight-frame capacity is established |\n| Does ordered multi-image ingestion prove temporal reasoning quality? | Static F8 sanity sequence | No meaningful change reported, but references to nonexistent Image 9/10 appeared | Smoke test | Capacity does not establish temporal grounding |\n| Does the explicit sequence contract cause a real runtime representation change? | Same F4 frames through image and video requests | Ordered-image and native-video runtime encodings differ; no fallback | Hardware validation | Temporal representation is a real model-input semantic, not a label |\n| Does native video work on Thor? | CR2-2B F4/F8 native video | F4 **559 ms**, F8 **601 ms** inference in smoke runs | Hardware validation | Native video is operational for bounded temporal context |\n| Are timing and representation part of model semantics? | Qwen3-VL/Cosmos video path | Native video consumes FPS/timestamp metadata; ordered images do not | Implementation/API finding | Sequence type, runtime encoding, and timing policy are first-class provenance |\n| Can irregular timestamps be replaced by average FPS without changing the task? | Runtime/distillation design | **No** | Design invariant | Preserve exact timestamps, explicitly resample and record it, or reject the sample |\n| Is Cosmos3 native-video inference sensitive to chronology? | 8-frame 1.868 s motion-rich window; exact same frames/timestamps forward vs reverse | Forward: person **right->left**; reverse: **left->right** | Controlled semantic test | **Chronology sensitivity demonstrated for this sequence** |\n| Does repeated static video force a false change? | Final frame repeated 8x with same native-video timestamp schedule | Structured `CHANGES: none`; summary still described walking | Controlled semantic control | Structured change field passed static control; free-form summary consistency needs improvement |\n| Does the model reject temporally incoherent ordering? | Deterministically shuffled same 8 frames | Model still produced a plausible motion narrative | Controlled semantic control | Temporal coherence/rejection is **not established** |\n| Does a single image avoid action inference? | Final frame only | Model inferred walking/forward from appearance | Diagnostic | Treat as action-state inference, not temporal displacement evidence |\n| Do we know whether native video improves temporal quality over ordered images across a dataset? | Not yet measured across a shared corpus | **Unknown** | Open experiment | Requires model-agnostic semantic benchmark |\n| Do we know which supported video model has the best quality/latency tradeoff? | Multiple video-capable models available in pipeline | **Unknown** | Open experiment | Freeze working baselines and compare on identical saved windows |\n\n## Current conclusions\n\n1. Short bounded visual histories are computationally tractable on Thor.\n2. Generation/decoder cost dominates the measured CR2 latency profile.\n3. Native-video timing and representation must be preserved as experiment provenance.\n4. Cosmos3 native video has demonstrated chronology sensitivity on a controlled motion sequence.\n5. General temporal reliability is still open: shuffled-order rejection and output-field consistency need dataset-level measurement.\n6. The next step is comparative evaluation across video-capable models, not additional model-specific prompt tuning on a single clip.\n\n## Next evidence to collect\n\n1. Build a shared set of motion-rich and static saved windows.\n2. Run forward, reverse, shuffled, repeated-static, and dropped-frame controls for each video-capable model.\n3. Score direction accuracy, reverse consistency, static false-change rate, shuffle rejection, schema compliance, latency, and memory.\n4. Compare native-video and ordered-image representations using identical source frames.\n5. Only after comparative evaluation, optimize prompts or specialize/distill the strongest deployment candidates.\n''',
+              encoding='utf-8',
+          )
+
+          # Strengthen the public-facing README framing without discarding the existing deployment guide.
+          readme = (root / 'README.md').read_text(encoding='utf-8')
+          marker = '## Architecture\n'
+          intro_end = readme.find(marker)
+          if intro_end < 0:
+              raise RuntimeError('README architecture marker not found')
+          new_intro = '''# edge_vlm_ros\n\nA generic, model-neutral ROS 2 VLM pipeline demo for NVIDIA Jetson platforms. The repository demonstrates camera-to-VLM inference, process-isolated GPU workers, structured ROS results, tracked-observation context, bounded multi-frame history, native-video temporal inference, model/profile management, and repeatable benchmarking.\n\nThe project is intentionally application-agnostic: it provides reusable ROS 2 plumbing and evaluation tools for vision-language reasoning without coupling the pipeline to a specific autonomy task or operating environment. Current hardware validation targets Jetson AGX Thor with JetPack 7.2.x / Jetson Linux R39.2.x and includes NVIDIA Cosmos-Reason2, Cosmos3 Edge, and Qwen3-VL-oriented runtime paths.\n\n'''
+          readme = new_intro + readme[intro_end:]
+          temporal_section = '''\n## Temporal and native-video experiments\n\nThe repository includes bounded temporal-window sampling, exact frame-timestamp transport, native-video IPC/runtime support, and a controlled chronology harness. Saved captures can be replayed as forward, reversed, shuffled, repeated-static, and single-frame controls so different video-capable models can be compared on identical evidence.\n\nThe first controlled Cosmos3 native-video experiment on Thor showed frame-order sensitivity: reversing the same eight frames reversed the inferred lateral motion direction. Shuffled-order rejection is not yet reliable, so the current focus is comparative model evaluation rather than model-specific prompt tuning. See [the chronology results](docs/temporal-chronology-results.md) and [the temporal evidence matrix](docs/architecture/temporal-results-matrix.md).\n\n'''
+          if '## Temporal and native-video experiments' not in readme:
+              insert_at = readme.find('## Supported target baseline')
+              if insert_at < 0:
+                  raise RuntimeError('README supported baseline marker not found')
+              readme = readme[:insert_at] + temporal_section + readme[insert_at:]
+          readme = readme.replace('Apache 2.0. See [LICENSE](LICENSE).', 'MIT. See [LICENSE](LICENSE).')
+          (root / 'README.md').write_text(readme, encoding='utf-8')
+
+          # Final genericization pass over newly-authored docs/README and package metadata.
+          for path in root.rglob('*'):
+              if not path.is_file() or '.git' in path.parts:
+                  continue
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except UnicodeDecodeError:
+                  continue
+              text = genericize(text)
+              text = text.replace('<license>Apache-2.0</license>', '<license>MIT</license>')
+              text = text.replace('Apache 2.0. See [LICENSE](LICENSE).', 'MIT. See [LICENSE](LICENSE).')
+              path.write_text(text, encoding='utf-8')
+
+          # Remove this one-time workflow from the resulting repository state.
+          Path('.github/workflows/reframe-generic-vlm.yml').unlink()
+
+          # Guardrails: no application-specific acronym/identifier or stale project license remains.
+          bad_context = []
+          bad_license = []
+          for path in root.rglob('*'):
+              if not path.is_file() or '.git' in path.parts:
+                  continue
+              if 'odd' in str(path).lower():
+                  bad_context.append(f'path:{path}')
+              try:
+                  text = path.read_text(encoding='utf-8')
+              except UnicodeDecodeError:
+                  continue
+              if re.search(r'odd', text, flags=re.IGNORECASE):
+                  bad_context.append(str(path))
+              if 'Licensed under the Apache License' in text or 'Apache-2.0' in text:
+                  bad_license.append(str(path))
+          if bad_context:
+              raise RuntimeError('Application-specific references remain: ' + ', '.join(sorted(set(bad_context))))
+          if bad_license:
+              raise RuntimeError('Stale Apache project licensing remains: ' + ', '.join(sorted(set(bad_license))))
+          PY
+
+      - name: Validate text and Python syntax
+        shell: bash
+        run: |
+          git diff --check
+          python3 -m compileall -q distillation scripts/benchmark flashrt_temporal
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          hits = []
+          for p in Path('.').rglob('*'):
+              if not p.is_file() or '.git' in p.parts:
+                  continue
+              try:
+                  text = p.read_text(encoding='utf-8')
+              except UnicodeDecodeError:
+                  continue
+              if re.search(r'odd', text, re.IGNORECASE) or 'odd' in str(p).lower():
+                  hits.append(str(p))
+          if hits:
+              raise SystemExit('Remaining application-specific references: ' + ', '.join(sorted(set(hits))))
+          PY
+
+      - name: Commit reframe
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: reframe repository as generic ROS 2 VLM demo"
+          git push origin HEAD:feature/flashrt-temporal-video
