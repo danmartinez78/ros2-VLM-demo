@@ -16,7 +16,7 @@ flowchart LR
     WORKER --> MODEL[VLM runtime / engine]
     MODEL --> WORKER
     WORKER --> IPC
-    ROS -->|VlmResult| RESULT[/vlm/result]
+    ROS -->|VlmResult| RESULT["/vlm/result"]
 ```
 
 The ROS and GPU runtimes intentionally run in separate processes. This keeps ROS/DDS dependencies isolated from accelerator/runtime libraries, allows the model worker to remain loaded while clients reconnect, and lets a failed worker restart without restarting the ROS graph.
