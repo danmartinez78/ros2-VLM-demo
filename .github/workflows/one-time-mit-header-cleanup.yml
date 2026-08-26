@@ -1,0 +1,65 @@
+name: one-time-mit-header-cleanup
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  normalize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Replace stale Apache headers
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          files = [
+              Path('src/tensorrt_edge_llm_backend.cpp'),
+              Path('src/vlm_reasoner_node.cpp'),
+              Path('test/test_node.cpp'),
+          ]
+          old = '''// Copyright 2025 edge_vlm_ros contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+'''
+          new = '''// Copyright 2025 edge_vlm_ros contributors
+// SPDX-License-Identifier: MIT
+'''
+          for path in files:
+              text = path.read_text()
+              if old not in text:
+                  raise SystemExit(f'expected Apache header not found in {path}')
+              path.write_text(text.replace(old, new, 1))
+          PY
+      - name: Verify no stale Apache notices remain
+        run: |
+          if grep -RInE 'Apache License|apache.org/licenses/LICENSE-2.0|SPDX-License-Identifier: Apache-2.0' \
+            --exclude-dir=.git .; then
+            echo 'stale Apache reference remains' >&2
+            exit 1
+          fi
+      - name: Commit cleanup and remove this one-time workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/one-time-mit-header-cleanup.yml
+          git add src/tensorrt_edge_llm_backend.cpp src/vlm_reasoner_node.cpp test/test_node.cpp
+          git commit -m 'chore: replace stale Apache headers with MIT SPDX'
+          git push
