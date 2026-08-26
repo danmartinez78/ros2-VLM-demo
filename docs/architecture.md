@@ -28,7 +28,7 @@ flowchart LR
     WORKER --> RUNTIME[TensorRT Edge-LLM / model engine]
     RUNTIME --> WORKER
     WORKER --> SOCK
-    NODE --> RESULT[/vlm/result]
+    NODE --> RESULT["/vlm/result"]
 ```
 
 ### ROS process responsibilities
