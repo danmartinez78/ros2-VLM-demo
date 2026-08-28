@@ -8,17 +8,22 @@ if [[ "$(uname -m)" != "aarch64" ]]; then
   echo "warning: validated target is aarch64/Jetson AGX Thor; detected $(uname -m)" >&2
 fi
 
-for cmd in docker curl jq; do
-  if ! command -v "$cmd" >/dev/null 2>&1; then
-    echo "missing required command: $cmd" >&2
-    exit 1
-  fi
-done
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker is required before running this setup script." >&2
+  exit 1
+fi
 
+missing_packages=()
+command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
+command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
 if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
-  echo "Installing ffmpeg/ffprobe..."
+  missing_packages+=(ffmpeg)
+fi
+
+if ((${#missing_packages[@]})); then
+  echo "Installing host utilities: ${missing_packages[*]}"
   sudo apt-get update
-  sudo apt-get install -y ffmpeg
+  sudo apt-get install -y "${missing_packages[@]}"
 fi
 
 if [[ ! -s "$TOKEN_PATH" ]]; then
