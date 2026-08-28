@@ -90,9 +90,14 @@ def main() -> None:
     )
     parser.add_argument("capture_dir", type=Path)
     parser.add_argument(
-        "--output-dir",
+        "--data-root",
         type=Path,
-        default=Path("teacher_outputs/cosmos3_nano/media"),
+        default=Path.home() / "cosmos3_teacher",
+        help="Host directory mounted into the vLLM container as /data",
+    )
+    parser.add_argument(
+        "--output-name",
+        help="Output directory name under DATA_ROOT/generated; defaults to capture name",
     )
     args = parser.parse_args()
 
@@ -122,8 +127,12 @@ def main() -> None:
         raise ValueError("capture timestamp span must be positive")
     fps = (len(frame_files) - 1) / span
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_dir = args.output_dir.resolve()
+    data_root = args.data_root.expanduser().resolve()
+    output_name = args.output_name or capture_dir.name
+    output_dir = data_root / "generated" / output_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    container_dir = Path("/data/generated") / output_name
+
     n = len(frame_files)
     variants = {
         "forward": list(range(n)),
@@ -137,7 +146,8 @@ def main() -> None:
         output_path = output_dir / f"{name}.mp4"
         probe = write_video(capture_dir, frame_files, order, fps, output_path)
         output_variants[name] = {
-            "path": str(output_path),
+            "host_path": str(output_path),
+            "container_path": str(container_dir / f"{name}.mp4"),
             "frame_order": order,
             "frame_count": n,
             "probe": probe,
@@ -159,9 +169,12 @@ def main() -> None:
         "source_relative_timestamps_sec": manifest.get("relative_timestamps_sec"),
         "source_timestamp_span_sec": span,
         "effective_constant_fps": fps,
+        "data_root": str(data_root),
+        "container_data_root": "/data",
         "variants": output_variants,
         "terminal_only": {
-            "path": str(terminal_output),
+            "host_path": str(terminal_output),
+            "container_path": str(container_dir / "terminal_only.png"),
             "frame_order": [n - 1],
         },
     }
