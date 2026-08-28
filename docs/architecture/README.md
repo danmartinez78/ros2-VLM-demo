@@ -1,14 +1,15 @@
 # Architecture design map
 
-This directory contains design-level documentation for the generic ROS 2 VLM pipeline, including single-frame reasoning, bounded temporal windows, native-video inference, model/runtime isolation, and evaluation.
+This directory contains design-level documentation for the generic ROS 2 VLM pipeline, including single-frame reasoning, bounded temporal windows, native-video inference, model/runtime isolation, shared serving, and evaluation.
 
-The existing [`../architecture.md`](../architecture.md) remains the source of truth for the deployed ROS/IPC/runtime process architecture. The documents here describe temporal representation, scheduling boundaries, reproducibility rules, and measured evidence that should remain useful across models and applications.
+The existing [`../architecture.md`](../architecture.md) remains the source of truth for the deployed ROS/IPC/runtime process architecture. The documents here describe temporal representation, scheduling boundaries, runtime alternatives, reproducibility rules, and measured evidence that should remain useful across models and applications.
 
 ## Documents
 
 | Document | Purpose |
 | --- | --- |
 | [Temporal VLM architecture](temporal-vlm-architecture.md) | End-to-end temporal context path, representation contract, scheduling/runtime boundaries, timing semantics, and evaluation implications |
+| [Shared vLLM serving](shared-vllm-serving.md) | Target architecture for modular ROS callers sharing one serving-oriented VLM backend alongside the dedicated IPC path; includes concurrency benchmark and decision criteria |
 | [Temporal VLM evidence/results matrix](temporal-results-matrix.md) | Compact synthesis of measured latency/runtime evidence, chronology tests, architecture interpretation, and open experiment gaps |
 | [Controlled chronology results](../temporal-chronology-results.md) | Exact forward/reverse/shuffled/static control results from the native-video Cosmos3 experiment on Thor |
 | [`../distillation-pipeline-design.md`](../distillation-pipeline-design.md) | Teacher-to-student temporal task-distillation design with explicit representation-fidelity requirements |
