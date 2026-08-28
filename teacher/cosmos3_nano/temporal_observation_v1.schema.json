@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "temporal_observation_v1",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "objects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "class": {"type": "string"},
+          "observed_state": {"type": "string"},
+          "temporal_change": {
+            "type": "string",
+            "enum": [
+              "none",
+              "lateral_displacement",
+              "approaching",
+              "receding",
+              "appeared",
+              "disappeared",
+              "unknown"
+            ]
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right",
+              "toward_camera",
+              "away_from_camera",
+              "none",
+              "unknown"
+            ]
+          },
+          "evidence": {"type": "string"}
+        },
+        "required": [
+          "class",
+          "observed_state",
+          "temporal_change",
+          "direction",
+          "evidence"
+        ]
+      }
+    },
+    "camera_motion": {
+      "type": "string",
+      "enum": [
+        "stationary",
+        "pan_left",
+        "pan_right",
+        "forward",
+        "backward",
+        "uncertain"
+      ]
+    },
+    "temporal_coherence": {
+      "type": "string",
+      "enum": ["coherent", "incoherent", "uncertain"]
+    },
+    "unsupported_claims": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    }
+  },
+  "required": [
+    "objects",
+    "camera_motion",
+    "temporal_coherence",
+    "unsupported_claims",
+    "confidence"
+  ]
+}
