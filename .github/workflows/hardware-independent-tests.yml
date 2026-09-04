@@ -2,21 +2,27 @@ name: hardware-independent-tests
 
 # Approval note: GitHub requires a maintainer to approve the first workflow run
 # for pull requests from forks and for any PR that modifies workflow files
-# (including those authored by bots such as Copilot).  This is a platform
-# security policy ("action_required") that cannot be disabled.  Normal
+# (including those authored by bots such as Copilot). This is a platform
+# security policy ("action_required") that cannot be disabled. Normal
 # same-repository PRs that do not touch workflow files run automatically.
 #
 # CI image: ghcr.io/<owner>/ros2-vlm-demo-ci:jazzy
-# Built by the ensure-ci-image job below before ipc-and-node-tests runs.
-# The image pre-installs all stable apt dependencies so the build step
-# does not repeat expensive apt/rosdep setup on every PR.
-# On the first run (or after Dockerfile changes) the image is built from
-# scratch using GitHub Actions layer cache; subsequent PRs reuse the cache.
+# Built by build-ci-image.yml when .github/docker/Dockerfile.ci changes on main.
+# This workflow only pulls the prebuilt image, so routine PR validation does not
+# rebuild or push shared CI infrastructure.
 
 on:
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -24,51 +30,14 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
+  packages: read
 
 jobs:
-  # Build and push the CI image whenever the Dockerfile changes; all other runs
-  # hit the GitHub Actions layer cache and complete in seconds.
-  ensure-ci-image:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    outputs:
-      image: ${{ steps.image-ref.outputs.image }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build and push CI image (cached)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: .github/docker/Dockerfile.ci
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/ros2-vlm-demo-ci:jazzy
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Output image ref
-        id: image-ref
-        run: echo "image=ghcr.io/${{ github.repository_owner }}/ros2-vlm-demo-ci:jazzy" >> "$GITHUB_OUTPUT"
-
   ipc-and-node-tests:
     runs-on: ubuntu-24.04
-    needs: ensure-ci-image
     timeout-minutes: 15
     container:
-      image: ${{ needs.ensure-ci-image.outputs.image }}
+      image: ghcr.io/${{ github.repository_owner }}/ros2-vlm-demo-ci:jazzy
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -87,7 +56,7 @@ jobs:
         uses: actions/checkout@v4
 
       # Install only the package's own rosdep keys (not the stable apt deps,
-      # which are already baked into the CI image).  Bounded to 3 minutes so a
+      # which are already baked into the CI image). Bounded to 3 minutes so a
       # mirror stall does not silently consume the job timeout.
       - name: Install package rosdep dependencies
         timeout-minutes: 3
